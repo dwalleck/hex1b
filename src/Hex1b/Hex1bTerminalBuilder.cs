@@ -449,11 +449,16 @@ public sealed class Hex1bTerminalBuilder
         if (string.IsNullOrEmpty(options.FileName))
             throw new InvalidOperationException("FileName must be set in process options.");
 
+#pragma warning disable HEX1B_UNIX_PTY_STARTUP
+        var unixPtyStartupTimeout = options.UnixPtyStartupTimeout;
+#pragma warning restore HEX1B_UNIX_PTY_STARTUP
+
         SetWorkloadFactory(presentation =>
         {
             var width = presentation?.Width ?? _width;
             var height = presentation?.Height ?? _height;
 
+#pragma warning disable HEX1B_UNIX_PTY_STARTUP
             var process = new Hex1bTerminalChildProcess(
                 options.FileName,
                 options.Arguments?.ToArray() ?? [],
@@ -462,9 +467,14 @@ public sealed class Hex1bTerminalBuilder
                 inheritEnvironment: options.InheritEnvironment,
                 initialWidth: width,
                 initialHeight: height,
-                ptyHandleFactory: () => Hex1bTerminalChildProcess.CreatePtyHandle(
+                ptyHandleFactory: timeout => Hex1bTerminalChildProcess.CreatePtyHandle(
                     options.WindowsPtyMode,
-                    options.WindowsPtyHostPath));
+                    options.WindowsPtyHostPath,
+                    timeout))
+            {
+                UnixPtyStartupTimeout = unixPtyStartupTimeout
+            };
+#pragma warning restore HEX1B_UNIX_PTY_STARTUP
 
             Func<CancellationToken, Task<int>> runCallback = async ct =>
             {
@@ -1594,6 +1604,27 @@ internal sealed class Hex1bTerminalBuildContext(
 /// </summary>
 public sealed class Hex1bTerminalProcessOptions
 {
+    private TimeSpan _unixPtyStartupTimeout = UnixPtyStartupOptions.DefaultTimeout;
+
+    /// <summary>
+    /// Gets or sets the Unix PTY startup-handshake timeout. Defaults to 10 seconds.
+    /// </summary>
+    /// <remarks>
+    /// Accepts any positive duration or <see cref="Timeout.InfiniteTimeSpan"/>.
+    /// Infinite waiting remains cancellable. This bounds the Unix pre-exec/exec handshake,
+    /// not shell-prompt or application readiness. It does not affect Windows or redirected
+    /// processes. Cleanup may outlast the deadline when kernel operations block.
+    /// The builder snapshots this value when process configuration completes.
+    /// This experimental option's name, scope, and policy may change.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The value is zero or negative other than infinite.</exception>
+    [System.Diagnostics.CodeAnalysis.Experimental("HEX1B_UNIX_PTY_STARTUP")]
+    public TimeSpan UnixPtyStartupTimeout
+    {
+        get => _unixPtyStartupTimeout;
+        set => _unixPtyStartupTimeout = UnixPtyStartupOptions.ValidateTimeout(value);
+    }
+
     /// <summary>
     /// Gets or sets the executable to run.
     /// </summary>
