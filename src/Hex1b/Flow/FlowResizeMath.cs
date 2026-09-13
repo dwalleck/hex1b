@@ -111,4 +111,124 @@ internal static class FlowResizeMath
         }
         return rows;
     }
+
+    /// <summary>
+    /// Computes the row where new finalized content continues after the host
+    /// terminal re-wrapped its buffer for a new geometry.
+    /// </summary>
+    /// <param name="initialRowOrigin">The row at which the flow's first
+    /// paragraph started (see <see cref="ComputeRowOriginAtWidth"/>). Rows above
+    /// it belong to earlier output and stay above the flow's content through a
+    /// reflow, so they shift the screen row the content lands on.</param>
+    /// <param name="paragraphWidths">Every paragraph the flow has emitted, in
+    /// emission order, as logical (pre-wrap) widths in display cells — the same
+    /// model <see cref="ComputeRowOriginAtWidth"/> consumes.</param>
+    /// <param name="oldWidth">Terminal width the paragraphs were emitted at.</param>
+    /// <param name="newWidth">Terminal width after the change.</param>
+    /// <param name="newHeight">Terminal height after the change.</param>
+    /// <param name="cursorScreenRow">The cursor's screen row before the change.</param>
+    /// <param name="cursorColumn">The cursor's column before the change.</param>
+    /// <param name="cursorBelowContent">True when the cursor sits on a row below
+    /// the last content row (the live region's own top row) rather than on the
+    /// last content row itself.</param>
+    /// <returns>The screen row where the next content row belongs. This may be
+    /// one past the last row when the content already reaches the bottom; the
+    /// caller scrolls before writing.</returns>
+    /// <remarks>
+    /// <para>
+    /// This mirrors the host reflow rule the reflow strategies in
+    /// <c>Hex1b.Reflow</c> implement (VTE/Ghostty: the cursor's visual row is
+    /// preserved and content above it is pushed into scrollback as needed).
+    /// The computation stays in content coordinates, so it remains correct when
+    /// the host scrolled rows the framework never asked for — the drift an
+    /// absolute row counter cannot detect.
+    /// </para>
+    /// <para>
+    /// The live region's own rows are deliberately not part of the model: they
+    /// are rewritten on every turn, so treating the content as ending at its
+    /// last committed row keeps the answer an upper bound — content is never
+    /// written above the true tail.
+    /// </para>
+    /// </remarks>
+    public static int ComputeAppendRowAfterReflow(
+        int initialRowOrigin,
+        IReadOnlyList<IReadOnlyList<int>> paragraphWidths,
+        int oldWidth,
+        int newWidth,
+        int newHeight,
+        int cursorScreenRow,
+        int cursorColumn,
+        bool cursorBelowContent)
+    {
+        if (oldWidth < 1) throw new ArgumentOutOfRangeException(nameof(oldWidth), oldWidth, "oldWidth must be at least 1");
+        if (newWidth < 1) throw new ArgumentOutOfRangeException(nameof(newWidth), newWidth, "newWidth must be at least 1");
+        if (newHeight < 1) throw new ArgumentOutOfRangeException(nameof(newHeight), newHeight, "newHeight must be at least 1");
+
+        var contentRowsNew = 0;
+        var rowsBeforeLast = 0;
+        var lastParagraphRows = 0;
+        var paragraphCount = 0;
+
+        foreach (var tombstone in paragraphWidths)
+        {
+            foreach (var paragraphWidth in tombstone)
+            {
+                if (paragraphWidth < 0)
+                {
+                    throw new ArgumentOutOfRangeException(
+                        nameof(paragraphWidths), paragraphWidth, "paragraph widths must be non-negative");
+                }
+
+                var rows = Math.Max(1, (paragraphWidth + newWidth - 1) / newWidth);
+                rowsBeforeLast = contentRowsNew;
+                contentRowsNew += rows;
+                lastParagraphRows = rows;
+                paragraphCount++;
+            }
+        }
+
+        if (paragraphCount == 0)
+        {
+            return Math.Max(0, initialRowOrigin);
+        }
+
+        // Rows above the flow's first paragraph are unaffected by the reflow and
+        // remain above the content, so they shift every content row.
+        var leadRows = Math.Max(0, initialRowOrigin);
+
+        int cursorRowInContent;
+        if (cursorBelowContent)
+        {
+            // The cursor sits one row below the content (the live region's top),
+            // which keeps that row part of the reflowed buffer.
+            cursorRowInContent = contentRowsNew;
+        }
+        else
+        {
+            var rowInLastParagraph = Math.Clamp(cursorColumn / newWidth, 0, lastParagraphRows - 1);
+            cursorRowInContent = rowsBeforeLast + rowInLastParagraph;
+        }
+
+        // The host anchors the cursor's visual row and scrolls everything above
+        // it into scrollback as needed, so the content's start row follows from
+        // the cursor's row rather than from the old absolute position.
+        var cursorRowIncludingLead = leadRows + cursorRowInContent;
+        var desiredCursorScreenRow = Math.Clamp(cursorScreenRow, 0, newHeight - 1);
+        // Only reflowed content rows take part: the live region's own rows are
+        // rewritten every turn and including them would widen the clamp enough
+        // to move the anchor above the content's true tail.
+        var contentRowCount = Math.Max(leadRows + contentRowsNew, cursorRowIncludingLead + 1);
+        var maxScreenStart = Math.Max(0, contentRowCount - newHeight);
+        var screenStart = Math.Clamp(leadRows + cursorRowInContent - desiredCursorScreenRow, 0, maxScreenStart);
+
+        var lastContentRow = leadRows + contentRowsNew - 1 - screenStart;
+        var cursorScreenRowAfter = cursorRowIncludingLead - screenStart;
+        var appendRow = Math.Max(lastContentRow + 1, cursorBelowContent ? cursorScreenRowAfter : lastContentRow + 1);
+
+        // Deliberately NOT clamped to newHeight - 1: when the content reaches
+        // the bottom row the append position is one past it, and callers rely
+        // on seeing that to scroll before writing. Clamping here would make a
+        // write land on the content's last row.
+        return Math.Max(0, appendRow);
+    }
 }

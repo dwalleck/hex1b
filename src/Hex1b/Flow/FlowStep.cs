@@ -196,7 +196,14 @@ public sealed class FlowStep
     /// True when a previous commit failed after content may already have reached
     /// the terminal, so further history commitment is suspended.
     /// </summary>
-    public bool IsCommitUncertain => _commitCoordinator is { CanCommit: false };
+    public bool IsCommitUncertain => _commitCoordinator?.IsUncertain ?? false;
+
+    /// <summary>
+    /// True while a history commit is admitted and running. Distinct from
+    /// <see cref="IsCommitUncertain"/>: an in-flight commit is a transient state,
+    /// not a suspension of further commitment.
+    /// </summary>
+    public bool IsCommitInFlight => _commitCoordinator?.IsCommitInFlight ?? false;
 
     /// <summary>
     /// Waits until the step's application has rendered and entered its

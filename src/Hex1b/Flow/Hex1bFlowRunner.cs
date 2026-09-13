@@ -1613,6 +1613,27 @@ internal sealed class Hex1bFlowRunner
 
         public int RowOrigin => _stepAdapter.RowOrigin;
 
+        public int ComputeAppendRowAfterReflow(
+            int newWidth,
+            int newHeight,
+            int cursorScreenRow,
+            int cursorColumn,
+            bool cursorBelowContent)
+        {
+            lock (_runner._stepOpsLock)
+            {
+                return FlowResizeMath.ComputeAppendRowAfterReflow(
+                    _runner._initialRowOrigin,
+                    _runner._emittedTombstones,
+                    Math.Max(1, _runner._parentAdapter.Width),
+                    newWidth,
+                    newHeight,
+                    cursorScreenRow,
+                    cursorColumn,
+                    cursorBelowContent);
+            }
+        }
+
         public int LiveHeight => Math.Max(1, _step.StepHeight);
 
         public long FrameCount => _app.FrameCount;
