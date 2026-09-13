@@ -435,6 +435,9 @@ internal sealed class FlowCommitCoordinator
                     cursorBelowContent = true;
                 }
 
+                // Cleared before and after every unit: while no unit is in
+                // flight there are no aborted rows, and a cancellation at a loop
+                // guard must not attribute the previous unit's rows to it.
                 emission.Reset();
                 await EmitUnitAsync(
                     Record,
@@ -447,6 +450,7 @@ internal sealed class FlowCommitCoordinator
                 cursorRow = emission.LastRow;
                 cursorColumn = emission.LastColumn;
                 cursorBelowContent = false;
+                emission.Reset();
 
                 completedUnits++;
                 completedRows += unitHeight;
