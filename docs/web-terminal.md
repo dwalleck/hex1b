@@ -67,6 +67,27 @@ and making that state conform to terminal protocols. A faithful renderer can
 faithfully reveal a server bug. Such bugs should be fixed at the authoritative
 layer rather than hidden by browser-specific compensation.
 
+### Kitty graphics upload compatibility
+
+The producer accepts redundant metadata on chunked KGP image and animation
+uploads, matching Kitty's first-chunk-authoritative behavior. For example,
+kitty-doom repeats `r=1` on animation continuation chunks. Hex1b ignores that
+repeated metadata rather than rejecting the upload. Animation continuations
+can also omit `a=f`; the pending upload determines their meaning.
+
+The first chunk fixes image/frame identity, dimensions, format, compression,
+and placement. Later chunks cannot override those values, even if they specify
+different values. Continuations still require `m`, contribute payload, and
+retain the existing `q` response-suppression behavior. Malformed controls and
+payloads, upload limits, and unrelated actions are still checked; delete
+commands abort pending uploads. Images and frame edits become visible only
+after the complete upload is validated.
+
+This is a compatibility extension beyond the
+[protocol's strict continuation key restrictions](https://sw.kovidgoyal.net/kitty/graphics-protocol/#remote-client),
+not a browser-specific workaround. Clients should still emit the minimal
+continuation controls required by the specification.
+
 ## What the spike implements
 
 See [WebTerminalDemo](../samples/WebTerminalDemo/README.md) for run instructions.

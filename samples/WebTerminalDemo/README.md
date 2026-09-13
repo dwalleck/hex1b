@@ -109,6 +109,35 @@ See the package's [complete link API examples](../../src/web-terminal/README.md#
 for all text modes, action payloads, rule disabling, and worker deployment.
 This walkthrough is not a claim of browser validation or performance measurements.
 
+## Minimal chrome
+
+Click **Minimal chrome** in a terminal view's title bar to fill the browser page
+with that view. Playground controls, other views, title bars, status bars, and
+the command-history rail are hidden. A small **Restore controls** button stays
+in the top-right corner and restores the previous floating-window layout.
+
+The terminal stays connected and retains its sizing mode: **Auto** adjusts the
+primary terminal's grid to the extra space, while a fixed grid scales to fit.
+Secondary views still follow their primary; expanding one does not take
+primary ownership. Hidden views stay connected. Connection-error and reconnect
+overlays remain available in minimal mode.
+
+This does not enter the browser's fullscreen mode or intercept Escape, so
+terminal applications keep their normal keyboard controls.
+
+With the demo running and `playwright-cli` available, run the browser regression
+from the repository root in a separate automation session:
+
+```sh
+playwright-cli -s=minimal-chrome open 'http://localhost:5290/?empty=1'
+playwright-cli -s=minimal-chrome run-code --filename samples/WebTerminalDemo/tests/minimal-chrome.playwright.js
+playwright-cli -s=minimal-chrome close
+```
+
+The regression creates and removes its own text terminal. It covers full-page
+and narrow-screen layout, sizing, focus, secondary views, and reconnect/close
+behavior.
+
 ## Choose a reflow strategy
 
 Use **New terminal reflow** before clicking **New terminal** to compare the
