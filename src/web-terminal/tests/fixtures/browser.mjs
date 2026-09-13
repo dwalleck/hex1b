@@ -67,14 +67,17 @@ export class Element extends Target {
 }
 
 class WorkerBridge extends Target {
-  worker = new NodeWorker(new URL("./title-worker.mjs", import.meta.url));
   pending = new Map();
   outputs = [];
+  inputs = [];
   commands = [];
   errors = [];
   serial = 0;
-  constructor() {
+  constructor(url) {
     super();
+    this.url = String(url);
+    this.worker = new NodeWorker(new URL(
+      String(url).includes("link-detection-worker") ? "./link-worker.mjs" : "./title-worker.mjs", import.meta.url));
     this.worker.on("message", envelope => {
       if (envelope.type === "output") {
         this.outputs.push(envelope.message);
@@ -100,7 +103,11 @@ class WorkerBridge extends Target {
       this.pending.clear();
     });
   }
-  deliver(message) { this.dispatchEvent({ type: "message", data: message }); }
+  deliver(message) {
+    const event = { type: "message", data: message };
+    this.onmessage?.(event);
+    this.dispatchEvent(event);
+  }
   request(action, details = {}) {
     const id = ++this.serial;
     const pending = Promise.withResolvers();
@@ -108,8 +115,11 @@ class WorkerBridge extends Target {
     this.worker.postMessage({ id, action, ...details });
     return pending.promise;
   }
-  postMessage(message) { this.request("input", { message }).catch(() => {}); }
-  terminate() { return this.worker.terminate(); }
+  postMessage(message) {
+    this.inputs.push(message);
+    this.request("input", { message }).catch(() => {});
+  }
+  terminate() { this.terminated = true; return this.worker.terminate(); }
 }
 
 export function browser(t, overrides = {}) {
@@ -120,7 +130,7 @@ export function browser(t, overrides = {}) {
     ResizeObserver: class { observe() {} disconnect() {} },
     OffscreenCanvas: class {},
     Worker: class extends WorkerBridge {
-      constructor() { super(); workers.push(this); }
+      constructor(url) { super(url); workers.push(this); }
     },
     document: { createElement: () => new Element(), title: "Host document", activeElement: null },
     location: { href: "https://example.test/terminal" },
@@ -146,6 +156,7 @@ export function browser(t, overrides = {}) {
 }
 
 export function frame({ title = "", revision = 1, full = revision === 1, baseRevision = full ? 0 : revision - 1,
+  cells,
   peer = { id: null, primaryId: null, isPrimary: true }, ...overrides } = {}) {
   const metadata = {
     version: 1, title, revision, full, baseRevision, peer,
@@ -159,19 +170,26 @@ export function frame({ title = "", revision = 1, full = revision === 1, baseRev
     stats: { workloadBytes: 0, outputBatches: 0, captureMs: 0, elapsedMs: 0 }, ...overrides
   };
   const json = new TextEncoder().encode(JSON.stringify(metadata));
-  const count = full ? metadata.columns * metadata.rows : 0;
-  const bytes = new Uint8Array(12 + json.length + count * 23);
+  const encodedCells = (cells ?? (full ? Array.from({ length: metadata.columns * metadata.rows },
+    (_, index) => ({ index, text: "A", width: 1 })) : [])).map(cell => ({
+      ...cell, bytes: new TextEncoder().encode(cell.text ?? " ")
+    }));
+  const count = encodedCells.length;
+  const bytes = new Uint8Array(12 + json.length + encodedCells.reduce((sum, cell) => sum + 22 + cell.bytes.length, 0));
   const view = new DataView(bytes.buffer);
   view.setUint32(0, 0x31545748, true);
   view.setUint32(4, json.length, true);
   bytes.set(json, 8);
   view.setUint32(8 + json.length, count, true);
-  for (let index = 0; index < count; index++) {
-    const offset = 12 + json.length + index * 23;
-    view.setUint32(offset, index, true);
-    view.setUint8(offset + 18, 1);
-    view.setUint16(offset + 20, 1, true);
-    view.setUint8(offset + 22, 65);
+  let offset = 12 + json.length;
+  for (const cell of encodedCells) {
+    view.setUint32(offset, cell.index, true);
+    view.setUint16(offset + 16, cell.attributes ?? 0, true);
+    view.setUint8(offset + 18, cell.width ?? 1);
+    view.setUint8(offset + 19, cell.underlineStyle ?? 0);
+    view.setUint16(offset + 20, cell.bytes.length, true);
+    bytes.set(cell.bytes, offset + 22);
+    offset += 22 + cell.bytes.length;
   }
   return bytes.buffer;
 }
