@@ -100,6 +100,7 @@ const resizeEdges = {
 };
 let instances: TerminalInstance[] = [];
 let selected: TerminalView | undefined;
+let minimalView: TerminalView | undefined;
 let nextView = 0;
 let zIndex = 0;
 let refreshing: Promise<void> | undefined;
@@ -324,6 +325,7 @@ function metrics(view: Pick<TerminalView, "id" | "stats" | "text" | "transport">
 }
 
 function selectView(view: TerminalView) {
+  if (minimalView && minimalView !== view) setMinimalChrome();
   selected?.element.classList.remove("selected");
   selected = view;
   view.element.classList.add("selected");
@@ -333,6 +335,25 @@ function selectView(view: TerminalView) {
     updateInstanceControls();
   }
   metrics(view);
+}
+
+function setMinimalChrome(view?: TerminalView) {
+  const previous = minimalView;
+  if (previous) {
+    previous.element.classList.remove("minimal-chrome");
+    elementAt(previous.element, ".minimal-chrome-toggle", HTMLButtonElement).setAttribute("aria-pressed", "false");
+  }
+  minimalView = view;
+  document.body.classList.toggle("minimal-chrome", !!view);
+  button("restore-chrome").hidden = !view;
+  if (view) {
+    selectView(view);
+    view.element.classList.add("minimal-chrome");
+    elementAt(view.element, ".minimal-chrome-toggle", HTMLButtonElement).setAttribute("aria-pressed", "true");
+  }
+  const target = view ?? previous;
+  if (target?.phase === "connected") target.terminal?.focus();
+  else target?.element.focus({ preventScroll: true });
 }
 
 function updateSizingControls(view: TerminalView) {
@@ -522,6 +543,7 @@ function moveAndResize(view: TerminalView) {
 }
 
 function closeView(view: TerminalView) {
+  if (minimalView === view) setMinimalChrome();
   view.controller.abort();
   view.connectionController?.abort();
   view.terminal?.dispose();
@@ -557,6 +579,7 @@ async function openView(instance: TerminalInstance, { primary = false, thumbnail
   element.innerHTML = `
     <header class="view-titlebar">
       <span class="view-title"></span><span class="view-role">Joining</span>
+      <button class="minimal-chrome-toggle" aria-pressed="false" title="Fill the page with this terminal and hide playground controls">Minimal chrome</button>
       <button class="close-view" title="Close this view; keep the terminal running" aria-label="Close view">Close</button>
     </header>
     <div class="view-tools">
@@ -643,6 +666,7 @@ async function openView(instance: TerminalInstance, { primary = false, thumbnail
     if (selected !== view) selectView(view);
   }, { signal: view.controller.signal });
   elementAt(element, ".close-view", HTMLButtonElement).addEventListener("click", () => closeView(view), { signal: view.controller.signal });
+  elementAt(element, ".minimal-chrome-toggle", HTMLButtonElement).addEventListener("click", () => setMinimalChrome(view), { signal: view.controller.signal });
   elementAt(element, ".dismiss-view", HTMLButtonElement).addEventListener("click", () => closeView(view), { signal: view.controller.signal });
   action(elementAt(element, ".thumbnail", HTMLButtonElement), () => openView(instance, { thumbnail: true }),
     () => updateViewControls(view));
@@ -845,6 +869,7 @@ async function createInstance() {
   await openView(instance, { primary: true });
 }
 
+button("restore-chrome").addEventListener("click", () => setMinimalChrome());
 action(button("create"), createInstance);
 action(button("attach"), () => {
   const instance = instances.find(item => item.id === instancesSelect.value);
