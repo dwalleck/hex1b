@@ -241,7 +241,12 @@ public sealed class FlowStep
     /// <para>
     /// Emission proceeds in bounded turns so input and resize processing get
     /// opportunities between them, and only units that have not been emitted are
-    /// re-materialized if the terminal width changes mid-commit.
+    /// re-materialized if the terminal width changes mid-commit. The live region
+    /// is not left out of the picture while that happens: each unit is written
+    /// together with the region re-anchored and repainted below it, in one
+    /// serialized terminal update bracketed by synchronized output, so the prompt
+    /// stays on screen and an edit the app renders while the output pump is muted
+    /// becomes visible in the same update rather than at the next turn.
     /// </para>
     /// <para>
     /// <see cref="FlowCommitResult.CompletedRows"/> counts physical rows that

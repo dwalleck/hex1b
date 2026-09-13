@@ -66,6 +66,18 @@ internal sealed class Hex1bFlowRunner
     // commit cannot reposition the same region concurrently.
     private readonly object _stepOpsLock = new();
 
+    // Atomic terminal-update scope. While one is open, the writes its owner
+    // issues are composed into this buffer and handed to the parent terminal as
+    // ONE write, bracketed by synchronized output (DEC mode 2026). That is what
+    // keeps a unit's rows and the live-region repaint that follows them from
+    // being painted as two states: a host that honors mode 2026 sees only the
+    // finished update, so the prompt is never displayed displaced. The scope
+    // holds both step locks for its synchronous duration, so no other writer can
+    // interleave inside a unit's update.
+    private readonly StringBuilder _atomicUpdate = new(4096);
+    private bool _atomicUpdateActive;
+    private int _atomicUpdateThreadId;
+
     // Optional JSONL file receiving framework-side commit events. The driver
     // writes its own app-side evidence; this is the framework's view of the
     // same commits, and both are observations rather than host history proof.
@@ -110,14 +122,111 @@ internal sealed class Hex1bFlowRunner
     /// <summary>
     /// Positions at an absolute terminal row and writes, atomically under the
     /// terminal write lock, so the cursor can never be moved away from the row
-    /// between positioning and content.
+    /// between positioning and content. Inside an atomic update owned by this
+    /// thread the pair is appended to that update's single terminal write.
     /// </summary>
-    private void WriteTerminalAt(int row, string text)
+    private void WriteTerminalAt(int row, string text) => WriteTerminalUpdate(row, text);
+
+    /// <summary>
+    /// Moves the terminal's cursor to the start of an absolute row without
+    /// writing content.
+    /// </summary>
+    private void SetTerminalCursorRow(int row) => WriteTerminalUpdate(row, text: null);
+
+    /// <summary>
+    /// The single writer for live-step terminal bytes: positions the cursor at
+    /// <paramref name="row"/> and writes <paramref name="text"/>, or only moves
+    /// the cursor when <paramref name="text"/> is null.
+    /// </summary>
+    /// <remarks>
+    /// Inside an atomic update owned by the calling thread the update is
+    /// appended to the scope's buffer; otherwise it goes to the parent terminal
+    /// under the write lock. The buffered form emits the same cursor-position
+    /// bytes the adapter would (<c>ESC[row;1H</c>).
+    /// </remarks>
+    private void WriteTerminalUpdate(int row, string? text)
     {
+        var clamped = Math.Clamp(row, 0, Math.Max(0, _parentAdapter.Height - 1));
+
+        if (_atomicUpdateActive && Environment.CurrentManagedThreadId == _atomicUpdateThreadId)
+        {
+            _atomicUpdate.Append("\x1b[").Append(clamped + 1).Append(";1H");
+            if (!string.IsNullOrEmpty(text))
+            {
+                _atomicUpdate.Append(text);
+            }
+            return;
+        }
+
         lock (_terminalWriteLock)
         {
-            _parentAdapter.SetCursorPosition(0, Math.Clamp(row, 0, Math.Max(0, _parentAdapter.Height - 1)));
-            _parentAdapter.Write(text);
+            _parentAdapter.SetCursorPosition(0, clamped);
+            if (!string.IsNullOrEmpty(text))
+            {
+                _parentAdapter.Write(text);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Opens an atomic terminal-update scope. Every write the caller issues
+    /// through this runner on the same thread while the scope is open is
+    /// composed into ONE terminal write, bracketed by synchronized output
+    /// (DEC mode 2026), so a host that honors mode 2026 never paints the
+    /// intermediate state — and no other writer can interleave between the rows
+    /// that displace the live region and the repaint that restores it.
+    /// </summary>
+    /// <remarks>
+    /// The scope is synchronous by contract: nothing inside it may await, and it
+    /// must be disposed on the thread that opened it. Both step-level locks are
+    /// held for its duration; the writes it contains are a bounded number of
+    /// escape sequences, so the hold is short.
+    /// </remarks>
+    private IDisposable BeginAtomicTerminalUpdate()
+    {
+        Monitor.Enter(_stepOpsLock);
+        Monitor.Enter(_terminalWriteLock);
+        _atomicUpdate.Clear();
+        _atomicUpdateThreadId = Environment.CurrentManagedThreadId;
+        _atomicUpdateActive = true;
+        return new AtomicTerminalUpdateScope(this);
+    }
+
+    private void EndAtomicTerminalUpdate()
+    {
+        try
+        {
+            if (_atomicUpdate.Length > 0)
+            {
+                // One write for the whole update. Terminals that ignore mode
+                // 2026 ignore both bracket sequences and see the same bytes.
+                _atomicUpdate.Insert(0, SyncUpdateBegin);
+                _atomicUpdate.Append(SyncUpdateEnd);
+                _parentAdapter.Write(_atomicUpdate.ToString());
+                _atomicUpdate.Clear();
+            }
+        }
+        finally
+        {
+            _atomicUpdateActive = false;
+            Monitor.Exit(_terminalWriteLock);
+            Monitor.Exit(_stepOpsLock);
+        }
+    }
+
+    private sealed class AtomicTerminalUpdateScope(Hex1bFlowRunner runner) : IDisposable
+    {
+        private bool _disposed;
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            runner.EndAtomicTerminalUpdate();
         }
     }
 
@@ -1642,6 +1751,8 @@ internal sealed class Hex1bFlowRunner
 
         public void WriteTerminalAt(int row, string text) => _runner.WriteTerminalAt(row, text);
 
+        public IDisposable BeginAtomicTerminalUpdate() => _runner.BeginAtomicTerminalUpdate();
+
         public void ScrollViewportUp(int rows)
         {
             if (rows <= 0)
@@ -1688,8 +1799,7 @@ internal sealed class Hex1bFlowRunner
                     {
                         var absolute = rowOrigin + row;
                         if (absolute < 0 || absolute >= terminalHeight) continue;
-                        _runner._parentAdapter.SetCursorPosition(0, absolute);
-                        _runner._parentAdapter.Write("\x1b[2K");
+                        _runner.WriteTerminalUpdate(absolute, "\x1b[2K");
                     }
 
                     // 2. Paint the live image with clear-before-content on every
@@ -1704,13 +1814,13 @@ internal sealed class Hex1bFlowRunner
                     {
                         var absolute = rowOrigin + row;
                         if (absolute < 0 || absolute >= terminalHeight) continue;
-                        _runner._parentAdapter.SetCursorPosition(0, absolute);
-                        _runner._parentAdapter.Write(SoftWrapEmitter.OrderedRowPrefix);
-                        _runner._parentAdapter.Write(SoftWrapEmitter.RenderRowText(liveSurface, row));
+                        _runner.WriteTerminalUpdate(
+                            absolute,
+                            SoftWrapEmitter.OrderedRowPrefix + SoftWrapEmitter.RenderRowText(liveSurface, row));
                     }
 
                     // 3. Leave the cursor at the region's top-left.
-                    _runner._parentAdapter.SetCursorPosition(0, rowOrigin);
+                    _runner.SetTerminalCursorRow(rowOrigin);
                 }
             }
         }

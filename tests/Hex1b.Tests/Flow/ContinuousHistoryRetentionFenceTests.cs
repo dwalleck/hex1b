@@ -155,6 +155,233 @@ public class ContinuousHistoryRetentionFenceTests
         }
     }
 
+    /// <summary>
+    /// The live region must stay on screen for every committed unit, and an edit
+    /// typed while the batch is committing must be rendered, without waiting for
+    /// a turn boundary.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the fence for the defect the native typing leg measured: with the
+    /// region repainted only per bounded turn, the commit's own rows overwrite
+    /// the region's top rows for the first units of every turn, and a frame the
+    /// live app renders while the output pump is muted stays invisible until the
+    /// next boundary. A screenshot taken mid-commit showed history only.
+    /// </para>
+    /// <para>
+    /// The assertions are taken at unit indices inside a turn (2 and 11, with
+    /// turns ending at 8 and 16), so a per-turn repaint cannot satisfy them, and
+    /// the oracle is the terminal model's screen — what a host would have
+    /// displayed — not the application's draft ledger, which records edits the
+    /// screen never showed.
+    /// </para>
+    /// </remarks>
+    [TestMethod]
+    public async Task LiveRegion_StaysOnScreenAndRendersMidCommitEditInsideATurn()
+    {
+        var source = new FenceCommitSource(CommitId, PayloadRows);
+        FlowCommitResult? result = null;
+        FlowStep? step = null;
+        var liveText = LiveMarker;
+        string? screenEarlyInFirstTurn = null;
+        string? screenAfterMidTurnEdit = null;
+
+        using var terminal = CreateTerminal(async flow =>
+        {
+            step = flow.Step(
+                ctx => Task.FromResult<Hex1bWidget>(ctx.VStack(v =>
+                [
+                    v.Text(liveText),
+                    v.Text("committed rows leave this region"),
+                    v.Text("prompt stays usable across commitment"),
+                ])),
+                options =>
+                {
+                    options.MinHeight = 24;
+                    options.MaxHeight = 24;
+                });
+            await step.WaitForReadyAsync();
+            try
+            {
+                result = await step.CommitAsync(
+                    source,
+                    ctx => Task.FromResult<Hex1bWidget>(ctx.VStack(v => [v.Text(liveText)])));
+            }
+            finally
+            {
+                step.Complete();
+            }
+        }, width: 138, height: 37);
+
+        // Gate before each unit is materialized: a gate at index N reads the
+        // screen as it stands after units 0..N-1 were written and repainted.
+        source.Gate = async index =>
+        {
+            switch (index)
+            {
+                case 2:
+                    // Inside the first turn: before the repair, the commit's own
+                    // rows had already overwritten the region's top row.
+                    await Task.Delay(200);
+                    screenEarlyInFirstTurn = terminal.GetScreenText();
+                    break;
+
+                case 10:
+                    // A non-boundary index: type, and let the app — muted to the
+                    // terminal but still rendering — produce a frame carrying the
+                    // edit.
+                    liveText = "FENCE-LIVE-TYPED";
+                    step!.Invalidate();
+                    await Task.Delay(200);
+                    break;
+
+                case 11:
+                    // Still inside the turn that began at unit 8, so only a
+                    // per-unit repaint can have rendered the edit by now.
+                    await Task.Delay(200);
+                    screenAfterMidTurnEdit = terminal.GetScreenText();
+                    break;
+            }
+        };
+
+        await terminal.RunAsync().WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.IsNotNull(result);
+        Assert.AreEqual(PayloadRows + 2, result!.CompletedUnits);
+
+        // Both readings are collected before asserting, so one run of this fence
+        // against a broken build reports every failure with its screen instead of
+        // stopping at the first.
+        var findings = new List<string>();
+        if (screenEarlyInFirstTurn is null ||
+            !screenEarlyInFirstTurn.Contains(LiveMarker, StringComparison.Ordinal))
+        {
+            findings.Add(
+                "the live region must still be on screen after the first units of a commit.\n" +
+                $"screen at unit 2:\n{screenEarlyInFirstTurn}");
+        }
+
+        if (screenAfterMidTurnEdit is null ||
+            !screenAfterMidTurnEdit.Contains("FENCE-LIVE-TYPED", StringComparison.Ordinal))
+        {
+            findings.Add(
+                "an edit typed mid-commit must be rendered without waiting for a turn boundary.\n" +
+                $"screen at unit 11:\n{screenAfterMidTurnEdit}");
+        }
+
+        if (screenAfterMidTurnEdit is null ||
+            !screenAfterMidTurnEdit.Contains("prompt stays usable across commitment", StringComparison.Ordinal))
+        {
+            findings.Add(
+                "the whole live region, not just its first row, must be on screen mid-commit.\n" +
+                $"screen at unit 11:\n{screenAfterMidTurnEdit}");
+        }
+
+        Assert.AreEqual(0, findings.Count, string.Join("\n\n", findings));
+
+        // Visibility must not have cost retention.
+        AssertKeysExactlyOnce(ReadFullBuffer(terminal), CommitId, PayloadRows, trace: "(trace not captured)");
+    }
+
+    /// <summary>
+    /// Each unit's displacement and the live-region repaint that follows it must
+    /// reach the terminal as ONE write, bracketed by synchronized output.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This fences the mechanism the visibility case observes on screen. If the
+    /// commit wrote the unit's rows and the repaint as separate writes, every
+    /// host would have a window in which the region is displaced — the state the
+    /// native screenshot caught — regardless of how fast the repaint followed.
+    /// One write per unit, bracketed by DEC mode 2026, means a host that honors
+    /// mode 2026 paints only the finished state, and a host that ignores it
+    /// processes the whole update before it can paint anything new.
+    /// </para>
+    /// <para>
+    /// The runner writes to a recording parent adapter, so the assertions are on
+    /// the emitted byte stream rather than on a terminal model's screen.
+    /// </para>
+    /// </remarks>
+    [TestMethod]
+    public async Task EveryUnitUpdate_IsOneBracketedWriteCarryingTheLiveRegion()
+    {
+        const string SyncBegin = "\x1b[?2026h";
+        const string SyncEnd = "\x1b[?2026l";
+        var adapter = new RecordingParentAdapter(width: 100, height: 30);
+        var source = new FenceCommitSource(CommitId, PayloadRows);
+        FlowCommitResult? result = null;
+
+        var runner = new Hex1bFlowRunner(
+            flowCallback: async flow =>
+            {
+                var step = flow.Step(
+                    ctx => Task.FromResult<Hex1bWidget>(ctx.VStack(v =>
+                    [
+                        v.Text(LiveMarker),
+                        v.Text("committed rows leave this region"),
+                    ])),
+                    options =>
+                    {
+                        options.MinHeight = 8;
+                        options.MaxHeight = 8;
+                    });
+                await step.WaitForReadyAsync();
+                try
+                {
+                    result = await step.CommitAsync(
+                        source,
+                        ctx => Task.FromResult<Hex1bWidget>(ctx.VStack(v => [v.Text(LiveMarker)])));
+                }
+                finally
+                {
+                    step.Complete();
+                }
+            },
+            options: new Hex1bFlowOptions
+            {
+                UseSoftWrapTombstones = true,
+                InitialCursorRow = 0,
+            },
+            parentAdapter: adapter);
+
+        var runTask = runner.RunAsync(CancellationToken.None);
+        await runTask.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.IsNotNull(result);
+        Assert.AreEqual(PayloadRows + 2, result!.CompletedUnits);
+
+        var writes = adapter.SnapshotWritesSince(0);
+        var unitWrites = writes
+            .Where(w => w.Contains(CommitId + ":r", StringComparison.Ordinal)
+                        || w.Contains($"<<<COMMIT {CommitId} BEGIN", StringComparison.Ordinal)
+                        || w.Contains($"<<<COMMIT {CommitId} END", StringComparison.Ordinal))
+            .ToArray();
+
+        Assert.AreEqual(
+            PayloadRows + 2,
+            unitWrites.Length,
+            "each unit must reach the terminal as exactly one write (BEGIN, each payload row, END)");
+
+        var unbracketed = unitWrites
+            .Where(w => !w.StartsWith(SyncBegin, StringComparison.Ordinal)
+                        || !w.EndsWith(SyncEnd, StringComparison.Ordinal))
+            .ToArray();
+        Assert.AreEqual(
+            0,
+            unbracketed.Length,
+            "every unit update must be bracketed by synchronized output; first offender:\n" +
+            (unbracketed.Length > 0 ? unbracketed[0] : ""));
+
+        var withoutRegion = unitWrites
+            .Where(w => !w.Contains(LiveMarker, StringComparison.Ordinal))
+            .ToArray();
+        Assert.AreEqual(
+            0,
+            withoutRegion.Length,
+            "the unit's rows and the live-region repaint must be in the same write; first offender:\n" +
+            (withoutRegion.Length > 0 ? withoutRegion[0] : ""));
+    }
+
     [TestMethod]
     public async Task FaultAfterThreeUnits_PreservesReportedPrefixAndNeverReplays()
     {

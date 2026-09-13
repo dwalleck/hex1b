@@ -36,6 +36,19 @@ internal interface ILiveStepHandle
     void WriteTerminalAt(int row, string text);
 
     /// <summary>
+    /// Opens a serialized terminal-update scope. Every write the commit issues
+    /// through this handle inside the scope is composed into ONE terminal write,
+    /// bracketed by synchronized output (DEC mode 2026), so a host that honors
+    /// mode 2026 never paints the intermediate state — the rows a unit displaces
+    /// the live region with and the repaint that restores it land together.
+    /// </summary>
+    /// <remarks>
+    /// Synchronous by contract: nothing inside the scope may await, and it must
+    /// be disposed on the thread that opened it. An empty scope writes nothing.
+    /// </remarks>
+    IDisposable BeginAtomicTerminalUpdate();
+
+    /// <summary>
     /// Scrolls the viewport up by <paramref name="rows"/> rows by parking the
     /// cursor on the bottom row and emitting that many linefeeds, pushing the
     /// top rows into the host's scrollback. Never clears or replays the
@@ -131,20 +144,20 @@ internal interface ILiveStepHandle
 /// </summary>
 /// <remarks>
 /// <para>
-/// The algorithm, per bounded turn of at most
-/// <see cref="UnitsPerTurn"/> units:
+/// The algorithm, per unit:
 /// </para>
 /// <list type="number">
-///   <item>materialize each not-yet-emitted unit at the width in force when its
-///         turn begins (so pending content is always at the current width);</item>
-///   <item>scroll the viewport up if the unit does not fit below the append
+///   <item>materialize the unit at the width in force (re-materializing it at the
+///         settled width if the terminal changed since the last check);</item>
+///   <item>in one serialized terminal update, bracketed by synchronized output:
+///         scroll the viewport up if the unit does not fit below the append
 ///         cursor, pushing older content into the host's scrollback via bottom-row
-///         linefeeds, then append the unit's logical rows below the live
-///         region;</item>
-///   <item>repaint the live region at the new append position, so the region is
-///         continuously rewritten rather than left blank while a large batch is
-///         committed;</item>
-///   <item>yield so queued input and resize events are dispatched.</item>
+///         linefeeds, append the unit's logical rows, then repaint the live
+///         region at the new append position from the freshest live frame — so
+///         the region is never left displaced, and an edit rendered while the
+///         output pump was muted becomes visible in that same update;</item>
+///   <item>wait for the terminal side to consume the update, then yield at the
+///         turn boundary so queued input and resize events are dispatched.</item>
 /// </list>
 /// <para>
 /// Progress is counted in logical units, never in terminal rows: a unit that
@@ -168,7 +181,8 @@ internal sealed class FlowCommitCoordinator
     /// <summary>
     /// Maximum units emitted per turn. Bounds the work done between
     /// opportunities for input and resize processing; not a bound on total
-    /// commit size.
+    /// commit size. The live region is repainted per unit, not per turn — a turn
+    /// boundary only decides where the commit yields.
     /// </summary>
     internal const int UnitsPerTurn = 8;
 
@@ -422,35 +436,71 @@ internal sealed class FlowCommitCoordinator
 
                 var unitHeight = Math.Max(1, unit.Surface.Height);
 
-                // Proven geometry discipline (same as the tombstone path):
-                // scroll first so the whole unit fits below the cursor, then
-                // append. Without this, a full-height append clamps onto the
-                // last row and destroys already-emitted history.
-                appendRow = EnsureRoom(appendRow, unitHeight, Record, "unit");
-                if (_live.TerminalHeight > 0)
+                // One serialized terminal update carries the whole displacement:
+                // room for the unit (scrolling if it does not fit), the unit's
+                // rows, and then the live region re-anchored and repainted below
+                // them. Bracketed by synchronized output, so a host that honors
+                // mode 2026 never paints the state where the unit's rows have
+                // overwritten the region and the repaint has not landed yet; a
+                // host that ignores it sees at most one transient frame. This is
+                // per unit, not per turn: after every committed unit the region
+                // is back on screen at the new append position, painted from the
+                // freshest live frame, so typed edits are rendered while the
+                // batch is still in flight instead of being buffered until the
+                // next boundary. The scope is synchronous — the drain wait runs
+                // after it.
+                using (_live.BeginAtomicTerminalUpdate())
                 {
-                    // EnsureRoom's scrolls park the host cursor on the bottom row.
-                    cursorRow = Math.Max(0, _live.TerminalHeight - 1);
-                    cursorColumn = 0;
-                    cursorBelowContent = true;
+                    // Proven geometry discipline (same as the tombstone path):
+                    // scroll first so the whole unit fits below the cursor, then
+                    // append. Without this, a full-height append clamps onto the
+                    // last row and destroys already-emitted history.
+                    appendRow = EnsureRoom(appendRow, unitHeight, Record, "unit");
+                    if (_live.TerminalHeight > 0)
+                    {
+                        // EnsureRoom's scrolls park the host cursor on the bottom
+                        // row.
+                        cursorRow = Math.Max(0, _live.TerminalHeight - 1);
+                        cursorColumn = 0;
+                        cursorBelowContent = true;
+                    }
+
+                    // Cleared before and after every unit: while no unit is in
+                    // flight there are no aborted rows, and a cancellation at a
+                    // loop guard must not attribute the previous unit's rows to
+                    // it.
+                    emission.Reset();
+                    EmitUnit(
+                        Record,
+                        completedUnits,
+                        unit,
+                        appendRow,
+                        faultThreshold,
+                        emission,
+                        token);
+
+                    // Repaint the region below the unit's rows inside the same
+                    // update, so a completed unit never leaves the region
+                    // displaced. The repaint is also where a live frame rendered
+                    // while the pump was muted becomes visible, and it returns
+                    // the row the next content row appends at.
+                    appendRow = RepaintLiveRegion(appendRow + unitHeight, Record);
                 }
 
-                // Cleared before and after every unit: while no unit is in
-                // flight there are no aborted rows, and a cancellation at a loop
-                // guard must not attribute the previous unit's rows to it.
+                // The host cursor now sits at the region's top-left, below every
+                // row that may carry committed content — the anchor state the
+                // reflow model is derived from, held after every unit rather
+                // than only at turn boundaries.
+                cursorRow = appendRow;
+                cursorColumn = 0;
+                cursorBelowContent = true;
                 emission.Reset();
-                await EmitUnitAsync(
-                    Record,
-                    completedUnits,
-                    unit,
-                    appendRow,
-                    faultThreshold,
-                    emission,
-                    token).ConfigureAwait(false);
-                cursorRow = emission.LastRow;
-                cursorColumn = emission.LastColumn;
-                cursorBelowContent = false;
-                emission.Reset();
+
+                // The unit is fully written, repainted and recorded; waiting for
+                // the terminal side is deliberately not cancellable, so a
+                // cancellation cannot land after the last row but before the
+                // caller counts the unit as completed.
+                await WaitForTerminalConsumptionAsync(CancellationToken.None).ConfigureAwait(false);
 
                 completedUnits++;
                 completedRows += unitHeight;
@@ -458,22 +508,12 @@ internal sealed class FlowCommitCoordinator
                 // key, so RowKeys stays index-aligned with unit order and
                 // RowKeys.Count == CompletedUnits.
                 rowKeys.Add(unit.RowKey);
-                appendRow += unitHeight;
                 emittedInTurn++;
 
                 if (emittedInTurn >= UnitsPerTurn && completedUnits < totalUnits)
                 {
                     emittedInTurn = 0;
-                    // Repaint the live region at every turn boundary, below the
-                    // appended content, so the region is continuously rewritten
-                    // instead of being left blank across a large batch. Whether
-                    // the host has displayed the repaint is not claimed here.
-                    appendRow = RepaintLiveRegion(appendRow, Record);
-                    cursorRow = appendRow;
-                    cursorColumn = 0;
-                    cursorBelowContent = true;
-                    Record($"turn yield after unit {completedUnits}");
-                    await WaitForTerminalConsumptionAsync(token).ConfigureAwait(false);
+                    Record($"turn yield after unit {completedUnits} origin={appendRow} liveHeight={_live.LiveHeight}");
                     await Task.Yield();
                 }
             }
@@ -725,16 +765,25 @@ internal sealed class FlowCommitCoordinator
     }
 
     /// <summary>
-    /// Emits one logical unit as contiguous logical rows, then waits for the
-    /// terminal side to consume it.
+    /// Emits one logical unit as contiguous logical rows, synchronously, inside
+    /// the caller's atomic terminal update.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Row order per row is: position at the row, clear it, write the text, then
     /// terminate the line. Clearing before content means a row that fills the
     /// full width keeps its last cell, while a shorter row still removes
     /// whatever a previous frame left at the right margin.
+    /// </para>
+    /// <para>
+    /// Synchronous by contract: the caller writes this and the live-region
+    /// repaint as one atomic terminal update, and the drain wait that follows
+    /// runs outside that scope. A fault or cancellation thrown from here still
+    /// flushes the rows already composed, so the recovery hand-off sees exactly
+    /// what reached the write path.
+    /// </para>
     /// </remarks>
-    private async Task EmitUnitAsync(
+    private void EmitUnit(
         Action<string> record,
         int unitIndex,
         FlowCommitUnit unit,
@@ -767,8 +816,6 @@ internal sealed class FlowCommitCoordinator
                 // The bytes reached the host, so the recovery hand-off must
                 // treat this row as written and never paint over it.
                 emission.RowsWritten++;
-                emission.LastRow = unitRow;
-                emission.LastColumn = SoftWrapEmitter.RenderRowText(surface, row).Length;
                 throw new IOException(
                     $"injected history emission failure after {unitIndex} completed unit(s) " +
                     $"({FailAfterRowsVariable})");
@@ -778,8 +825,6 @@ internal sealed class FlowCommitCoordinator
                 unitRow + row,
                 row == height - 1 ? text : text + "\r\n");
             emission.RowsWritten++;
-            emission.LastRow = unitRow + row;
-            emission.LastColumn = SoftWrapEmitter.RenderRowText(surface, row).Length;
         }
 
         // Track the committed rows as paragraphs so a later resize settle can
@@ -789,11 +834,6 @@ internal sealed class FlowCommitCoordinator
         record(
             $"unit {unitIndex} key={unit.RowKey ?? "-"} rows={height} " +
             $"at={unitRow} width={surface.Width}");
-
-        // The unit is fully written and recorded; waiting for the terminal side
-        // is deliberately not cancellable, so a cancellation cannot land after
-        // the last row but before the caller counts the unit as completed.
-        await WaitForTerminalConsumptionAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -829,19 +869,11 @@ internal sealed class FlowCommitCoordinator
         /// <summary>Rows of the current unit already handed to the terminal.</summary>
         public int RowsWritten { get; set; }
 
-        /// <summary>Screen row of the last row the unit wrote.</summary>
-        public int LastRow { get; set; }
-
-        /// <summary>Column the last row's text ended at.</summary>
-        public int LastColumn { get; set; }
-
         /// <summary>Clears the tracker before each unit, so an aborted unit's
         /// row count never includes rows from earlier units.</summary>
         public void Reset()
         {
             RowsWritten = 0;
-            LastRow = 0;
-            LastColumn = 0;
         }
     }
 
