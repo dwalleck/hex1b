@@ -1,4 +1,4 @@
-import { WebTerminal, MIN_FONT_SIZE, MAX_FONT_SIZE, getCmdlineUrl, type TerminalCloseDetails, type TerminalCommandMark } from "@hex1b/web-terminal";
+import { WebTerminal, MIN_FONT_SIZE, MAX_FONT_SIZE, getCmdlineUrl, linkAction, type TerminalCloseDetails, type TerminalCommandMark } from "@hex1b/web-terminal";
 
 interface TerminalInstance {
   id: string;
@@ -100,6 +100,7 @@ const resizeEdges = {
 };
 let instances: TerminalInstance[] = [];
 let selected: TerminalView | undefined;
+let minimalView: TerminalView | undefined;
 let nextView = 0;
 let zIndex = 0;
 let refreshing: Promise<void> | undefined;
@@ -114,6 +115,48 @@ window.webTerminalScreenText = "";
 function report(message: string, level = "info") {
   byId("status").textContent = message;
   byId("status").dataset.level = level;
+}
+
+function reportLink(view: TerminalView, message: string, level = "info") {
+  const status = elementAt(view.element, ".view-status", HTMLElement);
+  status.textContent = message;
+  status.title = message;
+  status.dataset.level = level;
+  report(`View ${view.id}: ${message}`, level);
+}
+
+function viewLinks(view: TerminalView): Parameters<WebTerminal["setLinks"]>[0] {
+  const mode = elementAt(view.element, ".view-links", HTMLSelectElement).value;
+  if (mode === "disabled") return false;
+  if (mode !== "preview") return { detection: false };
+  const decoration = elementAt(view.element, ".view-link-decoration", HTMLSelectElement).value;
+  const underlineStyle = elementAt(view.element, ".view-link-style", HTMLSelectElement).value;
+  if (decoration !== "always" && decoration !== "hover" && decoration !== "none")
+    throw new Error("Invalid link decoration selection");
+  if (underlineStyle !== "solid" && underlineStyle !== "dashed")
+    throw new Error("Invalid link underline style selection");
+  return {
+    osc8: { action: "demo.previewUri" },
+    detection: {
+      activation: "modifierClick",
+      decoration,
+      underlineStyle,
+      rules: [
+        { id: "web", builtin: "url", action: "demo.previewUri" },
+        { id: "files", builtin: "absolutePath", action: "demo.remoteFile" },
+        { id: "home", builtin: "homePath", action: "demo.remoteFile" },
+        { id: "uris", builtin: "uri", action: "demo.previewUri" },
+        {
+          id: "issues", pattern: /\bPROJ-(?<number>\d+)\b/gu,
+          kind: "custom", text: "logicalLine", action: "demo.issue",
+          resolve(match) {
+            const number = match.groups.number;
+            return number ? { target: number, data: { label: match.text } } : null;
+          }
+        }
+      ]
+    }
+  };
 }
 
 async function api(path: string, method = "GET", body?: object): Promise<unknown> {
@@ -324,6 +367,7 @@ function metrics(view: Pick<TerminalView, "id" | "stats" | "text" | "transport">
 }
 
 function selectView(view: TerminalView) {
+  if (minimalView && minimalView !== view) setMinimalChrome();
   selected?.element.classList.remove("selected");
   selected = view;
   view.element.classList.add("selected");
@@ -333,6 +377,25 @@ function selectView(view: TerminalView) {
     updateInstanceControls();
   }
   metrics(view);
+}
+
+function setMinimalChrome(view?: TerminalView) {
+  const previous = minimalView;
+  if (previous) {
+    previous.element.classList.remove("minimal-chrome");
+    elementAt(previous.element, ".minimal-chrome-toggle", HTMLButtonElement).setAttribute("aria-pressed", "false");
+  }
+  minimalView = view;
+  document.body.classList.toggle("minimal-chrome", !!view);
+  button("restore-chrome").hidden = !view;
+  if (view) {
+    selectView(view);
+    view.element.classList.add("minimal-chrome");
+    elementAt(view.element, ".minimal-chrome-toggle", HTMLButtonElement).setAttribute("aria-pressed", "true");
+  }
+  const target = view ?? previous;
+  if (target?.phase === "connected") target.terminal?.focus();
+  else target?.element.focus({ preventScroll: true });
 }
 
 function updateSizingControls(view: TerminalView) {
@@ -358,6 +421,10 @@ function updateViewControls(view: TerminalView) {
   elementAt(view.element, ".resync", HTMLButtonElement).disabled = !connected;
   elementAt(view.element, ".trigger-failure", HTMLButtonElement).disabled = !connected;
   elementAt(view.element, ".view-failure", HTMLSelectElement).disabled = !connected;
+  elementAt(view.element, ".view-links", HTMLSelectElement).disabled = !connected;
+  const previewLinks = connected && elementAt(view.element, ".view-links", HTMLSelectElement).value === "preview";
+  elementAt(view.element, ".view-link-decoration", HTMLSelectElement).disabled = !previewLinks;
+  elementAt(view.element, ".view-link-style", HTMLSelectElement).disabled = !previewLinks;
   elementAt(view.element, ".thumbnail", HTMLButtonElement).disabled = !!view.closure && !view.closure.reconnect;
   elementAt(view.element, ".reconnect-view", HTMLButtonElement).disabled =
     view.phase !== "closed" || !view.closure?.reconnect;
@@ -522,6 +589,7 @@ function moveAndResize(view: TerminalView) {
 }
 
 function closeView(view: TerminalView) {
+  if (minimalView === view) setMinimalChrome();
   view.controller.abort();
   view.connectionController?.abort();
   view.terminal?.dispose();
@@ -557,12 +625,34 @@ async function openView(instance: TerminalInstance, { primary = false, thumbnail
   element.innerHTML = `
     <header class="view-titlebar">
       <span class="view-title"></span><span class="view-role">Joining</span>
+      <button class="minimal-chrome-toggle" aria-pressed="false" title="Fill the page with this terminal and hide playground controls">Minimal chrome</button>
       <button class="close-view" title="Close this view; keep the terminal running" aria-label="Close view">Close</button>
     </header>
     <div class="view-tools">
       <button class="take-primary" disabled>Take primary</button>
       <button class="thumbnail">Thumbnail</button>
       <button class="resync" disabled>Resync</button>
+      <label>Links
+        <select class="view-links" disabled aria-label="Local link policy"
+          title="Preview links: Ctrl/Cmd+click shows text only. Paths belong to the remote terminal, not this browser.">
+          <option value="legacy">OSC 8 only (default)</option>
+          <option value="preview">Preview links (opt in)</option>
+          <option value="disabled">All links disabled</option>
+        </select>
+      </label>
+      <label>Underline
+        <select class="view-link-decoration" disabled aria-label="Detected link underline visibility">
+          <option value="always">Always</option>
+          <option value="hover">On hover</option>
+          <option value="none">None</option>
+        </select>
+      </label>
+      <label>Style
+        <select class="view-link-style" disabled aria-label="Detected link underline style">
+          <option value="solid">Solid</option>
+          <option value="dashed">Dashed</option>
+        </select>
+      </label>
       <span class="view-grid"></span>
     </div>
     <div class="view-failures" role="group" aria-label="Connection failure demonstration">
@@ -643,11 +733,25 @@ async function openView(instance: TerminalInstance, { primary = false, thumbnail
     if (selected !== view) selectView(view);
   }, { signal: view.controller.signal });
   elementAt(element, ".close-view", HTMLButtonElement).addEventListener("click", () => closeView(view), { signal: view.controller.signal });
+  elementAt(element, ".minimal-chrome-toggle", HTMLButtonElement).addEventListener("click", () => setMinimalChrome(view), { signal: view.controller.signal });
   elementAt(element, ".dismiss-view", HTMLButtonElement).addEventListener("click", () => closeView(view), { signal: view.controller.signal });
   action(elementAt(element, ".thumbnail", HTMLButtonElement), () => openView(instance, { thumbnail: true }),
     () => updateViewControls(view));
   action(elementAt(element, ".take-primary", HTMLButtonElement), () => mounted(view).requestPrimary(), () => updateViewControls(view));
   action(elementAt(element, ".resync", HTMLButtonElement), () => mounted(view).resync(), () => updateViewControls(view));
+  const links = elementAt(element, ".view-links", HTMLSelectElement);
+  const updateLinks = () => {
+    try {
+      mounted(view).setLinks(viewLinks(view));
+      reportLink(view, links.value === "preview"
+        ? "Link previews enabled: Ctrl/Cmd+click. Remote paths are shown only; no navigation or file access."
+        : links.value === "disabled" ? "All local link interactions disabled."
+        : "Detection disabled; legacy allowlisted OSC 8 navigation restored.");
+    } catch (error) { reportLink(view, message(error), "error"); }
+    updateViewControls(view);
+  };
+  for (const selector of [".view-links", ".view-link-decoration", ".view-link-style"])
+    elementAt(element, selector, HTMLSelectElement).addEventListener("change", updateLinks, { signal: view.controller.signal });
   action(elementAt(element, ".reconnect-view", HTMLButtonElement), () => mountView(view), () => updateViewControls(view));
   action(elementAt(element, ".trigger-failure", HTMLButtonElement), async () => {
     if (view.phase !== "connected" || !view.connectionId) throw new Error("Connect this view before triggering a failure");
@@ -710,6 +814,23 @@ async function mountView(view: TerminalView, primary = false, failure = "", focu
       scale: select("scale").value === "auto" ? "auto" : Number(select("scale").value),
       font: select("font").value === "monospace" ? { family: "monospace" } : undefined,
       label: `${instance.name}, view ${id}, terminal input`,
+      links: viewLinks(view),
+      actions: {
+        "demo.previewUri": linkAction((_context, link) => {
+          reportLink(view, `URI preview (not opened): ${link.target}`);
+        }),
+        "demo.remoteFile": linkAction((context, link) => {
+          const cwd = context.terminal.workingDirectory.path ?? "unknown";
+          reportLink(view, `Remote file callback (no file access): ${link.target} / remote cwd: ${cwd}`);
+        }),
+        "demo.issue": linkAction((_context, link) => {
+          reportLink(view, `Issue preview (not fetched): PROJ-${link.target}`);
+        })
+      },
+      onLinkDetectionError(error) {
+        if (current()) reportLink(view,
+          `Link detection ${error.code} / rule ${error.ruleId ?? "all"} / revision ${error.revision}: ${error.message}`, "error");
+      },
       onClose(details) {
         if (current()) connectionClosed(view, details);
       },
@@ -845,6 +966,7 @@ async function createInstance() {
   await openView(instance, { primary: true });
 }
 
+button("restore-chrome").addEventListener("click", () => setMinimalChrome());
 action(button("create"), createInstance);
 action(button("attach"), () => {
   const instance = instances.find(item => item.id === instancesSelect.value);

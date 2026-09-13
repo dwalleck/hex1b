@@ -55,6 +55,89 @@ Selections are invalidated by resize. Generated text/graphics scenes retain
 crop behavior. The library's adapter defaults have not changed: consumers must
 [opt in on their producer](../../docs/web-terminal.md#shell-reflow-configuration).
 
+## Try local link previews
+
+Open <http://localhost:5290>, create an **Interactive shell** terminal, and choose
+**Links → Preview links (opt in)** in that view's controls. Each new view starts
+with **OSC 8 only (default)**: inferred text detection is disabled, and existing
+allowlisted OSC 8 navigation is unchanged. No query parameter enables detection.
+
+Print some targets at an idle POSIX shell prompt:
+
+```sh
+printf ' %s \n' 'https://example.com/docs' 'mailto:demo@example.com' \
+  'demo:preview' '/workspace/project/README.md' 'C:\Code\project\README.md' \
+  '~/project/README.md' 'PROJ-123'
+```
+
+Hold **Ctrl or Cmd and click** a detected target. URI previews, remote-file
+callbacks, and the custom `PROJ-123` regex write plain text to the existing view
+status and playground status. Hovering reveals the destination/activation hint.
+The preview mode also replaces OSC 8 navigation with the URI-preview action.
+It does not call `window.open`, fetch an issue, run commands, or access files.
+Paths refer to the terminal's environment, **not the browser's local filesystem**;
+the remote-file callback only displays the literal target and reported remote
+working directory. It does not expand `~` or check existence.
+
+Change the picker while connected: it calls `setLinks` without remounting.
+When previews are enabled, **Underline** selects **Always**, **On hover**, or
+**None**, and **Style** selects **Solid** or **Dashed** independently. Both
+controls update the current view immediately; hover-only underlines appear
+without holding Ctrl/Cmd, while activation still requires Ctrl/Cmd+click.
+**None** hides inferred underlines but leaves links clickable. On narrow views,
+scroll the view toolbar horizontally to reach these controls.
+**All links disabled** calls `setLinks(false)`; **OSC 8 only (default)** calls
+`setLinks({ detection: false })`, restoring legacy allowlisted OSC 8 navigation.
+All named demo actions are registered at mount time, including when detection
+is off. Reconnecting a view retains its picker choice; new views opt in
+independently. This works with either sample transport and renderer selection.
+
+Only currently visible text is considered, including displayed history. Keep
+the surrounding spaces in the example: uncertain/clipped edges are deliberately
+not activated. HWT1 is unchanged: soft-wrap flags already exist, but wide-wrap
+padding metadata is missing, so some wide-character wraps cannot be recognized.
+There is no off-screen continuation fetch. Built-in paths are whitespace-delimited;
+use custom rules for quotes, spaces, UNC paths, and location suffixes.
+OSC 8 occupies its spans even when blocked/disabled, and existing application
+SGR underline styles/colors are preserved.
+
+The dedicated regex worker bounds detection work and isolates pathological
+regexes from rendering. Synchronous trusted resolvers still run on the main
+thread and cannot be preempted: keep them fast and side-effect-free.
+Detection diagnostics appear through `onLinkDetectionError` and `onStatus`.
+See the package's [complete link API examples](../../src/web-terminal/README.md#opt-in-text-links-and-host-actions)
+for all text modes, action payloads, rule disabling, and worker deployment.
+This walkthrough is not a claim of browser validation or performance measurements.
+
+## Minimal chrome
+
+Click **Minimal chrome** in a terminal view's title bar to fill the browser page
+with that view. Playground controls, other views, title bars, status bars, and
+the command-history rail are hidden. A small **Restore controls** button stays
+in the top-right corner and restores the previous floating-window layout.
+
+The terminal stays connected and retains its sizing mode: **Auto** adjusts the
+primary terminal's grid to the extra space, while a fixed grid scales to fit.
+Secondary views still follow their primary; expanding one does not take
+primary ownership. Hidden views stay connected. Connection-error and reconnect
+overlays remain available in minimal mode.
+
+This does not enter the browser's fullscreen mode or intercept Escape, so
+terminal applications keep their normal keyboard controls.
+
+With the demo running and `playwright-cli` available, run the browser regression
+from the repository root in a separate automation session:
+
+```sh
+playwright-cli -s=minimal-chrome open 'http://localhost:5290/?empty=1'
+playwright-cli -s=minimal-chrome run-code --filename samples/WebTerminalDemo/tests/minimal-chrome.playwright.js
+playwright-cli -s=minimal-chrome close
+```
+
+The regression creates and removes its own text terminal. It covers full-page
+and narrow-screen layout, sizing, focus, secondary views, and reconnect/close
+behavior.
+
 ## Choose a reflow strategy
 
 Use **New terminal reflow** before clicking **New terminal** to compare the
@@ -1232,7 +1315,7 @@ produce frames.
   are allocated. Producer graphics accounting remains independent.
   Inactive resources are evicted first; exceeding visible-resource limits ends
   the session explicitly.
-- Historical graphics, hyperlink activation, a complete
+- Historical graphics, a complete
   screen-reader experience, ligature shaping, and a cross-browser font/shaping
   guarantee remain future work. Glyphs are clipped to server-owned spans; decoration and
   cursor appearance still need a broader fidelity corpus.

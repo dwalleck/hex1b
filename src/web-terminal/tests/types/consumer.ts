@@ -1,5 +1,5 @@
 import {
-  WebTerminal, InputRoute, TerminalAction, defaultInputBindings, MIN_FONT_SIZE, MAX_FONT_SIZE,
+  WebTerminal, InputRoute, TerminalAction, defaultInputBindings, MIN_FONT_SIZE, MAX_FONT_SIZE, linkAction,
   type WebTerminalOptions, type WebTerminalHandle, type TerminalInput, type InputBinding,
   type TerminalSelection, type TerminalViewport, type SelectionUIEvent, type TerminalStats,
   type TerminalRendererKind, type TerminalRendererPreference, type TerminalProgress,
@@ -14,12 +14,25 @@ const bindings: InputBinding[] = defaultInputBindings();
 const options: WebTerminalOptions = {
   url: new URL("wss://example.test/terminal"),
   workerUrl: new URL("/web-terminal/terminal-worker.js", "https://example.test"),
+  linkDetectionWorkerUrl: "/web-terminal/link-detection-worker.js",
+  links: { detection: { underlineStyle: "dashed", decoration: "hover", rules: [
+    { id: "web", builtin: "url", action: "preview" },
+    { id: "custom", pattern: /\bPROJ-(?<id>\d+)\b/gu, kind: "custom", text: "viewport",
+      action: "preview", resolve: match => ({ target: match.text, data: match.groups.id }) }
+  ] } },
   signal: new AbortController().signal,
   scale: "auto",
   renderer: "auto",
   sizing: { mode: "fixed", columns: 80, rows: 24, fontSize: 16 },
   font: { family: "Terminal Font", faces: [{ url: "/font.woff2", weight: "200 700" }] },
   actions: {
+    preview: linkAction((context, link, input) => {
+      const target: string = link.target;
+      const source: "detected" | "osc8" = link.source;
+      console.log(target, source, context.viewport, input);
+      // @ts-expect-error Activation snapshots are readonly.
+      link.ranges[0].startColumn = 42;
+    }),
     inspect(context, args, input) {
       const selection: TerminalSelection = context.selection;
       const viewport: TerminalViewport = context.viewport;
@@ -100,6 +113,14 @@ const mountedTerminal: WebTerminal = await WebTerminal.mount(container, options)
 const terminal: WebTerminalHandle = mountedTerminal;
 const readOnly: boolean = terminal.readOnly;
 terminal.setReadOnly(!readOnly);
+terminal.setLinks({ detection: false });
+terminal.setLinks(false);
+// @ts-expect-error Underline styles are explicitly enumerated.
+terminal.setLinks({ detection: { rules: [], underlineStyle: "wavy" } });
+// @ts-expect-error Rule input modes are explicitly enumerated.
+terminal.setLinks({ detection: { rules: [{ id: "bad", pattern: /x/u, kind: "custom", text: "document", action: "preview" }] } });
+// @ts-expect-error Rule resolvers are synchronous.
+terminal.setLinks({ detection: { rules: [{ id: "bad", builtin: "url", action: "preview", resolve: async match => ({ target: match.text }) }] } });
 mountedTerminal.setReadOnly(false);
 const title: string = terminal.title;
 const mountedTitle: string = mountedTerminal.title;

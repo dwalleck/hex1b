@@ -100,7 +100,9 @@
     .view-title { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; font-weight: 600; }
     .view-role { flex: none; font-size: 11px; color: var(--cp-text-muted); }
     .terminal-window[data-primary=true] .view-role { color: var(--cp-accent); font-weight: 600; }
-    .view-tools { display: flex; flex: 0 0 36px; min-width: 0; align-items: center; gap: 4px; overflow: hidden; padding: 4px 6px; border-bottom: 1px solid var(--cp-border); }
+    .view-tools { display: flex; flex: 0 0 36px; min-width: 0; align-items: center; gap: 4px; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; padding: 4px 6px; border-bottom: 1px solid var(--cp-border); }
+    .view-tools label { display: flex; flex: none; align-items: center; gap: 4px; font-size: 11px; white-space: nowrap; }
+    .view-tools select { min-height: 26px; height: 26px; padding: 2px 4px; font-size: 11px; }
     .view-failures { display: flex; flex: 0 0 36px; min-width: 0; align-items: center; gap: 6px; padding: 4px 6px; border-bottom: 1px solid var(--cp-border); }
     .view-failures label { display: flex; flex: 1; min-width: 0; align-items: center; font-size: 11px; }
     .view-failure { flex: 1; min-width: 0; height: 26px; min-height: 26px; padding: 2px 4px; font-size: 11px; border-radius: 6px; }
@@ -167,6 +169,16 @@
     summary { cursor: pointer; }
     #screen-mirror { overflow: auto; max-height: 200px; white-space: pre; font: 12px/1.4 Consolas, "Courier New", Courier, monospace; }
     @media (max-width: 640px) { body { padding: 8px; } main { height: calc(100dvh - 16px); } .instance-controls { border-left: 0; padding-left: 0; } }
+    #restore-chrome { position: fixed; top: 8px; right: 8px; z-index: 2147483647; font-size: 12px; box-shadow: var(--cp-shadow); }
+    body.minimal-chrome { padding: 0; overflow: hidden; }
+    body.minimal-chrome main { height: 100dvh; gap: 0; }
+    body.minimal-chrome main > :not(#workspace) { display: none; }
+    body.minimal-chrome #workspace { min-height: 0; overflow: hidden; border: 0; border-radius: 0; }
+    body.minimal-chrome .terminal-window:not(.minimal-chrome) { visibility: hidden; }
+    /* Override floating bounds without changing the inline geometry restored on exit. */
+    .terminal-window.minimal-chrome { position: fixed; inset: 0 !important; width: 100% !important; height: 100dvh !important; min-width: 0; min-height: 0; border: 0; border-radius: 0; }
+    .terminal-window.minimal-chrome > :not(.terminal-stage),
+    .terminal-window.minimal-chrome .command-marks-rail { display: none; }
   </style>
   <script type="importmap">
     { "imports": { "@hex1b/web-terminal": "./web-terminal/index.js" } }
@@ -174,6 +186,7 @@
   <script type="module" src="./playground/main.js"></script>
 </head>
 <body>
+  <button id="restore-chrome" type="button" hidden title="Restore playground controls and the previous window layout">Restore controls</button>
   <main>
     <header>
       <h1>WebTerminalDemo</h1>

@@ -67,6 +67,27 @@ and making that state conform to terminal protocols. A faithful renderer can
 faithfully reveal a server bug. Such bugs should be fixed at the authoritative
 layer rather than hidden by browser-specific compensation.
 
+### Kitty graphics upload compatibility
+
+The producer accepts redundant metadata on chunked KGP image and animation
+uploads, matching Kitty's first-chunk-authoritative behavior. For example,
+kitty-doom repeats `r=1` on animation continuation chunks. Hex1b ignores that
+repeated metadata rather than rejecting the upload. Animation continuations
+can also omit `a=f`; the pending upload determines their meaning.
+
+The first chunk fixes image/frame identity, dimensions, format, compression,
+and placement. Later chunks cannot override those values, even if they specify
+different values. Continuations still require `m`, contribute payload, and
+retain the existing `q` response-suppression behavior. Malformed controls and
+payloads, upload limits, and unrelated actions are still checked; delete
+commands abort pending uploads. Images and frame edits become visible only
+after the complete upload is validated.
+
+This is a compatibility extension beyond the
+[protocol's strict continuation key restrictions](https://sw.kovidgoyal.net/kitty/graphics-protocol/#remote-client),
+not a browser-specific workaround. Clients should still emit the minimal
+continuation controls required by the specification.
+
 ## What the spike implements
 
 See [WebTerminalDemo](../samples/WebTerminalDemo/README.md) for run instructions.
@@ -624,6 +645,76 @@ than claiming universal terminal behavior. Other implementations can scroll
 without updating a stationary pointer's selection endpoint, and selection
 override modifiers do not always override application wheel reporting.
 
+### Client-only link detection
+
+The package now offers opt-in local text links through `WebTerminalOptions.links`
+and runtime `setLinks`. This adds no C# terminal behavior, HMP1 messages, or
+HWT1 wire fields. Different views of the same producer can recognize different
+targets without changing server cells, copied text, or downstream replicas.
+See the [public API examples](../src/web-terminal/README.md#opt-in-text-links-and-host-actions)
+and [opt-in playground](../samples/WebTerminalDemo/README.md#try-local-link-previews).
+
+Omitting `links` preserves legacy Ctrl/Cmd+click OSC 8 navigation to allowlisted
+absolute HTTP, HTTPS, and mailto destinations; detection stays off.
+`links: false` disables all local link interactions. A detection configuration
+contains ordered built-in/custom rules, `activation: "modifierClick" | "click"`,
+`decoration: "always" | "hover" | "none"`, and
+`underlineStyle: "solid" | "dashed"`. Visibility and appearance are independent;
+defaults are always-visible solid underlines. Hover-only decoration covers all
+visible spans of the hovered match without requiring a modifier key.
+`setLinks` replaces the whole
+configuration rather than merging; resubmit a rule with `enabled: false` to
+disable it individually. `osc8: false` disables only OSC 8 interaction;
+`osc8: { action }` routes it to a host action instead of legacy navigation.
+
+Detected links never navigate or open a file automatically. `linkAction`
+adapts `(context, activation, input) => unknown` into the existing
+`InputActionHandler` registry; register named actions with mount-time `actions`.
+No second action registry or `onLinkClick` hook is needed. The host owns URI
+preview, authorization, and remote-file behavior. Targets and callback payloads
+are untrusted content, not permission to execute, navigate, or access a browser
+filesystem. Built-in paths recognize whitespace-delimited POSIX absolute,
+Windows drive-absolute, and literal home-relative forms, without `~` expansion
+or existence checks. Quoted/spaced paths, UNC, and location suffix grammars
+require custom rules.
+
+Detection uses displayed cells and cell-span mapping, not the trimmed
+`screenText` mirror. `"physicalRow"` scans individual rows, `"logicalLine"`
+(default) joins authoritative soft wraps, and `"viewport"` also retains hard
+breaks as newlines. Hidden cells and graphics placeholders are barriers.
+Only displayed text, including displayed history, is available: there is no
+off-screen fetch or unseen-history scan. HWT1's existing soft-wrap bit allows
+visible continuations to join, but it does not transport wide-wrap padding.
+Preserving those ambiguous spaces means some Unicode wrapped targets are
+missed. Unknown/clipped edges and unavailable continuations are not active;
+false negatives are preferable to opening a truncated destination.
+
+Authoritative OSC 8 spans reserve their cells even when their destinations are
+blocked or OSC 8 is disabled; overlapping detected candidates are rejected in
+full. Enabled rules then compete in order. Local inferred decoration preserves
+existing SGR underline style/color, graphics occlusion, and cell text.
+Input policy has first refusal. Ctrl/Cmd+click is the recommended default;
+release-time activation rejects drags and stale matches. Read-only views can
+invoke local host actions without bypassing remote input permissions.
+
+A separate lazy detection worker protects rendering from pathological regexes.
+Work is coalesced and bounded by internal text/rule/match/time budgets; this is
+not a throughput guarantee or a public tuning API. Optional synchronous
+resolvers are **trusted main-thread callbacks and cannot be preempted** by the
+regex watchdog. Keep them fast and side-effect-free; they may run repeatedly
+and must return `null` or `{ target, action?, data? }`, not a Promise.
+Detection failures report `onLinkDetectionError` with
+`{ code: "timeout" | "limit" | "resolver" | "worker", ruleId: string | null, revision, message }`
+and `onStatus`, without stopping the terminal. Action errors use the existing
+input-error channel.
+
+The optional mount-time `linkDetectionWorkerUrl: string | URL` mirrors
+`workerUrl` for deployments that relocate worker entries; relative overrides
+resolve against the page. Static deployments must copy the complete emitted
+package tree, including the detector and its dependencies. This feature does
+not introduce an external link-scanning service or new runtime dependencies.
+The opt-in demo is not evidence of benchmark results or cross-browser validation.
+
 ### Browser input bindings and actions
 
 Defaults are replaceable per view through `inputBindings`; `onInput` provides
@@ -707,7 +798,7 @@ Scrollback, selection, and reconnect behavior should be designed together.
 | Text fidelity | Bundled Nerd Font default, worker-side loading, per-view font selection, and measured cell-fit metrics exist. Missing-glyph fallback and rasterization remain browser/OS-dependent; no broad shaping guarantee. | Qualify more fonts, scripts, decorations, and fallback glyphs; preserve font-owned borders and server-owned spans rather than introduce procedural glyph replacements. |
 | Resizing / zoom | Auto text-size controls, fixed-grid presets, element fitting, and HMP1 primary resize authority exist. Logical cell metrics and maximum raster scale remain fixed. | Qualify tiny/hidden/large containers and native-primary geometry; higher-resolution re-rasterization for zoom and live font-family/DPR changes remain separate work. |
 | Input coverage | Shared encoding now lives in Hex1b, but keyboard layouts/IME have limited coverage and some keys stay browser-owned. | Extend modifier, composition/paste, mode-change, repeat, focus-loss, and browser-shortcut coverage. Decide advanced keyboard and pixel-mouse scope explicitly. |
-| Browser UX | Text scrollback/selection/copy exist. Search, hyperlink activation, full accessibility, and complete touch behavior remain absent. | Build remaining features on server text/history and safe metadata, with keyboard-accessible controls and a real screen-reader strategy rather than only a text mirror. |
+| Browser UX | Text scrollback/selection/copy, OSC 8 activation, and opt-in client-only detected links exist. Search, full accessibility, and complete touch behavior remain absent. | Build remaining features on server text/history and safe metadata, with keyboard-accessible controls and a real screen-reader strategy rather than only a text mirror. |
 | Recovery | Views can detach and attach to a process-local persistent instance, each with a fresh viewport/selection and baseline. GPU failure is surfaced; there is no automatic reconnect or durable recovery. | Define recovery across transport/device/server failure, resource restoration, authorization, and retention policy beyond the spike's explicit attach/end actions. |
 | Integration | The demo consumes a public experimental adapter, but stable hosting and browser-component APIs remain undefined. | Stabilize embedding and hosting APIs independently of HWT1, which remains internal to the paired server/client implementation. |
 | Compatibility | WebGPU-preferred auto selection and explicit WebGPU/WebGL2 modes exist; exercised mainly in one Chromium/macOS environment. | Establish a browser/OS/GPU matrix and qualify backend performance. There is no Canvas2D terminal renderer or automatic runtime device-loss recovery. |
