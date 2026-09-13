@@ -240,6 +240,85 @@ public class ContinuousHistoryRetentionFenceTests
         }
     }
 
+    /// <summary>
+    /// Cancellation between units: the token is signalled while the commit is
+    /// admitted, and the coordinator observes it at the next boundary.
+    /// </summary>
+    /// <remarks>
+    /// This is the path that must not attribute a previous unit's rows to the
+    /// aborted one, so it is what pins the per-unit abort tracker and the
+    /// whole-unit accounting. A cancellation landing between two rows of the
+    /// same unit is NOT covered here: the commit source has no per-row hook, and
+    /// adding a test-only one to the coordinator would be a production seam for
+    /// the sake of a test. The row-level check and the non-cancellable post-unit
+    /// drain are therefore covered by inspection, not by this fence.
+    /// </remarks>
+    [TestMethod]
+    public async Task CancelBetweenUnits_ReportsWholeUnitsAndPreservesThePrefix()
+    {
+        var source = new FenceCommitSource(CommitId, PayloadRows);
+        FlowCommitResult? result = null;
+        using var cancellation = new CancellationTokenSource();
+        const int CancelAtUnit = 24;
+
+        using var terminal = CreateTerminal(async flow =>
+        {
+            var step = flow.Step(BuildLive, options =>
+            {
+                options.MinHeight = 14;
+                options.MaxHeight = 14;
+            });
+            await step.WaitForReadyAsync();
+            try
+            {
+                result = await step.CommitAsync(source, BuildLive, cancellation.Token);
+            }
+            finally
+            {
+                step.Complete();
+            }
+        }, width: 121, height: 30);
+
+        source.Gate = index =>
+        {
+            if (index == CancelAtUnit)
+            {
+                cancellation.Cancel();
+            }
+
+            return Task.CompletedTask;
+        };
+
+        await terminal.RunAsync().WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.IsNotNull(result);
+        Assert.AreEqual(FlowCommitStatus.Cancelled, result!.Status);
+        Assert.IsTrue(result.Cancelled);
+        // Cancellation is not rollback: the units emitted before it stay
+        // completed and are never replayed.
+        Assert.AreEqual(CancelAtUnit, result.CompletedUnits);
+        Assert.AreEqual(CancelAtUnit, result.RowKeys.Count);
+        Assert.AreEqual(0, result.AbortedRows);
+
+        var buffer = ReadFullBuffer(terminal);
+        Assert.AreEqual(1, Regex.Matches(buffer, Regex.Escape($"COMMIT {CommitId} BEGIN")).Count, "BEGIN count");
+        for (var row = 0; row < CancelAtUnit - 1; row++)
+        {
+            Assert.AreEqual(
+                1,
+                Regex.Matches(buffer, Regex.Escape($"{CommitId}:r{row:00} ")).Count,
+                $"payload row {row} must remain exactly once after cancellation");
+        }
+
+        // Unit i renders payload row i-1 (unit 0 is BEGIN), so the unit that was
+        // pending when cancellation arrived is payload row CancelAtUnit - 1.
+        Assert.AreEqual(
+            0,
+            Regex.Matches(buffer, Regex.Escape($"{CommitId}:r{CancelAtUnit - 1:00} ")).Count,
+            "the pending unit's row must not appear");
+        Assert.IsTrue(terminal.GetScreenText().Length > 0, "the live region must still be present after cancellation");
+    }
+
     // === harness =============================================================
 
     private static Hex1bTerminal CreateTerminal(Func<Hex1bFlowContext, Task> flowCallback, int width, int height)
