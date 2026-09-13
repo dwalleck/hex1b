@@ -151,6 +151,26 @@ public class KgpZlibCoreTests
     }
 
     [TestMethod]
+    [DataRow("m=0,f=24,s=999,v=999,i=99,t=f")]
+    [DataRow("a=t,m=0,f=32,s=1,v=1,o=z")]
+    public void Transmission_CompressedContinuationMetadata_PreservesInitialDecoding(string controls)
+    {
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = CreateTerminal(workload);
+        byte[] data = [1, 2, 3, 4];
+        var encoded = Compress(data);
+        Send(terminal, "a=t,i=1,f=32,s=1,v=1,o=z,q=2,m=1", encoded[..3]);
+        Send(terminal, controls, encoded[3..]);
+
+        var image = terminal.KgpImageStore.GetImageById(1)!;
+        Assert.IsNotNull(image);
+        TestSeq.AreEqual(data, image.Data);
+        Assert.AreEqual(1, terminal.KgpImageStore.ImageCount);
+        AssertAccounting(terminal.KgpImageStore, encoded.Length, data.Length);
+        Assert.AreEqual(0L, terminal.KgpImageStore.PendingUploadCapacity);
+    }
+
+    [TestMethod]
     public async Task Transmission_MalformedQuietAndQuery_ReturnExpectedResponsesWithoutStorage()
     {
         var workload = new ResponseWorkload();
@@ -181,7 +201,7 @@ public class KgpZlibCoreTests
         StringAssert.Contains(await workload.ReadAsync(), "i=1;EINVAL:");
         Assert.IsFalse(terminal.KgpImageStore.IsChunkedTransferInProgress);
         Send(terminal, "a=t,i=1,f=32,s=1,v=1,o=z,q=2,m=1", encoded[..3]);
-        Send(terminal, "m=0,f=32", encoded[3..]);
+        Send(terminal, "a=f,m=0,f=32", encoded[3..]);
         Send(terminal, "a=t,i=2,f=32,s=1,v=1,o=z", encoded);
         Assert.AreEqual("\x1b_Gi=2;OK\x1b\\", await workload.ReadAsync());
         Assert.IsNull(terminal.KgpImageStore.GetImageById(1));
@@ -190,7 +210,9 @@ public class KgpZlibCoreTests
     }
 
     [TestMethod]
-    public void Transmission_InputRasterAndPendingBounds_RejectWithoutLeakingAssembly()
+    [DataRow("m=0")]
+    [DataRow("a=t,m=0,s=999,v=999,i=99,f=24")]
+    public void Transmission_InputRasterAndPendingBounds_RejectWithoutLeakingAssembly(string controls)
     {
         using var workload = new Hex1bAppWorkloadAdapter();
         var encoded = Compress([1, 2, 3, 4]);
@@ -203,7 +225,7 @@ public class KgpZlibCoreTests
         Assert.IsNull(terminal.KgpImageStore.GetImageById(1));
         Send(terminal, "a=t,i=1,f=32,s=1,v=1,o=z,m=1", encoded[..3]);
         Assert.AreEqual(3L, terminal.KgpImageStore.PendingUploadBytes);
-        Send(terminal, "m=0", encoded[3..]);
+        Send(terminal, controls, encoded[3..]);
         Assert.AreEqual(0L, terminal.KgpImageStore.PendingUploadCapacity);
         Send(terminal, "a=t,i=1,f=32,s=2,v=1,o=z", Compress(new byte[8]));
         Send(terminal, "a=t,i=1,f=32,s=4294967295,v=4294967295,o=z", encoded);

@@ -7983,15 +7983,15 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         if (!command.ControlKeys.Contains('m'))
             return false;
 
+        // Kitty tolerates repeated metadata: the pending upload owns all metadata
+        // except m/q. An omitted action also continues a pending animation frame.
         return initialCommand switch
         {
             KgpParsedCommand.Transmit or KgpParsedCommand.TransmitAndDisplay
-                => command is KgpParsedCommand.Transmit &&
-                   command.ControlKeys.IsSubsetOf(KgpImageContinuationControls),
+                => command is KgpParsedCommand.Transmit or KgpParsedCommand.TransmitAndDisplay,
             KgpParsedCommand.AnimationFrame
-                => command is KgpParsedCommand.AnimationFrame &&
-                   command.ControlKeys.Contains('a') &&
-                   command.ControlKeys.IsSubsetOf(KgpFrameContinuationControls),
+                => command is KgpParsedCommand.AnimationFrame ||
+                   command is KgpParsedCommand.Transmit && !command.ControlKeys.Contains('a'),
             _ => false,
         };
     }
