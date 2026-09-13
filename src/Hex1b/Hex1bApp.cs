@@ -41,7 +41,11 @@ namespace Hex1b;
 /// </remarks>
 public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
 {
-    private readonly Func<RootContext, Task<Hex1bWidget>> _rootComponent;
+    // Not readonly: a live inline step can replace its root layout without
+    // stopping the app (see SwapRootComponent). Read once per frame; the
+    // frame loop is the only place the swap is observed, so no widget tree is
+    // ever reconciled by two threads at once.
+    private volatile Func<RootContext, Task<Hex1bWidget>> _rootComponent;
     private readonly Func<Hex1bTheme>? _themeProvider;
     private readonly IHex1bAppTerminalWorkloadAdapter _adapter;
     private readonly Hex1bTerminal? _ownedTerminal; // Terminal we created and should dispose
@@ -124,6 +128,10 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
     
     // Render optimization - track if this is the first frame (needs full clear)
     private bool _isFirstFrame = true;
+
+    // Completed frame count, polled by flow commitment to coordinate with the
+    // render loop (see FrameCount). Written only on the render loop thread.
+    private long _frameCount;
     
     // Channel for signaling that a re-render is needed (from Invalidate() calls)
     private readonly Channel<bool> _invalidateChannel = Channel.CreateBounded<bool>(
@@ -351,6 +359,77 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
     {
         // TryWrite with DropOldest ensures we don't block and coalesce rapid invalidations
         _invalidateChannel.Writer.TryWrite(true);
+    }
+
+    /// <summary>
+    /// Number of frames this app has completed rendering. Incremented on the
+    /// render loop thread immediately after <see cref="RenderFrameAsync"/>'s
+    /// frame output has been written.
+    /// </summary>
+    /// <remarks>
+    /// Used as a render-loop coordination point: a caller that changes what the
+    /// app should render waits for this to advance instead of assuming a frame
+    /// happened. It is not a terminal-scanout signal.
+    /// </remarks>
+    internal long FrameCount => Volatile.Read(ref _frameCount);
+
+    /// <summary>
+    /// Raised on the render loop thread after every completed frame.
+    /// </summary>
+    internal event Action? FrameRendered;
+
+    /// <summary>
+    /// A detached copy of the most recently rendered frame's surface, or null
+    /// before the first frame. Used to repaint a live region without
+    /// re-rendering the widget tree.
+    /// </summary>
+    /// <remarks>
+    /// The render loop reuses its two surfaces: every frame swaps them and clears
+    /// the one it is about to draw into. Handing out the live reference would give
+    /// the caller a buffer that is mutated — and cleared — on the next frame, so
+    /// the cells are copied into a fresh surface here. The copy is region-sized
+    /// and is taken on the caller's thread, so the caller sees one coherent frame.
+    /// </remarks>
+    internal Surface? SnapshotCurrentSurface()
+    {
+        var source = _currentSurface;
+        if (source is null)
+        {
+            return null;
+        }
+
+        var copy = new Surface(source.Width, source.Height, source.CellMetrics);
+        for (var y = 0; y < source.Height; y++)
+        {
+            for (var x = 0; x < source.Width; x++)
+            {
+                copy.TrySetCell(x, y, source.GetCell(x, y));
+            }
+        }
+
+        return copy;
+    }
+
+    /// <summary>
+    /// Replaces the root layout builder of the running application.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The app, its node tree, focus ring, and input routing are untouched —
+    /// only the builder that produces the next frame's widget tree changes.
+    /// The swap is observed by the render loop on its next frame, so a new
+    /// tree is never reconciled concurrently with one already being rendered.
+    /// </para>
+    /// <para>
+    /// Intended for inline flow steps that commit history while staying live;
+    /// it is not a general-purpose hot-reload entry point.
+    /// </para>
+    /// </remarks>
+    internal void SwapRootComponent(Func<RootContext, Task<Hex1bWidget>> builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        _rootComponent = builder;
+        Invalidate();
     }
 
     /// <summary>
@@ -1147,6 +1226,11 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
                 _context.Write(SyncUpdateEnd);
             }
         }
+
+        // Frame completed on the render loop thread: publish the count and
+        // notify waiters (flow commitment coordinates with the loop here).
+        Volatile.Write(ref _frameCount, _frameCount + 1);
+        FrameRendered?.Invoke();
     }
     
     /// <summary>
@@ -1275,14 +1359,20 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
         // rendering targets text-only step UIs.
         if (_useSoftWrapEmission)
         {
-            // CUP to top-left of frame, then clear from cursor to end of
-            // screen. When the workload adapter rebases CUP coordinates
-            // (InlineStepAdapter), the leading "ESC[1;1H" lands at the
-            // top of the host-terminal region the adapter owns, and the
-            // trailing "ESC[J" wipes that region down to the bottom of
-            // the screen — leaving any content above it intact.
-            _adapter.Write("\x1b[1;1H\x1b[J");
-            SoftWrapEmitter.Emit(_currentSurface, _adapter);
+            // CUP to the top-left of the frame, then repaint every row with
+            // clear-before-content ordering. When the workload adapter rebases
+            // CUP coordinates (InlineStepAdapter), the leading "ESC[1;1H" lands
+            // at the top of the host-terminal region the adapter owns.
+            //
+            // Clear-before-content is what keeps the right margin correct here:
+            // a row whose content reaches the right edge keeps its final cell
+            // (no escape follows it), while a shorter row still erases whatever
+            // the previous frame painted past its end. The ordering on this
+            // path is deliberately different from SoftWrapEmitter.Emit, whose
+            // trailing clear is correct for append-once tombstones but would
+            // truncate a full-width live row.
+            _adapter.Write("\x1b[1;1H");
+            SoftWrapEmitter.EmitOrdered(_currentSurface, _adapter);
             // Reset the previous-surface cache so a future switch off of
             // soft-wrap emission (or a downstream diff) starts from a
             // known-empty baseline rather than a stale cell grid that the

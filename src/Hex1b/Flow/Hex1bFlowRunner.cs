@@ -55,6 +55,148 @@ internal sealed class Hex1bFlowRunner
     // The currently active step, if any. Only one step may run at a time.
     private FlowStep? _activeStep;
 
+    // Serializes every write to the parent terminal. The live app's frame pump,
+    // the resize/reposition paths, tombstone emission, and continuous-history
+    // commitment all write through it, so a cursor-positioning sequence and the
+    // content it belongs to can never be split by another writer.
+    private readonly object _terminalWriteLock = new();
+
+    // Serializes step-level operations that move the live region and update its
+    // bookkeeping, so the runner's resize handling and an in-flight history
+    // commit cannot reposition the same region concurrently.
+    private readonly object _stepOpsLock = new();
+
+    // Optional JSONL file receiving framework-side commit events. The driver
+    // writes its own app-side evidence; this is the framework's view of the
+    // same commits, and both are observations rather than host history proof.
+    private static readonly string? CommitEventLogPath =
+        Environment.GetEnvironmentVariable("HEX1B_FLOW_COMMIT_EVENTS");
+    private static readonly object CommitEventLock = new();
+
+    /// <summary>
+    /// Writes to the parent terminal under the terminal write lock.
+    /// </summary>
+    private void WriteTerminal(string text)
+    {
+        lock (_terminalWriteLock)
+        {
+            _parentAdapter.Write(text);
+        }
+    }
+
+    /// <summary>
+    /// Writes live-application output under the terminal write lock, re-checking
+    /// the mute gate <em>inside</em> the lock.
+    /// </summary>
+    /// <remarks>
+    /// The gate must be sampled while holding the lock. A frame that passed an
+    /// unlocked check can be held behind the lock while a commit mutes,
+    /// repositions the live region and unmutes; it would then be forwarded at a
+    /// superseded origin — the stale-origin replay the mute exists to prevent.
+    /// </remarks>
+    private void WriteTerminalUnlessMuted(string text, Func<bool>? isMuted)
+    {
+        lock (_terminalWriteLock)
+        {
+            if (isMuted?.Invoke() == true)
+            {
+                return;
+            }
+
+            _parentAdapter.Write(text);
+        }
+    }
+
+    /// <summary>
+    /// Positions at an absolute terminal row and writes, atomically under the
+    /// terminal write lock, so the cursor can never be moved away from the row
+    /// between positioning and content.
+    /// </summary>
+    private void WriteTerminalAt(int row, string text)
+    {
+        lock (_terminalWriteLock)
+        {
+            _parentAdapter.SetCursorPosition(0, Math.Clamp(row, 0, Math.Max(0, _parentAdapter.Height - 1)));
+            _parentAdapter.Write(text);
+        }
+    }
+
+    /// <summary>
+    /// Scrolls the viewport up by <paramref name="rows"/> rows by parking the
+    /// cursor on the bottom row and emitting that many linefeeds. Each linefeed
+    /// at the bottom row pushes the top row into the host's scrollback. The
+    /// scrollback itself is never cleared or replayed.
+    /// </summary>
+    private void ScrollViewportUp(int rows)
+    {
+        if (rows <= 0) return;
+        var terminalHeight = Math.Max(1, _parentAdapter.Height);
+        var sb = new StringBuilder(rows);
+        for (var i = 0; i < rows; i++)
+        {
+            sb.Append('\n');
+        }
+        WriteTerminalAt(terminalHeight - 1, sb.ToString());
+    }
+
+    /// <summary>
+    /// Appends one framework-side commit event to the JSONL evidence file when
+    /// <c>HEX1B_FLOW_COMMIT_EVENTS</c> names a writable path. Best-effort: a
+    /// logging failure never disturbs the flow.
+    /// </summary>
+    private static void RecordCommitEvent(string message)
+    {
+        var path = CommitEventLogPath;
+        if (string.IsNullOrEmpty(path)) return;
+        lock (CommitEventLock)
+        {
+            try
+            {
+                var line = string.Create(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    $"{{\"ts\":{Environment.TickCount64},\"kind\":\"commit\",\"source\":\"hex1b\",\"detail\":\"{EscapeJson(message)}\"}}{Environment.NewLine}");
+                File.AppendAllText(path, line);
+            }
+            catch
+            {
+                // Evidence logging is best-effort only.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Minimal JSON string escaping for evidence records. Hand-rolled rather
+    /// than using <c>JsonSerializer</c>, which the library cannot use under
+    /// trimming/AOT without a source-generated context.
+    /// </summary>
+    private static string EscapeJson(string value)
+    {
+        var sb = new StringBuilder(value.Length + 8);
+        foreach (var ch in value)
+        {
+            switch (ch)
+            {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (ch < ' ')
+                    {
+                        sb.Append("\\u");
+                        sb.Append(((int)ch).ToString("x4", System.Globalization.CultureInfo.InvariantCulture));
+                    }
+                    else
+                    {
+                        sb.Append(ch);
+                    }
+                    break;
+            }
+        }
+        return sb.ToString();
+    }
+
     // CancellationToken from RunAsync, surfaced to flow callbacks via Hex1bFlowContext.
     private CancellationToken _cancellationToken;
 
@@ -153,7 +295,7 @@ internal sealed class Hex1bFlowRunner
 
         // After flow completes, position cursor below the last yield widget
         _parentAdapter.SetCursorPosition(0, _cursorRow);
-        _parentAdapter.Write("\x1b[?25h"); // Ensure cursor is visible
+        WriteTerminal("\x1b[?25h"); // Ensure cursor is visible
     }
 
     /// <summary>
@@ -176,7 +318,7 @@ internal sealed class Hex1bFlowRunner
             _parentAdapter.SetCursorPosition(0, terminalHeight - 1);
             for (int i = 0; i < overflow; i++)
             {
-                _parentAdapter.Write("\n");
+                WriteTerminal("\n");
             }
             _cursorRow -= overflow;
         }
@@ -223,8 +365,15 @@ internal sealed class Hex1bFlowRunner
         // Pre-measure the widget to determine actual content height
         var step = new FlowStep(terminalWidth, terminalHeight, maxHeight);
         var contentHeight = MeasureStepContent(builder, step, terminalWidth, maxHeight);
-        var desiredHeight = Math.Min(contentHeight, maxHeight);
-        if (desiredHeight < 1) desiredHeight = 1;
+
+        // MinHeight gives the live region a stable, reliably interactive
+        // allocation from the first frame instead of letting it grow with the
+        // body, so a short initial body is not mistaken for a smaller region.
+        // Clamped to the host terminal height and to MaxHeight so it can never
+        // allocate off-screen. (The previously disproved FixedHeight workaround
+        // padded the *content*; this sets the region allocation.)
+        var minHeight = Math.Clamp(options?.MinHeight ?? 0, 0, maxHeight);
+        var desiredHeight = Math.Clamp(Math.Max(contentHeight, minHeight), 1, maxHeight);
         step.StepHeight = desiredHeight;
 
         _activeStep = step;
@@ -297,7 +446,7 @@ internal sealed class Hex1bFlowRunner
                 _parentAdapter.SetCursorPosition(0, terminalHeight - 1);
                 for (int i = 0; i < overflow; i++)
                 {
-                    _parentAdapter.Write("\n");
+                    WriteTerminal("\n");
                 }
                 rowOrigin -= overflow;
                 _cursorRow = rowOrigin;
@@ -346,6 +495,13 @@ internal sealed class Hex1bFlowRunner
             // CR+LF row terminators inside each frame.
             using var outputPumpCts = new CancellationTokenSource();
             var outputMuteGate = new System.Runtime.CompilerServices.StrongBox<bool>(false);
+
+            // Set once the app and its commit coordinator exist. The resize
+            // handler reads it so a resize that lands during an in-flight
+            // history commit updates geometry without fighting the commit for
+            // the live region's origin.
+            var commitCoordinatorBox =
+                new System.Runtime.CompilerServices.StrongBox<FlowCommitCoordinator?>(null);
             var outputPumpTask = PumpStepOutputAsync(
                 stepAdapter,
                 outputPumpCts.Token,
@@ -378,6 +534,26 @@ internal sealed class Hex1bFlowRunner
                 onResize: (newWidth, newHeight) =>
                 {
                     var newStepHeight = FlowResizeMath.ComputeStepHeight(options?.MaxHeight, newHeight);
+
+                    // An in-flight history commit owns the live region's origin
+                    // and repaints it at its own turn boundaries. Update the
+                    // geometry the commit will read next, forward the resize to
+                    // the adapter, and leave the repositioning to the commit —
+                    // running the burst/clear/placeholder path underneath it
+                    // would fight it for the same rows.
+                    if (System.Threading.Volatile.Read(ref commitCoordinatorBox.Value)?.IsCommitInFlight == true)
+                    {
+                        desiredHeight = newStepHeight;
+                        step.StepHeight = Math.Max(1, newStepHeight);
+                        step.TerminalWidth = newWidth;
+                        lastKnownWidth = newWidth;
+                        lastKnownHeight = newHeight;
+                        _ = stepAdapter.ResizeAsync(Math.Max(1, newWidth), Math.Max(1, newStepHeight));
+                        Trace($"onResize during commit: defers repositioning to the commit " +
+                              $"newSize={newWidth}x{newHeight} newStepH={newStepHeight}");
+                        return;
+                    }
+
                     Trace($"onResize: newSize={newWidth}x{newHeight} newStepH={newStepHeight} useSoftWrap={_options.UseSoftWrapTombstones} settleDelay={_options.ResizeSettleDelay}");
 
                     var useSettle = _options.UseSoftWrapTombstones
@@ -417,7 +593,7 @@ internal sealed class Hex1bFlowRunner
 
                             // Hide the cursor for the duration of the drag
                             // so it doesn't visibly chase the reflow.
-                            _parentAdapter.Write("\x1b[?25l");
+                            WriteTerminal("\x1b[?25l");
 
                             // Disable line wrap (DECAWM) for the duration
                             // of the drag. The inner Hex1bApp keeps
@@ -433,7 +609,7 @@ internal sealed class Hex1bFlowRunner
                             // the active region but never scrolls. The
                             // settle pass re-enables DECAWM as its last
                             // act before showing the cursor.
-                            _parentAdapter.Write("\x1b[?7l");
+                            WriteTerminal("\x1b[?7l");
 
                             // Mute the inner-app output pump for the
                             // duration of the drag. DECAWM-off protects
@@ -468,7 +644,7 @@ internal sealed class Hex1bFlowRunner
                             // runs), but all later events in the same
                             // drag are anchored. The settle pass
                             // restores the cursor to its proper place.
-                            _parentAdapter.Write("\x1b[H");
+                            WriteTerminal("\x1b[H");
 
                             // Render the placeholder (if any) into the
                             // active rect. With the inner-app output
@@ -497,7 +673,7 @@ internal sealed class Hex1bFlowRunner
                                     Math.Max(1, placeholderHeight));
                                 if (phSurface is not null)
                                 {
-                                    _parentAdapter.Write(SyncUpdateBegin);
+                                    WriteTerminal(SyncUpdateBegin);
                                     try
                                     {
                                         // Wipe the rect first so we don't
@@ -508,7 +684,7 @@ internal sealed class Hex1bFlowRunner
                                             var row = placeholderRowOrigin + i;
                                             if (row < 0 || row >= newHeight) continue;
                                             _parentAdapter.SetCursorPosition(0, row);
-                                            _parentAdapter.Write("\x1b[2K");
+                                            WriteTerminal("\x1b[2K");
                                         }
                                         if (placeholderRowOrigin >= 0
                                             && placeholderRowOrigin < newHeight)
@@ -519,14 +695,14 @@ internal sealed class Hex1bFlowRunner
                                     }
                                     finally
                                     {
-                                        _parentAdapter.Write(SyncUpdateEnd);
+                                        WriteTerminal(SyncUpdateEnd);
                                     }
                                     // Park the cursor at home again so
                                     // the placeholder emission (which
                                     // leaves the cursor at the end of
                                     // the last paragraph) cannot anchor
                                     // a subsequent shrink-scroll.
-                                    _parentAdapter.Write("\x1b[H");
+                                    WriteTerminal("\x1b[H");
                                 }
                             }
 
@@ -587,7 +763,7 @@ internal sealed class Hex1bFlowRunner
                                     _parentAdapter.SetCursorPosition(0, settledHeight - 1);
                                     for (var i = 0; i < bottomOverflow; i++)
                                     {
-                                        _parentAdapter.Write("\n");
+                                        WriteTerminal("\n");
                                     }
                                     _initialRowOrigin -= bottomOverflow;
                                     settledRowOrigin -= bottomOverflow;
@@ -631,10 +807,10 @@ internal sealed class Hex1bFlowRunner
                                 // the old rect too. Row-by-row ESC[2K
                                 // (never ESC[J) so a wrong computation
                                 // can't erase tombstones above.
-                                _parentAdapter.Write(SyncUpdateBegin);
+                                WriteTerminal(SyncUpdateBegin);
                                 try
                                 {
-                                    _parentAdapter.Write("\x1b[?7l");
+                                    WriteTerminal("\x1b[?7l");
 
                                     var clearTop = rowOrigin;
                                     var clearBottom = rowOrigin + settledStepHeight - 1;
@@ -648,15 +824,15 @@ internal sealed class Hex1bFlowRunner
                                     {
                                         if (row < 0 || row >= settledHeight) continue;
                                         _parentAdapter.SetCursorPosition(0, row);
-                                        _parentAdapter.Write("\x1b[2K");
+                                        WriteTerminal("\x1b[2K");
                                     }
                                     _parentAdapter.SetCursorPosition(0, rowOrigin);
-                                    _parentAdapter.Write("\x1b[?7h");
-                                    _parentAdapter.Write("\x1b[?25h"); // show cursor
+                                    WriteTerminal("\x1b[?7h");
+                                    WriteTerminal("\x1b[?25h"); // show cursor
                                 }
                                 finally
                                 {
-                                    _parentAdapter.Write(SyncUpdateEnd);
+                                    WriteTerminal(SyncUpdateEnd);
                                 }
 
                                 _ = stepAdapter.ResizeAsync(settledWidth, settledStepHeight);
@@ -727,7 +903,45 @@ internal sealed class Hex1bFlowRunner
                     return builder(stepCtx);
                 }, appOptions);
                 step.SetApp(app);
-                await app.RunAsync(default);
+
+                // Continuous-history commitment: this step keeps running while
+                // finalized content is appended to native history above it.
+                var liveHandle = new LiveStepHandle(
+                    this, step, stepAdapter, app, stepCtx, outputMuteGate);
+                var commitCoordinator = new FlowCommitCoordinator(
+                    liveHandle, _parentAdapter, _cancellationToken);
+                step.AttachCommitCoordinator(commitCoordinator);
+                System.Threading.Volatile.Write(ref commitCoordinatorBox.Value, commitCoordinator);
+
+                // Publish the live app as the diagnostic tree provider on the
+                // terminal-facing adapter while the step runs, so the active
+                // prompt's real widget tree can be inspected. An inline step's
+                // own adapter is not a Hex1bAppWorkloadAdapter, so the app's
+                // own registration cannot reach the host; this is the existing
+                // seam, not an additional renderer.
+                Hex1bAppWorkloadAdapter? diagnosticHost = null;
+                Diagnostics.IDiagnosticTreeProvider? previousDiagnosticProvider = null;
+                if (_parentAdapter is Hex1bAppWorkloadAdapter parentWorkloadAdapter)
+                {
+                    diagnosticHost = parentWorkloadAdapter;
+                    previousDiagnosticProvider = parentWorkloadAdapter.DiagnosticTreeProvider;
+                    parentWorkloadAdapter.DiagnosticTreeProvider = app;
+                }
+
+                try
+                {
+                    await app.RunAsync(default);
+                }
+                finally
+                {
+                    // Restore only if the app is still the registered provider,
+                    // so a later owner is never clobbered.
+                    if (diagnosticHost is not null
+                        && ReferenceEquals(diagnosticHost.DiagnosticTreeProvider, app))
+                    {
+                        diagnosticHost.DiagnosticTreeProvider = previousDiagnosticProvider;
+                    }
+                }
             }
             finally
             {
@@ -858,7 +1072,7 @@ internal sealed class Hex1bFlowRunner
             {
                 _parentAdapter.SetCursorPosition(0, terminalHeight - 1);
                 for (int i = 0; i < overflow; i++)
-                    _parentAdapter.Write("\n");
+                    WriteTerminal("\n");
                 _cursorRow -= overflow;
             }
 
@@ -996,7 +1210,7 @@ internal sealed class Hex1bFlowRunner
             sb.Append($"\x1b[{rowOrigin + row + 1};1H");
             sb.Append("\x1b[2K");
         }
-        _parentAdapter.Write(sb.ToString());
+        WriteTerminal(sb.ToString());
     }
 
     private Surface? RenderToSurface(
@@ -1136,7 +1350,7 @@ internal sealed class Hex1bFlowRunner
             _parentAdapter.SetCursorPosition(0, terminalHeight - 1);
             for (int i = 0; i < overflow; i++)
             {
-                _parentAdapter.Write("\n");
+                WriteTerminal("\n");
             }
             _cursorRow -= overflow;
             // The viewport scrolled up by `overflow` rows, so every
@@ -1251,29 +1465,28 @@ internal sealed class Hex1bFlowRunner
         var resizeId = Interlocked.Increment(ref _resizeCounter);
         Trace($"ScrollViewportToScrollback[#{resizeId}] enter: newHeight={newHeight}");
 
-        _parentAdapter.Write(SyncUpdateBegin);
+        WriteTerminal(SyncUpdateBegin);
         try
         {
             // Park at bottom-left and emit one LF per viewport row. Each
             // LF at the bottom scrolls the viewport up by one row, moving
             // the top line into scrollback. After newHeight LFs every
             // previously-visible row has been pushed into scrollback.
-            _parentAdapter.SetCursorPosition(0, newHeight - 1);
-            var sb = new StringBuilder(newHeight);
+            var sb = new StringBuilder(newHeight + 16);
             for (int i = 0; i < newHeight; i++)
             {
                 sb.Append('\n');
             }
-            _parentAdapter.Write(sb.ToString());
+            WriteTerminalAt(newHeight - 1, sb.ToString());
 
             // Home + clear-to-end-of-screen. After scrolling, the cursor
             // may be anywhere; reset to top-left and wipe so the step can
             // render from a known-blank canvas.
-            _parentAdapter.Write("\x1b[1;1H\x1b[J");
+            WriteTerminal("\x1b[1;1H\x1b[J");
         }
         finally
         {
-            _parentAdapter.Write(SyncUpdateEnd);
+            WriteTerminal(SyncUpdateEnd);
         }
 
         Trace($"ScrollViewportToScrollback[#{resizeId}] exit");
@@ -1294,11 +1507,12 @@ internal sealed class Hex1bFlowRunner
                 var data = await stepAdapter.ReadOutputAsync(ct);
                 if (data.IsEmpty) continue;
                 // Drop frames while the runner has the pump muted (e.g.
-                // during a resize burst). Forwarding them would replay
-                // stale-sized content at the stale rowOrigin, which is
-                // the dominant cause of buffer-scroll during a drag.
-                if (isMuted?.Invoke() == true) continue;
-                _parentAdapter.Write(Encoding.UTF8.GetString(data.Span));
+                // during a resize burst or an in-flight commit). Forwarding
+                // them would replay stale-sized or stale-origin content.
+                // The gate is re-checked inside the write lock by
+                // WriteTerminalUnlessMuted, so a frame already in flight when
+                // the mute is set cannot slip through afterwards.
+                WriteTerminalUnlessMuted(Encoding.UTF8.GetString(data.Span), isMuted);
             }
         }
         catch (OperationCanceledException) { }
@@ -1360,6 +1574,215 @@ internal sealed class Hex1bFlowRunner
         }
 
         return Task.FromResult<int?>(_options.InitialCursorRow);
+    }
+
+    /// <summary>
+    /// Per-step bridge between <see cref="FlowCommitCoordinator"/> and the
+    /// runner's live app, its output pump, and the terminal write lock. Keeps
+    /// every terminal mutation the commit needs inside the runner's existing
+    /// serialization seams rather than opening a second writer.
+    /// </summary>
+    private sealed class LiveStepHandle : ILiveStepHandle
+    {
+        private readonly Hex1bFlowRunner _runner;
+        private readonly FlowStep _step;
+        private readonly InlineStepAdapter _stepAdapter;
+        private readonly Hex1bApp _app;
+        private readonly FlowStepContext _stepContext;
+        private readonly System.Runtime.CompilerServices.StrongBox<bool> _muteGate;
+
+        public LiveStepHandle(
+            Hex1bFlowRunner runner,
+            FlowStep step,
+            InlineStepAdapter stepAdapter,
+            Hex1bApp app,
+            FlowStepContext stepContext,
+            System.Runtime.CompilerServices.StrongBox<bool> muteGate)
+        {
+            _runner = runner;
+            _step = step;
+            _stepAdapter = stepAdapter;
+            _app = app;
+            _stepContext = stepContext;
+            _muteGate = muteGate;
+        }
+
+        public int TerminalWidth => _runner._parentAdapter.Width;
+
+        public int TerminalHeight => _runner._parentAdapter.Height;
+
+        public int RowOrigin => _stepAdapter.RowOrigin;
+
+        public int LiveHeight => Math.Max(1, _step.StepHeight);
+
+        public long FrameCount => _app.FrameCount;
+
+        public Surface? SnapshotLiveSurface() => _app.SnapshotCurrentSurface();
+
+        public void WriteTerminalAt(int row, string text) => _runner.WriteTerminalAt(row, text);
+
+        public void ScrollViewportUp(int rows)
+        {
+            if (rows <= 0)
+            {
+                return;
+            }
+
+            lock (_runner._stepOpsLock)
+            {
+                _runner.ScrollViewportUp(rows);
+
+                // The viewport scrolled up by `rows`, so every row already on
+                // screen moved up by the same amount — including tracked
+                // tombstones and previously committed content. Shift the flow's
+                // on-screen bookkeeping to match, exactly as the tombstone path
+                // does, so the soft-wrap settle pass recomputes the live region's
+                // origin from a correct starting row instead of anchoring it
+                // above the committed history.
+                _runner._cursorRow -= rows;
+                _runner._initialRowOrigin -= rows;
+            }
+        }
+
+        public void ReanchorLive(int rowOrigin, int liveHeight, Surface liveSurface)
+        {
+            lock (_runner._stepOpsLock)
+            {
+                var terminalHeight = Math.Max(1, _runner._parentAdapter.Height);
+                liveHeight = Math.Clamp(liveHeight, 1, terminalHeight);
+                rowOrigin = Math.Clamp(rowOrigin, 0, Math.Max(0, terminalHeight - liveHeight));
+
+                // Bookkeeping first: the app's next frame is laid out for the
+                // new origin/height, and a resize computation reads these.
+                _runner._cursorRow = rowOrigin;
+                _stepAdapter.RowOrigin = rowOrigin;
+                _step.StepHeight = liveHeight;
+                _step.TerminalWidth = _runner._parentAdapter.Width;
+
+                lock (_runner._terminalWriteLock)
+                {
+                    // 1. Blank every row of the region, so a region that shrank
+                    //    cannot leave orphaned rows behind.
+                    for (var row = 0; row < liveHeight; row++)
+                    {
+                        var absolute = rowOrigin + row;
+                        if (absolute < 0 || absolute >= terminalHeight) continue;
+                        _runner._parentAdapter.SetCursorPosition(0, absolute);
+                        _runner._parentAdapter.Write("\x1b[2K");
+                    }
+
+                    // 2. Paint the live image with clear-before-content on every
+                    //    row: a row that fills the width keeps its last cell,
+                    //    while a shorter row still erases the previous frame's
+                    //    residue at the right margin. No escape follows the
+                    //    final row — the region's last row can be the terminal's
+                    //    bottom row, where a trailing newline would scroll the
+                    //    buffer and lift the content above it.
+                    var paintRows = Math.Min(liveHeight, Math.Max(1, liveSurface.Height));
+                    for (var row = 0; row < paintRows; row++)
+                    {
+                        var absolute = rowOrigin + row;
+                        if (absolute < 0 || absolute >= terminalHeight) continue;
+                        _runner._parentAdapter.SetCursorPosition(0, absolute);
+                        _runner._parentAdapter.Write(SoftWrapEmitter.OrderedRowPrefix);
+                        _runner._parentAdapter.Write(SoftWrapEmitter.RenderRowText(liveSurface, row));
+                    }
+
+                    // 3. Leave the cursor at the region's top-left.
+                    _runner._parentAdapter.SetCursorPosition(0, rowOrigin);
+                }
+            }
+        }
+
+        public void RecordCommittedRows(Surface surface)
+        {
+            lock (_runner._stepOpsLock)
+            {
+                // One entry per committed row, appended in emission order, so
+                // FlowResizeMath.ComputeRowOriginAtWidth sees the committed
+                // content exactly like a tombstone paragraph when it recomputes
+                // the live region's row after a reflow.
+                for (var row = 0; row < surface.Height; row++)
+                {
+                    _runner._emittedTombstones.Add(
+                        new[] { Hex1bFlowRunner.MeasureSurfaceRowWidth(surface, row) });
+                }
+            }
+        }
+
+        public int DiscardQueuedLiveOutput() => _stepAdapter.DiscardQueuedOutput();
+
+        public void ResizeLive(int width, int liveHeight)
+        {
+            // Always push the resize: the inner app treats it as a re-render
+            // trigger, and the region must repaint at the settled geometry.
+            _ = _stepAdapter.ResizeAsync(Math.Max(1, width), Math.Max(1, liveHeight));
+        }
+
+        public void ApplyLiveLayout(Func<FlowStepContext, Task<Hex1bWidget>> builder)
+        {
+            _app.SwapRootComponent(rootContext =>
+            {
+                _stepContext.CancellationToken = rootContext.CancellationToken;
+                return builder(_stepContext);
+            });
+        }
+
+        public void RequestLiveFrame() => _app.Invalidate();
+
+        public bool SetLiveOutputMuted(bool muted)
+        {
+            var previous = System.Threading.Volatile.Read(ref _muteGate.Value);
+            System.Threading.Volatile.Write(ref _muteGate.Value, muted);
+            return previous;
+        }
+
+        public async Task<bool> WaitForNextLiveFrameAsync(
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            // A frame completed before this call does not satisfy the wait: the
+            // caller needs a frame produced after it changed what the app
+            // should render.
+            var target = _app.FrameCount + 1;
+            var completion = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+
+            void OnFrameRendered()
+            {
+                if (_app.FrameCount >= target)
+                {
+                    completion.TrySetResult(true);
+                }
+            }
+
+            _app.FrameRendered += OnFrameRendered;
+            try
+            {
+                if (_app.FrameCount >= target)
+                {
+                    return true;
+                }
+
+                using var timeoutCts =
+                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                var delay = Task.Delay(timeout, timeoutCts.Token);
+                var finished = await Task.WhenAny(completion.Task, delay).ConfigureAwait(false);
+                if (finished == completion.Task)
+                {
+                    await timeoutCts.CancelAsync().ConfigureAwait(false);
+                    return true;
+                }
+
+                return false;
+            }
+            finally
+            {
+                _app.FrameRendered -= OnFrameRendered;
+            }
+        }
+
+        public void RecordCommitEvent(string message) => Hex1bFlowRunner.RecordCommitEvent(message);
     }
 }
 

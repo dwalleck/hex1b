@@ -12,6 +12,7 @@ public sealed class FlowStep
     private readonly TaskCompletionSource _tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private volatile Hex1bApp? _app;
     private int _completed; // 0 = active, 1 = completed
+    private FlowCommitCoordinator? _commitCoordinator;
 
     internal FlowStep(int terminalWidth, int terminalHeight, int stepHeight)
     {
@@ -19,6 +20,13 @@ public sealed class FlowStep
         TerminalHeight = terminalHeight;
         StepHeight = stepHeight;
     }
+
+    /// <summary>
+    /// Attaches the continuous-history coordinator created for this step by the
+    /// runner. Called once, before the step's app starts running.
+    /// </summary>
+    internal void AttachCommitCoordinator(FlowCommitCoordinator coordinator)
+        => _commitCoordinator = coordinator;
 
     /// <summary>
     /// Gets the completed builder set by <see cref="Complete(Func{RootContext, Hex1bWidget})"/>
@@ -29,9 +37,11 @@ public sealed class FlowStep
     internal Func<RootContext, Task<Hex1bWidget>>? CompletedBuilder { get; private set; }
 
     /// <summary>
-    /// Width of the terminal in columns.
+    /// Width of the terminal in columns. Kept current across resizes so a
+    /// finalized-content builder can pad rows to the width the commit will
+    /// actually emit at.
     /// </summary>
-    public int TerminalWidth { get; }
+    public int TerminalWidth { get; internal set; }
 
     /// <summary>
     /// Height of the terminal in rows.
@@ -47,6 +57,13 @@ public sealed class FlowStep
     /// Sets the underlying app instance. Called by the runner after the app is created.
     /// </summary>
     internal void SetApp(Hex1bApp app) => _app = app;
+
+    /// <summary>
+    /// The live app instance while the step is running, or null before it starts.
+    /// Used by diagnostics (widget-tree inspection) and by proof harnesses that
+    /// verify the app is never restarted across a history commit.
+    /// </summary>
+    internal Hex1bApp? AppForDiagnostics => _app;
 
     /// <summary>
     /// Marks the task as completed. Called by the runner after cleanup.
@@ -163,6 +180,102 @@ public sealed class FlowStep
             ? _tcs.Task.WaitAsync(cancellationToken)
             : _tcs.Task;
     }
+
+    /// <summary>
+    /// True when this step can currently accept a history commit: no commit is
+    /// outstanding and no earlier commit ended in an uncertain emission failure.
+    /// </summary>
+    /// <remarks>
+    /// Once an emission failure has left the terminal stream uncertain, commits
+    /// stay rejected for the lifetime of the step. Recovery is explicit; an
+    /// uncertain batch is never replayed automatically.
+    /// </remarks>
+    public bool CanCommit => _commitCoordinator?.CanCommit ?? false;
+
+    /// <summary>
+    /// True when a previous commit failed after content may already have reached
+    /// the terminal, so further history commitment is suspended.
+    /// </summary>
+    public bool IsCommitUncertain => _commitCoordinator is { CanCommit: false };
+
+    /// <summary>
+    /// Waits until the step's application has rendered and entered its
+    /// input-capable lifecycle.
+    /// </summary>
+    /// <remarks>
+    /// Readiness means the persistent app has produced at least one frame and is
+    /// processing input. It is not a terminal-scanout or input-echo oracle: a
+    /// rendered marker alone does not prove the host has displayed anything.
+    /// </remarks>
+    /// <returns>A task that completes when the step is ready for commitment.</returns>
+    public Task WaitForReadyAsync(CancellationToken cancellationToken = default)
+    {
+        var coordinator = _commitCoordinator
+            ?? throw new InvalidOperationException(
+                "This step has no history commitment coordinator. It was created by a flow " +
+                "runner without continuous-history support.");
+        return coordinator.WaitForReadyAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Commits finalized presentation content to native terminal history while
+    /// the step stays live, applying the next live layout as part of the same
+    /// coordinated operation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The application supplies immutable logical units through
+    /// <see cref="FlowCommitSource"/>; each unit is emitted exactly once, in
+    /// order, below the live region. The host owns scrolling and scrollback, and
+    /// Hex1b never clears or replays it. The live step is not ended and the app
+    /// is not restarted: the same application, node tree, and editor identity
+    /// persist across the commit, with only the root layout builder replaced.
+    /// </para>
+    /// <para>
+    /// Emission proceeds in bounded turns so input and resize processing get
+    /// opportunities between them, and only units that have not been emitted are
+    /// re-materialized if the terminal width changes mid-commit.
+    /// </para>
+    /// <para>
+    /// <see cref="FlowCommitResult.CompletedRows"/> counts physical rows that
+    /// Hex1b handed to the terminal-side write path, and
+    /// <see cref="FlowCommitResult.CompletedUnits"/> counts logical units. Both
+    /// describe framework emission only — they are not evidence that the host
+    /// terminal displayed them, retained them in scrollback, or made them
+    /// durable.
+    /// </para>
+    /// <para>
+    /// Await this from a background task, never from inside the step's own event
+    /// handlers: the commit waits for frames produced by the app's render loop,
+    /// so blocking that handler would deadlock.
+    /// </para>
+    /// <para>
+    /// A second outstanding commit request is rejected with
+    /// <see cref="InvalidOperationException"/>.
+    /// </para>
+    /// </remarks>
+    /// <param name="finalized">Immutable finalized units, in commit order.</param>
+    /// <param name="nextLive">Builder for the step's next live layout.</param>
+    /// <param name="cancellationToken">Cancels the commit between units.</param>
+    /// <exception cref="FlowCommitException">
+    /// Emission failed after content may have reached the terminal.
+    /// </exception>
+    public Task<FlowCommitResult> CommitAsync(
+        FlowCommitSource finalized,
+        Func<FlowStepContext, Task<Hex1bWidget>> nextLive,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(finalized);
+        ArgumentNullException.ThrowIfNull(nextLive);
+        var coordinator = RequireCoordinator();
+        return coordinator.CommitAsync(finalized, nextLive, cancellationToken);
+    }
+
+    private FlowCommitCoordinator RequireCoordinator()
+        => _commitCoordinator
+            ?? throw new InvalidOperationException(
+                "This step has no history commitment coordinator. It was created by a flow " +
+                "runner without continuous-history support.");
 
     /// <summary>
     /// Requests that focus be moved to a node matching the predicate.

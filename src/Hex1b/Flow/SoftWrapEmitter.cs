@@ -8,9 +8,9 @@ namespace Hex1b.Flow;
 /// <summary>
 /// Walks a <see cref="Surface"/> and emits its contents as soft-wrap-friendly
 /// terminal output: per row, the visible characters with grouped SGR runs,
-/// followed by <c>ESC[K</c> (clear-to-end-of-line). Rows other than the last
-/// are also terminated with <c>CR + LF</c> so the next row starts at column
-/// zero of the next terminal line.
+/// plus line-termination and right-margin handling. Rows other than the last
+/// are terminated with <c>CR + LF</c> so the next row starts at column zero of
+/// the next terminal line.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -33,24 +33,34 @@ namespace Hex1b.Flow;
 /// </list>
 /// </para>
 /// <para>
-/// Each row except the last is emitted as
-/// <c>(SGR runs and characters) + ESC[K + CR + LF</c>. The terminating
-/// <c>ESC[K</c> clears any residual content past the rendered glyphs, and
-/// <c>CR + LF</c> moves the cursor to column zero of the next row so the
-/// following row's characters start at the left margin (a bare LF would only
-/// move the cursor down and would shift each subsequent row right by the
-/// width of the previous row's content — a raw-mode terminal does not
-/// translate LF to CRLF). The final row deliberately omits the trailing
-/// <c>CR + LF</c>: when a tombstone is emitted at the very bottom of the
-/// viewport, a trailing newline would scroll the screen up by one row,
-/// causing the tombstone to appear one row higher than the step it is
-/// freezing in place. The next operation that writes to the terminal
-/// (typically <see cref="IHex1bAppTerminalWorkloadAdapter.SetCursorPosition"/>
-/// for the next step) terminates the open row implicitly.
+/// Two orderings are provided, and the difference is not cosmetic:
 /// </para>
+/// <list type="bullet">
+///   <item><see cref="Emit"/> (tombstones, append-once content) writes the row
+///     and then clears from the cursor to the end of the line. A row that fills
+///     the full width could lose its last cell to that trailing clear, but
+///     append-once content has no right-margin residue to remove; the final row
+///     deliberately omits CR + LF so emitting at the very bottom of the viewport
+///     does not scroll the screen and lift the content one row above the region
+///     it is freezing in place.</item>
+///   <item><see cref="EmitOrdered"/> (in-place repaint of a live region) clears
+///     the row <em>before</em> writing it. Clearing first is what keeps the right
+///     margin correct while never erasing the last cell of full-width content;
+///     no escape follows the final row, so repainting a region whose last row is
+///     the bottom row of the terminal cannot scroll the buffer.</item>
+/// </list>
 /// </remarks>
 internal static class SoftWrapEmitter
 {
+    /// <summary>
+    /// Escape sequence prefix that resets SGR state and clears the current row
+    /// before its content is written. Clearing first is what makes in-place
+    /// repaint safe at the right margin: a row whose content fills the full
+    /// width keeps its last cell because no escape is emitted after it, while a
+    /// shorter row still erases whatever the previous frame left behind.
+    /// </summary>
+    internal const string OrderedRowPrefix = "\x1b[0m\x1b[K";
+
     /// <summary>
     /// Emits the contents of <paramref name="surface"/> to the supplied
     /// adapter as soft-wrap-friendly text. The cursor is hidden for the
@@ -88,6 +98,30 @@ internal static class SoftWrapEmitter
     }
 
     /// <summary>
+    /// Emits every row of <paramref name="surface"/> as a logical line with
+    /// clear-before-content ordering (see <see cref="OrderedRowPrefix"/>),
+    /// terminating every row except the last with CR + LF.
+    /// </summary>
+    /// <remarks>
+    /// Used for in-place live-region repaints. Unlike <see cref="Emit"/> it
+    /// emits no escape after the final row, so repainting a region whose last
+    /// row is the bottom row of the terminal cannot scroll the buffer.
+    /// </remarks>
+    internal static void EmitOrdered(Surface surface, IHex1bAppTerminalWorkloadAdapter adapter)
+    {
+        ArgumentNullException.ThrowIfNull(surface);
+        ArgumentNullException.ThrowIfNull(adapter);
+
+        var sb = new StringBuilder(EstimateBufferSize(surface));
+        sb.Append("\x1b[?25l");
+        sb.Append("\x1b[?7h");
+        AppendOrderedRows(surface, sb);
+        sb.Append("\x1b[?25h");
+
+        adapter.Write(sb.ToString());
+    }
+
+    /// <summary>
     /// Builds the bytes that <see cref="Emit"/> would write, returning them
     /// instead of dispatching to an adapter. Used by tests.
     /// </summary>
@@ -106,6 +140,35 @@ internal static class SoftWrapEmitter
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Builds the bytes that <see cref="EmitOrdered"/> would write, returning
+    /// them instead of dispatching to an adapter. Used by tests.
+    /// </summary>
+    internal static string FormatOrdered(Surface surface)
+    {
+        ArgumentNullException.ThrowIfNull(surface);
+
+        var sb = new StringBuilder(EstimateBufferSize(surface));
+        sb.Append("\x1b[?25l");
+        sb.Append("\x1b[?7h");
+        AppendOrderedRows(surface, sb);
+        sb.Append("\x1b[?25h");
+        return sb.ToString();
+    }
+
+    private static void AppendOrderedRows(Surface surface, StringBuilder sb)
+    {
+        for (int row = 0; row < surface.Height; row++)
+        {
+            sb.Append(OrderedRowPrefix);
+            sb.Append(RenderRowText(surface, row));
+            if (row != surface.Height - 1)
+            {
+                sb.Append("\r\n");
+            }
+        }
+    }
+
     private static int EstimateBufferSize(Surface surface)
     {
         // Rough estimate: each cell averages ~2 chars (SGR overhead amortises
@@ -115,8 +178,16 @@ internal static class SoftWrapEmitter
         return surface.Width * surface.Height * 2 + surface.Height * 5 + 16;
     }
 
-    private static void EmitRow(Surface surface, int row, StringBuilder sb, bool isLastRow)
+    /// <summary>
+    /// Builds the SGR runs and characters for one surface row, with no
+    /// line-termination or right-margin escape of its own. A trailing reset is
+    /// emitted when the row left styling active, so a following clear or write
+    /// cannot inherit it.
+    /// </summary>
+    internal static string RenderRowText(Surface surface, int row)
     {
+        var sb = new StringBuilder(surface.Width * 2 + 16);
+
         // Track SGR state within the row. We always emit a leading reset
         // ("\x1b[0m") as part of the first SGR — see BuildSgrParameters where
         // stateUnknown=true forces a "0" — which guarantees the row starts
@@ -132,7 +203,8 @@ internal static class SoftWrapEmitter
         var lastContent = FindLastContentColumn(surface, row);
 
         // Emit cells from column 0 up to and including the last content
-        // column. Anything past that is wiped with ESC[K below.
+        // column. Anything past that is left to the caller's clear-before or
+        // clear-after handling.
         int x = 0;
         while (x <= lastContent)
         {
@@ -179,14 +251,21 @@ internal static class SoftWrapEmitter
             x += Math.Max(1, emit.DisplayWidth);
         }
 
-        // Reset SGR before the line clear so the cleared cells don't inherit
-        // a coloured background from the last run on the row.
+        // Reset SGR before any line clear the caller emits so cleared cells
+        // don't inherit a coloured background from this row's last run.
         if (!stateUnknown && (currentAttrs != CellAttributes.None
             || currentFg is not null
             || currentBg is not null))
         {
             sb.Append("\x1b[0m");
         }
+
+        return sb.ToString();
+    }
+
+    private static void EmitRow(Surface surface, int row, StringBuilder sb, bool isLastRow)
+    {
+        sb.Append(RenderRowText(surface, row));
 
         // Clear any residual content past the rendered glyphs (handles
         // overwriting the active-step region). For every row except the
@@ -204,6 +283,9 @@ internal static class SoftWrapEmitter
         // appear one row higher than the step it is freezing in place. The
         // next operation that writes to the terminal terminates the open
         // row implicitly.
+        //
+        // Callers that repaint a row in place must use EmitOrdered instead:
+        // this trailing clear would erase the last cell of a full-width row.
         sb.Append("\x1b[K");
         if (!isLastRow)
         {

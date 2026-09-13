@@ -100,6 +100,23 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
     public int OutputQueueDepth => _outputQueueDepth;
 
     /// <summary>
+    /// Discards every frame already queued for the terminal, returning how many
+    /// items were dropped. Used when the runner repositions the step region:
+    /// frames laid out for the superseded origin must never be replayed once
+    /// the output pump resumes.
+    /// </summary>
+    internal int DiscardQueuedOutput()
+    {
+        var dropped = 0;
+        while (_outputChannel.Reader.TryRead(out _))
+        {
+            Interlocked.Decrement(ref _outputQueueDepth);
+            dropped++;
+        }
+        return dropped;
+    }
+
+    /// <summary>
     /// Enter TUI mode for inline step — hides cursor and enables mouse if supported.
     /// Does NOT enter alternate screen.
     /// </summary>
