@@ -100,7 +100,9 @@
     .view-title { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; font-weight: 600; }
     .view-role { flex: none; font-size: 11px; color: var(--cp-text-muted); }
     .terminal-window[data-primary=true] .view-role { color: var(--cp-accent); font-weight: 600; }
-    .view-tools { display: flex; flex: 0 0 36px; min-width: 0; align-items: center; gap: 4px; overflow: hidden; padding: 4px 6px; border-bottom: 1px solid var(--cp-border); }
+    .view-tools { display: flex; flex: 0 0 36px; min-width: 0; align-items: center; gap: 4px; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; padding: 4px 6px; border-bottom: 1px solid var(--cp-border); }
+    .view-tools label { display: flex; flex: none; align-items: center; gap: 4px; font-size: 11px; white-space: nowrap; }
+    .view-tools select { min-height: 26px; height: 26px; padding: 2px 4px; font-size: 11px; }
     .view-failures { display: flex; flex: 0 0 36px; min-width: 0; align-items: center; gap: 6px; padding: 4px 6px; border-bottom: 1px solid var(--cp-border); }
     .view-failures label { display: flex; flex: 1; min-width: 0; align-items: center; font-size: 11px; }
     .view-failure { flex: 1; min-width: 0; height: 26px; min-height: 26px; padding: 2px 4px; font-size: 11px; border-radius: 6px; }

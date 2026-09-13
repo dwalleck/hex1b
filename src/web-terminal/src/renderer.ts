@@ -352,7 +352,10 @@ export class TerminalRenderer {
     if (cell.attributes & 128) this.solid(x, y + 10, width, 1, foreground);
     if (cell.attributes & 256) this.solid(x, y + 1, width, 1, foreground);
     const style = cell.underlineStyle || (cell.attributes & 8 ? 1 : 0);
-    const color = rgba(cell.underlineColor);
+    this.underline(style, x, y, width, rgba(cell.underlineColor));
+  }
+
+  private underline(style: number, x: number, y: number, width: number, color: Vector4): void {
     if (style === 1) this.solid(x, y + 18, width, 1, color);
     else if (style === 2) {
       this.solid(x, y + 16, width, 1, color);
@@ -368,7 +371,8 @@ export class TerminalRenderer {
     }
   }
 
-  render(cells: readonly (TerminalCell | undefined)[], metadata: FrameMetadata, blinkOn: boolean) {
+  render(cells: readonly (TerminalCell | undefined)[], metadata: FrameMetadata, blinkOn: boolean,
+    linkDecorations?: Uint8Array) {
     const start = performance.now();
     this.quadCount = 0;
     this.batches = [];
@@ -399,6 +403,9 @@ export class TerminalRenderer {
       }
       // Reverse and dim are already reflected in server-projected colors.
       this.decorations(cell, x, y, width, foreground);
+      if (linkDecorations?.[i] && !cell.underlineStyle && !(cell.attributes & 8) && !isKgpPlaceholder(cell)) {
+        this.underline(linkDecorations[i], x, y, width, foreground);
+      }
     }
     for (const item of placements) if (item.z >= 0) this.placement(item.placement);
     const cursor = metadata.cursor;

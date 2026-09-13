@@ -12,7 +12,7 @@ const read = path => readFileSync(new URL(path, root), "utf8");
 test("Package entry exposes only the supported runtime API", () => {
   assert.deepEqual(Object.keys(entry).sort(), [
     "InputRoute", "MAX_FONT_SIZE", "MIN_FONT_SIZE", "TerminalAction", "WebTerminal", "defaultInputBindings",
-    "getCmdlineUrl", "parseCommandMarkParameters"
+    "getCmdlineUrl", "linkAction", "parseCommandMarkParameters"
   ]);
   assert.equal(entry.MIN_FONT_SIZE, 8);
   assert.equal(entry.MAX_FONT_SIZE, 32);
@@ -35,7 +35,7 @@ test("Packed allowlist ships a complete, registry-neutral browser package", () =
   for (const file of ["package.json", "README.md", "LICENSE", "dist/index.js", "dist/index.d.ts",
     "dist/web-terminal.js", "dist/terminal-worker.js", "dist/renderer.js", "dist/protocol.js",
     "dist/backend-selection.js", "dist/render-backend.js", "dist/renderer-options.js",
-    "dist/webgpu-backend.js", "dist/webgl2-backend.js",
+    "dist/webgpu-backend.js", "dist/webgl2-backend.js", "dist/link-detection-worker.js",
     "dist/fonts/cascadia-mono-nf/CascadiaMonoNF.woff2",
     "dist/fonts/cascadia-mono-nf/LICENSE.txt", "dist/fonts/cascadia-mono-nf/README.md"]) {
     assert.ok(paths.has(file), `Missing ${file}`);
@@ -59,6 +59,7 @@ test("Packed allowlist ships a complete, registry-neutral browser package", () =
 
 test("Worker and default font resolve relative to emitted modules", () => {
   assert.match(read("dist/web-terminal.js"), /new Worker\(new URL\("\.\/terminal-worker\.js", import\.meta\.url\)/u);
+  assert.match(read("dist/link-detection.js"), /new URL\("\.\/link-detection-worker\.js", import\.meta\.url\)/u);
   assert.match(read("dist/terminal-font.js"), /new URL\("\.\/fonts\/cascadia-mono-nf\/CascadiaMonoNF\.woff2", import\.meta\.url\)/u);
   const font = new URL(normalizeFont().faces[0].url);
   assert.equal(statSync(font).size, 976460);
@@ -72,5 +73,9 @@ test("Worker overrides reject malformed public inputs before DOM initialization"
   for (const workerUrl of [null, false, 42, {}, [], "", "   "]) {
     assert.throws(() => new entry.WebTerminal({ url: "/terminal", workerUrl }),
       /workerUrl must be a nonempty URL string or URL/u);
+  }
+  for (const linkDetectionWorkerUrl of [null, false, 42, {}, [], "", "   "]) {
+    assert.throws(() => new entry.WebTerminal({ url: "/terminal", linkDetectionWorkerUrl }),
+      /linkDetectionWorkerUrl must be a nonempty URL string or URL/u);
   }
 });
