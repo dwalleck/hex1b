@@ -317,7 +317,8 @@ internal sealed class FlowCommitCoordinator
                 $"start empty width={committedWidth} liveOrigin={_live.RowOrigin} " +
                 $"liveHeight={_live.LiveHeight}");
             return new FlowCommitResult(
-                0, 0, rowKeys: Array.Empty<string?>(), FlowCommitStatus.Emitted, events, cancelled: false);
+                0, 0, rowKeys: Array.Empty<string?>(), FlowCommitStatus.Emitted, events,
+                cancelled: false, abortedRows: 0, drainTimedOut: false);
         }
 
         Record(
@@ -527,13 +528,18 @@ internal sealed class FlowCommitCoordinator
                 completedUnits,
                 abortedRows).ConfigureAwait(false);
             Record($"cancelled after unit {completedUnits} abortedRows={abortedRows}");
+            // CompletedRows keeps its documented meaning (rows of fully emitted
+            // units only). The aborted unit's rows are reserved on screen and
+            // reported through the commit trace, not counted as completed.
             return new FlowCommitResult(
                 completedUnits,
-                completedRows + abortedRows,
+                completedRows,
                 rowKeys,
                 FlowCommitStatus.Cancelled,
                 events,
-                cancelled: true);
+                cancelled: true,
+                abortedRows: abortedRows,
+                drainTimedOut: false);
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {
@@ -572,9 +578,10 @@ internal sealed class FlowCommitCoordinator
         // The final drain is part of the emission outcome, so a cancellation
         // here must surface as a cancelled commit rather than escaping as an
         // unrelated failure the caller would have to treat as uncertain.
+        bool drained;
         try
         {
-            await WaitForTerminalConsumptionAsync(token).ConfigureAwait(false);
+            drained = await WaitForTerminalConsumptionAsync(token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -585,7 +592,20 @@ internal sealed class FlowCommitCoordinator
                 rowKeys,
                 FlowCommitStatus.Cancelled,
                 events,
-                cancelled: true);
+                cancelled: true,
+                abortedRows: 0,
+                drainTimedOut: false);
+        }
+
+        if (!drained)
+        {
+            // The bounded drain expired with the adapter's output queue still
+            // holding bytes. Emission is not withdrawn — the units were handed
+            // to the write path — but the result must not imply the terminal
+            // side consumed them.
+            Record(
+                $"drain-timeout units={completedUnits} rows={completedRows} " +
+                $"queueDepth={_terminal.OutputQueueDepth}");
         }
 
         return new FlowCommitResult(
@@ -594,7 +614,9 @@ internal sealed class FlowCommitCoordinator
             rowKeys,
             FlowCommitStatus.Emitted,
             events,
-            cancelled: false);
+            cancelled: false,
+            abortedRows: 0,
+            drainTimedOut: !drained);
     }
 
     /// <summary>
@@ -722,6 +744,11 @@ internal sealed class FlowCommitCoordinator
 
         for (var row = 0; row < height; row++)
         {
+            // Cancellation is observed between rows, never after the unit's last
+            // row: once every row has been handed to the terminal the unit is
+            // complete, so cancelling there must not report it as aborted.
+            cancellationToken.ThrowIfCancellationRequested();
+
             var text = SoftWrapEmitter.OrderedRowPrefix
                 + SoftWrapEmitter.RenderRowText(surface, row);
 
@@ -749,8 +776,6 @@ internal sealed class FlowCommitCoordinator
             emission.RowsWritten++;
             emission.LastRow = unitRow + row;
             emission.LastColumn = SoftWrapEmitter.RenderRowText(surface, row).Length;
-
-            cancellationToken.ThrowIfCancellationRequested();
         }
 
         // Track the committed rows as paragraphs so a later resize settle can
@@ -761,7 +786,10 @@ internal sealed class FlowCommitCoordinator
             $"unit {unitIndex} key={unit.RowKey ?? "-"} rows={height} " +
             $"at={unitRow} width={surface.Width}");
 
-        await WaitForTerminalConsumptionAsync(cancellationToken).ConfigureAwait(false);
+        // The unit is fully written and recorded; waiting for the terminal side
+        // is deliberately not cancellable, so a cancellation cannot land after
+        // the last row but before the caller counts the unit as completed.
+        await WaitForTerminalConsumptionAsync(CancellationToken.None).ConfigureAwait(false);
     }
 
     /// <summary>

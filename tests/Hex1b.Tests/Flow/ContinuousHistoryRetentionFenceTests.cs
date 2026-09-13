@@ -77,8 +77,16 @@ public class ContinuousHistoryRetentionFenceTests
 
             // Gate at the last unit of a turn, so the resize is pending when the
             // commit reaches the next turn boundary and must re-flow for it.
+            // One-shot per index: the coordinator legitimately re-materializes a
+            // unit at the settled width, so the gate must not resize twice.
+            var gated = new HashSet<int>();
             source.Gate = async index =>
             {
+                if (!gated.Add(index))
+                {
+                    return;
+                }
+
                 switch (index)
                 {
                     case 15 when scenario is "shrink-grow-shrink" or "shrink":

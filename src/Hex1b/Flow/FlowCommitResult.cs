@@ -19,7 +19,9 @@ public sealed class FlowCommitResult
         IReadOnlyList<string?> rowKeys,
         FlowCommitStatus status,
         int eventCount,
-        bool cancelled)
+        bool cancelled,
+        int abortedRows,
+        bool drainTimedOut)
     {
         CompletedUnits = completedUnits;
         CompletedRows = completedRows;
@@ -27,6 +29,8 @@ public sealed class FlowCommitResult
         Status = status;
         EventCount = eventCount;
         Cancelled = cancelled;
+        AbortedRows = abortedRows;
+        EmissionDrainTimedOut = drainTimedOut;
     }
 
     /// <summary>
@@ -67,6 +71,22 @@ public sealed class FlowCommitResult
     /// cancelled. Completed units stay emitted and are never replayed.
     /// </summary>
     public bool Cancelled { get; }
+
+    /// <summary>
+    /// Physical rows of the unit that was being emitted when a cancellation
+    /// arrived. Those rows may already carry content and are reserved on screen
+    /// (the live region is re-anchored below them), but they are not part of
+    /// <see cref="CompletedRows"/> because their unit was never completed.
+    /// </summary>
+    public int AbortedRows { get; }
+
+    /// <summary>
+    /// True when the bounded wait for the terminal side to consume the emitted
+    /// bytes expired with the adapter's output queue still non-empty. Emission
+    /// is not withdrawn — this only says the framework could not observe the
+    /// drain, so the result must not be read as terminal-side confirmation.
+    /// </summary>
+    public bool EmissionDrainTimedOut { get; }
 }
 
 /// <summary>
