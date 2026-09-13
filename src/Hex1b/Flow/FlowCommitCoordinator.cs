@@ -569,7 +569,24 @@ internal sealed class FlowCommitCoordinator
             }
         }
 
-        await WaitForTerminalConsumptionAsync(token).ConfigureAwait(false);
+        // The final drain is part of the emission outcome, so a cancellation
+        // here must surface as a cancelled commit rather than escaping as an
+        // unrelated failure the caller would have to treat as uncertain.
+        try
+        {
+            await WaitForTerminalConsumptionAsync(token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            Record($"cancelled after unit {completedUnits} during final drain");
+            return new FlowCommitResult(
+                completedUnits,
+                completedRows,
+                rowKeys,
+                FlowCommitStatus.Cancelled,
+                events,
+                cancelled: true);
+        }
 
         return new FlowCommitResult(
             completedUnits,
