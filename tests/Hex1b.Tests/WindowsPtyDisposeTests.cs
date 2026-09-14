@@ -23,6 +23,50 @@ namespace Hex1b.Tests;
 [TestClass]
 public class WindowsPtyDisposeTests
 {
+    [TestMethod]
+    public async Task ConnectWithRetriesAsync_CanceledBeforeConnect_PreservesCancellationToken()
+    {
+        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        using var helper = Process.GetCurrentProcess();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var failure = await Assert.ThrowsExactlyAsync<OperationCanceledException>(() =>
+            WindowsShimPtyHandle.ConnectWithRetriesAsync(socket,
+                new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0), helper, cancellation.Token));
+
+        Assert.AreEqual(cancellation.Token, failure.CancellationToken);
+        Assert.IsFalse(socket.Connected);
+    }
+
+    [TestMethod]
+    [TestCategory("Windows")]
+    [DataRow(WindowsPtyMode.Direct)]
+    [DataRow(WindowsPtyMode.RequireProxy)]
+    public async Task StartAsync_MissingWorkingDirectory_FaultsStartupAndWaitingIo(WindowsPtyMode mode)
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        var missingDirectory = Path.Combine(Environment.CurrentDirectory, $"missing-pty-cwd-{Guid.NewGuid():N}");
+        var shimPath = mode == WindowsPtyMode.RequireProxy ? ResolveShimPath() : null;
+        await using var process = new Hex1bTerminalChildProcess(
+            "cmd.exe", ["/d", "/c", "exit 0"], missingDirectory, null, true, 80, 24,
+            _ => Hex1bTerminalChildProcess.CreatePtyHandle(mode, shimPath));
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var read = process.ReadOutputAsync(cancellation.Token).AsTask();
+        var write = process.WriteInputAsync(new byte[] { 1 }, cancellation.Token).AsTask();
+
+        var failure = await Assert.ThrowsAsync<Exception>(() => process.StartAsync(cancellation.Token));
+        Assert.IsFalse(failure is OperationCanceledException, "Missing cwd must fail startup, not time out.");
+        Assert.AreSame(failure, await Assert.ThrowsAsync<Exception>(() => read.WaitAsync(cancellation.Token)));
+        Assert.AreSame(failure, await Assert.ThrowsAsync<Exception>(() => write.WaitAsync(cancellation.Token)));
+        Assert.IsFalse(process.HasStarted);
+        Assert.IsFalse(process.HasExited);
+        Assert.AreEqual(-1, process.ProcessId);
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => process.WaitForExitAsync(cancellation.Token));
+    }
+
     private static string ResolveShimPath()
     {
         Assert.IsTrue(WindowsPtyShimLocator.TryResolve(out var path), "Expected PTY shim to be resolvable via WindowsPtyShimLocator");
@@ -162,7 +206,7 @@ public class WindowsPtyDisposeTests
             inheritEnvironment: true,
             initialWidth: 80,
             initialHeight: 12,
-            ptyHandleFactory: () => Hex1bTerminalChildProcess.CreatePtyHandle(
+            ptyHandleFactory: _ => Hex1bTerminalChildProcess.CreatePtyHandle(
                 WindowsPtyMode.RequireProxy,
                 shimPath));
 
@@ -216,7 +260,7 @@ public class WindowsPtyDisposeTests
             inheritEnvironment: true,
             initialWidth: 80,
             initialHeight: 12,
-            ptyHandleFactory: () => Hex1bTerminalChildProcess.CreatePtyHandle(WindowsPtyMode.Direct));
+            ptyHandleFactory: _ => Hex1bTerminalChildProcess.CreatePtyHandle(WindowsPtyMode.Direct));
 
         await process.StartAsync(TestContext.Current.CancellationToken);
         var pid = process.ProcessId;
@@ -760,7 +804,7 @@ public class WindowsPtyDisposeTests
             inheritEnvironment: true,
             initialWidth: 80,
             initialHeight: 10,
-            ptyHandleFactory: () => Hex1bTerminalChildProcess.CreatePtyHandle(
+            ptyHandleFactory: _ => Hex1bTerminalChildProcess.CreatePtyHandle(
                 WindowsPtyMode.RequireProxy,
                 missingShimPath));
 
