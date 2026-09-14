@@ -271,6 +271,25 @@ public class ChildProcessStartupTests
         }
     }
 
+    [TestMethod]
+    public async Task ResizeAsync_UnchangedDimensions_DoesNotSendToStartedProcess()
+    {
+        var handle = new ControlledPtyHandle();
+        handle.ReleaseStart.TrySetResult();
+        await using var process = Create(_ => handle);
+        await process.StartAsync();
+
+        await process.ResizeAsync(80, 24);
+        Assert.AreEqual(0, handle.ResizeCount);
+
+        await process.ResizeAsync(101, 37);
+        Assert.AreEqual(1, handle.ResizeCount);
+        Assert.AreEqual((101, 37), handle.LastSize);
+
+        await process.ResizeAsync(101, 37);
+        Assert.AreEqual(1, handle.ResizeCount);
+    }
+
 #pragma warning disable HEX1B_UNIX_PTY_STARTUP
     [TestMethod]
     public async Task UnixPtyStartupTimeout_DefaultAndAcceptedValues_AreSharedAndForwarded()
@@ -374,6 +393,7 @@ public class ChildProcessStartupTests
         public int WaitCount { get; private set; }
         public int KillSignal { get; private set; }
         public int WriteCount { get; private set; }
+        public int ResizeCount { get; private set; }
         public (int, int) LastSize { get; private set; }
         public int ProcessId { get; private set; } = -1;
 
@@ -399,6 +419,7 @@ public class ChildProcessStartupTests
 
         public void Resize(int width, int height)
         {
+            ResizeCount++;
             LastSize = (width, height);
             if (ResizeError is not null)
                 throw ResizeError;

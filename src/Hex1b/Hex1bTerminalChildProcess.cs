@@ -344,6 +344,9 @@ public sealed class Hex1bTerminalChildProcess : IHex1bTerminalWorkloadAdapter
     {
         lock (_lifecycleLock)
         {
+            if (_width == width && _height == height)
+                return ValueTask.CompletedTask;
+
             _width = width;
             _height = height;
             if (_started && !_exited && !_disposed && _ptyHandle != null)

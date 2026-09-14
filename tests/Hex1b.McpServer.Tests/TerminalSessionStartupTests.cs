@@ -64,7 +64,7 @@ public class TerminalSessionStartupTests
                     ct: timeout.Token);
             });
 
-            Assert.Contains(badCwd, error.ToString());
+            AssertWorkingDirectoryStartupError(error, badCwd);
             Assert.IsNull(session, "A failed launch must not publish a session.");
 
             // The recorder opens lazily. Its disposal writes the final header even
@@ -142,7 +142,7 @@ public class TerminalSessionStartupTests
 
             Assert.HasCount(2, error.InnerExceptions);
             Assert.IsInstanceOfType<InvalidOperationException>(error.InnerExceptions[0]);
-            Assert.Contains(badCwd, error.InnerExceptions[0].ToString());
+            AssertWorkingDirectoryStartupError(error.InnerExceptions[0], badCwd);
             Assert.IsInstanceOfType<DirectoryNotFoundException>(error.InnerExceptions[1]);
             Assert.Contains(recording, error.InnerExceptions[1].Message);
             Assert.IsNull(session);
@@ -153,6 +153,15 @@ public class TerminalSessionStartupTests
                 await session.DisposeAsync();
             Directory.Delete(directory.FullName, recursive: true);
         }
+
+    }
+
+    private static void AssertWorkingDirectoryStartupError(Exception error, string workingDirectory)
+    {
+        if (OperatingSystem.IsWindows())
+            Assert.Contains("The Windows PTY shim failed to start the child process", error.ToString());
+        else
+            Assert.Contains(workingDirectory, error.ToString());
     }
 
     [TestMethod]
