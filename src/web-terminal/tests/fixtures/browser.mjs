@@ -71,6 +71,8 @@ class WorkerBridge extends Target {
   pending = new Map();
   outputs = [];
   commands = [];
+  requests = [];
+  sockets = [];
   errors = [];
   serial = 0;
   constructor() {
@@ -83,6 +85,10 @@ class WorkerBridge extends Target {
         catch (error) { this.errors.push(error); }
       } else if (envelope.type === "sent") {
         this.commands.push(envelope.command);
+      } else if (envelope.type === "requested") {
+        this.requests.push(envelope.url);
+      } else if (envelope.type === "socket") {
+        this.sockets.push(envelope.url);
       } else {
         const pending = this.pending.get(envelope.id);
         if (!pending) return;

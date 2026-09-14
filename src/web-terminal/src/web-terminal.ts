@@ -12,7 +12,8 @@ import type { MouseCapture } from "./mouse-input.js";
 import type { CopySelectionOptions, InputActionHandler, InputDecision, InputBinding,
   TerminalActionName, TerminalGeometry, TerminalInput, TerminalInputContext, TerminalPeer,
   TerminalRendererPreference, TerminalSelection, TerminalSizing, TerminalSizingState, TerminalStats, TerminalViewport,
-  TerminalProgress, TerminalShellIntegration, WebTerminalHandle, WebTerminalOptions } from "./types.js";
+  TerminalProgress, TerminalShellIntegration, WebTerminalHandle, WebTerminalOptions,
+  TerminalPlaybackState, WebTerminalRecordingHandle, WebTerminalRecordingOptions } from "./types.js";
 import type { InputCommand, TerminalCommand, WorkerInputMessage, WorkerOutputMessage } from "./wire-types.js";
 import { errorMessage, isRecord } from "./validation.js";
 export { InputRoute, TerminalAction, defaultInputBindings } from "./input-policy.js";
@@ -76,11 +77,38 @@ export class WebTerminal implements WebTerminalHandle {
   #selectionUIError = "";
   #canvasSize = { width: 0, height: 0 };
   #hyperlinks = new Hyperlinks();
+  #recording: WebTerminalRecordingOptions | undefined;
+  #playback: TerminalPlaybackState = { status: "paused", positionMs: 0, durationMs: 0, frameIndex: -1, frameCount: 0 };
 
   /** Resolves after a connected terminal frame is presented. Supply signal to cancel mounting. */
   static async mount(container: HTMLElement, options: WebTerminalOptions): Promise<WebTerminal> {
+    return WebTerminal.#mount(container, options);
+  }
+
+  /** Experimental: fetch a same-build HWT recording and present it without a WebSocket. */
+  static async mountRecording(container: HTMLElement, options: WebTerminalRecordingOptions): Promise<WebTerminalRecordingHandle> {
+    const terminal = await WebTerminal.#mount(container, { ...options, readOnly: true }, options);
+    const command = (action: "play" | "pause" | "restart") => {
+      if (terminal.#disposed) throw new Error("Recording view is disposed");
+      terminal.#post({ type: "playback", action });
+    };
+    return {
+      get element() { return terminal.element; },
+      get geometry() { return terminal.geometry; },
+      get stats() { return terminal.stats; },
+      get screenText() { return terminal.screenText; },
+      get playback() { return { ...terminal.#playback }; },
+      play: () => command("play"),
+      pause: () => command("pause"),
+      restart: () => command("restart"),
+      dispose: () => terminal.dispose(),
+    };
+  }
+
+  static async #mount(container: HTMLElement, options: WebTerminalOptions,
+    recording?: WebTerminalRecordingOptions): Promise<WebTerminal> {
     if (!(container instanceof HTMLElement)) throw new TypeError("A terminal container HTMLElement is required");
-    if (!options?.url) throw new TypeError("A terminal WebSocket URL is required");
+    if (!options?.url) throw new TypeError("A terminal source URL is required");
     if (options.signal?.aborted) throw options.signal.reason;
     if (normalizeRenderer(options.renderer) === "webgpu" && (!window.isSecureContext || !navigator.gpu)) {
       throw new Error("The requested WebGPU renderer requires WebGPU over HTTPS or localhost");
@@ -90,6 +118,7 @@ export class WebTerminal implements WebTerminalHandle {
       throw new Error("WebTerminal requires module workers, ResizeObserver, and a transferable OffscreenCanvas");
     }
     const terminal = new WebTerminal(options);
+    terminal.#recording = recording;
     try {
       await Promise.all([terminal.#ready.promise, Promise.resolve().then(() => terminal.#start(container))]);
       return terminal;
@@ -146,9 +175,13 @@ export class WebTerminal implements WebTerminalHandle {
   #start(container: HTMLElement): void {
     if (this.#options.signal?.aborted) throw this.#options.signal.reason;
     const url = new URL(this.#options.url, location.href);
-    if (url.protocol === "https:") url.protocol = "wss:";
-    if (url.protocol === "http:") url.protocol = "ws:";
-    if (!["ws:", "wss:"].includes(url.protocol)) throw new TypeError("A ws: or wss: URL is required");
+    if (this.#recording) {
+      if (!["http:", "https:"].includes(url.protocol)) throw new TypeError("A recording HTTP or HTTPS URL is required");
+    } else {
+      if (url.protocol === "https:") url.protocol = "wss:";
+      if (url.protocol === "http:") url.protocol = "ws:";
+      if (!["ws:", "wss:"].includes(url.protocol)) throw new TypeError("A ws: or wss: URL is required");
+    }
     const scale = this.#options.scale === undefined || this.#options.scale === "auto"
       ? Math.min(3, Math.max(0.5, window.devicePixelRatio || 1)) : this.#options.scale;
     if (!Number.isFinite(scale) || scale < 0.5 || scale > 3) throw new RangeError("Backing scale must be 0.5-3 or 'auto'");
@@ -218,7 +251,7 @@ export class WebTerminal implements WebTerminalHandle {
       try { this.#inspectionError = ""; operation(); }
       catch (error) { this.#inspectionError = errorMessage(error); this.#inspectionChanged(); }
     };
-    this.#mouse = captureMouse(this.#canvas, command => this.#inputCommand(command), () => this.focus(), {
+    if (!this.#recording) this.#mouse = captureMouse(this.#canvas, command => this.#inputCommand(command), () => this.focus(), {
       state: () => ({ historical: !this.viewport.following || this.viewport.pending, readOnly: this.#readOnly,
         selection: this.selection }),
       begin: (point, selection) => inspect(() => this.#history.begin(point, selection)),
@@ -233,7 +266,7 @@ export class WebTerminal implements WebTerminalHandle {
         catch (error) { this.#actionFailed(error); }
       }
     });
-    this.#bindKeyboard();
+    if (!this.#recording) this.#bindKeyboard();
     requiredElement(this.#inspection, ".return-live", HTMLButtonElement).addEventListener("click", () => {
       this.runAction(TerminalAction.ScrollToLive).catch(error => this.#actionFailed(error));
     }, { signal: this.#listeners.signal });
@@ -270,12 +303,19 @@ export class WebTerminal implements WebTerminalHandle {
     this.#worker.addEventListener("messageerror", () => this.#fail(new Error("Terminal worker message could not be decoded")));
     const canvas = this.#canvas.transferControlToOffscreen();
     this.#post({ type: "init", canvas, url: url.href, scale, font,
-      renderer: this.#renderer }, [canvas]);
+      renderer: this.#renderer, ...(this.#recording ? { recording: true } : {}) }, [canvas]);
   }
 
   #message(message: WorkerOutputMessage): void {
     if (this.#disposed) return;
-    if (message.type === "connected") {
+    if (message.type === "playback") {
+      this.#playback = { ...message.state };
+      if (message.state.frameIndex >= 0) {
+        clearTimeout(this.#readyTimer);
+        this.#ready.resolve(this);
+      }
+      this.#recording?.onPlaybackChange?.({ ...this.#playback });
+    } else if (message.type === "connected") {
       this.#connected = true;
       this.#input.disabled = !this.#canInput();
     } else if (message.type === "closed") {
@@ -360,7 +400,7 @@ export class WebTerminal implements WebTerminalHandle {
   #fit() {
     const width = this.#geometry.columns * this.#geometry.cellWidth;
     const height = this.#geometry.rows * this.#geometry.cellHeight;
-    const scale = fittedScale(this.#size, this.#geometry, this.#peer.isPrimary, this.#sizing);
+    const scale = fittedScale(this.#size, this.#geometry, !this.#recording && this.#peer.isPrimary, this.#sizing);
     this.#surface.style.width = `${width * scale}px`;
     this.#surface.style.height = `${height * scale}px`;
     // Overlay positions use layout pixels, before any ancestor CSS transforms.

@@ -7,6 +7,18 @@ import {
 } from "@hex1b/web-terminal";
 
 const container = document.createElement("div");
+const recording = await WebTerminal.mountRecording(container, {
+  url: "/recordings/sample.hwt.json",
+  renderer: "auto",
+  onPlaybackChange(state) { console.log(state.status, state.positionMs, state.frameCount); },
+});
+recording.play();
+recording.pause();
+recording.restart();
+console.log(recording.screenText, recording.stats, recording.playback);
+// @ts-expect-error Offline recordings cannot send input to a terminal.
+recording.paste("no live session");
+recording.dispose();
 const minimumFontSize: 8 = MIN_FONT_SIZE;
 const maximumFontSize: 32 = MAX_FONT_SIZE;
 console.log(minimumFontSize, maximumFontSize);

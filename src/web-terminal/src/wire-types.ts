@@ -1,7 +1,7 @@
 import type { InputModifiers, PointerButton, SelectionMode, SelectionRange,
   TerminalBuffer, TerminalFont, TerminalGeometry, TerminalPeer, TerminalSize, TerminalStats,
   TerminalRendererPreference, TerminalStatusLevel, TerminalProgress, TerminalShellIntegration,
-  TerminalCloseDetails } from "./types.js";
+  TerminalCloseDetails, TerminalPlaybackState } from "./types.js";
 
 export type SelectionText =
   | { status: "valid"; text: string }
@@ -66,8 +66,9 @@ export type TerminalCommand = InputCommand
   | { type: "ack"; revision: number };
 export type WorkerInputMessage =
   | { type: "init"; canvas: OffscreenCanvas; url: string; scale: number; font: TerminalFont;
-      renderer: TerminalRendererPreference }
+      renderer: TerminalRendererPreference; recording?: boolean }
   | ({ type: "viewport" } & TerminalSize)
+  | { type: "playback"; action: "play" | "pause" | "restart" }
   | { type: "command"; command: TerminalCommand }
   | { type: "stop" };
 export interface WorkerStats extends TerminalStats {
@@ -83,6 +84,7 @@ export interface WorkerStats extends TerminalStats {
 }
 export type WorkerOutputMessage =
   | { type: "connected" }
+  | { type: "playback"; state: TerminalPlaybackState }
   | { type: "closed"; details: TerminalCloseDetails }
   | { type: "status"; message: string; level: TerminalStatusLevel }
   | ({ type: "geometry"; peer: TerminalPeer; history: HistoryMetadata | null;
