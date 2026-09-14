@@ -13,6 +13,8 @@ namespace Hex1b.Flow;
 /// </summary>
 internal sealed class Hex1bFlowRunner
 {
+    private const string GhosttyCommitBoundaryMark = "\x1b]133;C\x07";
+    private const string GhosttyLivePromptMark = "\x1b]133;P;k=i\x07";
     private readonly Func<Hex1bFlowContext, Task> _flowCallback;
     private readonly Hex1bFlowOptions _options;
     private readonly IHex1bAppTerminalWorkloadAdapter _parentAdapter;
@@ -28,6 +30,11 @@ internal sealed class Hex1bFlowRunner
     /// step's place.
     /// </summary>
     private int _cursorRow;
+    private long _resizeVersion;
+    private int _lastGeometryWidth = int.MinValue;
+    private int _lastGeometryHeight = int.MinValue;
+    private readonly object _geometrySync = new();
+    private long _anchorGeneration;
 
     /// <summary>
     /// The row at which the very first tombstone (or the active step, if no
@@ -66,32 +73,47 @@ internal sealed class Hex1bFlowRunner
     // commit cannot reposition the same region concurrently.
     private readonly object _stepOpsLock = new();
 
-    // Atomic terminal-update scope. While one is open, the writes its owner
-    // issues are composed into this buffer and handed to the parent terminal as
-    // ONE write, bracketed by synchronized output (DEC mode 2026). That is what
-    // keeps a unit's rows and the live-region repaint that follows them from
-    // being painted as two states: a host that honors mode 2026 sees only the
-    // finished update, so the prompt is never displayed displaced. The scope
-    // holds both step locks for its synchronous duration, so no other writer can
-    // interleave inside a unit's update.
+    // Atomic terminal-update scope. While one is open, the caller's writes are
+    // composed into one serialized hand-off and optionally bracketed by DEC
+    // synchronized-output mode 2026. The lock provides framework serialization;
+    // it does not claim that a host will present the hand-off atomically.
+    // The scope holds both step locks for its synchronous duration, so no other
+    // writer can interleave inside a unit's update.
     private readonly StringBuilder _atomicUpdate = new(4096);
     private bool _atomicUpdateActive;
     private int _atomicUpdateThreadId;
 
+    // Reused buffer for one forwarded live frame plus the park that leaves the
+    // host cursor at the live region's top-left. Guarded by _terminalWriteLock,
+    // the same lock as the write it feeds, so a frame is never composed while
+    // another writer owns the parent terminal.
+    private readonly StringBuilder _softWrapFrameBuffer = new(4096);
+
     // Optional JSONL file receiving framework-side commit events. The driver
     // writes its own app-side evidence; this is the framework's view of the
     // same commits, and both are observations rather than host history proof.
-    private static readonly string? CommitEventLogPath =
+    // Read per record rather than cached at type load: a process that runs more
+    // than one flow — a test host, or a harness that arms the variable around a
+    // single commit — must be able to change the path between them.
+    private static string? CommitEventLogPath =>
         Environment.GetEnvironmentVariable("HEX1B_FLOW_COMMIT_EVENTS");
+
     private static readonly object CommitEventLock = new();
 
     /// <summary>
-    /// Writes to the parent terminal under the terminal write lock.
+    /// Writes under the terminal write lock, composing into the calling thread's
+    /// atomic update when one is active.
     /// </summary>
     private void WriteTerminal(string text)
     {
         lock (_terminalWriteLock)
         {
+            if (_atomicUpdateActive && Environment.CurrentManagedThreadId == _atomicUpdateThreadId)
+            {
+                _atomicUpdate.Append(text);
+                return;
+            }
+
             _parentAdapter.Write(text);
         }
     }
@@ -101,12 +123,26 @@ internal sealed class Hex1bFlowRunner
     /// the mute gate <em>inside</em> the lock.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The gate must be sampled while holding the lock. A frame that passed an
     /// unlocked check can be held behind the lock while a commit mutes,
     /// repositions the live region and unmutes; it would then be forwarded at a
     /// superseded origin — the stale-origin replay the mute exists to prevent.
+    /// </para>
+    /// <para>
+    /// When <paramref name="parkAtOriginOf"/> is supplied the frame and the park
+    /// it is followed by are composed into the <em>same</em> parent write: a
+    /// separate positioning write could be split off by another writer, and the
+    /// row is read inside the lock so a concurrent re-anchor cannot park the
+    /// host cursor at an origin that has already been superseded.
+    /// </para>
     /// </remarks>
-    private void WriteTerminalUnlessMuted(string text, Func<bool>? isMuted)
+    private void WriteTerminalUnlessMuted(
+        string text,
+        Func<bool>? isMuted,
+        InlineStepAdapter? parkAtOriginOf = null,
+        long? outputEpoch = null,
+        InlineStepAdapter? generationSource = null)
     {
         lock (_terminalWriteLock)
         {
@@ -114,8 +150,51 @@ internal sealed class Hex1bFlowRunner
             {
                 return;
             }
+            if (generationSource is not null)
+            {
+                var (presentationWidth, presentationHeight) = ReadCurrentGeometry();
+                if ((outputEpoch is { } frameEpoch
+                        && frameEpoch != generationSource.OutputEpoch)
+                    || presentationWidth != generationSource.Width
+                    || presentationHeight != Math.Max(1, _parentAdapter.Height))
+                {
+                    // A native resize can be visible through the parent
+                    // presentation before its resize event has reached the
+                    // inline adapter. Hold the old frame until the resize
+                    // handler publishes matching render dimensions.
+                    return;
+                }
 
-            _parentAdapter.Write(text);
+                var expectedStepHeight = _activeStep is { StepHeight: > 0 } activeStep
+                    ? Math.Min(activeStep.StepHeight, presentationHeight)
+                    : generationSource.Height;
+                if (generationSource.Height != expectedStepHeight)
+                {
+                    // The presentation may have published a new height while
+                    // the app's resize event is still queued. Do not forward a
+                    // frame from the old live rectangle.
+                    return;
+                }
+            }
+
+            if (parkAtOriginOf is null)
+            {
+                _parentAdapter.Write(text);
+                return;
+            }
+
+            // Leave the host cursor at the live region's top-left, so an
+            // observation made while the pump is muted measures the live boundary
+            // instead of wherever the app's last row ended. One write, one buffer.
+            var terminalHeight = ReadCurrentGeometry().Height;
+            var row = Math.Clamp(
+                parkAtOriginOf.RowOrigin,
+                0,
+                Math.Max(0, terminalHeight - 1));
+            _softWrapFrameBuffer.Clear();
+            _softWrapFrameBuffer.Append(text);
+            _softWrapFrameBuffer.Append("\x1b[").Append(row + 1).Append(";1H");
+            _parentAdapter.Write(_softWrapFrameBuffer.ToString());
         }
     }
 
@@ -146,7 +225,8 @@ internal sealed class Hex1bFlowRunner
     /// </remarks>
     private void WriteTerminalUpdate(int row, string? text)
     {
-        var clamped = Math.Clamp(row, 0, Math.Max(0, _parentAdapter.Height - 1));
+        var terminalHeight = ReadCurrentGeometry().Height;
+        var clamped = Math.Clamp(row, 0, Math.Max(0, terminalHeight - 1));
 
         if (_atomicUpdateActive && Environment.CurrentManagedThreadId == _atomicUpdateThreadId)
         {
@@ -169,6 +249,99 @@ internal sealed class Hex1bFlowRunner
     }
 
     /// <summary>
+    /// Reads the presentation's current geometry when this workload is attached
+    /// to one, refreshing the adapter's event-delivered dimensions first.
+    /// </summary>
+    private (int Width, int Height) ReadCurrentGeometry()
+    {
+        var cachedWidth = _parentAdapter.Width;
+        var cachedHeight = _parentAdapter.Height;
+        var geometry = _parentAdapter is IFlowCurrentGeometrySource source
+            ? source.ReadCurrentGeometry()
+            : (Width: cachedWidth, Height: cachedHeight);
+
+        var width = Math.Max(1, geometry.Width);
+        var height = Math.Max(1, geometry.Height);
+        lock (_geometrySync)
+        {
+            var previousWidth = _lastGeometryWidth;
+            var previousHeight = _lastGeometryHeight;
+            if (previousWidth == int.MinValue || previousHeight == int.MinValue)
+            {
+                _lastGeometryWidth = width;
+                _lastGeometryHeight = height;
+            }
+            else if (width != previousWidth || height != previousHeight)
+            {
+                // A native presentation may apply its resize before the
+                // workload's Hex1bResizeEvent arrives. Treat that observation
+                // as a resize boundary exactly once, so pending units are
+                // rechecked.
+                _lastGeometryWidth = width;
+                _lastGeometryHeight = height;
+                Interlocked.Increment(ref _resizeVersion);
+            }
+        }
+
+        return (width, height);
+    }
+    private void RecordResizeDimensions(int width, int height)
+    {
+        lock (_geometrySync)
+        {
+            _lastGeometryWidth = Math.Max(1, width);
+            _lastGeometryHeight = Math.Max(1, height);
+        }
+    }
+
+    /// <summary>
+    /// Refreshes geometry after the atomic terminal-update locks are held.
+    /// Callers must perform this check before appending any positioning or
+    /// content bytes to the scope.
+    /// </summary>
+    private (int Width, int Height, long ResizeVersion) ReadFreshGeometryForEmission()
+    {
+        var (width, height) = ReadCurrentGeometry();
+        return (width, height, Interlocked.Read(ref _resizeVersion));
+    }
+
+    private void EnsureHistoryCommitSupported()
+    {
+        var provider = _options.HostProfileProvider;
+        if (provider is null)
+        {
+            // Headless and custom adapters without a native profile provider
+            // retain the existing deterministic/cursor-observation path.
+            return;
+        }
+
+        switch (provider())
+        {
+            case FlowTerminalHostProfile.Ghostty_1_3_1:
+            case FlowTerminalHostProfile.WindowsConsole:
+                return;
+            case FlowTerminalHostProfile.Ghostty_Unqualified:
+                throw new NotSupportedException(
+                    "Continuous history commitment requires the qualified Ghostty 1.3.1 " +
+                    "XTVERSION profile; this Ghostty build is not allowlisted.");
+            default:
+                throw new NotSupportedException(
+                    "Continuous history commitment requires a completed, qualified native " +
+                    "terminal profile; the host did not identify as a supported profile.");
+        }
+    }
+
+    private bool UseOsc133PromptMarks =>
+        _options.HostProfileProvider?.Invoke() == FlowTerminalHostProfile.Ghostty_1_3_1;
+    private void MarkCommittedRow(int row)
+    {
+        if (UseOsc133PromptMarks)
+        {
+            WriteTerminalUpdate(row, GhosttyCommitBoundaryMark);
+        }
+    }
+
+    /// <summary>
     /// Opens an atomic terminal-update scope. Every write the caller issues
     /// through this runner on the same thread while the scope is open is
     /// composed into ONE terminal write, bracketed by synchronized output
@@ -182,7 +355,7 @@ internal sealed class Hex1bFlowRunner
     /// held for its duration; the writes it contains are a bounded number of
     /// escape sequences, so the hold is short.
     /// </remarks>
-    private IDisposable BeginAtomicTerminalUpdate()
+    private IAtomicTerminalUpdate BeginAtomicTerminalUpdate()
     {
         Monitor.Enter(_stepOpsLock);
         Monitor.Enter(_terminalWriteLock);
@@ -192,7 +365,16 @@ internal sealed class Hex1bFlowRunner
         return new AtomicTerminalUpdateScope(this);
     }
 
-    private void EndAtomicTerminalUpdate()
+    /// <summary>
+    /// Closes an atomic update scope, handing its composed bytes to the parent
+    /// terminal as one write.
+    /// </summary>
+    /// <returns>
+    /// Whether the hand-off completed. A throw from the write propagates after
+    /// both locks are released, leaving the caller's scope reporting
+    /// <see cref="IAtomicTerminalUpdate.FlushCompleted"/> as false.
+    /// </returns>
+    private bool EndAtomicTerminalUpdate()
     {
         try
         {
@@ -202,9 +384,25 @@ internal sealed class Hex1bFlowRunner
                 // 2026 ignore both bracket sequences and see the same bytes.
                 _atomicUpdate.Insert(0, SyncUpdateBegin);
                 _atomicUpdate.Append(SyncUpdateEnd);
-                _parentAdapter.Write(_atomicUpdate.ToString());
+                var payload = _atomicUpdate.ToString();
                 _atomicUpdate.Clear();
+
+                // The real workload adapter rejects a hand-off to a disposed or
+                // closed channel instead of silently dropping it, so a unit that
+                // never reached the terminal is reported as a failed flush
+                // rather than counted as emitted. Test adapters keep the
+                // interface's best-effort write.
+                if (_parentAdapter is Hex1bAppWorkloadAdapter app)
+                {
+                    app.WriteRequired(payload);
+                }
+                else
+                {
+                    _parentAdapter.Write(payload);
+                }
             }
+
+            return true;
         }
         finally
         {
@@ -214,9 +412,302 @@ internal sealed class Hex1bFlowRunner
         }
     }
 
-    private sealed class AtomicTerminalUpdateScope(Hex1bFlowRunner runner) : IDisposable
+    /// <summary>
+    /// Admission state shared by one live step's output pump, resize machinery
+    /// and commit-preparation hook.
+    /// </summary>
+    /// <remarks>
+    /// A class rather than a set of captured locals because three independent
+    /// closures read it: the output pump's gate, the resize settle path, and the
+    /// handle the commit calls into.
+    /// </remarks>
+    private sealed class LiveAdmissionState
+    {
+        /// <summary>
+        /// True while the live pump may forward frames. Cleared when a commit is
+        /// admitted — even before the commit's own mute lands — and set again when
+        /// the commit resumes the pump.
+        /// </summary>
+        public bool ResumeGranted = true;
+
+        /// <summary>
+        /// True while the mute in force belongs to commit admission rather than to
+        /// the caller, so <c>SetLiveOutputMuted(true)</c> reports the caller's
+        /// ownership instead of echoing the commit's own mute back at it.
+        /// </summary>
+        public bool MuteTaken;
+
+        /// <summary>Mute ownership from immediately before admission took the pump.</summary>
+        public bool PriorMute;
+    }
+
+    /// <summary>
+    /// How many times a cursor observation is re-taken when a resize lands while
+    /// it is in flight. A row observed against a geometry that has since changed
+    /// is not an anchor for the current geometry.
+    /// </summary>
+    private const int CursorObservationAttempts = 4;
+
+    /// <summary>
+    /// How long a settled soft-wrap resize waits for the app's frame at the new
+    /// geometry before repainting from whatever surface it has.
+    /// </summary>
+    private static readonly TimeSpan ResizeRenderTimeout = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>
+    /// True when the parent can authoritatively report the host's own cursor row.
+    /// </summary>
+    private bool SupportsCursorObservation =>
+        _parentAdapter is Hex1bAppWorkloadAdapter appAdapter
+            ? appAdapter.HasCursorSource
+            : _parentAdapter is ICursorPositionSource;
+
+    /// <summary>
+    /// True when the resize and admission paths anchor to an observed host row.
+    /// Both halves are required: the parent must be able to report its cursor,
+    /// and the live output must be soft-wrap emission — every forwarded soft-wrap
+    /// frame ends parked at the live region's top-left, which is what makes the
+    /// observed row the region's own row. Cell-positioned (legacy) emission does
+    /// not leave that park, so it keeps anchoring to the step's tracked origin.
+    /// </summary>
+    private bool UsesObservedCursorOrigin =>
+        SupportsCursorObservation && _options.UseSoftWrapTombstones;
+
+    /// <summary>
+    /// The host's cursor row, or null when the parent cannot authoritatively
+    /// report it. Never a fallback: null means "unknown", not row zero.
+    /// </summary>
+    private async Task<int?> ObserveCursorRowAsync(CancellationToken cancellationToken)
+    {
+        if (_parentAdapter is not ICursorPositionSource source)
+        {
+            return null;
+        }
+
+        var position = await source.ObserveCursorPositionAsync(cancellationToken).ConfigureAwait(false);
+        return position?.Row;
+    }
+
+    /// <summary>
+    /// Observes the host cursor row and retries while a resize lands during the
+    /// observation, so the returned row describes the geometry in force when it
+    /// was taken.
+    /// </summary>
+    private async Task<int?> ObserveStableCursorRowAsync(CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; attempt < CursorObservationAttempts; attempt++)
+        {
+            var (width, height) = ReadCurrentGeometry();
+            var version = Interlocked.Read(ref _resizeVersion);
+
+            var observed = await ObserveCursorRowAsync(cancellationToken).ConfigureAwait(false);
+            if (observed is null)
+            {
+                return null;
+            }
+
+            var after = ReadCurrentGeometry();
+            if (Interlocked.Read(ref _resizeVersion) == version
+                && after.Width == width
+                && after.Height == height)
+            {
+                return observed;
+            }
+
+            Trace($"cursor observation discarded: geometry changed while observing (attempt {attempt + 1})");
+        }
+
+        Trace($"cursor observation gave up after {CursorObservationAttempts} attempts: geometry kept changing");
+        return null;
+    }
+
+    /// <summary>
+    /// Reserves room below <paramref name="observedRow"/> for a region
+    /// <paramref name="height"/> rows tall, scrolling the viewport only when the
+    /// region would not otherwise fit, and rebases the scalar model onto the
+    /// resulting anchor.
+    /// </summary>
+    /// <remarks>
+    /// Only rows <em>below</em> the observed anchor are ever scrolled or
+    /// cleared: everything above it is the host's reflowed history, and the host
+    /// owns it. Callers hold <c>_stepOpsLock</c>.
+    /// </remarks>
+    private int ReserveBelowObservedAnchor(int observedRow, int height)
+    {
+        var terminalHeight = ReadCurrentGeometry().Height;
+        var overflow = (observedRow + height) - terminalHeight;
+        if (overflow > 0)
+        {
+            _parentAdapter.SetCursorPosition(0, terminalHeight - 1);
+            for (var i = 0; i < overflow; i++)
+            {
+                WriteTerminal("\n");
+            }
+
+            observedRow = Math.Max(0, observedRow - overflow);
+        }
+
+        RebaseModelToObservedOrigin(observedRow);
+        return observedRow;
+    }
+
+    /// <summary>
+    /// Rebases the scalar reflow model onto an observed row, so later model
+    /// computations agree with where the host says the live region is.
+    /// </summary>
+    /// <remarks>
+    /// The observation is authoritative and the model is not: the model cannot see
+    /// a reflow that moved a row and moved it back. Rebasing keeps the model's
+    /// <em>relative</em> tracking (which committed rows did to the region) while
+    /// taking the host's absolute row as the truth.
+    /// </remarks>
+    private void RebaseModelToObservedOrigin(int observedRow)
+    {
+        var width = ReadCurrentGeometry().Width;
+        var modelRow = FlowResizeMath.ComputeRowOriginAtWidth(
+            _initialRowOrigin, _emittedTombstones, width);
+        var delta = observedRow - modelRow;
+        _initialRowOrigin += delta;
+        _cursorRow = observedRow;
+        Trace(
+            $"observed origin {observedRow} rebases model {modelRow} -> " +
+            $"initialRowOrigin={_initialRowOrigin} width={width} delta={delta}");
+    }
+
+    /// <summary>
+    /// Atomically moves the live region to <paramref name="rowOrigin"/> and
+    /// resizes it to <paramref name="liveHeight"/>, then repaints it as one
+    /// serialized pass: blank every row, paint <paramref name="liveSurface"/>,
+    /// and leave the cursor at the region's top-left. Callers hold
+    /// <c>_stepOpsLock</c>.
+    /// </summary>
+    /// <returns>The clamped origin and height actually painted.</returns>
+    private (int RowOrigin, int LiveHeight) ReanchorLiveRegion(
+        InlineStepAdapter stepAdapter,
+        int rowOrigin,
+        int liveHeight,
+        Surface liveSurface)
+    {
+        var terminalHeight = ReadCurrentGeometry().Height;
+        liveHeight = Math.Clamp(liveHeight, 1, terminalHeight);
+        rowOrigin = Math.Clamp(rowOrigin, 0, Math.Max(0, terminalHeight - liveHeight));
+        Interlocked.Increment(ref _anchorGeneration);
+
+        // Bookkeeping first: the app's next frame is laid out for the new
+        // origin/height, and a resize computation reads these.
+        _cursorRow = rowOrigin;
+        stepAdapter.RowOrigin = rowOrigin;
+
+        lock (_terminalWriteLock)
+        {
+            try
+            {
+                // This is a replaceable live image, not a history paragraph.
+                // Its snapshot may still have the pre-resize width: clipping
+                // that frame is safe, wrapping it into scrollback is not.
+                WriteTerminal(UseOsc133PromptMarks ? "\x1b[?7h" : "\x1b[?7l");
+
+                // Blank before painting. A hard LF also clears persistent
+                // soft-wrap metadata, which EL alone leaves behind. Never send
+                // it at the bottom: that row is reset by the next reservation's
+                // LF, without introducing an extra scroll during repaint.
+                for (var row = 0; row < liveHeight; row++)
+                {
+                    var absolute = rowOrigin + row;
+                    if (absolute < 0 || absolute >= terminalHeight) continue;
+                    WriteTerminalUpdate(
+                        absolute,
+                        absolute < terminalHeight - 1 ? "\x1b[2K\r\n" : "\x1b[2K");
+                }
+
+                // Qualified Ghostty uses the prompt mark at the live boundary;
+                // the mark must precede the first live row in this repaint.
+                if (UseOsc133PromptMarks)
+                {
+                    WriteTerminalUpdate(rowOrigin, GhosttyLivePromptMark);
+                }
+
+                var paintRows = Math.Min(liveHeight, Math.Max(1, liveSurface.Height));
+                for (var row = 0; row < paintRows; row++)
+                {
+                    var absolute = rowOrigin + row;
+                    if (absolute < 0 || absolute >= terminalHeight) continue;
+                    WriteTerminalUpdate(
+                        absolute,
+                        SoftWrapEmitter.OrderedRowPrefix + SoftWrapEmitter.RenderRowText(liveSurface, row));
+                }
+
+                SetTerminalCursorRow(rowOrigin);
+            }
+            finally
+            {
+                // History emission must retain its wrapping semantics, including
+                // when composing a repaint fails partway through an update.
+                WriteTerminal("\x1b[?7h");
+            }
+        }
+
+        return (rowOrigin, liveHeight);
+    }
+
+    /// <summary>
+    /// Waits until <paramref name="app"/> has completed a frame newer than
+    /// <paramref name="afterFrame"/>. Subscribes before the first check so a frame
+    /// landing in between is not missed; returns false on timeout or cancellation.
+    /// </summary>
+    private static async Task<bool> WaitForFrameAfterAsync(
+        Hex1bApp app,
+        long afterFrame,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<bool>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        void OnFrameRendered()
+        {
+            if (app.FrameCount > afterFrame)
+            {
+                completion.TrySetResult(true);
+            }
+        }
+
+        app.FrameRendered += OnFrameRendered;
+        try
+        {
+            if (app.FrameCount > afterFrame)
+            {
+                return true;
+            }
+
+            using var timeoutCts =
+                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var delay = Task.Delay(timeout, timeoutCts.Token);
+            var finished = await Task.WhenAny(completion.Task, delay).ConfigureAwait(false);
+            if (finished == completion.Task)
+            {
+                await timeoutCts.CancelAsync().ConfigureAwait(false);
+                return true;
+            }
+
+            return false;
+        }
+        finally
+        {
+            app.FrameRendered -= OnFrameRendered;
+        }
+    }
+
+    private sealed class AtomicTerminalUpdateScope(Hex1bFlowRunner runner) : IAtomicTerminalUpdate
     {
         private bool _disposed;
+
+        /// <summary>
+        /// True once the adapter accepted the scope's composed bytes. Acceptance
+        /// is not proof the host consumed them — only that the hand-off was
+        /// taken, which is the fact the exception alone cannot carry.
+        /// </summary>
+        public bool FlushCompleted { get; private set; }
 
         public void Dispose()
         {
@@ -226,7 +717,11 @@ internal sealed class Hex1bFlowRunner
             }
 
             _disposed = true;
-            runner.EndAtomicTerminalUpdate();
+
+            // Assigned only when the hand-off returns: if it throws, this stays
+            // false and Dispose rethrows, so a caller catching that exception
+            // can still read it.
+            FlushCompleted = runner.EndAtomicTerminalUpdate();
         }
     }
 
@@ -239,7 +734,7 @@ internal sealed class Hex1bFlowRunner
     private void ScrollViewportUp(int rows)
     {
         if (rows <= 0) return;
-        var terminalHeight = Math.Max(1, _parentAdapter.Height);
+        var terminalHeight = ReadCurrentGeometry().Height;
         var sb = new StringBuilder(rows);
         for (var i = 0; i < rows; i++)
         {
@@ -368,18 +863,18 @@ internal sealed class Hex1bFlowRunner
     /// <summary>
     /// Gets the terminal width in columns.
     /// </summary>
-    internal int TerminalWidth => _parentAdapter.Width;
+    internal int TerminalWidth => ReadCurrentGeometry().Width;
 
     /// <summary>
     /// Gets the terminal height in rows.
     /// </summary>
-    internal int TerminalHeight => _parentAdapter.Height;
+    internal int TerminalHeight => ReadCurrentGeometry().Height;
 
     /// <summary>
     /// Gets the number of rows available from the current cursor position
     /// to the bottom of the terminal (before any scrolling would occur).
     /// </summary>
-    internal int AvailableHeight => Math.Max(0, _parentAdapter.Height - _cursorRow);
+    internal int AvailableHeight => Math.Max(0, ReadCurrentGeometry().Height - _cursorRow);
 
     /// <summary>
     /// Runs the entire flow from start to finish.
@@ -395,7 +890,8 @@ internal sealed class Hex1bFlowRunner
         _initialRowOrigin = _cursorRow;
         _emittedTombstones.Clear();
 
-        Trace($"RunAsync start: termSize={_parentAdapter.Width}x{_parentAdapter.Height} cursorRow={_cursorRow} useSoftWrap={_options.UseSoftWrapTombstones}");
+        var initialGeometry = ReadCurrentGeometry();
+        Trace($"RunAsync start: termSize={initialGeometry.Width}x{initialGeometry.Height} cursorRow={_cursorRow} useSoftWrap={_options.UseSoftWrapTombstones}");
 
         var context = new Hex1bFlowContext(this);
         await _flowCallback(context);
@@ -413,8 +909,8 @@ internal sealed class Hex1bFlowRunner
     /// </summary>
     internal async Task RenderStaticAsync(Func<RootContext, Task<Hex1bWidget>> builder)
     {
-        var terminalWidth = _parentAdapter.Width;
-        var terminalHeight = _parentAdapter.Height;
+        var terminalWidth = ReadCurrentGeometry().Width;
+        var terminalHeight = ReadCurrentGeometry().Height;
 
         // Measure the content to determine how much space it needs
         var contentHeight = await MeasureYieldHeightAsync(builder, terminalWidth, terminalHeight);
@@ -465,8 +961,9 @@ internal sealed class Hex1bFlowRunner
             throw new InvalidOperationException(
                 "A step is already active. Call Complete() and await the current step before starting a new one.");
 
-        var terminalWidth = _parentAdapter.Width;
-        var terminalHeight = _parentAdapter.Height;
+        var currentGeometry = ReadCurrentGeometry();
+        var terminalWidth = currentGeometry.Width;
+        var terminalHeight = currentGeometry.Height;
 
         var maxHeight = Math.Min(options?.MaxHeight ?? terminalHeight, terminalHeight);
         if (maxHeight < 1) maxHeight = 1;
@@ -542,14 +1039,13 @@ internal sealed class Hex1bFlowRunner
     {
         try
         {
-            var terminalWidth = _parentAdapter.Width;
-            var terminalHeight = _parentAdapter.Height;
+            var (terminalWidth, terminalHeight) = ReadCurrentGeometry();
 
             // Track the row origin for this step (may be updated on resize)
-            var rowOrigin = _cursorRow;
+            var startRowOrigin = _cursorRow;
 
             // Scroll the terminal if the cursor is too far down to fit the step
-            var overflow = (rowOrigin + desiredHeight) - terminalHeight;
+            var overflow = (startRowOrigin + desiredHeight) - terminalHeight;
             if (overflow > 0)
             {
                 _parentAdapter.SetCursorPosition(0, terminalHeight - 1);
@@ -557,12 +1053,12 @@ internal sealed class Hex1bFlowRunner
                 {
                     WriteTerminal("\n");
                 }
-                rowOrigin -= overflow;
-                _cursorRow = rowOrigin;
+                startRowOrigin -= overflow;
+                _cursorRow = startRowOrigin;
             }
 
             // Clear the step region
-            ClearRegion(rowOrigin, desiredHeight);
+            ClearRegion(startRowOrigin, desiredHeight);
 
             // Create the inline adapter for this step
             var stepEnableMouse = options?.EnableMouse ?? false;
@@ -573,8 +1069,15 @@ internal sealed class Hex1bFlowRunner
             }
 
             using var stepAdapter = new InlineStepAdapter(
-                terminalWidth, desiredHeight, rowOrigin,
+                terminalWidth, desiredHeight, startRowOrigin,
                 stepCapabilities);
+
+            if (UseOsc133PromptMarks)
+            {
+                // Establish the live prompt boundary before the first frame
+                // enters the output pump; later reanchors refresh this mark.
+                WriteTerminalUpdate(startRowOrigin, GhosttyLivePromptMark);
+            }
 
             var appOptions = new Hex1bAppOptions
             {
@@ -611,10 +1114,22 @@ internal sealed class Hex1bFlowRunner
             // the live region's origin.
             var commitCoordinatorBox =
                 new System.Runtime.CompilerServices.StrongBox<FlowCommitCoordinator?>(null);
+
+            // Set once the live app exists, so the settle path can wait for a
+            // frame rendered at the settled geometry before it repaints.
+            var appBox = new System.Runtime.CompilerServices.StrongBox<Hex1bApp?>(null);
+
+            // Admission state shared with the commit's preparation hook: the
+            // frame gate, the mute ownership admission takes, and the app whose
+            // frames a settle waits for.
+            var admission = new LiveAdmissionState();
             var outputPumpTask = PumpStepOutputAsync(
                 stepAdapter,
                 outputPumpCts.Token,
-                isMuted: () => System.Threading.Volatile.Read(ref outputMuteGate.Value));
+                isMuted: () => System.Threading.Volatile.Read(ref outputMuteGate.Value)
+                    || (System.Threading.Volatile.Read(ref commitCoordinatorBox.Value)?.IsCommitInFlight == true
+                        && !System.Threading.Volatile.Read(ref admission.ResumeGranted)),
+                parkCursorAtLiveOrigin: _options.UseSoftWrapTombstones);
 
             // Pump input from parent adapter to step adapter, with resize handling
             using var inputPumpCts = new CancellationTokenSource();
@@ -628,378 +1143,459 @@ internal sealed class Hex1bFlowRunner
             var settleSync = new object();
             CancellationTokenSource? settleTimerCts = null;
             (int Width, int Height)? settleOriginalDims = null;
-            // Snapshot of where the active step's render region *was* when
-            // the current burst started. Used at settle time to clear the
-            // pre-burst rectangle in addition to the post-settle one — so
-            // a stale frame the inner Hex1bApp emitted just before the
-            // mute gate closed cannot leave artifacts above or below the
-            // new render.
-            (int RowOrigin, int Height)? settleOriginalRect = null;
             (int Width, int Height) settleLatestDims = default;
-            var lastKnownWidth = _parentAdapter.Width;
-            var lastKnownHeight = _parentAdapter.Height;
+            var resizeTaskSync = new object();
+            var resizeRepaintTasks = new List<Task>();
+            var resizeObservationGate = new SemaphoreSlim(1, 1);
+            long resizeGeneration = 0;
+            // Mute-gate value from immediately before the burst muted the pump,
+            // so the settle pass (and admission) can restore exactly what the
+            // burst transiently overrode instead of clobbering another owner.
+            var settlePreBurstMute = false;
+            var (lastKnownWidth, lastKnownHeight) = ReadCurrentGeometry();
+
+            // Admission hook for continuous-history commitment. The coordinator
+            // calls this through <see cref="ILiveStepHandle"/> after a commit is
+            // admitted and before it samples any geometry. On success the live
+            // pump is muted and the anchor the commit reads is the host's own
+            // observed row for a host that can report one. A failed observation
+            // leaves output muted: restoring an unobserved row could erase history.
+            Func<CancellationToken, Task<bool>> prepareForCommitAsync = async cancellationToken =>
+            {
+                // Taking the step-ops lock waits out a settle pass that is
+                // already executing: every settle mutation holds it. Holding it
+                // is also what makes the per-event handler's in-lock admission
+                // re-check effective — either that handler ran first and armed a
+                // timer this method then cancels, or it observes the admission
+                // and only updates geometry.
+                bool priorMute;
+                lock (_stepOpsLock)
+                {
+                    lock (settleSync)
+                    {
+                        // Drop live frames until the commit resumes the pump:
+                        // a frame forwarded before the commit's own handling
+                        // would move the cursor the anchor below records.
+                        System.Threading.Volatile.Write(ref admission.ResumeGranted, false);
+
+                        // Cancel the armed settle so its clear/scroll/repaint
+                        // pass can never run against output the commit appends.
+                        settleTimerCts?.Cancel();
+                        settleTimerCts = null;
+
+                        var burstWasActive = settleOriginalDims is not null;
+                        settleOriginalDims = null;
+
+                        if (burstWasActive)
+                        {
+                            // The settle pass that would have restored the drag's
+                            // transient terminal state was just cancelled, so do
+                            // it here: autowrap back on (oversized rows must wrap,
+                            // not truncate), cursor visible, the burst's
+                            // transient mute returned to whatever it was before
+                            // the burst, and the pending geometry pushed to the
+                            // app so it is laid out for the size the host already
+                            // has rather than the pre-resize one.
+                            WriteTerminal("\x1b[?7h");
+                            WriteTerminal("\x1b[?25h");
+                            _ = stepAdapter.ResizeAsync(
+                                Math.Max(1, settleLatestDims.Width),
+                                Math.Max(1, FlowResizeMath.ComputeStepHeight(
+                                    options?.MaxHeight, settleLatestDims.Height)));
+                            System.Threading.Volatile.Write(ref outputMuteGate.Value, settlePreBurstMute);
+
+                            // The burst's mute was transient and has just been
+                            // released, so the ownership to report is the pump's
+                            // state before the burst — reporting the burst's own
+                            // mute would leave the pump muted forever.
+                            priorMute = settlePreBurstMute;
+                        }
+                        else
+                        {
+                            priorMute = System.Threading.Volatile.Read(ref outputMuteGate.Value);
+                        }
+
+                        // The commit holds the pump for its whole duration. The
+                        // prior ownership is reported back so the caller can
+                        // return the pump to its real owner, and recorded here so
+                        // a caller that mutes through the handle anyway still
+                        // receives that prior ownership instead of the commit's
+                        // own mute.
+                        System.Threading.Volatile.Write(ref outputMuteGate.Value, true);
+                        System.Threading.Volatile.Write(ref admission.PriorMute, priorMute);
+                        System.Threading.Volatile.Write(ref admission.MuteTaken, true);
+                    }
+                }
+
+                if (!UsesObservedCursorOrigin)
+                {
+                    // A synthetic adapter cannot report the host's own position,
+                    // so the step's tracked origin stays the anchor and the cursor
+                    // is parked there.
+                    lock (_stepOpsLock)
+                    {
+                        lock (settleSync)
+                        {
+                            SetTerminalCursorRow(stepAdapter.RowOrigin);
+                        }
+                    }
+
+                    return priorMute;
+                }
+
+                int? observed;
+                try
+                {
+                    // Nothing may CUP or home the cursor before this: the park
+                    // that every forwarded soft-wrap frame ends with is the
+                    // anchor, and overwriting it with a tracked row would replace
+                    // the host's answer with the model's.
+                    observed = await ObserveStableCursorRowAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    commitCoordinatorBox.Value?.Suspend(ex);
+                    throw;
+                }
+
+                if (observed is null)
+                {
+                    // No authoritative anchor, and the flow's scalar reflow model
+                    // is not a substitute: it cannot see a reflow that moved a row
+                    // and moved it back. Keep the pump muted — nothing may repaint
+                    // over content whose position cannot be stated — and suspend
+                    // the step's commitment instead of committing from a guess.
+                    throw SuspendOnMissingObservation("commit admission");
+                }
+
+                lock (_stepOpsLock)
+                {
+                    lock (settleSync)
+                    {
+                        RebaseModelToObservedOrigin(observed.Value);
+                        stepAdapter.RowOrigin = observed.Value;
+                        Interlocked.Increment(ref _anchorGeneration);
+                    }
+                }
+
+                return priorMute;
+            };
+
+            // True while a commit is admitted and running. Read without taking a
+            // lock: it is a volatile flag on the coordinator the runner publishes.
+            bool CommitInFlightNow() =>
+                System.Threading.Volatile.Read(ref commitCoordinatorBox.Value)?.IsCommitInFlight == true;
+
+            // A host that cannot say where the live region is leaves nothing to
+            // anchor against: the flow's scalar reflow model is not a substitute,
+            // because it cannot see a reflow that moved a row and moved it back.
+            // Suspends the step's commitment and leaves the pump muted rather than
+            // painting over content whose position cannot be stated.
+            InvalidOperationException SuspendOnMissingObservation(string what)
+            {
+                var failure = new InvalidOperationException(
+                    $"The host did not report a cursor row for the {what}, and the flow's scalar reflow " +
+                    "model is not a substitute for an authoritative observation.");
+                Trace($"{what}: no authoritative cursor observation; suspending commitment");
+                try
+                {
+                    commitCoordinatorBox.Value?.Suspend(failure);
+                }
+                catch (Exception ex)
+                {
+                    Trace($"{what}: suspend threw {ex.GetType().Name}: {ex.Message}");
+                }
+
+                return failure;
+            }
+            async Task RepaintLiveAfterResizeAsync(long generation, CancellationToken resizeToken)
+            {
+                await resizeObservationGate.WaitAsync(resizeToken).ConfigureAwait(false);
+                try
+                {
+                    if (generation != Interlocked.Read(ref resizeGeneration))
+                        return;
+
+                    var app = appBox.Value;
+                    if (app is not null)
+                    {
+                        // The resize event and an explicit Invalidate may both
+                        // be queued behind this callback. Do not snapshot until
+                        // the app has completed a frame after this repaint
+                        // request; otherwise the immediate hand-off can repaint
+                        // the old prompt before the new frame reaches the pump.
+                        var frameBefore = app.FrameCount;
+                        app.Invalidate();
+                        var frameObserved = await WaitForFrameAfterAsync(
+                            app, frameBefore, ResizeRenderTimeout, resizeToken)
+                            .ConfigureAwait(false);
+                        resizeToken.ThrowIfCancellationRequested();
+                        if (!frameObserved)
+                        {
+                            throw new TimeoutException(
+                                "The resized live layout did not render before repaint.");
+                        }
+                    }
+
+                    for (var attempt = 0; attempt < 3; attempt++)
+                    {
+                        resizeToken.ThrowIfCancellationRequested();
+                        // Commit admission owns the live region. A resize
+                        // repaint must not write (or move the host cursor)
+                        // while the committer is between its admission and
+                        // final re-anchor; the commit's own geometry fence
+                        // will incorporate the resize instead.
+                        if (CommitInFlightNow())
+                            return;
+
+                        var observedAnchorGeneration =
+                            Interlocked.Read(ref _anchorGeneration);
+                        int? observed = null;
+                        if (UsesObservedCursorOrigin)
+                        {
+                            observed = await ObserveStableCursorRowAsync(resizeToken)
+                                .ConfigureAwait(false);
+                            if (observed is null)
+                                throw SuspendOnMissingObservation("resize repaint");
+                        }
+
+                        resizeToken.ThrowIfCancellationRequested();
+                        var retry = false;
+                        lock (_stepOpsLock)
+                        {
+                            if (generation != Interlocked.Read(ref resizeGeneration))
+                                return;
+                            // Admission can begin after the observation
+                            // above but before this lock. Do not repaint
+                            // from a row captured outside the commit.
+                            if (CommitInFlightNow())
+                                return;
+                            if (observedAnchorGeneration !=
+                                Interlocked.Read(ref _anchorGeneration))
+                            {
+                                retry = true;
+                            }
+                            else
+                            {
+                                var (width, terminalHeight) = ReadCurrentGeometry();
+                                var liveHeight = FlowResizeMath.ComputeStepHeight(
+                                    options?.MaxHeight, terminalHeight);
+                                var anchor = CommitInFlightNow()
+                                    ? Math.Clamp(
+                                        stepAdapter.RowOrigin,
+                                        0,
+                                        Math.Max(0, terminalHeight - liveHeight))
+                                    : observed is { } observedRow
+                                        ? ReserveBelowObservedAnchor(observedRow, liveHeight)
+                                        : FlowResizeMath.ComputeRowOriginAtWidth(
+                                            _initialRowOrigin, _emittedTombstones, width);
+                                anchor = Math.Clamp(
+                                    anchor,
+                                    0,
+                                    Math.Max(0, terminalHeight - liveHeight));
+
+                                desiredHeight = liveHeight;
+                                step.StepHeight = liveHeight;
+                                step.TerminalWidth = width;
+                                stepAdapter.RowOrigin = anchor;
+                                if (stepAdapter.Width != width
+                                    || stepAdapter.Height != liveHeight)
+                                {
+                                    _ = stepAdapter.ResizeAsync(width, liveHeight);
+                                }
+
+                                // Keep positioning, clearing, prompt mark and
+                                // surface bytes in one serialized hand-off.
+                                var scope = BeginAtomicTerminalUpdate();
+                                try
+                                {
+                                    var surface = appBox.Value?.SnapshotCurrentSurface();
+                                    if (surface is not null)
+                                    {
+                                        var painted = ReanchorLiveRegion(
+                                            stepAdapter, anchor, liveHeight, surface);
+                                        stepAdapter.RowOrigin = painted.RowOrigin;
+                                        step.StepHeight = painted.LiveHeight;
+                                        desiredHeight = painted.LiveHeight;
+                                    }
+                                    else
+                                    {
+                                        SetTerminalCursorRow(anchor);
+                                    }
+                                }
+                                finally
+                                {
+                                    scope.Dispose();
+                                }
+
+                            }
+                        }
+
+                        if (!retry)
+                            return;
+                    }
+
+                    throw new InvalidOperationException(
+                        "Resize repaint could not establish a stable live anchor.");
+                }
+                finally
+                {
+                    resizeObservationGate.Release();
+                }
+            }
+
+            async Task CompleteResizeBurstAsync(long generation, CancellationToken settleTokenIn)
+            {
+                await RepaintLiveAfterResizeAsync(generation, settleTokenIn)
+                    .ConfigureAwait(false);
+
+                lock (_stepOpsLock)
+                {
+                    lock (settleSync)
+                    {
+                        if (settleTokenIn.IsCancellationRequested
+                            || generation != Interlocked.Read(ref resizeGeneration)
+                            || CommitInFlightNow())
+                            return;
+
+                        System.Threading.Volatile.Write(
+                            ref outputMuteGate.Value, settlePreBurstMute);
+                        settleOriginalDims = null;
+                        settleTimerCts = null;
+                        Trace("settle(repaint): resumed live output");
+                    }
+                }
+            }
+
+            void TrackResizeTask(Task task)
+            {
+                lock (resizeTaskSync)
+                {
+                    resizeRepaintTasks.Add(task);
+                }
+            }
 
             var inputPumpTask = PumpStepInputAsync(stepAdapter, inputPumpCts.Token,
                 onResize: (newWidth, newHeight) =>
                 {
+                    RecordResizeDimensions(newWidth, newHeight);
+                    Interlocked.Increment(ref _resizeVersion);
+                    var generation = Interlocked.Increment(ref resizeGeneration);
                     var newStepHeight = FlowResizeMath.ComputeStepHeight(options?.MaxHeight, newHeight);
-
-                    // An in-flight history commit owns the live region's origin
-                    // and repaints it at its own turn boundaries. Update the
-                    // geometry the commit will read next, forward the resize to
-                    // the adapter, and leave the repositioning to the commit —
-                    // running the burst/clear/placeholder path underneath it
-                    // would fight it for the same rows.
-                    if (System.Threading.Volatile.Read(ref commitCoordinatorBox.Value)?.IsCommitInFlight == true)
-                    {
-                        desiredHeight = newStepHeight;
-                        step.StepHeight = Math.Max(1, newStepHeight);
-                        step.TerminalWidth = newWidth;
-                        lastKnownWidth = newWidth;
-                        lastKnownHeight = newHeight;
-                        _ = stepAdapter.ResizeAsync(Math.Max(1, newWidth), Math.Max(1, newStepHeight));
-                        Trace($"onResize during commit: defers repositioning to the commit " +
-                              $"newSize={newWidth}x{newHeight} newStepH={newStepHeight}");
-                        return;
-                    }
-
-                    Trace($"onResize: newSize={newWidth}x{newHeight} newStepH={newStepHeight} useSoftWrap={_options.UseSoftWrapTombstones} settleDelay={_options.ResizeSettleDelay}");
-
                     var useSettle = _options.UseSoftWrapTombstones
-                        && _options.ResizeSettleDelay is { } _;
+                        && _options.ResizeSettleDelay is not null;
 
-                    if (useSettle)
+                    // Publish the event-delivered geometry before scheduling
+                    // any repaint, and mute old frames while the new surface is
+                    // composed. The native source is still re-read by the
+                    // repaint and commit emission fences.
+                    CancellationToken settleToken = default;
+                    lock (_stepOpsLock)
                     {
-                        // "Track cursor on every event, repaint on settle".
-                        //
-                        // Per-event we do NOT touch the screen at all — no
-                        // ESC[J, no placeholder draw, no bottom-overflow
-                        // LFs. The host terminal already owns reflow of
-                        // every byte we've emitted, so its own scrolling
-                        // (if any) keeps the tombstones above naturally
-                        // anchored. We only update internal bookkeeping
-                        // so the settle-time repaint knows where to land.
-                        //
-                        // When events go quiet for ResizeSettleDelay, we
-                        // do any necessary bottom-overflow scroll, clear
-                        // ONLY the active-step rectangle (per-row ESC[2K,
-                        // never ESC[J), optionally drop a resize-marker
-                        // tombstone above it, then ask the inner Hex1bApp
-                        // to repaint into the cleared region.
-                        CancellationToken settleToken;
                         lock (settleSync)
                         {
-                            // First event of a burst: snapshot the pre-burst
-                            // rect so we can clear it at settle (the inner
-                            // Hex1bApp may have left a frame painted at the
-                            // old origin/height before the mute gate closed).
                             if (settleOriginalDims is null)
                             {
+                                settlePreBurstMute =
+                                    System.Threading.Volatile.Read(ref outputMuteGate.Value);
                                 settleOriginalDims = (lastKnownWidth, lastKnownHeight);
-                                settleOriginalRect = (rowOrigin, step.StepHeight);
                             }
+
                             settleLatestDims = (newWidth, newHeight);
-
-                            // Hide the cursor for the duration of the drag
-                            // so it doesn't visibly chase the reflow.
-                            WriteTerminal("\x1b[?25l");
-
-                            // Disable line wrap (DECAWM) for the duration
-                            // of the drag. The inner Hex1bApp keeps
-                            // rendering at the OLD width via the output
-                            // pump (glow animations, focus blink, etc.);
-                            // when the terminal is shrunk, that stale
-                            // wide content would wrap at the new right
-                            // edge and — if any wrap lands on the bottom
-                            // row — scroll the buffer up, pushing the
-                            // tombstones above off-screen. With DECAWM
-                            // off the host terminal truncates instead of
-                            // wrapping, so the stale content lands on
-                            // the active region but never scrolls. The
-                            // settle pass re-enables DECAWM as its last
-                            // act before showing the cursor.
-                            WriteTerminal("\x1b[?7l");
-
-                            // Mute the inner-app output pump for the
-                            // duration of the drag. DECAWM-off protects
-                            // against right-edge wrap, but the inner
-                            // app's frames also contain explicit CR+LF
-                            // row separators (UseSoftWrapEmission =
-                            // true). Those CR+LFs advance the cursor
-                            // unconditionally — if the cursor lands at
-                            // the bottom row of the now-shrunken
-                            // terminal, the buffer scrolls and the
-                            // tombstones above slide off-screen. Muting
-                            // the pump lets the inner app keep rendering
-                            // into the channel without those frames ever
-                            // reaching the parent terminal.
-                            System.Threading.Volatile.Write(ref outputMuteGate.Value, true);
-
-                            // Park the cursor at the home position
-                            // (1,1). The host terminal scrolls the
-                            // primary buffer on shrink to keep the
-                            // cursor visible — and the cursor is
-                            // wherever the inner Hex1bApp last left it
-                            // (typically the textbox row near the
-                            // bottom of the active step). If we don't
-                            // intervene, every subsequent shrink event
-                            // in the burst pushes another row off the
-                            // top. With the cursor parked at the home
-                            // position, the host has no reason to
-                            // scroll on subsequent shrink events. The
-                            // very first event of a burst still loses
-                            // a row or two (the host has already
-                            // scrolled by the time our event handler
-                            // runs), but all later events in the same
-                            // drag are anchored. The settle pass
-                            // restores the cursor to its proper place.
-                            WriteTerminal("\x1b[H");
-
-                            // Render the placeholder (if any) into the
-                            // active rect. With the inner-app output
-                            // pump muted, the prompt would otherwise
-                            // stay frozen showing the pre-resize frame
-                            // (which is laid out for the OLD width and
-                            // would visibly clip/wrap on shrink). The
-                            // placeholder is a deliberately tiny widget
-                            // (typically a single short line) so it
-                            // fits inside even an aggressively shrunken
-                            // viewport.
-                            if (_options.ResizePlaceholder is { } placeholderBuilder)
-                            {
-                                var placeholderRowOrigin = settleOriginalRect?.RowOrigin
-                                    ?? rowOrigin;
-                                var placeholderHeight = settleOriginalRect?.Height
-                                    ?? step.StepHeight;
-
-                                // Use the most up-to-date width we have
-                                // (latest event in the burst). DECAWM
-                                // is off so any over-wide content
-                                // simply truncates at the right edge.
-                                var phSurface = RenderToSurface(
-                                    placeholderBuilder,
-                                    Math.Max(1, newWidth),
-                                    Math.Max(1, placeholderHeight));
-                                if (phSurface is not null)
-                                {
-                                    WriteTerminal(SyncUpdateBegin);
-                                    try
-                                    {
-                                        // Wipe the rect first so we don't
-                                        // composite the placeholder onto
-                                        // the old prompt's leftovers.
-                                        for (var i = 0; i < placeholderHeight; i++)
-                                        {
-                                            var row = placeholderRowOrigin + i;
-                                            if (row < 0 || row >= newHeight) continue;
-                                            _parentAdapter.SetCursorPosition(0, row);
-                                            WriteTerminal("\x1b[2K");
-                                        }
-                                        if (placeholderRowOrigin >= 0
-                                            && placeholderRowOrigin < newHeight)
-                                        {
-                                            _parentAdapter.SetCursorPosition(0, placeholderRowOrigin);
-                                            SoftWrapEmitter.Emit(phSurface, _parentAdapter);
-                                        }
-                                    }
-                                    finally
-                                    {
-                                        WriteTerminal(SyncUpdateEnd);
-                                    }
-                                    // Park the cursor at home again so
-                                    // the placeholder emission (which
-                                    // leaves the cursor at the end of
-                                    // the last paragraph) cannot anchor
-                                    // a subsequent shrink-scroll.
-                                    WriteTerminal("\x1b[H");
-                                }
-                            }
-
-                            // Update internal state for the eventual
-                            // settle. Note: we deliberately don't write
-                            // anything to the parent here — the settle
-                            // pass below recomputes the origin against
-                            // whatever the LATEST dimensions ended up
-                            // being and does the scroll/clear/repaint as
-                            // a single atomic pass.
                             desiredHeight = newStepHeight;
-                            step.StepHeight = newStepHeight;
-
-                            settleTimerCts?.Cancel();
-                            settleTimerCts = CancellationTokenSource.CreateLinkedTokenSource(inputPumpCts.Token);
-                            settleToken = settleTimerCts.Token;
+                            step.StepHeight = Math.Max(1, newStepHeight);
+                            step.TerminalWidth = Math.Max(1, newWidth);
                             lastKnownWidth = newWidth;
                             lastKnownHeight = newHeight;
+                            System.Threading.Volatile.Write(ref outputMuteGate.Value, true);
+                            _ = stepAdapter.ResizeAsync(
+                                Math.Max(1, newWidth), Math.Max(1, newStepHeight));
+
+                            // ResizeSettleDelay remains a quiet-period cleanup,
+                            // not a visibility debounce. Re-arm only cleanup;
+                            // immediate repaints use the independent generation.
+                            if (useSettle)
+                            {
+                                settleTimerCts?.Cancel();
+                                settleTimerCts?.Dispose();
+                                settleTimerCts = CancellationTokenSource.CreateLinkedTokenSource(
+                                    inputPumpCts.Token);
+                                settleToken = settleTimerCts.Token;
+                            }
                         }
+                    }
 
-                        var delay = _options.ResizeSettleDelay!.Value;
-                        _ = Task.Run(async () =>
+                    var repaintTask = Task.Run(async () =>
+                    {
+                        try
                         {
-                            try
+                            await RepaintLiveAfterResizeAsync(
+                                generation, inputPumpCts.Token).ConfigureAwait(false);
+                            var requestFreshFrame = false;
+                            lock (_stepOpsLock)
                             {
-                                await Task.Delay(delay, settleToken);
+                                lock (settleSync)
+                                {
+                                    if (generation == Interlocked.Read(ref resizeGeneration)
+                                        && !CommitInFlightNow())
+                                    {
+                                        // The immediate repaint is the ownership
+                                        // hand-off for this generation. Keep
+                                        // current-generation frames queued so
+                                        // an edit that lands after the snapshot
+                                        // can patch the freshly painted region.
+                                        System.Threading.Volatile.Write(
+                                            ref outputMuteGate.Value, settlePreBurstMute);
+                                        if (!useSettle)
+                                        {
+                                            settleOriginalDims = null;
+                                        }
+
+                                        requestFreshFrame = true;
+                                    }
+                                }
                             }
-                            catch (OperationCanceledException)
+
+                            // Close the snapshot-to-unmute window with a fresh
+                            // render request. The guarded hand-off above has
+                            // already released the transient mute; this request
+                            // is intentionally after it, so it cannot be lost
+                            // to a freshness-blind queue drain.
+                            if (requestFreshFrame)
                             {
-                                return;
+                                appBox.Value?.Invalidate();
                             }
+                        }
+                        catch (OperationCanceledException) when (inputPumpCts.IsCancellationRequested) { }
+                        catch (Exception ex)
+                        {
+                            commitCoordinatorBox.Value?.Suspend(ex);
+                            Trace($"resize(repaint) failed: {ex.GetType().Name}: {ex.Message}");
+                        }
+                    });
+                    TrackResizeTask(repaintTask);
 
-                            lock (settleSync)
-                            {
-                                if (settleToken.IsCancellationRequested) return;
+                    if (!useSettle) return;
 
-                                var original = settleOriginalDims ?? settleLatestDims;
-                                var dimsChanged = original != settleLatestDims;
-
-                                var settledWidth = settleLatestDims.Width;
-                                var settledHeight = settleLatestDims.Height;
-                                var settledStepHeight = FlowResizeMath.ComputeStepHeight(
-                                    options?.MaxHeight, settledHeight);
-
-                                // Compute where the active step lands at
-                                // the FINAL settled width.
-                                var settledRowOrigin = FlowResizeMath.ComputeRowOriginAtWidth(
-                                    _initialRowOrigin, _emittedTombstones, settledWidth);
-
-                                // Bottom-overflow scroll — applied ONCE,
-                                // at settle time, against the final
-                                // dimensions. Without this the active
-                                // region would render off the bottom of
-                                // a shrunken terminal.
-                                var bottomOverflow = (settledRowOrigin + settledStepHeight) - settledHeight;
-                                if (bottomOverflow > 0)
-                                {
-                                    _parentAdapter.SetCursorPosition(0, settledHeight - 1);
-                                    for (var i = 0; i < bottomOverflow; i++)
-                                    {
-                                        WriteTerminal("\n");
-                                    }
-                                    _initialRowOrigin -= bottomOverflow;
-                                    settledRowOrigin -= bottomOverflow;
-                                }
-
-                                rowOrigin = settledRowOrigin;
-                                stepAdapter.RowOrigin = settledRowOrigin;
-                                _cursorRow = settledRowOrigin;
-                                desiredHeight = settledStepHeight;
-                                step.StepHeight = settledStepHeight;
-
-                                // Optional one-off marker tombstone above
-                                // the active step. EmitSoftWrapTombstone
-                                // advances _cursorRow past the marker so
-                                // the step lands cleanly below it.
-                                if (dimsChanged && _options.ResizeMarker is { } markerBuilder)
-                                {
-                                    var markerSurface = RenderToSurface(
-                                        markerBuilder,
-                                        settledWidth,
-                                        Math.Max(1, settledHeight - settledStepHeight - 1));
-                                    if (markerSurface is not null)
-                                    {
-                                        _parentAdapter.SetCursorPosition(0, rowOrigin);
-                                        EmitSoftWrapTombstone(markerSurface);
-                                        rowOrigin = _cursorRow;
-                                        stepAdapter.RowOrigin = rowOrigin;
-                                    }
-                                }
-
-                                // Clear the union of the pre-burst rect
-                                // and the post-settle rect. Per-event we
-                                // mute the inner Hex1bApp's output pump,
-                                // but the very first frame of a burst may
-                                // already have been written to the parent
-                                // before the mute gate flipped — leaving a
-                                // partial render at the OLD origin/height.
-                                // If settledRowOrigin or settledStepHeight
-                                // moved, that stale fragment can sit above
-                                // or below the new render unless we wipe
-                                // the old rect too. Row-by-row ESC[2K
-                                // (never ESC[J) so a wrong computation
-                                // can't erase tombstones above.
-                                WriteTerminal(SyncUpdateBegin);
-                                try
-                                {
-                                    WriteTerminal("\x1b[?7l");
-
-                                    var clearTop = rowOrigin;
-                                    var clearBottom = rowOrigin + settledStepHeight - 1;
-                                    if (settleOriginalRect is { } origRect)
-                                    {
-                                        clearTop = Math.Min(clearTop, origRect.RowOrigin);
-                                        clearBottom = Math.Max(
-                                            clearBottom, origRect.RowOrigin + origRect.Height - 1);
-                                    }
-                                    for (var row = clearTop; row <= clearBottom; row++)
-                                    {
-                                        if (row < 0 || row >= settledHeight) continue;
-                                        _parentAdapter.SetCursorPosition(0, row);
-                                        WriteTerminal("\x1b[2K");
-                                    }
-                                    _parentAdapter.SetCursorPosition(0, rowOrigin);
-                                    WriteTerminal("\x1b[?7h");
-                                    WriteTerminal("\x1b[?25h"); // show cursor
-                                }
-                                finally
-                                {
-                                    WriteTerminal(SyncUpdateEnd);
-                                }
-
-                                _ = stepAdapter.ResizeAsync(settledWidth, settledStepHeight);
-
-                                // Unmute the output pump. From this point
-                                // the inner Hex1bApp's frames flow back
-                                // through to the parent — its very next
-                                // frame is rendered at the settled
-                                // dimensions so it lands in the cleared
-                                // active rectangle cleanly.
-                                System.Threading.Volatile.Write(ref outputMuteGate.Value, false);
-
-                                settleOriginalDims = null;
-                                settleOriginalRect = null;
-                                settleTimerCts = null;
-                            }
-                        });
-                        return;
-                    }
-
-                    if (_options.UseSoftWrapTombstones)
+                    // Captured while holding settleSync so admission cannot
+                    // dispose the source before this task starts.
+                    var delay = _options.ResizeSettleDelay!.Value;
+                    var cleanupTask = Task.Run(async () =>
                     {
-                        // Eager soft-wrap path (no settle delay): preserve
-                        // the existing scroll-to-scrollback behaviour so
-                        // callers who haven't opted into settle keep the
-                        // same semantics they've always had.
-                        ScrollViewportToScrollback(newHeight);
-
-                        stepAdapter.RowOrigin = 0;
-                        rowOrigin = 0;
-                        _cursorRow = 0;
-                        _initialRowOrigin = 0;
-                        _emittedTombstones.Clear();
-                        desiredHeight = newStepHeight;
-                        step.StepHeight = newStepHeight;
-                    }
-                    else
-                    {
-                        // Legacy path: cell-positioned tombstones can't be
-                        // preserved across reflow, so we wipe the whole visible
-                        // area and bottom-anchor the new step.
-                        var (clearOrigin, clearHeight) = FlowResizeMath.ComputeClearRegion(
-                            useSoftWrapTombstones: false, newHeight, newStepHeight);
-                        var newRowOrigin = Math.Max(0, newHeight - newStepHeight);
-
-                        ClearRegion(clearOrigin, clearHeight);
-
-                        stepAdapter.RowOrigin = newRowOrigin;
-                        rowOrigin = newRowOrigin;
-                        _cursorRow = newRowOrigin;
-                        desiredHeight = newStepHeight;
-                        step.StepHeight = newStepHeight;
-                    }
-
-                    lastKnownWidth = newWidth;
-                    lastKnownHeight = newHeight;
-
-                    _ = stepAdapter.ResizeAsync(newWidth, newStepHeight);
+                        try
+                        {
+                            await Task.Delay(delay, settleToken).ConfigureAwait(false);
+                            await CompleteResizeBurstAsync(generation, settleToken)
+                                .ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException) when (settleToken.IsCancellationRequested) { }
+                        catch (Exception ex)
+                        {
+                            commitCoordinatorBox.Value?.Suspend(ex);
+                            Trace($"settle(repaint) failed: {ex.GetType().Name}: {ex.Message}");
+                        }
+                    });
+                    TrackResizeTask(cleanupTask);
                 });
 
             try
@@ -1007,16 +1603,17 @@ internal sealed class Hex1bFlowRunner
                 // Wrap the user's builder to inject the FlowStepContext
                 var stepCtx = new FlowStepContext(step);
                 await using var app = new Hex1bApp(rootCtx =>
-                {
-                    stepCtx.CancellationToken = rootCtx.CancellationToken;
-                    return builder(stepCtx);
-                }, appOptions);
+                                                        {
+                                                            stepCtx.CancellationToken = rootCtx.CancellationToken;
+                                                            return builder(stepCtx);
+                                                        }, appOptions);
                 step.SetApp(app);
+                System.Threading.Volatile.Write(ref appBox.Value, app);
 
                 // Continuous-history commitment: this step keeps running while
                 // finalized content is appended to native history above it.
                 var liveHandle = new LiveStepHandle(
-                    this, step, stepAdapter, app, stepCtx, outputMuteGate);
+                    this, step, stepAdapter, app, stepCtx, outputMuteGate, admission, prepareForCommitAsync);
                 var commitCoordinator = new FlowCommitCoordinator(
                     liveHandle, _parentAdapter, _cancellationToken);
                 step.AttachCommitCoordinator(commitCoordinator);
@@ -1059,6 +1656,21 @@ internal sealed class Hex1bFlowRunner
 
                 try { await outputPumpTask; } catch (OperationCanceledException) { }
                 try { await inputPumpTask; } catch (OperationCanceledException) { }
+                Task[] pendingResizeTasks;
+                lock (resizeTaskSync)
+                {
+                    pendingResizeTasks = resizeRepaintTasks.ToArray();
+                }
+
+                try
+                {
+                    await Task.WhenAll(pendingResizeTasks).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (inputPumpCts.IsCancellationRequested) { }
+
+                settleTimerCts?.Cancel();
+                settleTimerCts?.Dispose();
+                resizeObservationGate.Dispose();
             }
 
             // Clear the step region so remnants don't show through the yield widget
@@ -1168,7 +1780,7 @@ internal sealed class Hex1bFlowRunner
         // We render the full content into a tall adapter, then write it page by page
         // to the terminal, scrolling between pages.
         var totalRendered = 0;
-        var terminalHeight = _parentAdapter.Height;
+        var terminalHeight = ReadCurrentGeometry().Height;
         var remainingLines = measuredHeight;
 
         while (remainingLines > 0)
@@ -1444,7 +2056,7 @@ internal sealed class Hex1bFlowRunner
     {
         var emitId = Interlocked.Increment(ref _emitCounter);
         var height = surface.Height;
-        var terminalHeight = _parentAdapter.Height;
+        var terminalHeight = ReadCurrentGeometry().Height;
 
         Trace($"EmitSoftWrapTombstone[#{emitId}] enter: surfaceSize={surface.Width}x{height} cursorRow={_cursorRow} termH={terminalHeight}");
 
@@ -1607,29 +2219,191 @@ internal sealed class Hex1bFlowRunner
     private async Task PumpStepOutputAsync(
         InlineStepAdapter stepAdapter,
         CancellationToken ct,
-        Func<bool>? isMuted = null)
+        Func<bool>? isMuted = null,
+        bool parkCursorAtLiveOrigin = false)
     {
+        // Hex1bApp writes the synchronized-output envelope as separate adapter
+        // items: BSU, the frame body, and ESU. Keep one pending frame here so
+        // admission can mute or forward the complete envelope, never just its
+        // opening or closing item.
+        var synchronizedFrame = new StringBuilder(4096);
+        var synchronizedFrameOpen = false;
+        var discardUntilBoundary = false;
+        long synchronizedFrameEpoch = 0;
+
+        void Forward(string text, long epoch)
+        {
+            if (text.Length == 0)
+            {
+                return;
+            }
+
+            lock (_stepOpsLock)
+            {
+                WriteTerminalUnlessMuted(
+                    text,
+                    isMuted,
+                    parkCursorAtLiveOrigin ? stepAdapter : null,
+                    epoch,
+                    stepAdapter);
+            }
+        }
+
+        void DropPendingFrame()
+        {
+            synchronizedFrame.Clear();
+            synchronizedFrameOpen = false;
+            synchronizedFrameEpoch = 0;
+        }
+
+        void StartPendingFrame(long epoch)
+        {
+            synchronizedFrame.Clear();
+            synchronizedFrame.Append(SyncUpdateBegin);
+            synchronizedFrameEpoch = epoch;
+            synchronizedFrameOpen = true;
+        }
+
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                var data = await stepAdapter.ReadOutputAsync(ct);
-                if (data.IsEmpty) continue;
-                // Drop frames while the runner has the pump muted (e.g.
-                // during a resize burst or an in-flight commit). Forwarding
-                // them would replay stale-sized or stale-origin content.
-                // The gate is re-checked inside the write lock by
-                // WriteTerminalUnlessMuted, so a frame already in flight when
-                // the mute is set cannot slip through afterwards.
-                WriteTerminalUnlessMuted(Encoding.UTF8.GetString(data.Span), isMuted);
+                var frame = await stepAdapter.ReadOutputFrameAsync(ct);
+                if (frame.Kind == InlineOutputFrameKind.DiscardBoundary)
+                {
+                    // DiscardQueuedOutput may have removed the BSU before the
+                    // pump read it. The typed sentinel makes that invalidation
+                    // visible even when no frame is currently open.
+                    DropPendingFrame();
+                    discardUntilBoundary = true;
+                    continue;
+                }
+
+                var data = frame.Bytes;
+                if (data.Length == 0)
+                {
+                    continue;
+                }
+
+                var text = Encoding.UTF8.GetString(data);
+                var offset = 0;
+                while (offset < text.Length)
+                {
+                    if (discardUntilBoundary)
+                    {
+                        // An epoch change invalidates the whole pending frame.
+                        // Drop its tail until the old ESU, or a fresh BSU that
+                        // can start a new frame, so body bytes never leak through
+                        // the unframed forwarding path.
+                        var begin = text.IndexOf(
+                            SyncUpdateBegin,
+                            offset,
+                            StringComparison.Ordinal);
+                        var discardEnd = text.IndexOf(
+                            SyncUpdateEnd,
+                            offset,
+                            StringComparison.Ordinal);
+                        if (begin < 0 && discardEnd < 0)
+                        {
+                            break;
+                        }
+
+                        if (begin >= 0 && (discardEnd < 0 || begin < discardEnd))
+                        {
+                            discardUntilBoundary = false;
+                            StartPendingFrame(frame.Epoch);
+                            offset = begin + SyncUpdateBegin.Length;
+                            continue;
+                        }
+
+                        discardUntilBoundary = false;
+                        DropPendingFrame();
+                        offset = discardEnd + SyncUpdateEnd.Length;
+                        continue;
+                    }
+
+                    if (!synchronizedFrameOpen)
+                    {
+                        var begin = text.IndexOf(
+                            SyncUpdateBegin,
+                            offset,
+                            StringComparison.Ordinal);
+                        if (begin < 0)
+                        {
+                            Forward(
+                                offset == 0 ? text : text[offset..],
+                                frame.Epoch);
+                            break;
+                        }
+
+                        if (begin > offset)
+                        {
+                            Forward(
+                                offset == 0
+                                    ? text[..begin]
+                                    : text.Substring(offset, begin - offset),
+                                frame.Epoch);
+                        }
+
+                        StartPendingFrame(frame.Epoch);
+                        offset = begin + SyncUpdateBegin.Length;
+                        continue;
+                    }
+
+                    if (frame.Epoch != synchronizedFrameEpoch)
+                    {
+                        DropPendingFrame();
+                        discardUntilBoundary = true;
+                        continue;
+                    }
+
+                    var nextBegin = text.IndexOf(
+                        SyncUpdateBegin,
+                        offset,
+                        StringComparison.Ordinal);
+                    var end = text.IndexOf(
+                        SyncUpdateEnd,
+                        offset,
+                        StringComparison.Ordinal);
+
+                    if (end >= 0 && (nextBegin < 0 || end < nextBegin))
+                    {
+                        var completeLength = end + SyncUpdateEnd.Length - offset;
+                        synchronizedFrame.Append(text.AsSpan(offset, completeLength));
+                        var completeEpoch = synchronizedFrameEpoch;
+                        var complete = synchronizedFrame.ToString();
+                        DropPendingFrame();
+                        Forward(complete, completeEpoch);
+                        offset = end + SyncUpdateEnd.Length;
+                        continue;
+                    }
+
+                    if (nextBegin >= 0)
+                    {
+                        // A new BSU before the pending ESU means the previous
+                        // frame was abandoned (for example, DiscardQueuedLiveOutput
+                        // removed its ESU). Never concatenate stale bytes with
+                        // the fresh frame.
+                        DropPendingFrame();
+                        StartPendingFrame(frame.Epoch);
+                        offset = nextBegin + SyncUpdateBegin.Length;
+                        continue;
+                    }
+
+                    // No boundary in this item: retain the body without copying
+                    // the growing frame. It is materialized only at ESU.
+                    synchronizedFrame.Append(text.AsSpan(offset));
+                    break;
+                }
             }
+            // An incomplete synchronized frame is deliberately not flushed on
+            // cancellation or channel disposal: without ESU it is not a frame.
         }
         catch (OperationCanceledException) { }
     }
 
     /// <summary>
-    /// Pumps input events from the parent adapter to a step adapter.
-    /// Intercepts resize events to recalculate the step position.
+    /// Pumps input events from the parent adapter to the step adapter, with resize handling.
     /// </summary>
     private async Task PumpStepInputAsync(
         InlineStepAdapter stepAdapter,
@@ -1699,6 +2473,8 @@ internal sealed class Hex1bFlowRunner
         private readonly Hex1bApp _app;
         private readonly FlowStepContext _stepContext;
         private readonly System.Runtime.CompilerServices.StrongBox<bool> _muteGate;
+        private readonly LiveAdmissionState _admission;
+        private readonly Func<CancellationToken, Task<bool>> _prepareForCommitAsync;
 
         public LiveStepHandle(
             Hex1bFlowRunner runner,
@@ -1706,7 +2482,9 @@ internal sealed class Hex1bFlowRunner
             InlineStepAdapter stepAdapter,
             Hex1bApp app,
             FlowStepContext stepContext,
-            System.Runtime.CompilerServices.StrongBox<bool> muteGate)
+            System.Runtime.CompilerServices.StrongBox<bool> muteGate,
+            LiveAdmissionState admission,
+            Func<CancellationToken, Task<bool>> prepareForCommitAsync)
         {
             _runner = runner;
             _step = step;
@@ -1714,34 +2492,58 @@ internal sealed class Hex1bFlowRunner
             _app = app;
             _stepContext = stepContext;
             _muteGate = muteGate;
+            _admission = admission;
+            _prepareForCommitAsync = prepareForCommitAsync;
         }
 
-        public int TerminalWidth => _runner._parentAdapter.Width;
+        public int TerminalWidth => _runner.ReadCurrentGeometry().Width;
 
-        public int TerminalHeight => _runner._parentAdapter.Height;
+        public int TerminalHeight => _runner.ReadCurrentGeometry().Height;
+
+        public long ResizeVersion => Interlocked.Read(ref _runner._resizeVersion);
+
+        public bool SupportsCursorObservation => _runner.SupportsCursorObservation;
+
+        public Task<int?> ObserveCursorRowAsync(CancellationToken cancellationToken)
+            => _runner.ObserveCursorRowAsync(cancellationToken);
 
         public int RowOrigin => _stepAdapter.RowOrigin;
 
-        public int ComputeAppendRowAfterReflow(
-            int newWidth,
-            int newHeight,
-            int cursorScreenRow,
-            int cursorColumn,
-            bool cursorBelowContent)
-        {
-            lock (_runner._stepOpsLock)
-            {
-                return FlowResizeMath.ComputeAppendRowAfterReflow(
-                    _runner._initialRowOrigin,
-                    _runner._emittedTombstones,
-                    Math.Max(1, _runner._parentAdapter.Width),
-                    newWidth,
-                    newHeight,
-                    cursorScreenRow,
-                    cursorColumn,
-                    cursorBelowContent);
-            }
-        }
+        public (int Width, int Height) ReadCurrentGeometry()
+            => _runner.ReadCurrentGeometry();
+
+        public (int Width, int Height, long ResizeVersion) ReadFreshGeometryForEmission()
+            => _runner.ReadFreshGeometryForEmission();
+        public void EnsureHistoryCommitSupported() =>
+            _runner.EnsureHistoryCommitSupported();
+
+        /// <summary>
+        /// Prepares the live step for a commit that has already been admitted:
+        /// quiesces the resize machinery, takes the live pump, and — for a host
+        /// that can report its own cursor — replaces the step's tracked origin
+        /// with the row the host says the region is actually on. After this
+        /// returns, <see cref="RowOrigin"/> is the host-current anchor.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Called by the coordinator while <c>IsCommitInFlight</c> is already
+        /// true and before it samples any geometry. Nothing in here runs under a
+        /// monitor while awaiting: the observation is taken outside the step
+        /// locks, in the same shape the resize settle path uses.
+        /// </para>
+        /// <para>
+        /// On success the pump is left muted and the returned value is the mute
+        /// ownership from <em>before</em> admission, so the caller can return the
+        /// pump to its real owner. A host that cannot report a cursor row — and
+        /// cannot be substituted by the flow's scalar reflow model — suspends the
+        /// step's commitment instead of anchoring to a guess; the pump stays
+        /// muted, because nothing may repaint over content whose position cannot
+        /// be stated.
+        /// </para>
+        /// </remarks>
+        /// <returns>The mute ownership from before admission took the pump.</returns>
+        public Task<bool> PrepareForCommitAsync(CancellationToken cancellationToken)
+            => _prepareForCommitAsync(cancellationToken);
 
         public int LiveHeight => Math.Max(1, _step.StepHeight);
 
@@ -1751,7 +2553,9 @@ internal sealed class Hex1bFlowRunner
 
         public void WriteTerminalAt(int row, string text) => _runner.WriteTerminalAt(row, text);
 
-        public IDisposable BeginAtomicTerminalUpdate() => _runner.BeginAtomicTerminalUpdate();
+        public IAtomicTerminalUpdate BeginAtomicTerminalUpdate() => _runner.BeginAtomicTerminalUpdate();
+
+        public void MarkCommittedRow(int row) => _runner.MarkCommittedRow(row);
 
         public void ScrollViewportUp(int rows)
         {
@@ -1780,48 +2584,9 @@ internal sealed class Hex1bFlowRunner
         {
             lock (_runner._stepOpsLock)
             {
-                var terminalHeight = Math.Max(1, _runner._parentAdapter.Height);
-                liveHeight = Math.Clamp(liveHeight, 1, terminalHeight);
-                rowOrigin = Math.Clamp(rowOrigin, 0, Math.Max(0, terminalHeight - liveHeight));
-
-                // Bookkeeping first: the app's next frame is laid out for the
-                // new origin/height, and a resize computation reads these.
-                _runner._cursorRow = rowOrigin;
-                _stepAdapter.RowOrigin = rowOrigin;
-                _step.StepHeight = liveHeight;
-                _step.TerminalWidth = _runner._parentAdapter.Width;
-
-                lock (_runner._terminalWriteLock)
-                {
-                    // 1. Blank every row of the region, so a region that shrank
-                    //    cannot leave orphaned rows behind.
-                    for (var row = 0; row < liveHeight; row++)
-                    {
-                        var absolute = rowOrigin + row;
-                        if (absolute < 0 || absolute >= terminalHeight) continue;
-                        _runner.WriteTerminalUpdate(absolute, "\x1b[2K");
-                    }
-
-                    // 2. Paint the live image with clear-before-content on every
-                    //    row: a row that fills the width keeps its last cell,
-                    //    while a shorter row still erases the previous frame's
-                    //    residue at the right margin. No escape follows the
-                    //    final row — the region's last row can be the terminal's
-                    //    bottom row, where a trailing newline would scroll the
-                    //    buffer and lift the content above it.
-                    var paintRows = Math.Min(liveHeight, Math.Max(1, liveSurface.Height));
-                    for (var row = 0; row < paintRows; row++)
-                    {
-                        var absolute = rowOrigin + row;
-                        if (absolute < 0 || absolute >= terminalHeight) continue;
-                        _runner.WriteTerminalUpdate(
-                            absolute,
-                            SoftWrapEmitter.OrderedRowPrefix + SoftWrapEmitter.RenderRowText(liveSurface, row));
-                    }
-
-                    // 3. Leave the cursor at the region's top-left.
-                    _runner.SetTerminalCursorRow(rowOrigin);
-                }
+                var painted = _runner.ReanchorLiveRegion(_stepAdapter, rowOrigin, liveHeight, liveSurface);
+                _step.StepHeight = painted.LiveHeight;
+                _step.TerminalWidth = _runner.ReadCurrentGeometry().Width;
             }
         }
 
@@ -1841,13 +2606,39 @@ internal sealed class Hex1bFlowRunner
             }
         }
 
-        public int DiscardQueuedLiveOutput() => _stepAdapter.DiscardQueuedOutput();
+        public int DiscardQueuedLiveOutput()
+        {
+            lock (_runner._stepOpsLock)
+            {
+                return _stepAdapter.DiscardQueuedOutput();
+            }
+        }
 
         public void ResizeLive(int width, int liveHeight)
         {
             // Always push the resize: the inner app treats it as a re-render
             // trigger, and the region must repaint at the settled geometry.
-            _ = _stepAdapter.ResizeAsync(Math.Max(1, width), Math.Max(1, liveHeight));
+            lock (_runner._stepOpsLock)
+            {
+                _ = _stepAdapter.ResizeAsync(
+                    Math.Max(1, width), Math.Max(1, liveHeight));
+            }
+        }
+
+        public void ResizeLiveToTerminalGeometry(int width, int terminalHeight)
+        {
+            var stepHeight = Math.Clamp(
+                _step.StepHeight,
+                1,
+                Math.Max(1, terminalHeight));
+            lock (_runner._stepOpsLock)
+            {
+                _step.TerminalWidth = Math.Max(1, width);
+                _step.StepHeight = stepHeight;
+                _ = _stepAdapter.ResizeAsync(
+                    Math.Max(1, width),
+                    Math.Max(1, stepHeight));
+            }
         }
 
         public void ApplyLiveLayout(Func<FlowStepContext, Task<Hex1bWidget>> builder)
@@ -1864,54 +2655,34 @@ internal sealed class Hex1bFlowRunner
         public bool SetLiveOutputMuted(bool muted)
         {
             var previous = System.Threading.Volatile.Read(ref _muteGate.Value);
+            if (muted && System.Threading.Volatile.Read(ref _admission.MuteTaken))
+            {
+                // Admission already took the pump. Its mute is not the caller's
+                // ownership, so report the state from before admission: an
+                // end-of-commit unmute then returns the pump to its real owner
+                // instead of echoing the commit's own mute back at it. The
+                // caller's idempotent mute still lands.
+                System.Threading.Volatile.Write(ref _admission.MuteTaken, false);
+                previous = System.Threading.Volatile.Read(ref _admission.PriorMute);
+            }
+
             System.Threading.Volatile.Write(ref _muteGate.Value, muted);
+            if (!muted)
+            {
+                // Resuming the pump also lifts the admission-time frame gate:
+                // from here the commit is finished with the live region and the
+                // next frame is laid out for it.
+                System.Threading.Volatile.Write(ref _admission.ResumeGranted, true);
+            }
+
             return previous;
         }
 
-        public async Task<bool> WaitForNextLiveFrameAsync(
+        public Task<bool> WaitForLiveFrameAfterAsync(
+            long afterFrame,
             TimeSpan timeout,
             CancellationToken cancellationToken)
-        {
-            // A frame completed before this call does not satisfy the wait: the
-            // caller needs a frame produced after it changed what the app
-            // should render.
-            var target = _app.FrameCount + 1;
-            var completion = new TaskCompletionSource<bool>(
-                TaskCreationOptions.RunContinuationsAsynchronously);
-
-            void OnFrameRendered()
-            {
-                if (_app.FrameCount >= target)
-                {
-                    completion.TrySetResult(true);
-                }
-            }
-
-            _app.FrameRendered += OnFrameRendered;
-            try
-            {
-                if (_app.FrameCount >= target)
-                {
-                    return true;
-                }
-
-                using var timeoutCts =
-                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                var delay = Task.Delay(timeout, timeoutCts.Token);
-                var finished = await Task.WhenAny(completion.Task, delay).ConfigureAwait(false);
-                if (finished == completion.Task)
-                {
-                    await timeoutCts.CancelAsync().ConfigureAwait(false);
-                    return true;
-                }
-
-                return false;
-            }
-            finally
-            {
-                _app.FrameRendered -= OnFrameRendered;
-            }
-        }
+            => Hex1bFlowRunner.WaitForFrameAfterAsync(_app, afterFrame, timeout, cancellationToken);
 
         public void RecordCommitEvent(string message) => Hex1bFlowRunner.RecordCommitEvent(message);
     }
@@ -1926,6 +2697,13 @@ public sealed class Hex1bFlowOptions
     /// Theme for all steps and full-screen apps in the flow.
     /// </summary>
     public Hex1bTheme? Theme { get; set; }
+
+    /// <summary>
+    /// Presentation-owned host profile provider. The builder binds this to a
+    /// lazy source so a profile is read only after the presentation's startup
+    /// capability probe has completed.
+    /// </summary>
+    internal Func<FlowTerminalHostProfile>? HostProfileProvider { get; set; }
 
     /// <summary>
     /// Whether to enable mouse input for full-screen steps.
@@ -1992,61 +2770,19 @@ public sealed class Hex1bFlowOptions
     public bool UseSoftWrapTombstones { get; set; }
 
     /// <summary>
-    /// Quiet window required after the last <c>Hex1bResizeEvent</c> before
-    /// the runner re-renders the active step at the new size. When
-    /// <c>null</c> (the default), the runner repaints eagerly on every
-    /// resize event — today's behaviour. When set, the runner enters a
-    /// two-phase resize mode: every resize event performs a cheap
-    /// "track-and-clear" pass (recompute where the active step should
-    /// land at the new width, move the cursor there, and erase the region
-    /// below), and only after the terminal has been idle for the settle
-    /// delay does the inner step app re-render.
+    /// Optional quiet window after the last <c>Hex1bResizeEvent</c> used only
+    /// for final resize cleanup. Every resize still publishes the current
+    /// geometry and repaints the live prompt immediately; this delay does not
+    /// debounce prompt visibility or hold the live region blank.
+    /// When <c>null</c> (the default), the resize path restores its transient
+    /// ownership as soon as the immediate repaint completes.
     /// </summary>
     /// <remarks>
     /// Only takes effect when <see cref="UseSoftWrapTombstones"/> is also
-    /// <c>true</c>: the track-and-clear pass relies on tombstones above
-    /// the active step being hard-newline-terminated paragraphs that the
-    /// host terminal will not reflow across paragraph boundaries.
-    /// Recommended value: 50–100 ms.
+    /// <c>true</c>: the cleanup path relies on tombstones above the active step
+    /// being hard-newline-terminated paragraphs that the host terminal will not
+    /// reflow across paragraph boundaries. Recommended value: 50–100 ms.
     /// </remarks>
     public TimeSpan? ResizeSettleDelay { get; set; }
 
-    /// <summary>
-    /// Optional widget builder emitted as a one-off hard-newline tombstone
-    /// <em>above</em> the repainted step after the resize has settled, but
-    /// only when the final dimensions differ from the dimensions at the
-    /// start of the settle window. Intended for a faint
-    /// "─── terminal resized ───" breadcrumb. When <c>null</c> (the
-    /// default), no marker is emitted.
-    /// </summary>
-    /// <remarks>
-    /// <para>Has no effect when <see cref="ResizeSettleDelay"/> is <c>null</c>.</para>
-    /// <para>
-    /// Sync-only by design: the runner invokes this builder from a render-time
-    /// critical section that cannot <c>await</c>. Build the widget from
-    /// already-resolved state and rely on the rest of the flow API's async
-    /// surface for IO-bearing work.
-    /// </para>
-    /// </remarks>
-    public Func<RootContext, Hex1bWidget>? ResizeMarker { get; set; }
-
-    /// <summary>
-    /// Optional widget builder rendered in place of the active step's
-    /// content during a drag-resize burst. The placeholder is drawn at
-    /// each per-event tick into the active rectangle and is then replaced
-    /// by the actual repainted step at settle. Use a deliberately tiny
-    /// widget (a single short line is ideal) so it fits inside even an
-    /// aggressively shrunken viewport. When <c>null</c> (the default),
-    /// the active rectangle simply stays cleared during the drag.
-    /// </summary>
-    /// <remarks>
-    /// <para>Has no effect when <see cref="ResizeSettleDelay"/> is <c>null</c>.</para>
-    /// <para>
-    /// Sync-only by design: the runner invokes this builder per resize event
-    /// from a critical section that cannot <c>await</c>. Build the widget
-    /// from already-resolved state and rely on the rest of the flow API's
-    /// async surface for IO-bearing work.
-    /// </para>
-    /// </remarks>
-    public Func<RootContext, Hex1bWidget>? ResizePlaceholder { get; set; }
 }

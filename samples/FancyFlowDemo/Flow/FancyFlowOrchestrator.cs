@@ -93,23 +93,12 @@ internal static class FancyFlowOrchestrator
                 {
                     options.InitialCursorRow = cursorRow;
 
-                    // Emit completed steps as soft-wrap tombstones (proper
-                    // logical lines that the host terminal reflows) and
-                    // turn on the track-and-clear settle-based resize
-                    // pipeline. Without this flag the runner falls back
-                    // to the legacy eager-repaint resize path which
-                    // re-emits the active step on every resize event —
-                    // catastrophic during a drag-resize burst.
+                    // Emit completed steps as soft-wrap tombstones so the host
+                    // terminal can reflow logical lines during resize. The
+                    // runner repaints the live prompt immediately on each
+                    // resize; this delay only bounds final cleanup ownership.
                     options.UseSoftWrapTombstones = true;
-
-                    // Hold the live step still during interactive drag-resize.
-                    // The runner tracks cursor position internally on every
-                    // resize event but does not mutate the screen — letting
-                    // the host terminal's own reflow keep the tombstones
-                    // above the active step intact. The actual repaint of
-                    // the live step is debounced until events settle.
                     options.ResizeSettleDelay = TimeSpan.FromMilliseconds(80);
-                    options.ResizePlaceholder = BuildResizePlaceholder;
                 })
                 .Build()
                 .RunAsync();
@@ -122,25 +111,6 @@ internal static class FancyFlowOrchestrator
             // more to do — the inline tombstone is the final word.
         }
     }
-
-    /// <summary>
-    /// Rendered in the active step's rectangle during a resize burst,
-    /// replaced by the real prompt as soon as events settle. A single
-    /// muted-grey line keeps the visible footprint minimal and fits
-    /// inside even an aggressively shrunken terminal.
-    /// </summary>
-    private static Hex1b.Widgets.Hex1bWidget BuildResizePlaceholder(RootContext ctx) =>
-        ctx.HStack(h =>
-        [
-            h.Text(" "),
-            h.ThemePanel(
-                t => t.Set(GlobalTheme.ForegroundColor, TemplatePromptWidget.BarColor),
-                h.Text(TemplatePromptWidget.BarChar)),
-            h.Text("  "),
-            h.ThemePanel(
-                t => t.Set(GlobalTheme.ForegroundColor, TemplatePromptWidget.MutedColor),
-                h.Text("Resizing…")),
-        ]);
 
 
     private static Task RunStepAsync(

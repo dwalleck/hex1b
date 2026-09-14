@@ -1,9 +1,9 @@
 using System.Runtime.InteropServices;
 using System.Text;
+using Hex1b.Flow;
 using Hex1b.Input;
 using Hex1b.Reflow;
 using Hex1b.Sixel;
-
 namespace Hex1b;
 
 /// <summary>
@@ -16,7 +16,10 @@ namespace Hex1b;
 public sealed class ConsolePresentationAdapter :
     IHex1bTerminalPresentationAdapter,
     ITerminalReflowProvider,
-    IInternalTerminalReflowProvider
+    IInternalTerminalReflowProvider,
+    ICursorPositionSource,
+    IFlowTerminalHostProfileSource,
+    IFlowCurrentGeometrySource
 {
     private const uint KgpProbeImageId = 2147483647u;
     private static readonly byte[] KgpProbeQuery = Encoding.ASCII.GetBytes(
@@ -39,6 +42,33 @@ public sealed class ConsolePresentationAdapter :
     private static readonly byte[] Csi18ProbeQuery = Encoding.ASCII.GetBytes("\x1b[18t");
     private static readonly byte[] Osc1337CellSizeProbeQuery = Encoding.ASCII.GetBytes("\x1b]1337;ReportCellSize\x1b\\");
 
+    // DSR 6 (Cursor Position Report). Plain CPR is the only cursor query Ghostty
+    // implements (ghostty src/terminal/device_status.zig registers cursor_position
+    // with question=false), and Windows conhost/ConPTY documents only this form —
+    // it additionally answers out of band through TryGetCursorPosition, so no DSR is
+    // sent there at all. DECXCPR (CSI ?6n) is therefore not usable: on Ghostty it is
+    // silently ignored, which would turn every observation into a timeout.
+    // XTVERSION is queried in the same startup read pass as the other
+    // capabilities. There is one stdin owner: after this probe completes,
+    // normal input and cursor observations use the existing reader.
+    private static readonly byte[] XtVersionProbeQuery = Encoding.ASCII.GetBytes("\x1b[>0q");
+    private static readonly byte[] CursorPositionQuery = Encoding.ASCII.GetBytes("\x1b[6n");
+
+    // How long the reader waits for a reply once it has written the query.
+    private static readonly TimeSpan CursorPositionReplyTimeout = TimeSpan.FromMilliseconds(150);
+
+    // How long the caller waits for the reader to finish a request. Deliberately
+    // longer than the reply timeout so the reader's own outcome wins the race when
+    // the reader is running at all; if no reader ever services the request (for
+    // example the terminal has not started), the observation fails deterministically
+    // with null rather than hanging.
+    private static readonly TimeSpan CursorObservationTimeout = TimeSpan.FromMilliseconds(250);
+
+    // Upper bound on bytes accepted while a reply is pending, so a paste arriving
+    // during the window cannot grow the buffer without bound. Anything buffered is
+    // preserved on exit, so nothing is lost when the cap is hit.
+    private const int MaxCursorObservationBufferedBytes = 4096;
+
     // A cell dimension above this is treated as implausible/overflow garbage
     // rather than a real (if unusual) HiDPI or legacy display value. Real
     // terminals report single-digit-to-low-double-digit pixel cells; this bound
@@ -53,6 +83,25 @@ public sealed class ConsolePresentationAdapter :
     private ITerminalReflowProvider _reflowStrategy;
     private TerminalCapabilities _capabilities;
     private byte[] _prefetchedInput = [];
+
+    // Serializes driver writes. The rendering path (WriteOutputAsync) and a cursor
+    // query both write to the same fd; UnixConsoleDriver.Write is a multi-write() loop,
+    // so without this a 4-byte query can land inside a partially written frame.
+    private readonly object _driverWriteSync = new();
+
+    // Cursor-observation request plumbing. All of these are guarded by
+    // _cursorObservationSync. The gate task serializes overlapping callers; the
+    // pending request is picked up by the input reader on its next pass; the wake
+    // source cancels a reader parked in a blocking read so it notices promptly.
+    private readonly object _cursorObservationSync = new();
+    private CursorObservationRequest? _pendingCursorObservation;
+    private CancellationTokenSource? _activeReadWakeCts;
+    private Task _cursorObservationGate = Task.CompletedTask;
+
+    // Completes when the capability probe's direct driver reads are done. A cursor
+    // query waits for this so two readers never race for the reply on the same fd.
+    private readonly TaskCompletionSource _probeReadCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Encoding? _inputEncoding;
     private Decoder? _inputDecoder;
     private bool _kgpProbeCompleted;
@@ -63,6 +112,7 @@ public sealed class ConsolePresentationAdapter :
     private SixelPresentationSupport? _declaredSixelSupport;
     private Sixel.SixelCellMetrics? _declaredSixelMetrics;
     private SixelCapabilityProbeDiagnostics _sixelDiagnostics = SixelCapabilityProbeDiagnostics.NotProbed;
+    private FlowTerminalHostProfile _flowHostProfile;
 
     /// <summary>
     /// Creates a new console presentation adapter with raw mode support.
@@ -92,7 +142,7 @@ public sealed class ConsolePresentationAdapter :
         _preserveOPost = preserveOPost;
         _kgpProbeTimeout = kgpProbeTimeout ?? DefaultKgpProbeTimeout;
         _capabilities = CreateCapabilities(supportsKgp: false);
-        
+
         // Wire up resize events. A resize invalidates only derived cell metrics
         // (computed from window-pixel-size / grid-size reports, which change
         // with a resize); authoritative/declared metrics reflect font geometry
@@ -103,10 +153,11 @@ public sealed class ConsolePresentationAdapter :
             InvalidateDerivedSixelMetricsOnResize();
             Resized?.Invoke(w, h);
         };
-        
+
         // Auto-detect terminal emulator reflow strategy (not enabled by default)
         _reflowStrategy = DetectReflowStrategy();
     }
+    FlowTerminalHostProfile IFlowTerminalHostProfileSource.FlowHostProfile => _flowHostProfile;
 
     /// <summary>
     /// Declares Sixel support and, optionally, protocol cell metrics directly,
@@ -240,6 +291,8 @@ public sealed class ConsolePresentationAdapter :
 
     /// <inheritdoc />
     public int Height => _driver.Height;
+    (int Width, int Height) IFlowCurrentGeometrySource.ReadCurrentGeometry() =>
+        (_driver.Width, _driver.Height);
 
     /// <inheritdoc />
     public TerminalCapabilities Capabilities => _capabilities;
@@ -295,8 +348,12 @@ public sealed class ConsolePresentationAdapter :
     {
         if (_disposed) return ValueTask.CompletedTask;
 
-        _driver.Write(data.Span);
-        _driver.Flush();
+        lock (_driverWriteSync)
+        {
+            _driver.Write(data.Span);
+            _driver.Flush();
+        }
+
         return ValueTask.CompletedTask;
     }
 
@@ -306,45 +363,458 @@ public sealed class ConsolePresentationAdapter :
         if (_disposed) return ReadOnlyMemory<byte>.Empty;
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _disposeCts.Token);
-        
+
         var buffer = new byte[256];
-        
+
         try
         {
-            if (_prefetchedInput.Length > 0)
+            while (true)
             {
-                var prefetched = _prefetchedInput;
-                _prefetchedInput = [];
-                var result = NormalizeInputToUtf8(prefetched);
-                if (!result.IsEmpty)
+                if (linkedCts.Token.IsCancellationRequested)
                 {
-                    return result;
+                    return ReadOnlyMemory<byte>.Empty;
                 }
-            }
 
-            while (!linkedCts.Token.IsCancellationRequested)
-            {
-                var bytesRead = await _driver.ReadAsync(buffer, linkedCts.Token);
+                if (_prefetchedInput.Length > 0)
+                {
+                    var prefetched = _prefetchedInput;
+                    _prefetchedInput = [];
+                    var result = NormalizeInputToUtf8(prefetched);
+                    if (!result.IsEmpty)
+                    {
+                        return result;
+                    }
+                    // Bytes completed no character (for example a split multibyte
+                    // sequence); keep reading until we have something to deliver.
+                    continue;
+                }
+
+                // A pending native cursor observation is serviced here, on the reader
+                // that already owns stdin. Opening a second reader on fd 0 would
+                // compete with this one and deadlock.
+                var observation = TakePendingCursorObservation();
+                if (observation is not null)
+                {
+                    await ServiceCursorPositionObservationAsync(observation, linkedCts.Token).ConfigureAwait(false);
+
+                    // Never return empty for a query-only iteration: the terminal
+                    // treats an empty read as EOF and stops the presentation reader.
+                    continue;
+                }
+
+                var wakeCts = new CancellationTokenSource();
+                int bytesRead;
+                bool woken;
+                try
+                {
+                    bytesRead = await ReadWithWakeAsync(buffer, linkedCts.Token, wakeCts).ConfigureAwait(false);
+                    woken = wakeCts.IsCancellationRequested;
+                }
+                finally
+                {
+                    ClearReadWake(wakeCts);
+                    wakeCts.Dispose();
+                }
 
                 if (bytesRead == 0)
                 {
+                    if (linkedCts.Token.IsCancellationRequested)
+                    {
+                        return ReadOnlyMemory<byte>.Empty;
+                    }
+
+                    // A wake (cancellation of the read's wake source) means an
+                    // observation was posted while we were blocked; service it on the
+                    // next pass instead of reporting EOF.
+                    if (woken)
+                    {
+                        continue;
+                    }
+
                     // EOF or cancelled
                     return ReadOnlyMemory<byte>.Empty;
                 }
 
-                var result = NormalizeInputToUtf8(buffer.AsSpan(0, bytesRead));
-                if (!result.IsEmpty)
+                var normalized = NormalizeInputToUtf8(buffer.AsSpan(0, bytesRead));
+                if (!normalized.IsEmpty)
                 {
-                    return result;
+                    return normalized;
                 }
             }
-
-            return ReadOnlyMemory<byte>.Empty;
         }
         catch (OperationCanceledException)
         {
             return ReadOnlyMemory<byte>.Empty;
         }
+    }
+
+    /// <summary>
+    /// Performs one blocking read while publishing a wake source that a posted cursor
+    /// observation can cancel, so the reader does not have to wait for the next
+    /// keystroke before it notices the request.
+    /// </summary>
+    private async ValueTask<int> ReadWithWakeAsync(byte[] buffer, CancellationToken ct, CancellationTokenSource wakeCts)
+    {
+        PublishReadWake(wakeCts);
+
+        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct, wakeCts.Token);
+        try
+        {
+            return await _driver.ReadAsync(buffer, readCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return 0;
+        }
+    }
+
+    private void PublishReadWake(CancellationTokenSource wakeCts)
+    {
+        bool observationPending;
+        lock (_cursorObservationSync)
+        {
+            _activeReadWakeCts = wakeCts;
+            observationPending = _pendingCursorObservation is not null;
+        }
+
+        if (observationPending)
+        {
+            wakeCts.Cancel();
+        }
+    }
+
+    private void ClearReadWake(CancellationTokenSource wakeCts)
+    {
+        lock (_cursorObservationSync)
+        {
+            if (ReferenceEquals(_activeReadWakeCts, wakeCts))
+            {
+                _activeReadWakeCts = null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Cancels a reader's wake source, tolerating the race where the reader retired
+    /// (and disposed) it between our read of the field and this call. In that case the
+    /// reader's next pass publishes a fresh source and sees the pending request.
+    /// </summary>
+    private static void TryCancelWake(CancellationTokenSource? wake)
+    {
+        if (wake is null)
+        {
+            return;
+        }
+
+        try
+        {
+            wake.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
+    private CursorObservationRequest? TakePendingCursorObservation()
+    {
+        lock (_cursorObservationSync)
+        {
+            var request = _pendingCursorObservation;
+            _pendingCursorObservation = null;
+            return request;
+        }
+    }
+
+    /// <summary>
+    /// Writes the cursor-position query and reads the reply on the input reader,
+    /// bounded by <see cref="CursorPositionReplyTimeout"/>. Any byte that is not an
+    /// accepted report — including text typed during the window, a partial sequence,
+    /// and an ambiguous modified-F3-shaped sequence — is preserved and re-delivered
+    /// through the normal input path.
+    /// </summary>
+    private async ValueTask ServiceCursorPositionObservationAsync(
+        CursorObservationRequest request,
+        CancellationToken ct)
+    {
+        if (request.IsCompleted)
+        {
+            return;
+        }
+
+        var buffered = new List<byte>();
+        var readBuffer = new byte[64];
+
+        // The caller already linked its token to the adapter's disposal, so link only
+        // to that: touching _disposeCts here could race its disposal during shutdown.
+        using var replyCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        replyCts.CancelAfter(CursorPositionReplyTimeout);
+
+        try
+        {
+            if (_disposed || ct.IsCancellationRequested)
+            {
+                return;
+            }
+
+            // Never issue the query while the capability probe may still be reading
+            // the driver: the two would race for the reply on the same fd. Bounded by
+            // the reply deadline above, so it fails as an unobserved position rather
+            // than stalling.
+            if (_inRawMode)
+            {
+                await _probeReadCompleted.Task.WaitAsync(replyCts.Token).ConfigureAwait(false);
+            }
+
+            // Written straight to the driver, not through the workload output path:
+            // the terminal would answer that from its own model, and the reply would
+            // never be ours. The write lock keeps it from splitting a live frame the
+            // output pump is concurrently writing.
+            lock (_driverWriteSync)
+            {
+                _driver.Write(CursorPositionQuery);
+                _driver.Flush();
+            }
+
+            while (!replyCts.IsCancellationRequested)
+            {
+                var bytesRead = await _driver.ReadAsync(readBuffer, replyCts.Token).ConfigureAwait(false);
+                if (bytesRead <= 0)
+                {
+                    break;
+                }
+
+                buffered.AddRange(readBuffer.AsSpan(0, bytesRead).ToArray());
+
+                if (TryConsumeCursorPositionReport(buffered, out var column, out var row))
+                {
+                    request.TrySetResult((column, row));
+                    break;
+                }
+
+                if (buffered.Count > MaxCursorObservationBufferedBytes)
+                {
+                    break;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Bounded deadline (or shutdown) reached before a usable report arrived.
+        }
+        catch (ObjectDisposedException)
+        {
+            // Shutdown raced the observation; fall through to the null result.
+        }
+        finally
+        {
+            // A no-op when a report already completed the request.
+            request.TrySetResult(null);
+
+            if (buffered.Count > 0)
+            {
+                AppendPrefetchedInput(CollectionsMarshal.AsSpan(buffered));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Scans the buffered input for a Cursor Position Report of the form
+    /// <c>CSI row ; column R</c> and, when found, removes it and converts both
+    /// parameters to 0-based values.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Only reports arriving inside a pending query window are ever scanned, so
+    /// ordinary input is untouched whenever no observation is outstanding.
+    /// </para>
+    /// <para>
+    /// The one overlap with real input is xterm's modified F1-F4 encoding:
+    /// <c>CSI 1;2..16 R</c> is both a plausible CPR (cursor at row 1, column 2..16)
+    /// and, per <see cref="Hex1b.Tokens.AnsiTokenizer"/>, Shift..modifier F3. A sequence in
+    /// that shape is deliberately NOT consumed: the query simply times out with a
+    /// <see langword="null"/> observation (the position cannot be observed without
+    /// guessing) and the bytes pass through unchanged, so a modified F3 is never
+    /// silently swallowed. Callers that need to observe a cursor parked at column 0
+    /// are unaffected, because the expected report there is <c>CSI row;1R</c>.
+    /// </para>
+    /// </remarks>
+    private static bool TryConsumeCursorPositionReport(List<byte> buffer, out int column, out int row)
+    {
+        column = 0;
+        row = 0;
+
+        var span = CollectionsMarshal.AsSpan(buffer);
+        for (var start = 0; start <= span.Length - 4; start++)
+        {
+            if (span[start] != 0x1b || span[start + 1] != (byte)'[')
+            {
+                continue;
+            }
+
+            var scanStart = start + 2;
+            if (scanStart >= span.Length || span[scanStart] < (byte)'0' || span[scanStart] > (byte)'9')
+            {
+                continue; // A private-parameter or otherwise non-numeric CSI is not a CPR.
+            }
+
+            var end = -1;
+            for (var i = scanStart; i < span.Length; i++)
+            {
+                var b = span[i];
+                if (b == (byte)'R')
+                {
+                    end = i;
+                    break;
+                }
+                if (b != (byte)';' && (b < (byte)'0' || b > (byte)'9'))
+                {
+                    break; // Not a CPR (for example CSI 3 ~ for Delete).
+                }
+            }
+
+            if (end < 0)
+            {
+                continue; // Not a complete CPR yet.
+            }
+
+            var parameters = Encoding.ASCII.GetString(span[scanStart..end]);
+            var parts = parameters.Split(';');
+            if (parts.Length != 2 ||
+                !int.TryParse(parts[0], out var reportRow) ||
+                !int.TryParse(parts[1], out var reportColumn))
+            {
+                continue; // Not a two-parameter CPR; leave it untouched.
+            }
+
+            if (IsAmbiguousWithModifiedFunctionKey(reportRow, reportColumn))
+            {
+                continue; // Preserve it: it may be a real Shift..modifier F3.
+            }
+
+            buffer.RemoveRange(start, end + 1 - start);
+            row = Math.Max(reportRow - 1, 0);
+            column = Math.Max(reportColumn - 1, 0);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Whether a CPR-shaped report collides with the xterm modified-F1-F4 encoding the
+    /// tokenizer maps to F3 (<c>CSI 1;mod R</c> with <c>mod</c> in 2..16). Such a report
+    /// cannot be consumed as an observation without risking a real key press.
+    /// </summary>
+    private static bool IsAmbiguousWithModifiedFunctionKey(int reportRow, int reportColumn) =>
+        reportRow == 1 && reportColumn is >= 2 and <= 16;
+
+    /// <summary>
+    /// Observes the attached terminal's cursor position. Prefers an out-of-band
+    /// platform query (Windows) and otherwise asks the input reader to issue and
+    /// filter a DSR reply.
+    /// </summary>
+    async Task<(int Column, int Row)?> ICursorPositionSource.ObserveCursorPositionAsync(
+        CancellationToken cancellationToken)
+    {
+        if (_disposed)
+        {
+            return null;
+        }
+
+        // Out-of-band platforms answer without touching stdin at all.
+        if (_driver.TryGetCursorPosition(out var column, out var row))
+        {
+            return (column, row);
+        }
+
+        var gate = await EnterCursorObservationGateAsync(cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            if (_disposed)
+            {
+                return null;
+            }
+
+            var request = new CursorObservationRequest();
+
+            using var timeoutCts = new CancellationTokenSource(CursorObservationTimeout);
+            using var timeoutRegistration = timeoutCts.Token.Register(
+                static state => ((CursorObservationRequest)state!).TrySetResult(null), request);
+            using var cancellationRegistration = cancellationToken.Register(
+                static state => ((CursorObservationRequest)state!).TrySetCanceled(), request);
+
+            CancellationTokenSource? wake;
+            lock (_cursorObservationSync)
+            {
+                _pendingCursorObservation = request;
+                wake = _activeReadWakeCts;
+            }
+
+            // Nudge a reader parked in a blocking read so it notices the request
+            // promptly instead of waiting for the next keystroke.
+            TryCancelWake(wake);
+
+            return await request.Completion.ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_cursorObservationSync)
+            {
+                _pendingCursorObservation = null;
+            }
+
+            gate.TrySetResult();
+        }
+    }
+
+    /// <summary>
+    /// Serializes observations: one query window is in flight at a time, because the
+    /// reader services exactly one pending request per pass. Returns the gate the
+    /// caller must complete (in a <c>finally</c>).
+    /// </summary>
+    private async Task<TaskCompletionSource> EnterCursorObservationGateAsync(CancellationToken cancellationToken)
+    {
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Task predecessor;
+        lock (_cursorObservationSync)
+        {
+            predecessor = _cursorObservationGate;
+            _cursorObservationGate = gate.Task;
+        }
+
+        try
+        {
+            await predecessor.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return gate;
+        }
+        catch
+        {
+            // Never strand the queue: release our own slot even though we never ran,
+            // then surface the failure (cancellation included) to the caller.
+            gate.TrySetResult();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// A single in-flight cursor observation: completed by the input reader with the
+    /// decoded position, by the deadline with <see langword="null"/>, or by caller
+    /// cancellation.
+    /// </summary>
+    private sealed class CursorObservationRequest
+    {
+        private readonly TaskCompletionSource<(int Column, int Row)?> _completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<(int Column, int Row)?> Completion => _completion.Task;
+
+        public bool IsCompleted => _completion.Task.IsCompleted;
+
+        public void TrySetResult((int Column, int Row)? position) => _completion.TrySetResult(position);
+
+        public void TrySetCanceled() => _completion.TrySetCanceled();
     }
 
     private ReadOnlyMemory<byte> NormalizeInputToUtf8(ReadOnlySpan<byte> input)
@@ -400,16 +870,26 @@ public sealed class ConsolePresentationAdapter :
     }
 
     /// <inheritdoc />
-    public ValueTask EnterRawModeAsync(CancellationToken ct = default)
+    public async ValueTask EnterRawModeAsync(CancellationToken ct = default)
     {
-        if (_inRawMode) return ValueTask.CompletedTask;
+        if (_inRawMode) return;
         _inRawMode = true;
 
         // Enter raw mode for proper input capture
         // No escape sequences - screen mode is controlled by the workload
         _driver.EnterRawMode(_preserveOPost);
 
-        return ProbeCapabilitiesAsync(ct);
+        try
+        {
+            await ProbeCapabilitiesAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            // The probe reads the driver directly. Until it finishes, a cursor query
+            // must not issue its own reads, or the two readers would race for the
+            // reply on the same fd (see ServiceCursorPositionObservationAsync).
+            _probeReadCompleted.TrySetResult();
+        }
     }
 
     /// <inheritdoc />
@@ -445,6 +925,10 @@ public sealed class ConsolePresentationAdapter :
         // Windows unless declared directly via WithSixelSupport.
         if (_driver is WindowsConsoleDriver)
         {
+            // Windows console input records do not expose the startup DCS
+            // response stream, so it is an explicitly supported repaint path,
+            // not a Ghostty-qualified mark path.
+            _flowHostProfile = FlowTerminalHostProfile.WindowsConsole;
             if (_declaredSixelSupport is null)
             {
                 const string reason = "Windows console driver does not support Sixel capability probing.";
@@ -469,20 +953,25 @@ public sealed class ConsolePresentationAdapter :
 
         var sixelProbeNeeded = _declaredSixelSupport is null;
 
-        _driver.Write(KgpProbeQuery);
-        // Piggyback an OSC 11 background-colour query, and (unless Sixel support was
-        // already declared directly) the Sixel discovery queries, on the same bounded
-        // probe pass rather than opening a second competing reader.
-        _driver.Write(BackgroundProbeQuery);
-        if (sixelProbeNeeded)
+        lock (_driverWriteSync)
         {
-            _driver.Write(Da1ProbeQuery);
-            _driver.Write(Csi16ProbeQuery);
-            _driver.Write(Csi14ProbeQuery);
-            _driver.Write(Csi18ProbeQuery);
-            _driver.Write(Osc1337CellSizeProbeQuery);
+            _driver.Write(KgpProbeQuery);
+            // Piggyback an OSC 11 background-colour query, the XTVERSION
+            // identity probe, and (unless Sixel support was already declared
+            // directly) the Sixel discovery queries on the same bounded pass.
+            // Opening another reader after startup would race the input pump.
+            _driver.Write(BackgroundProbeQuery);
+            _driver.Write(XtVersionProbeQuery);
+            if (sixelProbeNeeded)
+            {
+                _driver.Write(Da1ProbeQuery);
+                _driver.Write(Csi16ProbeQuery);
+                _driver.Write(Csi14ProbeQuery);
+                _driver.Write(Csi18ProbeQuery);
+                _driver.Write(Osc1337CellSizeProbeQuery);
+            }
+            _driver.Flush();
         }
-        _driver.Flush();
 
         var bufferedInput = new List<byte>();
         var readBuffer = new byte[256];
@@ -507,6 +996,9 @@ public sealed class ConsolePresentationAdapter :
         var osc1337Done = !sixelProbeNeeded;
         var osc1337Malformed = false;
 
+        string? xtVersion = null;
+        var xtVersionDone = false;
+
         using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _disposeCts.Token);
         probeCts.CancelAfter(_kgpProbeTimeout);
 
@@ -519,6 +1011,12 @@ public sealed class ConsolePresentationAdapter :
                     break;
 
                 bufferedInput.AddRange(readBuffer.AsSpan(0, bytesRead).ToArray());
+                if (!xtVersionDone &&
+                    TryConsumeXtVersionResponse(bufferedInput, out var version))
+                {
+                    xtVersion = version;
+                    xtVersionDone = true;
+                }
 
                 if (TryConsumeKgpProbeResponse(bufferedInput, KgpProbeImageId))
                 {
@@ -575,6 +1073,7 @@ public sealed class ConsolePresentationAdapter :
                 }
 
                 if (_capabilities.SupportsKgp && _backgroundProbeCompleted &&
+                    xtVersionDone &&
                     da1Done && csi16Done && csi14Done && csi18Done && osc1337Done)
                     break;
             }
@@ -595,6 +1094,8 @@ public sealed class ConsolePresentationAdapter :
                     csi18Done, csi18Malformed, csi18);
             }
 
+            _flowHostProfile = ClassifyFlowHostProfile(xtVersion);
+
             if (bufferedInput.Count > 0)
             {
                 AppendPrefetchedInput(CollectionsMarshal.AsSpan(bufferedInput));
@@ -606,17 +1107,95 @@ public sealed class ConsolePresentationAdapter :
 
     private static bool IsPlausibleCellDimension(double value) =>
         double.IsFinite(value) && value > 0 && value <= MaxPlausibleCellDimension;
+    private static FlowTerminalHostProfile ClassifyFlowHostProfile(string? xtVersion)
+    {
+        if (string.Equals(xtVersion, "ghostty 1.3.1", StringComparison.Ordinal)
+            || string.Equals(xtVersion, "ghostty 1.3.1-arch2.1", StringComparison.Ordinal))
+        {
+            return FlowTerminalHostProfile.Ghostty_1_3_1;
+        }
+
+        if (xtVersion is not null
+            && xtVersion.StartsWith("ghostty ", StringComparison.Ordinal))
+        {
+            return FlowTerminalHostProfile.Ghostty_Unqualified;
+        }
+
+        return FlowTerminalHostProfile.Unknown;
+    }
 
     private static bool IsPlausibleWindowPixelDimension(double value) =>
         double.IsFinite(value) && value > 0 && value <= MaxPlausibleWindowPixelDimension;
 
     /// <summary>
-    /// Scans for a DA1 (Primary Device Attributes) reply of the form
-    /// <c>CSI ? Pn(;Pn)* c</c> and reports whether it declares Sixel support via DEC
-    /// parameter 4. Only sequences that include the <c>?</c> private-parameter marker
-    /// (which every DA1 reply this library targets includes) are treated as replies,
-    /// so a workload-issued bare <c>CSI c</c> query is never misinterpreted as one.
+    /// Consumes the exact XTVERSION response emitted by the qualified Ghostty
+    /// build: <c>ESC P &gt; | payload ESC \</c>. The payload is kept verbatim
+    /// so version matching remains ordinal and pinned; malformed or incomplete
+    /// DCS input is left in the prefetched stream for the normal input parser.
     /// </summary>
+    private static bool TryConsumeXtVersionResponse(List<byte> buffer, out string version)
+    {
+        version = string.Empty;
+        var span = CollectionsMarshal.AsSpan(buffer);
+        const int headerLength = 4; // ESC P > |
+        for (var start = 0; start <= span.Length - headerLength; start++)
+        {
+            if (span[start] != 0x1b
+                || span[start + 1] != (byte)'P'
+                || span[start + 2] != (byte)'>'
+                || span[start + 3] != (byte)'|')
+            {
+                continue;
+            }
+
+            var payloadStart = start + headerLength;
+            var terminator = -1;
+            for (var i = payloadStart; i + 1 < span.Length; i++)
+            {
+                if (span[i] == 0x1b && span[i + 1] == (byte)'\\')
+                {
+                    terminator = i;
+                    break;
+                }
+            }
+
+            if (terminator < 0)
+            {
+                // The DCS may be split across driver reads. Do not consume
+                // anything until its complete final + ST arrives.
+                continue;
+            }
+
+            for (var i = payloadStart; i < terminator; i++)
+            {
+                if (span[i] < 0x20 || span[i] > 0x7e)
+                {
+                    // A non-printable payload is not an XTVERSION reply.
+                    // Leave it untouched so normal input handling can decide
+                    // what it means.
+                    terminator = -1;
+                    break;
+                }
+            }
+
+            if (terminator <= payloadStart)
+                continue;
+
+            version = Encoding.ASCII.GetString(span[payloadStart..terminator]);
+            buffer.RemoveRange(start, terminator + 2 - start);
+            return true;
+        }
+
+        return false;
+    }
+    /// <summary>
+    /// Scans for a DA1 (Primary Device Attributes) reply of the form <c>CSI ? Pn(;Pn)* c</c>
+    /// and reports whether it declares Sixel support via DEC parameter 4. Only sequences
+    /// that include the <c>?</c> private-parameter marker (which every DA1 reply this
+    /// library targets includes) are treated as replies, so a workload-issued bare
+    /// <c>CSI c</c> query is never misinterpreted as one.
+    /// </summary>
+
     private static bool TryConsumeDeviceAttributesResponse(List<byte> buffer, out bool sixelDeclared, out bool malformed)
     {
         sixelDeclared = false;
@@ -1179,6 +1758,21 @@ public sealed class ConsolePresentationAdapter :
     {
         if (_disposed) return;
         _disposed = true;
+        _disposeCts.Cancel();
+
+        // Fail any in-flight cursor observation deterministically, and wake the
+        // reader so shutdown cannot leave it parked in a blocking read.
+        CursorObservationRequest? pendingObservation;
+        CancellationTokenSource? activeWake;
+        lock (_cursorObservationSync)
+        {
+            pendingObservation = _pendingCursorObservation;
+            _pendingCursorObservation = null;
+            activeWake = _activeReadWakeCts;
+        }
+
+        TryCancelWake(activeWake);
+        pendingObservation?.TrySetResult(null);
 
         Disconnected?.Invoke();
 
@@ -1187,7 +1781,6 @@ public sealed class ConsolePresentationAdapter :
             await ExitRawModeAsync();
         }
 
-        _disposeCts.Cancel();
         _disposeCts.Dispose();
         _driver.Dispose();
     }

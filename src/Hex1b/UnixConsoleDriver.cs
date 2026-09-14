@@ -24,6 +24,13 @@ internal sealed class UnixConsoleDriver : IConsoleDriver
     private int _lastWidth;
     private int _lastHeight;
     private bool _disposed;
+
+    // Cancellation latency of ReadAsync: poll() returns immediately when data
+    // arrives, but a parked read only observes cancellation between slices. This is
+    // the floor on how quickly a pump-serviced cursor-position query can be woken,
+    // so keep it short — the syscall cost of 40 wakeups/s on an idle terminal is
+    // negligible next to the latency a full 100ms slice would add per observation.
+    private const int ReadPollSliceMilliseconds = 25;
     
     public UnixConsoleDriver()
     {
@@ -155,7 +162,7 @@ internal sealed class UnixConsoleDriver : IConsoleDriver
             {
                 // Poll with a short timeout to allow cancellation checks
                 var pfd = new PollFd { fd = STDIN_FILENO, events = POLLIN, revents = 0 };
-                var pollResult = poll(ref pfd, 1, 100); // 100ms timeout
+                var pollResult = poll(ref pfd, 1, ReadPollSliceMilliseconds);
                 
                 if (pollResult < 0)
                 {

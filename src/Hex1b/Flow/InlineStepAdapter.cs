@@ -10,14 +10,27 @@ namespace Hex1b.Flow;
 /// without entering the alternate screen. All cursor positioning is offset by the
 /// step's row origin in the terminal.
 /// </summary>
+internal enum InlineOutputFrameKind
+{
+    Data,
+    DiscardBoundary,
+}
+
+internal readonly record struct InlineOutputFrame(
+    byte[] Bytes,
+    long Epoch,
+    InlineOutputFrameKind Kind);
 internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapter, IDisposable
 {
-    private readonly Channel<byte[]> _outputChannel;
+
+    private readonly Channel<InlineOutputFrame> _outputChannel;
     private readonly Channel<Hex1bEvent> _inputChannel;
     private readonly TerminalCapabilities _capabilities;
+    private readonly object _outputGenerationSync = new();
     private int _width;
     private int _height;
     private int _rowOrigin;
+    private long _outputEpoch;
     private bool _disposed;
     private int _outputQueueDepth;
     private bool _inTuiMode;
@@ -42,44 +55,53 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
             SupportsTrueColor = true,
         };
 
-        _outputChannel = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions
+        _outputChannel = Channel.CreateUnbounded<InlineOutputFrame>(new UnboundedChannelOptions
         {
-            SingleReader = true,
+            SingleReader = false,
             SingleWriter = false
         });
 
         _inputChannel = Channel.CreateUnbounded<Hex1bEvent>(new UnboundedChannelOptions
         {
             SingleReader = true,
-            SingleWriter = true
+            SingleWriter = false
         });
     }
-
-    /// <summary>
-    /// The row origin of this step in the terminal buffer.
-    /// </summary>
     public int RowOrigin
     {
         get => _rowOrigin;
-        set => _rowOrigin = value;
+        set
+        {
+            lock (_outputGenerationSync)
+            {
+                if (_rowOrigin == value)
+                    return;
+
+                _rowOrigin = value;
+                Interlocked.Increment(ref _outputEpoch);
+            }
+        }
     }
-
     // === App-side APIs ===
-
-    /// <summary>
-    /// Write output, rewriting ANSI cursor positioning sequences to apply the row offset.
-    /// </summary>
     public void Write(string text)
     {
         if (_disposed) return;
 
-        // Rewrite cursor position sequences to apply row offset
-        var rewritten = RewriteCursorPositions(text);
-
-        var bytes = Encoding.UTF8.GetBytes(rewritten);
-        if (_outputChannel.Writer.TryWrite(bytes))
+        lock (_outputGenerationSync)
         {
-            Interlocked.Increment(ref _outputQueueDepth);
+            // Rewrite and tag under the same lock as RowOrigin, ResizeAsync,
+            // and DiscardQueuedOutput so a frame can never carry bytes laid out
+            // for one origin with another origin's generation.
+            var rewritten = RewriteCursorPositions(text);
+            var bytes = Encoding.UTF8.GetBytes(rewritten);
+            if (_outputChannel.Writer.TryWrite(
+                    new InlineOutputFrame(
+                        bytes,
+                        Volatile.Read(ref _outputEpoch),
+                        InlineOutputFrameKind.Data)))
+            {
+                Interlocked.Increment(ref _outputQueueDepth);
+            }
         }
     }
 
@@ -98,22 +120,45 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
     public int Height => _height;
     public TerminalCapabilities Capabilities => _capabilities;
     public int OutputQueueDepth => _outputQueueDepth;
+    internal long OutputEpoch => Volatile.Read(ref _outputEpoch);
 
     /// <summary>
-    /// Discards every frame already queued for the terminal, returning how many
-    /// items were dropped. Used when the runner repositions the step region:
-    /// frames laid out for the superseded origin must never be replayed once
-    /// the output pump resumes.
+    /// Discards every data frame already queued for the terminal, returning how
+    /// many data items were dropped. A typed boundary sentinel is then queued so
+    /// the output pump also invalidates a frame whose BSU was already removed
+    /// before the pump read it.
     /// </summary>
     internal int DiscardQueuedOutput()
     {
-        var dropped = 0;
-        while (_outputChannel.Reader.TryRead(out _))
+        lock (_outputGenerationSync)
         {
-            Interlocked.Decrement(ref _outputQueueDepth);
-            dropped++;
+            // Invalidate a frame already dequeued by the pump, and tag the
+            // sentinel plus every later write as the new generation.
+            var epoch = Interlocked.Increment(ref _outputEpoch);
+            var dropped = 0;
+            while (_outputChannel.Reader.TryRead(out var queued))
+            {
+                Interlocked.Decrement(ref _outputQueueDepth);
+                if (queued.Kind == InlineOutputFrameKind.Data)
+                {
+                    dropped++;
+                }
+            }
+
+            // The sentinel is a control item, not a data frame: keep it out of
+            // the returned discard count while tracking it in queue depth.
+            if (!_disposed
+                && _outputChannel.Writer.TryWrite(
+                    new InlineOutputFrame(
+                        Array.Empty<byte>(),
+                        epoch,
+                        InlineOutputFrameKind.DiscardBoundary)))
+            {
+                Interlocked.Increment(ref _outputQueueDepth);
+            }
+
+            return dropped;
         }
-        return dropped;
     }
 
     /// <summary>
@@ -122,46 +167,48 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
     /// </summary>
     public void EnterTuiMode()
     {
-        if (_inTuiMode) return;
-        _inTuiMode = true;
+        lock (_outputGenerationSync)
+        {
+            if (_disposed || _inTuiMode) return;
+            _inTuiMode = true;
 
-        var sb = new StringBuilder();
-        sb.Append("\x1b[?25l"); // Hide cursor
-        if (_capabilities.SupportsMouse)
-        {
-            sb.Append("\x1b[?1003h"); // Enable mouse tracking (all motion)
-            sb.Append("\x1b[?1006h"); // SGR mouse mode
+            var sb = new StringBuilder();
+            sb.Append("\x1b[?25l"); // Hide cursor
+            if (_capabilities.SupportsMouse)
+            {
+                sb.Append("\x1b[?1003h"); // Enable mouse tracking (all motion)
+                sb.Append("\x1b[?1006h"); // Enable SGR mouse mode
+            }
+            if (_capabilities.SupportsBracketedPaste)
+            {
+                sb.Append("\x1b[?2004h"); // Enable bracketed paste mode
+            }
+            WriteRaw(sb.ToString());
         }
-        if (_capabilities.SupportsBracketedPaste)
-        {
-            sb.Append("\x1b[?2004h"); // Enable bracketed paste mode
-        }
-        WriteRaw(sb.ToString());
     }
 
-    /// <summary>
-    /// Exit TUI mode for inline step — shows cursor, disables mouse, no alternate screen restore.
-    /// </summary>
     public void ExitTuiMode()
     {
-        if (!_inTuiMode) return;
-        _inTuiMode = false;
+        lock (_outputGenerationSync)
+        {
+            if (_disposed || !_inTuiMode) return;
+            _inTuiMode = false;
 
-        var sb = new StringBuilder();
-        if (_capabilities.SupportsBracketedPaste)
-        {
-            sb.Append("\x1b[?2004l"); // Disable bracketed paste mode
+            var sb = new StringBuilder();
+            if (_capabilities.SupportsBracketedPaste)
+            {
+                sb.Append("\x1b[?2004l"); // Disable bracketed paste mode
+            }
+            if (_capabilities.SupportsMouse)
+            {
+                sb.Append("\x1b[?1006l"); // Disable SGR mouse mode
+                sb.Append("\x1b[?1003l"); // Disable mouse tracking
+            }
+            sb.Append("\x1b[0m");   // Reset text attributes
+            sb.Append("\x1b[?25h"); // Show cursor
+            sb.Append($"\x1b[{_rowOrigin + _height + 1};1H");
+            WriteRaw(sb.ToString());
         }
-        if (_capabilities.SupportsMouse)
-        {
-            sb.Append("\x1b[?1006l"); // Disable SGR mouse mode
-            sb.Append("\x1b[?1003l"); // Disable mouse tracking
-        }
-        sb.Append("\x1b[0m");   // Reset text attributes
-        sb.Append("\x1b[?25h"); // Show cursor
-        // Position cursor below the step region
-        sb.Append($"\x1b[{_rowOrigin + _height + 1};1H");
-        WriteRaw(sb.ToString());
     }
 
     /// <summary>
@@ -169,13 +216,17 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
     /// </summary>
     public void Clear()
     {
-        var sb = new StringBuilder();
-        for (int row = 0; row < _height; row++)
+        lock (_outputGenerationSync)
         {
-            sb.Append($"\x1b[{_rowOrigin + row + 1};1H"); // Move to row (1-indexed)
-            sb.Append("\x1b[2K");                          // Clear entire line
+            if (_disposed) return;
+            var sb = new StringBuilder();
+            for (int row = 0; row < _height; row++)
+            {
+                sb.Append($"\x1b[{_rowOrigin + row + 1};1H");
+                sb.Append("\x1b[2K");
+            }
+            WriteRaw(sb.ToString());
         }
-        WriteRaw(sb.ToString());
     }
 
     /// <summary>
@@ -183,30 +234,44 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
     /// </summary>
     public void SetCursorPosition(int left, int top)
     {
-        WriteRaw($"\x1b[{_rowOrigin + top + 1};{left + 1}H");
+        lock (_outputGenerationSync)
+        {
+            if (_disposed) return;
+            WriteRaw($"\x1b[{_rowOrigin + top + 1};{left + 1}H");
+        }
     }
 
     // === Terminal-side APIs ===
 
     public async ValueTask<ReadOnlyMemory<byte>> ReadOutputAsync(CancellationToken ct = default)
+        => (await ReadOutputFrameAsync(ct).ConfigureAwait(false)).Bytes;
+
+    internal async ValueTask<InlineOutputFrame> ReadOutputFrameAsync(CancellationToken ct = default)
     {
-        if (_disposed) return ReadOnlyMemory<byte>.Empty;
+        if (_disposed)
+        {
+            return new InlineOutputFrame(
+                Array.Empty<byte>(),
+                OutputEpoch,
+                InlineOutputFrameKind.Data);
+        }
 
         try
         {
-            if (await _outputChannel.Reader.WaitToReadAsync(ct))
+            if (await _outputChannel.Reader.WaitToReadAsync(ct).ConfigureAwait(false)
+                && _outputChannel.Reader.TryRead(out var frame))
             {
-                if (_outputChannel.Reader.TryRead(out var bytes))
-                {
-                    Interlocked.Decrement(ref _outputQueueDepth);
-                    return bytes;
-                }
+                Interlocked.Decrement(ref _outputQueueDepth);
+                return frame;
             }
         }
         catch (OperationCanceledException) { }
         catch (ChannelClosedException) { }
 
-        return ReadOnlyMemory<byte>.Empty;
+        return new InlineOutputFrame(
+            Array.Empty<byte>(),
+            OutputEpoch,
+            InlineOutputFrameKind.Data);
     }
 
     public ValueTask WriteInputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
@@ -217,49 +282,54 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
 
     public ValueTask WriteInputEventAsync(Hex1bEvent evt, CancellationToken ct = default)
     {
-        if (_disposed) return ValueTask.CompletedTask;
-
-        // Translate mouse coordinates from absolute terminal space to step-relative space
-        if (evt is Hex1bMouseEvent mouse)
+        lock (_outputGenerationSync)
         {
-            var relativeY = mouse.Y - _rowOrigin;
-            if (relativeY < 0 || relativeY >= _height)
-                return ValueTask.CompletedTask; // Outside step bounds
-            evt = mouse with { Y = relativeY };
-        }
+            if (_disposed) return ValueTask.CompletedTask;
 
-        return _inputChannel.Writer.WriteAsync(evt, ct);
+            // Translate mouse coordinates from absolute terminal space to step-relative space
+            if (evt is Hex1bMouseEvent mouse)
+            {
+                var relativeY = mouse.Y - _rowOrigin;
+                if (relativeY < 0 || relativeY >= _height)
+                    return ValueTask.CompletedTask;
+                evt = mouse with { Y = relativeY };
+            }
+
+            return _inputChannel.Writer.WriteAsync(evt, ct);
+        }
     }
 
     public bool TryWriteInputEvent(Hex1bEvent evt)
     {
-        if (_disposed) return false;
-
-        if (evt is Hex1bMouseEvent mouse)
+        lock (_outputGenerationSync)
         {
-            var relativeY = mouse.Y - _rowOrigin;
-            if (relativeY < 0 || relativeY >= _height)
-                return false;
-            evt = mouse with { Y = relativeY };
-        }
+            if (_disposed) return false;
 
-        return _inputChannel.Writer.TryWrite(evt);
+            if (evt is Hex1bMouseEvent mouse)
+            {
+                var relativeY = mouse.Y - _rowOrigin;
+                if (relativeY < 0 || relativeY >= _height)
+                    return false;
+                evt = mouse with { Y = relativeY };
+            }
+
+            return _inputChannel.Writer.TryWrite(evt);
+        }
     }
 
     public ValueTask ResizeAsync(int width, int height, CancellationToken ct = default)
     {
-        // Always push a resize event, even if the dimensions didn't change.
-        // The inner Hex1bApp treats a resize event as a re-render trigger,
-        // and the flow runner clears the active rectangle on every settle
-        // before calling ResizeAsync — if we suppress the event here, the
-        // cleared rectangle stays blank until something else invalidates
-        // the inner app. (Example: a vertical-only terminal resize where
-        // the step height is clamped by MaxHeight ends up with the same
-        // width and same step height, but the flow runner has already
-        // wiped the prior frame.)
-        _width = width;
-        _height = height;
-        _inputChannel.Writer.TryWrite(new Hex1bResizeEvent(width, height));
+        // Resize changes the layout generation before the inner app receives
+        // its event. Any frame already composed for the old dimensions is
+        // therefore rejected by the runner if it is dequeued after this point.
+        lock (_outputGenerationSync)
+        {
+            Interlocked.Increment(ref _outputEpoch);
+            _width = width;
+            _height = height;
+            _inputChannel.Writer.TryWrite(new Hex1bResizeEvent(width, height));
+        }
+
         return ValueTask.CompletedTask;
     }
 
@@ -269,10 +339,13 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        _outputChannel.Writer.TryComplete();
-        _inputChannel.Writer.TryComplete();
+        lock (_outputGenerationSync)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _outputChannel.Writer.TryComplete();
+            _inputChannel.Writer.TryComplete();
+        }
     }
 
     public ValueTask DisposeAsync()
@@ -288,11 +361,18 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
     /// </summary>
     private void WriteRaw(string text)
     {
-        if (_disposed) return;
-        var bytes = Encoding.UTF8.GetBytes(text);
-        if (_outputChannel.Writer.TryWrite(bytes))
+        lock (_outputGenerationSync)
         {
-            Interlocked.Increment(ref _outputQueueDepth);
+            if (_disposed) return;
+            var bytes = Encoding.UTF8.GetBytes(text);
+            if (_outputChannel.Writer.TryWrite(
+                    new InlineOutputFrame(
+                        bytes,
+                        Volatile.Read(ref _outputEpoch),
+                        InlineOutputFrameKind.Data)))
+            {
+                Interlocked.Increment(ref _outputQueueDepth);
+            }
         }
     }
 

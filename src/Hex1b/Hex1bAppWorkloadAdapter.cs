@@ -34,7 +34,13 @@ namespace Hex1b;
 /// await app.RunAsync();
 /// </code>
 /// </example>
-public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, IHex1bTerminalTokenWorkloadAdapter, IRepaintableWorkloadAdapter, IDisposable
+public sealed class Hex1bAppWorkloadAdapter :
+    IHex1bAppTerminalWorkloadAdapter,
+    IHex1bTerminalTokenWorkloadAdapter,
+    IRepaintableWorkloadAdapter,
+    ICursorPositionSource,
+    Hex1b.Flow.IFlowCurrentGeometrySource,
+    IDisposable
 {
     private readonly Channel<WorkloadOutputItem> _outputChannel;
     private readonly Channel<Hex1bEvent> _inputChannel;
@@ -48,11 +54,37 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
     private int _outputQueueDepth; // Manual tracking since unbounded channels don't support Count
     private readonly int _maxQueuedOutputItems;
 
+    // In-flight observation barriers. Each observation enqueues an empty item carrying
+    // one of these and awaits it; the terminal completes it when the item is consumed,
+    // which proves everything queued before it has been applied. Disposal fails any
+    // still-outstanding barrier so an observation never reports a stale model.
+    private readonly object _barrierSync = new();
+    private readonly HashSet<TaskCompletionSource<bool>> _pendingBarriers = new();
+
     /// <summary>
     /// Optional diagnostic tree provider for MCP diagnostics.
     /// Set by Hex1bApp when it starts running.
     /// </summary>
     internal Diagnostics.IDiagnosticTreeProvider? DiagnosticTreeProvider { get; set; }
+
+    /// <summary>
+    /// The terminal's own applied cursor model, attached by <see cref="Hex1bTerminal"/>
+    /// during construction when this adapter is the terminal's workload.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is deliberately separate from an attached native presentation: it exposes
+    /// the cursor of the terminal's emulated screen (0-based <c>(Column, Row)</c>) and
+    /// is the authoritative source only when there is no native presentation to
+    /// observe. It is never reported as host state: when a native presentation is
+    /// attached, that presentation is observed instead (and its failure is reported as
+    /// <see langword="null"/>, not as this model).
+    /// </para>
+    /// </remarks>
+    internal Func<(int Column, int Row)>? HeadlessCursorProvider { get; set; }
+
+    internal bool HasCursorSource =>
+        _presentationAdapter is ICursorPositionSource || HeadlessCursorProvider is not null;
 
     // Callback installed by Hex1bApp.RunAsync so an outer multiplexer
     // (e.g. PlaceholderWorkloadAdapter) can ask the app to drop diff
@@ -71,7 +103,7 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
 
     /// <inheritdoc />
     public void RequestFullRepaint() => _repaintRequestHandler?.Invoke();
-    
+
     /// <summary>
     /// When true, Hex1bApp collects per-node timing metrics during reconcile and render.
     /// Set by the terminal builder when WithDiagnostics() is applied.
@@ -248,6 +280,25 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
     }
 
     /// <summary>
+    /// Writes output that the terminal must accept, throwing instead of silently
+    /// dropping it when the adapter is disposed or its output channel is closed.
+    /// </summary>
+    /// <param name="text">The text to write.</param>
+    /// <exception cref="ObjectDisposedException">The adapter has been disposed.</exception>
+    /// <exception cref="ChannelClosedException">The output channel is closed.</exception>
+    /// <remarks>
+    /// Used by atomic hand-offs (for example Flow's history commit) where a silent
+    /// drop would lose already-composed output. Ordinary rendering writes keep the
+    /// best-effort <see cref="Write(string)"/> semantics and never throw during
+    /// shutdown cleanup.
+    /// </remarks>
+    internal void WriteRequired(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        EnqueueOutput(new WorkloadOutputItem(Encoding.UTF8.GetBytes(text), Tokens: null), requireAcceptance: true);
+    }
+
+    /// <summary>
     /// Writes output with an already-tokenized representation to avoid terminal-side UTF-8 decode + tokenization.
     /// </summary>
     /// <param name="tokens">The tokens to ship to the consumer.</param>
@@ -298,8 +349,25 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
     /// pooled resources carried by the item are returned to their pools on
     /// any failure path so callers can't leak them.
     /// </summary>
-    private void EnqueueOutput(WorkloadOutputItem item)
+    /// <param name="item">The output item to enqueue.</param>
+    /// <param name="requireAcceptance">
+    /// When <see langword="true"/>, a rejected item (adapter disposed or channel
+    /// closed) throws after its pooled resources are returned instead of being
+    /// silently dropped. When <see langword="false"/> (default), rejection is the
+    /// best-effort shutdown behaviour ordinary rendering relies on.
+    /// </param>
+    private void EnqueueOutput(WorkloadOutputItem item, bool requireAcceptance = false)
     {
+        if (_disposed)
+        {
+            ReturnPooledResources(item);
+            if (requireAcceptance)
+            {
+                throw new ObjectDisposedException(nameof(Hex1bAppWorkloadAdapter));
+            }
+            return;
+        }
+
         // Fast path: unbounded channel always accepts; bounded channel
         // accepts when capacity is available.
         if (_outputChannel.Writer.TryWrite(item))
@@ -328,11 +396,19 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
             // Channel completed while we were waiting; return pooled
             // resources so they aren't leaked.
             ReturnPooledResources(item);
+            if (requireAcceptance)
+            {
+                throw;
+            }
         }
         catch (InvalidOperationException)
         {
             // Same: channel may surface a writer-completed state as IOE.
             ReturnPooledResources(item);
+            if (requireAcceptance)
+            {
+                throw;
+            }
         }
     }
 
@@ -402,12 +478,36 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
     public int Height => _height;
 
     /// <summary>
+    /// Reads the current native presentation dimensions when the presentation
+    /// itself exposes a live geometry source. Synthetic/static presentations
+    /// intentionally fall back to this adapter's event-delivered dimensions:
+    /// their Width/Height properties are commonly fixed test configuration,
+    /// not an authoritative resize observation.
+    /// </summary>
+    /// <remarks>
+    /// Native terminals can apply a resize before their input event reaches this
+    /// workload adapter. Flow calls this at its final serialized emission
+    /// boundary so cursor placement and width-sensitive bytes use the same
+    /// dimensions the native presentation currently reports. The read is
+    /// side-effect-free; resize events remain responsible for updating this
+    /// adapter's cached dimensions and notifying the live step.
+    /// </remarks>
+    (int Width, int Height) Hex1b.Flow.IFlowCurrentGeometrySource.ReadCurrentGeometry()
+    {
+        if (_presentationAdapter is Hex1b.Flow.IFlowCurrentGeometrySource source)
+        {
+            return source.ReadCurrentGeometry();
+        }
+
+        return (_width, _height);
+    }
+    /// <summary>
     /// Terminal capabilities. Returns live capabilities from presentation adapter if available,
     /// otherwise returns the static capabilities provided at construction.
     /// </summary>
-    public TerminalCapabilities Capabilities => 
+    public TerminalCapabilities Capabilities =>
         _presentationAdapter?.Capabilities ?? _staticCapabilities ?? TerminalCapabilities.Modern;
-    
+
     /// <summary>
     /// Gets the number of output items waiting to be consumed by the terminal.
     /// Can be used to detect back pressure and adjust input processing accordingly.
@@ -491,7 +591,7 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
     {
         data = ReadOnlyMemory<byte>.Empty;
         if (_disposed) return false;
-        
+
         if (_outputChannel.Reader.TryRead(out var item))
         {
             Interlocked.Decrement(ref _outputQueueDepth);
@@ -500,7 +600,7 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
         }
         return false;
     }
-    
+
     internal bool TryReadOutputItem(out WorkloadOutputItem item)
     {
         item = default;
@@ -511,7 +611,7 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
             Interlocked.Decrement(ref _outputQueueDepth);
             return true;
         }
-        
+
         return false;
     }
 
@@ -558,7 +658,7 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
         // Parse raw bytes into events and write to input channel
         // For now, we assume the terminal has already parsed bytes into events
         // and calls WriteInputEventAsync instead
-        
+
         // If we receive raw bytes, we need to parse them
         // This is a simplified version - full parsing is in Hex1bTerminal
         var text = Encoding.UTF8.GetString(data.Span);
@@ -595,11 +695,11 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
     {
         var wasInitialized = _dimensionsInitialized;
         _dimensionsInitialized = true;
-        
+
         var changed = _width != width || _height != height;
         _width = width;
         _height = height;
-        
+
         // Only fire resize event if dimensions changed AND we were already initialized
         // (skip the initial dimension setup from terminal constructor)
         if (changed && wasInitialized)
@@ -701,11 +801,146 @@ public sealed class Hex1bAppWorkloadAdapter : IHex1bAppTerminalWorkloadAdapter, 
         };
     }
 
+    // ========================================
+    // Cursor position observation
+    // ========================================
+
+    /// <inheritdoc />
+    async Task<(int Column, int Row)?> ICursorPositionSource.ObserveCursorPositionAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        // The terminal model is only an authority for a headless terminal; a native
+        // presentation (when attached) is the sole authority and its failure is never
+        // replaced by that model.
+        var nativeSource = _presentationAdapter as ICursorPositionSource;
+        var headlessProvider = HeadlessCursorProvider;
+        if (nativeSource is null && headlessProvider is null)
+        {
+            return null;
+        }
+
+        // Fence FIRST: only once everything this caller queued before the call has been
+        // applied can either source be asked for a position, otherwise a native query
+        // could observe a cursor that predates the caller's own writes.
+        if (!await TryAwaitOutputBarrierAsync(cancellationToken).ConfigureAwait(false))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return null;
+        }
+
+        if (nativeSource is not null)
+        {
+            return await nativeSource.ObserveCursorPositionAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        return headlessProvider!();
+    }
+
+    /// <summary>
+    /// How long an observation waits for its output barrier before giving up with a
+    /// <see langword="null"/> observation.
+    /// </summary>
+    private static readonly TimeSpan CursorObservationBarrierTimeout = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// Enqueues an empty barrier item and waits until the terminal's output pump has
+    /// consumed it, proving every item enqueued before it has already been applied.
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> when the barrier was consumed; <see langword="false"/> when
+    /// it could not be enqueued or was not consumed within
+    /// <see cref="CursorObservationBarrierTimeout"/> (including adapter disposal) — the
+    /// caller then reports no observation rather than a stale model. Cancellation throws.
+    /// </returns>
+    private async Task<bool> TryAwaitOutputBarrierAsync(CancellationToken cancellationToken)
+    {
+        var barrier = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var item = new WorkloadOutputItem(ReadOnlyMemory<byte>.Empty, Tokens: null)
+        {
+            ProcessingBarrier = barrier
+        };
+
+        lock (_barrierSync)
+        {
+            _pendingBarriers.Add(barrier);
+        }
+
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(CursorObservationBarrierTimeout);
+
+        try
+        {
+            if (!await EnqueueBarrierAsync(item, timeoutCts.Token).ConfigureAwait(false))
+            {
+                return false;
+            }
+
+            return await barrier.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw; // Caller cancellation is not a bounded-failure outcome.
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        finally
+        {
+            lock (_barrierSync)
+            {
+                _pendingBarriers.Remove(barrier);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Enqueues a barrier item, returning <see langword="false"/> when the adapter is
+    /// disposed or the channel is closed instead of throwing.
+    /// </summary>
+    private async ValueTask<bool> EnqueueBarrierAsync(WorkloadOutputItem item, CancellationToken cancellationToken)
+    {
+        if (_disposed)
+        {
+            return false;
+        }
+
+        try
+        {
+            await _outputChannel.Writer.WriteAsync(item, cancellationToken).ConfigureAwait(false);
+            Interlocked.Increment(ref _outputQueueDepth);
+            return true;
+        }
+        catch (ChannelClosedException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
     /// <inheritdoc />
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+
+        // Fail outstanding observation barriers: after disposal the terminal will never
+        // consume more output, so a barrier cannot clear and must not be reported as
+        // observed.
+        TaskCompletionSource<bool>[] pending;
+        lock (_barrierSync)
+        {
+            pending = _pendingBarriers.ToArray();
+            _pendingBarriers.Clear();
+        }
+
+        foreach (var barrier in pending)
+        {
+            barrier.TrySetResult(false);
+        }
 
         // Note: ExitTuiMode is NOT called here because Hex1bTerminal handles
         // writing mouse-disable and screen-restore sequences directly to the

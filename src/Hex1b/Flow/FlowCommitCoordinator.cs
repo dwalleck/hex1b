@@ -1,7 +1,41 @@
+using System.Runtime.ExceptionServices;
 using Hex1b.Surfaces;
 using Hex1b.Widgets;
 
 namespace Hex1b.Flow;
+
+/// <summary>
+/// One serialized terminal update: bytes are composed into a buffer and handed
+/// to the terminal when the scope is disposed.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Synchronous by contract: nothing inside the scope may await, it must be
+/// disposed on the thread that opened it, and an empty scope writes nothing.
+/// </para>
+/// <para>
+/// The caller must keep the scope object rather than discarding it in a
+/// <c>using</c> block, because <see cref="FlushCompleted"/> is the only place
+/// that says whether the update was actually handed off — the update's own
+/// failure cannot carry that fact.
+/// </para>
+/// <para>
+/// Acceptance is not consumption: a completed hand-off means the adapter took
+/// the bytes, never that the host terminal displayed or retained them.
+/// </para>
+/// </remarks>
+internal interface IAtomicTerminalUpdate : IDisposable
+{
+    /// <summary>
+    /// True once the adapter accepted the composed bytes.
+    /// </summary>
+    /// <remarks>
+    /// False when the buffer was never handed off because the write failed. True
+    /// for a scope that composed nothing: an empty scope writes nothing, so it
+    /// has no hand-off to fail.
+    /// </remarks>
+    bool FlushCompleted { get; }
+}
 
 /// <summary>
 /// Live-step operations the continuous-history committer needs from the flow
@@ -29,6 +63,33 @@ internal interface ILiveStepHandle
     Surface? SnapshotLiveSurface();
 
     /// <summary>
+    /// Reads the current presentation geometry. Native presentations refresh
+    /// this from the driver rather than the last event delivered to the app
+    /// workload adapter.
+    /// </summary>
+    (int Width, int Height) ReadCurrentGeometry();
+
+    /// <summary>
+    /// Rechecks presentation geometry after an atomic update has acquired the
+    /// step and terminal write locks, before any bytes are composed.
+    /// </summary>
+    (int Width, int Height, long ResizeVersion) ReadFreshGeometryForEmission();
+
+    /// <summary>
+    /// Rejects history commitment when this native presentation has no
+    /// qualified host profile. Headless/custom adapters without a profile
+    /// provider remain permitted.
+    /// </summary>
+    void EnsureHistoryCommitSupported();
+
+    /// <summary>
+    /// Acquires live-output ownership, cancels pending resize work, and observes
+    /// the current boundary before any positioning write. Returns the prior mute
+    /// state; on failure it restores that state itself.
+    /// </summary>
+    Task<bool> PrepareForCommitAsync(CancellationToken cancellationToken);
+
+    /// <summary>
     /// Writes <paramref name="text"/> at absolute terminal row
     /// <paramref name="row"/> under the terminal write lock, so positioning and
     /// content can never be split by another writer.
@@ -38,15 +99,25 @@ internal interface ILiveStepHandle
     /// <summary>
     /// Opens a serialized terminal-update scope. Every write the commit issues
     /// through this handle inside the scope is composed into ONE terminal write,
-    /// bracketed by synchronized output (DEC mode 2026), so a host that honors
-    /// mode 2026 never paints the intermediate state — the rows a unit displaces
-    /// the live region with and the repaint that restores it land together.
+    /// optionally bracketed by synchronized-output (DEC mode 2026) bytes. The
+    /// write lock prevents framework writers from interleaving the unit's rows
+    /// and its live-region repaint; host presentation atomicity is not inferred.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Synchronous by contract: nothing inside the scope may await, and it must
     /// be disposed on the thread that opened it. An empty scope writes nothing.
+    /// </para>
+    /// <para>
+    /// The returned scope reports whether its hand-off actually happened, which
+    /// the update's own failure cannot: <see cref="IAtomicTerminalUpdate.FlushCompleted"/>
+    /// is set only once the adapter has accepted the composed bytes. A caller
+    /// handling a failure must therefore keep the scope object — not just a
+    /// <c>using</c> block — to tell "composed but never handed off" from
+    /// "handed off". Acceptance is not host consumption.
+    /// </para>
     /// </remarks>
-    IDisposable BeginAtomicTerminalUpdate();
+    IAtomicTerminalUpdate BeginAtomicTerminalUpdate();
 
     /// <summary>
     /// Scrolls the viewport up by <paramref name="rows"/> rows by parking the
@@ -57,9 +128,15 @@ internal interface ILiveStepHandle
     void ScrollViewportUp(int rows);
 
     /// <summary>
+    /// Emits the qualified host's commit-boundary marker at a committed row.
+    /// Unqualified hosts receive no protocol bytes.
+    /// </summary>
+    void MarkCommittedRow(int row);
+
+    /// <summary>
     /// Atomically moves the live step's region to <paramref name="rowOrigin"/>
-    /// and resizes it to <paramref name="liveHeight"/> rows, then repaints the
-    /// region as a single serialized pass: blank every row of the region, paint
+    /// and resizes it to <paramref name="liveHeight"/>, then repaints the
+    /// region as a single serialized pass: blank every row, paint
     /// <paramref name="liveSurface"/>, and leave the cursor at the region's
     /// top-left.
     /// </summary>
@@ -76,10 +153,24 @@ internal interface ILiveStepHandle
     void ResizeLive(int width, int liveHeight);
 
     /// <summary>
+    /// Applies a terminal geometry discovered without a resize event and asks
+    /// the live app to render at the corresponding step height.
+    /// </summary>
+    void ResizeLiveToTerminalGeometry(int width, int terminalHeight);
+
+    /// <summary>
     /// Number of frames the live application has completed. Used to wait for a
     /// frame rendered after a builder swap instead of guessing.
     /// </summary>
     long FrameCount { get; }
+
+    /// <summary>
+    /// Monotonic counter of size changes this handle has observed, including a
+    /// change that returns the terminal to the dimensions it had before (an ABA
+    /// pair). A caller that samples it around an await can therefore tell that a
+    /// resize happened even when comparing width and height afterwards cannot.
+    /// </summary>
+    long ResizeVersion { get; }
 
     /// <summary>
     /// Applies a new live layout builder to the still-running live
@@ -88,18 +179,21 @@ internal interface ILiveStepHandle
     /// </summary>
     void ApplyLiveLayout(Func<FlowStepContext, Task<Hex1bWidget>> builder);
 
-    /// <summary>
-    /// Computes where the next content row belongs after the host terminal
-    /// re-wrapped its buffer for a new geometry, from the flow's own reflow
-    /// model rather than from a row counter a host scroll can invalidate.
-    /// </summary>
-    int ComputeAppendRowAfterReflow(
-        int newWidth,
-        int newHeight,
-        int cursorScreenRow,
-        int cursorColumn,
-        bool cursorBelowContent);
+    /// <summary>Whether the adapter can report an authoritative cursor position.</summary>
+    bool SupportsCursorObservation { get; }
 
+    /// <summary>
+    /// Asks the host where its own cursor actually is, in screen rows, or returns
+    /// <see langword="null"/> when the host cannot report it.
+    /// </summary>
+    /// <remarks>
+    /// This is the authoritative post-reflow anchor, where the flow's own reflow
+    /// model is only as good as the paragraphs it recorded: after the host has
+    /// re-wrapped its buffer it owns where the content landed, and a scalar row
+    /// the framework kept cannot see a change that moved that row and moved it
+    /// back. A null answer means "unknown", never "row zero".
+    /// </remarks>
+    Task<int?> ObserveCursorRowAsync(CancellationToken cancellationToken);
 
     /// <summary>
     /// Records the logical paragraph widths of the rows a commit just emitted,
@@ -128,10 +222,23 @@ internal interface ILiveStepHandle
     bool SetLiveOutputMuted(bool muted);
 
     /// <summary>
-    /// Waits until the live application completes a frame newer than the
-    /// current one, bounded by <paramref name="timeout"/>.
+    /// Waits until the live application has completed a frame newer than
+    /// <paramref name="afterFrame"/> — a <see cref="FrameCount"/> baseline the
+    /// caller captured before it changed what the app should render — bounded by
+    /// <paramref name="timeout"/>.
     /// </summary>
-    Task<bool> WaitForNextLiveFrameAsync(TimeSpan timeout, CancellationToken cancellationToken);
+    /// <remarks>
+    /// The baseline is passed in rather than read here so that a frame which
+    /// completes between the caller's change and this wait still satisfies it; a
+    /// wait that read the count at entry could miss that frame and then block for
+    /// the whole timeout waiting for one that already happened. Returns true as
+    /// soon as <see cref="FrameCount"/> exceeds the baseline, and false when the
+    /// wait times out or is cancelled.
+    /// </remarks>
+    Task<bool> WaitForLiveFrameAfterAsync(
+        long afterFrame,
+        TimeSpan timeout,
+        CancellationToken cancellationToken);
 
     /// <summary>Records a commit event for the driver's structured evidence log.</summary>
     void RecordCommitEvent(string message);
@@ -156,9 +263,36 @@ internal interface ILiveStepHandle
 ///         region at the new append position from the freshest live frame — so
 ///         the region is never left displaced, and an edit rendered while the
 ///         output pump was muted becomes visible in that same update;</item>
-///   <item>wait for the terminal side to consume the update, then yield at the
-///         turn boundary so queued input and resize events are dispatched.</item>
+///   <item>count the unit as completed the moment its atomic update has been
+///         handed to the write path, then wait for the terminal side to consume
+///         the update, then yield at the turn boundary so queued input and
+///         resize events are dispatched.</item>
 /// </list>
+/// <para>
+/// The count comes first because the count is the commit's outcome: a
+/// cancellation that lands during the post-emission wait must not be able to
+/// turn an already emitted unit into a pending one. Cancellation is therefore
+/// reported in two separate facts — how far the commit got
+/// (<see cref="FlowCommitResult.Status"/>) and whether cancellation was observed
+/// at all (<see cref="FlowCommitResult.CancellationRequested"/>) — and a
+/// cancellation observed only after the last unit was handed off resolves as a
+/// complete emission.
+/// </para>
+/// <para>
+/// A failure reaches the caller as <see cref="FlowCommitException"/> with the
+/// same hand-off facts, whatever raised it. When the failure left an emitted
+/// prefix or a partly composed unit, the step is suspended rather than left
+/// looking retryable, and the live region is re-anchored below everything the
+/// failed commit may have written. Recovery failure never replaces the original
+/// failure; it is reported alongside it.
+/// </para>
+/// <para>
+/// The live layout follows the hand-off rule: the commit applies its next live
+/// layout only when every submitted unit was handed off. A commit that stops
+/// with units pending — cancellation, or a failure — retains the step's current
+/// layout, because the pending content still owns the presentation and the
+/// caller decides what to do with it.
+/// </para>
 /// <para>
 /// Progress is counted in logical units, never in terminal rows: a unit that
 /// soft-wraps on a narrow terminal is still exactly one unit, so a mid-commit
@@ -218,6 +352,15 @@ internal sealed class FlowCommitCoordinator
     private volatile bool _inFlight;
     private long _nextCommitId;
 
+    private Exception? _suspensionFailure;
+
+    internal void Suspend(Exception failure)
+    {
+        _suspensionFailure = failure;
+        _uncertain = true;
+        _live.RecordCommitEvent($"suspended {failure.GetType().Name}: {failure.Message}");
+    }
+
     public FlowCommitCoordinator(
         ILiveStepHandle live,
         IHex1bAppTerminalWorkloadAdapter terminal,
@@ -261,6 +404,11 @@ internal sealed class FlowCommitCoordinator
         ArgumentNullException.ThrowIfNull(source);
         ArgumentNullException.ThrowIfNull(nextLive);
 
+        // Native host capability is a synchronous precondition. Check it before
+        // taking admission so an unqualified/unknown console never enters the
+        // in-flight state or reaches source preparation.
+        _live.EnsureHistoryCommitSupported();
+
         if (Interlocked.CompareExchange(ref _admission, 1, 0) != 0)
         {
             throw new FlowCommitAdmissionException(
@@ -296,12 +444,11 @@ internal sealed class FlowCommitCoordinator
         if (_uncertain)
         {
             throw new FlowCommitException(
-                "History commitment is suspended for this step: a previous commit failed after " +
-                "emission may already have reached the terminal, and it is never replayed.",
+                "History commitment is suspended: the previous failure left no safe append boundary.",
                 completedUnits: 0,
                 completedRows: 0,
-                mayHavePartialRow: false,
-                innerException: null);
+                abortedRows: 0,
+                innerException: _suspensionFailure);
         }
 
         var commitId = Interlocked.Increment(ref _nextCommitId);
@@ -318,54 +465,96 @@ internal sealed class FlowCommitCoordinator
 
         await WaitForReadyAsync(token).ConfigureAwait(false);
 
-        // The authoritative unit count comes from PrepareAsync, which is also
-        // where a render-backed source materializes for the first width. Unit
-        // count is stable across widths, so re-preparing after a resize cannot
-        // change a source's identity mid-commit.
-        var committedWidth = Math.Max(1, _terminal.Width);
-        var committedHeight = Math.Max(1, _live.TerminalHeight);
-        var totalUnits = await source.PrepareAsync(committedWidth, token).ConfigureAwait(false);
-        if (totalUnits <= 0)
+        bool wasMuted;
+        try
         {
-            Record(
-                $"start empty width={committedWidth} liveOrigin={_live.RowOrigin} " +
-                $"liveHeight={_live.LiveHeight}");
-            return new FlowCommitResult(
-                0, 0, rowKeys: Array.Empty<string?>(), FlowCommitStatus.Emitted, events,
-                cancelled: false, abortedRows: 0, drainTimedOut: false);
+            wasMuted = await _live.PrepareForCommitAsync(token).ConfigureAwait(false);
         }
-
-        Record(
-            $"start units={totalUnits} width={committedWidth} " +
-            $"liveOrigin={_live.RowOrigin} liveHeight={_live.LiveHeight} " +
-            $"terminalHeight={_live.TerminalHeight}");
+        catch (OperationCanceledException) when (token.IsCancellationRequested && !_uncertain)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new FlowCommitException(
+                "History commitment could not establish a safe admission boundary.",
+                0, 0, 0, innerException: ex);
+        }
+        var initialGeometry = _live.ReadCurrentGeometry();
+        var committedWidth = initialGeometry.Width;
+        var committedHeight = initialGeometry.Height;
+        var committedVersion = _live.ResizeVersion;
+        var totalUnits = 0;
+        var sourcePrepared = false;
 
         var completedUnits = 0;
         var completedRows = 0;
-        var rowKeys = new List<string?>(Math.Min(totalUnits, 256));
-        // Where the terminal's own cursor sits, in screen rows, and whether it
-        // is below the last content row (the live region's top row). The host
-        // preserves this visual row when it re-wraps the buffer, so it is what
-        // the post-reflow anchor is derived from.
-        var cursorRow = Math.Max(0, _live.RowOrigin);
-        var cursorColumn = 0;
-        var cursorBelowContent = true;
-        var appendRow = _live.ComputeAppendRowAfterReflow(
-            committedWidth, Math.Max(1, _live.TerminalHeight), cursorRow, cursorColumn, cursorBelowContent);
+        var rowKeys = new List<string?>();
+        var appendRow = Math.Max(0, _live.RowOrigin);
         var emittedInTurn = 0;
         var faultThreshold = ReadPrototypeFailureThreshold();
         var emission = new UnitEmission();
+        // Where the commit is when it fails. A unit's rows are composed into one
+        // buffered update whose only hand-off to the write path is the scope's
+        // dispose, so a failure raised after composition finished is a failed
+        // hand-off (the composed rows may not have reached the adapter at all),
+        // while a failure raised during composition leaves the composed rows to
+        // the disposal that follows — which may itself fail. Recording which one
+        // happened is what keeps the failure evidence from claiming a flush that
+        // never took place.
+        var phase = EmissionPhase.Preparing;
+        // Whether the most recent atomic scope's one hand-off to the write path
+        // was accepted. The failure path reports this, because a unit that was
+        // composed without a hand-off may not have reached the adapter at all.
+        var unitFlushed = false;
+        // The surface of the unit in flight, so the failure paths can record the
+        // rows it had already composed in the reflow model (see RecordComposedRows).
+        Surface? unitSurface = null;
 
-        // The live app stops painting while history is appended: its frames are
-        // discarded so a frame laid out for a superseded origin can never race
-        // the repositioning.
-        var wasMuted = _live.SetLiveOutputMuted(true);
+        // Retain every width seen for the pending unit: A -> B -> A must not
+        // materialize (index, A) twice. Clear after hand-off, not after reflow.
+        var materialized = new Dictionary<int, FlowCommitUnit>();
+
+        async Task<FlowCommitUnit> MaterializeAsync(int index, int width, CancellationToken ct)
+        {
+            if (materialized.TryGetValue(width, out var cached))
+            {
+                Record($"materialize-reuse unit={index} width={width}");
+                return cached;
+            }
+
+            var built = await source.UnitAsync(index, width, ct).ConfigureAwait(false);
+            materialized.Add(width, built);
+            return built;
+        }
+
+        var resumeOutput = true;
+        var recoveryOffset = 0;
 
         try
         {
+            totalUnits = await source.PrepareAsync(committedWidth, token).ConfigureAwait(false);
+            sourcePrepared = true;
+            if (totalUnits <= 0)
+            {
+                Record($"start empty width={committedWidth} liveOrigin={_live.RowOrigin}");
+                return new FlowCommitResult(
+                    0, 0, Array.Empty<string?>(), 0, events,
+                    cancellationRequested: token.IsCancellationRequested,
+                    abortedRows: 0, drainObserved: false, drainTimedOut: false);
+            }
+
+            rowKeys.Capacity = Math.Min(totalUnits, 256);
+            Record(
+                $"start units={totalUnits} width={committedWidth} " +
+                $"liveOrigin={_live.RowOrigin} liveHeight={_live.LiveHeight} " +
+                $"terminalHeight={_live.TerminalHeight}");
             while (completedUnits < totalUnits)
             {
                 token.ThrowIfCancellationRequested();
+                phase = EmissionPhase.Preparing;
+                unitFlushed = false;
+                recoveryOffset = 0;
 
                 // Geometry is re-checked before every unit AND again right before
                 // the write: the host re-wraps its buffer the moment it sees a
@@ -374,44 +563,63 @@ internal sealed class FlowCommitCoordinator
                 // already reflowed would land on committed content.
                 async Task<bool> ReflowIfNeededAsync(string when)
                 {
-                    var currentWidth = Math.Max(1, _terminal.Width);
-                    var currentHeight = Math.Max(1, _live.TerminalHeight);
-                    if (currentWidth == committedWidth && currentHeight == committedHeight)
+                    var (currentWidth, currentHeight) = _live.ReadCurrentGeometry();
+                    var currentVersion = _live.ResizeVersion;
+                    if (currentWidth == committedWidth && currentHeight == committedHeight
+                        && currentVersion == committedVersion)
                     {
                         return false;
                     }
 
-                    // Reflow: only not-yet-emitted units are re-materialized, at
-                    // the new width. Unit indices are stable across widths, so
-                    // nothing is duplicated or skipped. Content already emitted
-                    // stays where the host put it.
-                    var reprepared = await source.PrepareAsync(currentWidth, token)
-                        .ConfigureAwait(false);
-                    if (reprepared != totalUnits)
+                    // Only a width change invalidates a pending unit's bytes, so
+                    // only a width change re-prepares the source. A height-only
+                    // change is geometry: nothing is re-prepared, and nothing is
+                    // re-materialized at the unchanged width, which is the pair
+                    // FlowCommitSource forbids re-requesting.
+                    var widthChanged = currentWidth != committedWidth;
+                    if (widthChanged)
                     {
-                        // Unit identity must survive reflow. If the count
-                        // changed, index i no longer means what it meant when the
-                        // commit started, so continuing could silently duplicate
-                        // or drop content. Fail loudly.
-                        throw new InvalidOperationException(
-                            $"Commit source returned a different unit count at width {currentWidth} " +
-                            $"({totalUnits} -> {reprepared}); logical units must be stable " +
-                            "across widths so a resize cannot re-identify pending content.");
+                        await ReprepareForWidthChangeAsync(currentWidth).ConfigureAwait(false);
+                        committedWidth = currentWidth;
                     }
 
-                    // The host re-wrapped its whole buffer, so absolute rows no
-                    // longer identify where the flow's content ends. Re-derive
-                    // the append position from the flow's own reflow model:
-                    // committed paragraph widths plus the cursor's visual row,
-                    // which is what the host preserved.
-                    appendRow = _live.ComputeAppendRowAfterReflow(
-                        currentWidth, currentHeight, cursorRow, cursorColumn, cursorBelowContent);
-                    committedWidth = currentWidth;
+                    if (!_live.SupportsCursorObservation)
+                    {
+                        throw new NotSupportedException(
+                            "Resizing during history commitment requires cursor observation.");
+                    }
+
+                    appendRow = await ObserveBoundaryAsync(appendRow, 0, token).ConfigureAwait(false);
+                    committedVersion = _live.ResizeVersion;
                     committedHeight = currentHeight;
                     Record(
                         $"reflow when={when} width={currentWidth} height={currentHeight} units={totalUnits} " +
-                        $"appendRow={appendRow} cursorRow={cursorRow} cursorBelowContent={cursorBelowContent}");
-                    return true;
+                        $"appendRow={appendRow} resizeVersion={committedVersion} " +
+                        $"geometryOnly={(widthChanged ? "false" : "true")}");
+                    return widthChanged;
+                }
+
+                // Re-prepares the source for a new width and fails the commit if
+                // its unit identity did not survive the change.
+                async Task ReprepareForWidthChangeAsync(int width)
+                {
+                    var reprepared = await source.PrepareAsync(width, token).ConfigureAwait(false);
+                    if (reprepared == totalUnits)
+                    {
+                        return;
+                    }
+
+                    // Unit identity must survive reflow. If the count changed,
+                    // index i no longer means what it meant when the commit
+                    // started, so continuing could silently duplicate or drop
+                    // content — with units already emitted. Fail loudly, and let
+                    // the failure path report the emitted prefix and suspend the
+                    // step rather than leaving this looking like a retryable
+                    // precondition violation.
+                    throw new InvalidOperationException(
+                        $"Commit source returned a different unit count at width {width} " +
+                        $"({totalUnits} -> {reprepared}); logical units must be stable " +
+                        "across widths so a resize cannot re-identify pending content.");
                 }
 
                 await ReflowIfNeededAsync("pre-unit");
@@ -423,138 +631,273 @@ internal sealed class FlowCommitCoordinator
                     Record($"turn start unit={completedUnits} width={width}");
                 }
 
-                var unit = await source.UnitAsync(completedUnits, committedWidth, token)
-                    .ConfigureAwait(false);
-
-                // The host may have reflowed while the unit was being built, so
-                // re-check and re-materialize at the settled width before writing.
-                if (await ReflowIfNeededAsync("pre-write").ConfigureAwait(false))
+                FlowCommitUnit unit;
+                var materializationWidth = committedWidth;
+                while (true)
                 {
-                    unit = await source.UnitAsync(completedUnits, committedWidth, token)
+                    materializationWidth = committedWidth;
+                    unit = await MaterializeAsync(completedUnits, materializationWidth, token)
                         .ConfigureAwait(false);
+                    await ReflowIfNeededAsync("pre-write").ConfigureAwait(false);
+                    appendRow = await ObserveBoundaryAsync(appendRow, 0, token).ConfigureAwait(false);
+
+                    // Observation itself can span a resize. Reuse an existing
+                    // materialization only when its width and the final geometry
+                    // still agree; height-only changes never rebuild the unit.
+                    if (materializationWidth == committedWidth
+                        && committedWidth == _live.ReadCurrentGeometry().Width
+                        && committedHeight == _live.ReadCurrentGeometry().Height
+                        && committedVersion == _live.ResizeVersion)
+                    {
+                        break;
+                    }
                 }
 
                 var unitHeight = Math.Max(1, unit.Surface.Height);
+                unitSurface = unit.Surface;
 
-                // One serialized terminal update carries the whole displacement:
-                // room for the unit (scrolling if it does not fit), the unit's
-                // rows, and then the live region re-anchored and repainted below
-                // them. Bracketed by synchronized output, so a host that honors
-                // mode 2026 never paints the state where the unit's rows have
-                // overwritten the region and the repaint has not landed yet; a
-                // host that ignores it sees at most one transient frame. This is
-                // per unit, not per turn: after every committed unit the region
-                // is back on screen at the new append position, painted from the
-                // freshest live frame, so typed edits are rendered while the
-                // batch is still in flight instead of being buffered until the
-                // next boundary. The scope is synchronous — the drain wait runs
-                // after it.
-                using (_live.BeginAtomicTerminalUpdate())
+                // Compose history plus live repaint as one serialized write.
+                // Adapter acceptance is not a host-presentation acknowledgement.
+                var scope = _live.BeginAtomicTerminalUpdate();
+                var freshGeometry = _live.ReadFreshGeometryForEmission();
+                if (freshGeometry.Width != materializationWidth
+                    || freshGeometry.Height != committedHeight
+                    || freshGeometry.ResizeVersion != committedVersion)
                 {
-                    // Proven geometry discipline (same as the tombstone path):
-                    // scroll first so the whole unit fits below the cursor, then
-                    // append. Without this, a full-height append clamps onto the
-                    // last row and destroys already-emitted history.
-                    appendRow = EnsureRoom(appendRow, unitHeight, Record, "unit");
-                    if (_live.TerminalHeight > 0)
+                    // The native presentation can resize between the last
+                    // asynchronous observation and this write. The scope is
+                    // still empty, so release it and rebuild/re-observe rather
+                    // than emitting bytes laid out for stale geometry.
+                    scope.Dispose();
+                    var widthChanged = freshGeometry.Width != committedWidth;
+                    if (widthChanged)
                     {
-                        // EnsureRoom's scrolls park the host cursor on the bottom
-                        // row.
-                        cursorRow = Math.Max(0, _live.TerminalHeight - 1);
-                        cursorColumn = 0;
-                        cursorBelowContent = true;
+                        await ReprepareForWidthChangeAsync(freshGeometry.Width).ConfigureAwait(false);
+                        committedWidth = freshGeometry.Width;
                     }
 
-                    // Cleared before and after every unit: while no unit is in
-                    // flight there are no aborted rows, and a cancellation at a
-                    // loop guard must not attribute the previous unit's rows to
-                    // it.
-                    emission.Reset();
-                    EmitUnit(
-                        Record,
-                        completedUnits,
-                        unit,
-                        appendRow,
-                        faultThreshold,
-                        emission,
-                        token);
-
-                    // Repaint the region below the unit's rows inside the same
-                    // update, so a completed unit never leaves the region
-                    // displaced. The repaint is also where a live frame rendered
-                    // while the pump was muted becomes visible, and it returns
-                    // the row the next content row appends at.
-                    appendRow = RepaintLiveRegion(appendRow + unitHeight, Record);
+                    committedHeight = freshGeometry.Height;
+                    committedVersion = freshGeometry.ResizeVersion;
+                    _live.ResizeLiveToTerminalGeometry(
+                        freshGeometry.Width,
+                        freshGeometry.Height);
+                    appendRow = await ObserveBoundaryAsync(appendRow, 0, token)
+                        .ConfigureAwait(false);
+                    continue;
                 }
 
-                // The host cursor now sits at the region's top-left, below every
-                // row that may carry committed content — the anchor state the
-                // reflow model is derived from, held after every unit rather
-                // than only at turn boundaries.
-                cursorRow = appendRow;
-                cursorColumn = 0;
-                cursorBelowContent = true;
-                emission.Reset();
+                var wholeUnitComposed = false;
+                Exception? compositionFailure = null;
+                try
+                {
+                    phase = EmissionPhase.Composing;
+                    EmitUnit(
+                        Record, completedUnits, unit, ref appendRow,
+                        faultThreshold, emission, token);
+                    wholeUnitComposed = true;
+                    appendRow = RepaintLiveRegion(appendRow, Record);
+                    emission.NextRowOffset = 0;
+                    phase = EmissionPhase.Handoff;
+                }
+                catch (Exception ex)
+                {
+                    compositionFailure = ex;
+                }
+                finally
+                {
+                    try
+                    {
+                        // A composition failure can leave a partial row in this
+                        // scope. Repaint before disposing it so the partial
+                        // history and the retained prompt reach the host as one
+                        // presentable frame; recovery still re-anchors below the
+                        // exact composed-row offset afterward.
+                        if (compositionFailure is not null
+                            && !wholeUnitComposed
+                            && emission.RowsWritten > 0)
+                        {
+                            try
+                            {
+                                appendRow = RepaintLiveRegion(appendRow, Record);
+                                emission.NextRowOffset = 0;
+                            }
+                            catch (Exception repaintEx)
+                            {
+                                Record(
+                                    $"partial-repaint-failed unit={completedUnits} " +
+                                    $"{repaintEx.GetType().Name}: {repaintEx.Message}");
+                            }
+                        }
 
-                // The unit is fully written, repainted and recorded; waiting for
-                // the terminal side is deliberately not cancellable, so a
-                // cancellation cannot land after the last row but before the
-                // caller counts the unit as completed.
-                await WaitForTerminalConsumptionAsync(CancellationToken.None).ConfigureAwait(false);
+                        scope.Dispose();
+                    }
+                    catch (Exception handoffEx)
+                    {
+                        if (compositionFailure is null)
+                        {
+                            compositionFailure = handoffEx;
+                        }
+                        else
+                        {
+                            Record(
+                                $"scope-handoff-failed unit={completedUnits} " +
+                                $"{handoffEx.GetType().Name}: {handoffEx.Message}");
+                        }
+                    }
+                    finally
+                    {
+                        unitFlushed = scope.FlushCompleted;
+                    }
+                }
 
-                completedUnits++;
-                completedRows += unitHeight;
-                // Always record a slot, including for units submitted without a
-                // key, so RowKeys stays index-aligned with unit order and
-                // RowKeys.Count == CompletedUnits.
-                rowKeys.Add(unit.RowKey);
-                emittedInTurn++;
+                if (unitFlushed && wholeUnitComposed)
+                {
+                    // Count accepted units even if their subsequent live repaint
+                    // failed, and always before a cancellable drain.
+                    recoveryOffset = emission.NextRowOffset;
+                    emission.Reset();
+                    materialized.Clear();
+                    completedUnits++;
+                    completedRows += unitHeight;
+                    rowKeys.Add(unit.RowKey);
+                    emittedInTurn++;
+                    _live.RecordCommittedRows(unit.Surface);
+                }
+
+                if (compositionFailure is not null)
+                {
+                    ExceptionDispatchInfo.Capture(compositionFailure).Throw();
+                }
+
+                if (!unitFlushed)
+                {
+                    throw new IOException("The terminal did not accept the composed history update.");
+                }
+
+                var unitDrained = await WaitForTerminalConsumptionAsync(token).ConfigureAwait(false);
+                if (!unitDrained)
+                {
+                    // Not fatal here: the commit's own outcome is reported by the
+                    // final drain, so a per-unit timeout is evidence, not a
+                    // failure.
+                    Record(
+                        $"drain-timeout unit={completedUnits - 1} " +
+                        $"queueDepth={_terminal.OutputQueueDepth}");
+                }
 
                 if (emittedInTurn >= UnitsPerTurn && completedUnits < totalUnits)
                 {
                     emittedInTurn = 0;
-                    Record($"turn yield after unit {completedUnits} origin={appendRow} liveHeight={_live.LiveHeight}");
+                    Record($"turn yield after unit {completedUnits} origin={appendRow} liveHeight={EffectiveLiveHeight()}");
                     await Task.Yield();
                 }
             }
 
-            // Coordinated final step: reserve room for the live region, apply
-            // the next live layout to the still-running app, and repaint the
-            // region below the committed content before unmuting, so no
-            // stale-origin frame is ever replayed.
-            var liveOrigin = EnsureRoom(
-                appendRow, Math.Max(1, _live.LiveHeight), Record, "live-region");
-            var snapshot = _live.SnapshotLiveSurface() ?? EmptySurface(Math.Max(1, _terminal.Width));
-            _live.ApplyLiveLayout(nextLive);
-            _live.ReanchorLive(liveOrigin, _live.LiveHeight, snapshot);
-            _live.ResizeLive(Math.Max(1, _terminal.Width), _live.LiveHeight);
+            phase = EmissionPhase.Finalizing;
 
-            // Resume the live output pump, then ask for a frame and wait for it.
-            // Ordering matters: a frame rendered while muted would be discarded,
-            // so the unmute happens before the request, and the wait is what
-            // makes "nextLive applied" an observed fact rather than an
-            // assumption. It is bounded, and a timeout is recorded explicitly.
-            // Drop every frame the app queued while muted, then resume: the
-            // region's bookkeeping was already moved to the new origin, so the
-            // frames the app renders from here on are laid out for it, and no
-            // frame laid out for the superseded origin can be replayed.
+            // Coordinated final step, in the only order that cannot replay a
+            // frame laid out for the superseded origin: the pump stays muted
+            // while the next live layout is applied and the app renders it, the
+            // freshest surface is painted below the committed rows only after
+            // that frame has arrived, and the pump resumes last. Every submitted
+            // unit was handed off by the time the loop exits, which is exactly
+            // the condition under which the next live layout is applied.
+            //
+            // The frame baseline is captured BEFORE the swap and the render
+            // request, so a frame that completes in between still satisfies the
+            // wait instead of being missed and stalling it. The layout builder is
+            // free to trigger a resize of its own while it is applied, which is
+            // why nothing is painted until its frame is in hand.
+            var frameBeforeSwap = _live.FrameCount;
+            _live.ApplyLiveLayout(nextLive);
+            _live.RequestLiveFrame();
+            var liveFrameObserved = await _live
+                .WaitForLiveFrameAfterAsync(frameBeforeSwap, LiveFrameTimeout, token)
+                .ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            if (!liveFrameObserved)
+            {
+                throw new TimeoutException("The next live layout did not render before hand-off.");
+            }
+
+            appendRow = await ObserveBoundaryAsync(appendRow, 0, token).ConfigureAwait(false);
+            // Reserve and paint only after a bounded geometry-stability check.
+            // A host resize can land between the boundary observation and
+            // reservation; preserve the adjusted append row from any scroll
+            // rather than querying the cursor after EnsureRoom has parked it
+            // on the bottom row.
+            var finalLiveHeight = 0;
+            var liveOrigin = 0;
+            var finalWidth = 0;
+            var finalReserved = false;
+            for (var geometryAttempt = 0; geometryAttempt < 4; geometryAttempt++)
+            {
+                var geometryBefore = _live.ReadCurrentGeometry();
+                var versionBefore = _live.ResizeVersion;
+                finalLiveHeight = Math.Clamp(
+                    Math.Max(1, _live.LiveHeight),
+                    1,
+                    Math.Max(1, geometryBefore.Height));
+                liveOrigin = EnsureRoom(
+                    appendRow,
+                    finalLiveHeight,
+                    Record,
+                    "live-region",
+                    geometryBefore.Height);
+                var geometryAfter = _live.ReadCurrentGeometry();
+                if (geometryBefore.Width != geometryAfter.Width
+                    || geometryBefore.Height != geometryAfter.Height
+                    || versionBefore != _live.ResizeVersion)
+                {
+                    // EnsureRoom may have scrolled before the host published
+                    // the new geometry. Preserve its adjusted append row;
+                    // the cursor now points at the scroll position, not the
+                    // live boundary.
+                    appendRow = Math.Max(0, liveOrigin);
+                    continue;
+                }
+
+                finalWidth = Math.Max(1, geometryAfter.Width);
+                finalLiveHeight = Math.Clamp(
+                    finalLiveHeight, 1, Math.Max(1, geometryAfter.Height));
+                finalReserved = true;
+                break;
+            }
+
+            if (!finalReserved)
+            {
+                throw new InvalidOperationException(
+                    "The terminal geometry kept changing while reserving the live region.");
+            }
+
+            var reanchorUpdate = _live.BeginAtomicTerminalUpdate();
+            try
+            {
+                _live.ResizeLive(finalWidth, finalLiveHeight);
+                _live.ReanchorLive(
+                    liveOrigin,
+                    finalLiveHeight,
+                    _live.SnapshotLiveSurface() ?? EmptySurface(finalWidth));
+            }
+            finally
+            {
+                reanchorUpdate.Dispose();
+            }
+
+            // Drop every frame the app queued while muted — the region is painted
+            // at the origin those frames are now laid out for, so none of them may
+            // be replayed — and only then resume the pump, unless the caller had
+            // muted it before this commit.
             var discarded = _live.DiscardQueuedLiveOutput();
             if (!wasMuted)
             {
                 _live.SetLiveOutputMuted(false);
             }
-            _live.RequestLiveFrame();
-            var liveFrameObserved = await _live
-                .WaitForNextLiveFrameAsync(LiveFrameTimeout, token)
-                .ConfigureAwait(false);
+
             Record(
                 $"emission-ack units={completedUnits} rows={completedRows} liveOrigin={liveOrigin} " +
-                $"liveHeight={_live.LiveHeight} width={_terminal.Width} " +
+                $"liveHeight={finalLiveHeight} width={finalWidth} " +
                 $"discardedQueuedFrames={discarded} liveFrameObserved={liveFrameObserved}");
-        }
-        catch (FlowCommitException)
-        {
-            throw;
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -562,16 +905,69 @@ internal sealed class FlowCommitCoordinator
             // history and the aborted unit's rows stay where they were written.
             // Re-anchor below everything that may have been written before the
             // live pump resumes, so no later frame overwrites it.
+            //
+            // Only a prepared source with every unit handed off may install the
+            // next layout. Before preparation returns, the pending count is unknown.
             var abortedRows = emission.RowsWritten;
-            var recoveryRow = appendRow + abortedRows;
-            await ReanchorAndResumeAsync(
-                recoveryRow,
-                nextLive,
-                Record,
-                "cancelled",
-                completedUnits,
-                abortedRows).ConfigureAwait(false);
-            Record($"cancelled after unit {completedUnits} abortedRows={abortedRows}");
+            var pendingUnits = totalUnits - completedUnits;
+            RecordComposedRows(unitSurface, abortedRows, Record, unitFlushed);
+            Exception? recoveryFailure = null;
+            try
+            {
+                await ReanchorAndResumeAsync(
+                    appendRow,
+                    Math.Max(recoveryOffset, emission.NextRowOffset),
+                    sourcePrepared && pendingUnits == 0 ? nextLive : null,
+                    Record,
+                    sourcePrepared && pendingUnits == 0 ? "cancelled-all-handed-off" : "cancelled",
+                    completedUnits,
+                    abortedRows,
+                    wasMuted).ConfigureAwait(false);
+            }
+            catch (Exception recoveryEx)
+            {
+                // The commit is cancelled, but its emitted prefix is history and
+                // the live region was never moved below it. Letting the adapter
+                // exception escape would leave the step looking safely retryable,
+                // and a retry would duplicate the prefix.
+                recoveryFailure = recoveryEx;
+            }
+
+            Record(
+                $"cancelled after unit {completedUnits} abortedRows={abortedRows} " +
+                $"pendingUnits={(sourcePrepared ? pendingUnits.ToString() : "unknown")}" +
+                (recoveryFailure is null
+                    ? string.Empty
+                    : $" recoveryFailed={recoveryFailure.GetType().Name}: {recoveryFailure.Message}"));
+
+            if (recoveryFailure is not null)
+            {
+                // Same policy as any other failure with potential emitted
+                // progress: the step is suspended and the partial progress
+                // travels with the failure, rather than the recovery failure
+                // being reported as an unclassified error.
+                Suspend(recoveryFailure);
+                resumeOutput = false;
+                throw new FlowCommitException(
+                    $"History commitment was cancelled after {completedUnits} completed unit(s) " +
+                    $"({completedRows} row(s))" +
+                    (pendingUnits > 0 ? $", with {pendingUnits} unit(s) still pending" : string.Empty) +
+                    (abortedRows > 0 ? $", {abortedRows} row(s) of the pending unit composed" : string.Empty) +
+                    $"; live-region recovery also failed: {recoveryFailure.Message}",
+                    completedUnits,
+                    completedRows,
+                    abortedRows,
+                    innerException: recoveryFailure,
+                    recoveryFailure: recoveryFailure);
+            }
+
+            if (!sourcePrepared)
+            {
+                // No source count or hand-off exists yet. Preserve the ordinary
+                // pre-emission cancellation contract instead of inventing a result.
+                throw;
+            }
+
             // CompletedRows keeps its documented meaning (rows of fully emitted
             // units only). The aborted unit's rows are reserved on screen and
             // reported through the commit trace, not counted as completed.
@@ -579,49 +975,120 @@ internal sealed class FlowCommitCoordinator
                 completedUnits,
                 completedRows,
                 rowKeys,
-                FlowCommitStatus.Cancelled,
+                pendingUnits,
                 events,
-                cancelled: true,
+                cancellationRequested: true,
                 abortedRows: abortedRows,
+                drainObserved: false,
                 drainTimedOut: false);
         }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        catch (Exception ex)
         {
-            _uncertain = true;
-            // The failure left rows in an unknown state. Move the live region
-            // below everything that may have been written — including the
-            // aborted unit's partial rows — and resume there, so the completed
-            // prefix and the uncertain bytes are never painted over by the next
-            // live frame, and nothing is replayed.
+            // Every failure in the emission region is reported through one
+            // contract, whatever raised it. A raw exception escaping unchanged
+            // would look like a precondition violation the caller may simply
+            // retry, while the terminal may already hold emitted rows — above all
+            // the unit-count change detected at a resize check, which can only be
+            // reached with content already emitted.
             var abortedRows = emission.RowsWritten;
-            var recoveryRow = appendRow + abortedRows;
-            await ReanchorAndResumeAsync(
-                recoveryRow,
-                nextLive,
-                Record,
-                "fault",
-                completedUnits,
-                abortedRows).ConfigureAwait(false);
-            Record($"fault after unit {completedUnits}: {ex.GetType().Name}: {ex.Message} abortedRows={abortedRows}");
+            var pendingUnits = totalUnits - completedUnits;
+            // Potential emitted progress is what makes a retry unsafe: an emitted
+            // prefix would be duplicated, and a partly composed unit may already
+            // be on screen. With neither, nothing can be duplicated and the step
+            // stays committable.
+            var mayHaveEmitted = completedUnits > 0 || abortedRows > 0;
+            if (mayHaveEmitted)
+            {
+                Suspend(ex);
+            }
+
+            // Whether this unit's one hand-off was accepted. Composed rows whose
+            // hand-off failed may not have reached the adapter at all, so the
+            // failure is reported with that uncertainty rather than as an exact
+            // zero — the rows are still reserved and still never replayed.
+            //
+            // An empty scope reports a completed hand-off because it had nothing
+            // to hand off, so the fact only says anything about rows this unit
+            // actually composed: no composed rows must never be reported as a
+            // hand-off that failed.
+            var handoffMissing =
+                abortedRows > 0
+                && !unitFlushed
+                && phase is EmissionPhase.Composing or EmissionPhase.Handoff;
+
+            // The rows this unit composed are reserved on screen by the recovery
+            // below, so the reflow model has to carry the same rows: a later
+            // resize settle recomputes the region's origin from that model, and a
+            // model ending above these rows would move the region on top of them.
+            RecordComposedRows(unitSurface, abortedRows, Record, unitFlushed);
+
+            Exception? recoveryFailure = null;
+            try
+            {
+                if (handoffMissing)
+                {
+                    throw new IOException("The failed terminal hand-off left no safe repaint boundary.");
+                }
+
+                await ReanchorAndResumeAsync(
+                    appendRow,
+                    Math.Max(recoveryOffset, emission.NextRowOffset),
+                    sourcePrepared && pendingUnits == 0 ? nextLive : null,
+                    Record,
+                    mayHaveEmitted ? "fault" : "fault-no-progress",
+                    completedUnits,
+                    abortedRows,
+                    wasMuted).ConfigureAwait(false);
+            }
+            catch (Exception recoveryEx)
+            {
+                // Recovery failure must never replace or hide the failure that
+                // caused it: the original exception is what the caller sees, with
+                // the recovery failure reported next to it and traced here.
+                recoveryFailure = recoveryEx;
+                resumeOutput = false;
+                Suspend(recoveryEx);
+            }
+
+            Record(
+                $"fault after unit {completedUnits}: {ex.GetType().Name}: {ex.Message} " +
+                $"abortedRows={abortedRows} pendingUnits={pendingUnits} phase={phase} " +
+                $"handoffMissing={handoffMissing} suspended={mayHaveEmitted}" +
+                (recoveryFailure is null
+                    ? string.Empty
+                    : $" recoveryFailed={recoveryFailure.GetType().Name}: {recoveryFailure.Message}"));
+
             throw new FlowCommitException(
                 $"History emission failed after {completedUnits} completed unit(s) " +
-                $"({completedRows} row(s)): {ex.Message}",
+                $"({completedRows} row(s))" +
+                (pendingUnits > 0 ? $", with {pendingUnits} unit(s) still pending" : string.Empty) +
+                (abortedRows > 0 ? $", {abortedRows} row(s) of the failing unit composed" : string.Empty) +
+                (handoffMissing
+                    ? ", before the update carrying them was accepted by the terminal"
+                    : string.Empty) +
+                $": {ex.Message}" +
+                (recoveryFailure is null
+                    ? string.Empty
+                    : $" (live-region recovery also failed: {recoveryFailure.Message})"),
                 completedUnits,
                 completedRows,
-                mayHavePartialRow: ex is IOException,
-                innerException: ex);
+                abortedRows,
+                innerException: ex,
+                recoveryFailure: recoveryFailure);
         }
         finally
         {
-            if (!wasMuted)
+            if (resumeOutput && !wasMuted)
             {
                 _live.SetLiveOutputMuted(false);
             }
         }
 
-        // The final drain is part of the emission outcome, so a cancellation
-        // here must surface as a cancelled commit rather than escaping as an
-        // unrelated failure the caller would have to treat as uncertain.
+        // The final drain cannot change what was emitted: every unit was handed
+        // off and the next live layout was applied before it ran. Cancellation
+        // observed here is therefore reported alongside a complete emission, not
+        // as a partial commit, and the two drain facts stay honest about what the
+        // drain actually did.
         bool drained;
         try
         {
@@ -629,15 +1096,21 @@ internal sealed class FlowCommitCoordinator
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
-            Record($"cancelled after unit {completedUnits} during final drain");
+            // Every unit was handed off and the coordinated final step already
+            // applied the next live layout, so the commit emitted everything it
+            // was asked to; only the post-emission observation was cut short.
+            Record(
+                $"cancelled after unit {completedUnits} during final drain " +
+                $"queueDepth={_terminal.OutputQueueDepth}");
             return new FlowCommitResult(
                 completedUnits,
                 completedRows,
                 rowKeys,
-                FlowCommitStatus.Cancelled,
+                pendingUnits: 0,
                 events,
-                cancelled: true,
+                cancellationRequested: true,
                 abortedRows: 0,
+                drainObserved: false,
                 drainTimedOut: false);
         }
 
@@ -656,58 +1129,209 @@ internal sealed class FlowCommitCoordinator
             completedUnits,
             completedRows,
             rowKeys,
-            FlowCommitStatus.Emitted,
+            pendingUnits: 0,
             events,
-            cancelled: false,
+            cancellationRequested: token.IsCancellationRequested,
             abortedRows: 0,
+            drainObserved: drained,
             drainTimedOut: !drained);
     }
 
     /// <summary>
-    /// Moves the live region below everything the commit may have written and
-    /// resumes the live pump there. Used by the success path and by the fault
-    /// and cancellation paths, so a resumed live frame can never paint over
-    /// committed or uncertain rows.
+    /// Repaints below the observed prefix while output remains muted. A partial
+    /// commit retains the old builder; a fully handed-off commit installs nextLive.
     /// </summary>
-    /// <returns>The live region's new origin.</returns>
     private async Task<int> ReanchorAndResumeAsync(
         int appendRow,
-        Func<FlowStepContext, Task<Hex1bWidget>> nextLive,
+        int observedRowOffset,
+        Func<FlowStepContext, Task<Hex1bWidget>>? nextLive,
         Action<string> record,
         string reason,
         int completedUnits,
-        int abortedRows)
+        int abortedRows,
+        bool wasMuted)
     {
-        var liveHeight = Math.Max(1, _live.LiveHeight);
-        var liveOrigin = EnsureRoom(appendRow, liveHeight, record, "recovery-live-region");
-        var snapshot = _live.SnapshotLiveSurface() ?? EmptySurface(Math.Max(1, _terminal.Width));
-        _live.ApplyLiveLayout(nextLive);
-        _live.ReanchorLive(liveOrigin, liveHeight, snapshot);
-        _live.ResizeLive(Math.Max(1, _terminal.Width), liveHeight);
+        // Same order as the success path, and for the same reason: the pump stays
+        // muted while the layout is applied (when the hand-off rule says it
+        // applies) and the app renders it, and the region is painted from the
+        // frame that actually arrived rather than from the pre-swap surface.
+        var frameBeforeSwap = _live.FrameCount;
+        if (nextLive is not null)
+        {
+            _live.ApplyLiveLayout(nextLive);
+        }
+
+        _live.RequestLiveFrame();
+        var liveFrameObserved = await _live
+            .WaitForLiveFrameAfterAsync(frameBeforeSwap, LiveFrameTimeout, _flowCancellationToken)
+            .ConfigureAwait(false);
+        _flowCancellationToken.ThrowIfCancellationRequested();
+        if (!liveFrameObserved)
+        {
+            throw new TimeoutException("The live layout did not render during commitment recovery.");
+        }
+
+        appendRow = await ObserveBoundaryAsync(
+            appendRow, observedRowOffset, _flowCancellationToken).ConfigureAwait(false);
+
+        // The frame the app rendered may be a different height than the region
+        // was, so the reservation is computed from a stable geometry snapshot.
+        var liveHeight = 0;
+        var liveOrigin = 0;
+        var recoveryWidth = 0;
+        var recoveryReserved = false;
+        for (var geometryAttempt = 0; geometryAttempt < 4; geometryAttempt++)
+        {
+            var geometryBefore = _live.ReadCurrentGeometry();
+            var versionBefore = _live.ResizeVersion;
+            liveHeight = Math.Clamp(
+                Math.Max(1, _live.LiveHeight),
+                1,
+                Math.Max(1, geometryBefore.Height));
+            liveOrigin = EnsureRoom(
+                appendRow,
+                liveHeight,
+                record,
+                "recovery-live-region",
+                geometryBefore.Height);
+            var geometryAfter = _live.ReadCurrentGeometry();
+            if (geometryBefore.Width != geometryAfter.Width
+                || geometryBefore.Height != geometryAfter.Height
+                || versionBefore != _live.ResizeVersion)
+            {
+                // EnsureRoom may have scrolled before the host published the
+                // new geometry. Preserve that adjusted append row; querying
+                // the cursor now would observe the bottom-row scroll cursor,
+                // not the live boundary.
+                appendRow = Math.Max(0, liveOrigin);
+                continue;
+            }
+
+            recoveryWidth = Math.Max(1, geometryAfter.Width);
+            liveHeight = Math.Clamp(
+                liveHeight, 1, Math.Max(1, geometryAfter.Height));
+            recoveryReserved = true;
+            break;
+        }
+
+        if (!recoveryReserved)
+        {
+            throw new InvalidOperationException(
+                "The terminal geometry kept changing while reserving the recovery region.");
+        }
+
+        var reanchorUpdate = _live.BeginAtomicTerminalUpdate();
+        try
+        {
+            _live.ResizeLive(recoveryWidth, liveHeight);
+            _live.ReanchorLive(
+                liveOrigin,
+                liveHeight,
+                _live.SnapshotLiveSurface() ?? EmptySurface(recoveryWidth));
+        }
+        finally
+        {
+            reanchorUpdate.Dispose();
+        }
 
         // Drop every frame the app queued while muted: the region's bookkeeping
         // just moved, so frames laid out for the superseded origin must never be
-        // replayed.
+        // replayed. The pump is resumed only when this commit was the one that
+        // muted it. The frame wait is bounded by the flow's own lifetime, so a
+        // flow that is shutting down does not hold recovery open across the
+        // whole timeout — and recovery never throws on cancellation, because it
+        // runs while the commit is already unwinding an outcome.
         var discarded = _live.DiscardQueuedLiveOutput();
-        _live.SetLiveOutputMuted(false);
-        _live.RequestLiveFrame();
-        var liveFrameObserved = await _live
-            .WaitForNextLiveFrameAsync(LiveFrameTimeout, CancellationToken.None)
-            .ConfigureAwait(false);
+        if (!wasMuted)
+        {
+            _live.SetLiveOutputMuted(false);
+        }
+
         record(
             $"recovery-reanchor reason={reason} units={completedUnits} abortedRows={abortedRows} " +
-            $"liveOrigin={liveOrigin} liveHeight={liveHeight} width={_terminal.Width} " +
-            $"discardedQueuedFrames={discarded} liveFrameObserved={liveFrameObserved}");
+            $"liveOrigin={liveOrigin} liveHeight={liveHeight} width={recoveryWidth} " +
+            $"discardedQueuedFrames={discarded} nextLiveApplied={nextLive is not null} " +
+            $"liveFrameObserved={liveFrameObserved}");
         return liveOrigin;
     }
+
+    /// <summary>
+    /// Records the rows a stopped unit had already composed in the flow's reflow
+    /// model, so the model carries exactly the rows the recovery reserves on
+    /// screen.
+    /// </summary>
+    /// <remarks>
+    /// The composed row count is exact. A row's written extent is not: the failing
+    /// row may have been truncated or its hand-off rejected, and neither is
+    /// observable from here, so the row's composed cells are recorded as the
+    /// conservative upper bound. Recording less than that would end the model
+    /// above rows that may be on screen, and a later resize settle would then
+    /// anchor the live region over them.
+    /// </remarks>
+    private void RecordComposedRows(
+        Surface? surface,
+        int composedRows,
+        Action<string> record,
+        bool handoffAccepted)
+    {
+        if (!handoffAccepted || surface is null || composedRows <= 0)
+        {
+            return;
+        }
+
+        var rows = Math.Min(composedRows, Math.Max(1, surface.Height));
+        if (rows >= surface.Height)
+        {
+            _live.RecordCommittedRows(surface);
+        }
+        else
+        {
+            var cropped = new Surface(surface.Width, rows);
+            for (var row = 0; row < rows; row++)
+            {
+                for (var column = 0; column < surface.Width; column++)
+                {
+                    cropped.TrySetCell(column, row, surface.GetCell(column, row));
+                }
+            }
+
+            _live.RecordCommittedRows(cropped);
+        }
+
+        record(
+            $"partial-rows-recorded rows={rows} ofUnitRows={surface.Height} " +
+            $"handoffAccepted={handoffAccepted} extentConservative={rows < surface.Height}");
+    }
+
+    /// <summary>
+    /// The live region's height as it can actually exist in the terminal: never
+    /// taller than the terminal, which is the clamp
+    /// <see cref="ILiveStepHandle.ReanchorLive"/> applies when it paints.
+    /// </summary>
+    /// <remarks>
+    /// The commit can observe a new terminal size before the step's own height
+    /// bookkeeping catches up — the parent adapter reports the host's new
+    /// geometry the moment the host reflows, while the resize event reaches the
+    /// runner asynchronously. Reserving room for a region taller than the
+    /// terminal would compute an origin the painting clamp rejects, leaving the
+    /// append cursor above the screen and the next units stacked onto the bottom
+    /// row; the native shrink leg is what caught that.
+    /// </remarks>
+    private int EffectiveLiveHeight()
+        => Math.Clamp(Math.Max(1, _live.LiveHeight), 1, Math.Max(1, _live.TerminalHeight));
 
     /// <summary>
     /// Scrolls the viewport up until <paramref name="height"/> rows fit below
     /// <paramref name="appendRow"/>, returning the adjusted append row.
     /// </summary>
-    private int EnsureRoom(int appendRow, int height, Action<string> record, string what)
+    private int EnsureRoom(
+        int appendRow,
+        int height,
+        Action<string> record,
+        string what,
+        int? terminalHeightOverride = null)
     {
-        var terminalHeight = Math.Max(1, _live.TerminalHeight);
+        var terminalHeight = Math.Max(1, terminalHeightOverride ?? _live.TerminalHeight);
         var overflow = (appendRow + height) - terminalHeight;
         if (overflow > 0)
         {
@@ -718,6 +1342,7 @@ internal sealed class FlowCommitCoordinator
                 $"terminalHeight={terminalHeight} height={height} " +
                 $"terminalWidth={_live.TerminalWidth} liveHeight={_live.LiveHeight}");
         }
+
         return appendRow;
     }
 
@@ -727,13 +1352,40 @@ internal sealed class FlowCommitCoordinator
     /// </summary>
     private int RepaintLiveRegion(int appendRow, Action<string> record)
     {
-        var liveHeight = Math.Max(1, _live.LiveHeight);
+        var liveHeight = EffectiveLiveHeight();
         var origin = EnsureRoom(appendRow, liveHeight, record, "live-region");
+        var (width, _) = _live.ReadCurrentGeometry();
         _live.ReanchorLive(
             origin,
             liveHeight,
-            _live.SnapshotLiveSurface() ?? EmptySurface(Math.Max(1, _terminal.Width)));
+            _live.SnapshotLiveSurface() ?? EmptySurface(Math.Max(1, width)));
         return origin;
+    }
+
+    private async Task<int> ObserveBoundaryAsync(
+        int fallbackRow, int rowOffset, CancellationToken cancellationToken)
+    {
+        if (!_live.SupportsCursorObservation)
+        {
+            return fallbackRow;
+        }
+
+        while (true)
+        {
+            var (width, height) = _live.ReadCurrentGeometry();
+            var version = _live.ResizeVersion;
+            var row = await _live.ObserveCursorRowAsync(cancellationToken).ConfigureAwait(false);
+            if (row is null)
+            {
+                throw new IOException("The terminal did not report an authoritative history boundary.");
+            }
+
+            var after = _live.ReadCurrentGeometry();
+            if (version == _live.ResizeVersion && width == after.Width && height == after.Height)
+            {
+                return Math.Max(0, row.Value + rowOffset);
+            }
+        }
     }
 
     /// <summary>
@@ -754,8 +1406,12 @@ internal sealed class FlowCommitCoordinator
             return;
         }
 
+        // Baseline 0 is exactly the readiness predicate: the guard above already
+        // established that no frame has been rendered, so a fresh count sample
+        // here would ask for a frame after a first frame that may have landed in
+        // between, and would then time out on an app that rendered exactly once.
         var observed = await _live
-            .WaitForNextLiveFrameAsync(ReadinessTimeout, cancellationToken)
+            .WaitForLiveFrameAfterAsync(0, ReadinessTimeout, cancellationToken)
             .ConfigureAwait(false);
         if (!observed)
         {
@@ -778,62 +1434,69 @@ internal sealed class FlowCommitCoordinator
     /// <para>
     /// Synchronous by contract: the caller writes this and the live-region
     /// repaint as one atomic terminal update, and the drain wait that follows
-    /// runs outside that scope. A fault or cancellation thrown from here still
-    /// flushes the rows already composed, so the recovery hand-off sees exactly
-    /// what reached the write path.
+    /// runs outside that scope. A fault or cancellation thrown from here leaves
+    /// the rows already composed in that pending update; the scope's dispose is
+    /// what hands it to the write path, so the recovery hand-off treats those
+    /// rows as possibly-written rather than as flushed.
     /// </para>
     /// </remarks>
     private void EmitUnit(
         Action<string> record,
         int unitIndex,
         FlowCommitUnit unit,
-        int unitRow,
+        ref int unitRow,
         int faultThreshold,
         UnitEmission emission,
         CancellationToken cancellationToken)
     {
         var surface = unit.Surface;
         var height = Math.Max(1, surface.Height);
+        var startRow = unitRow;
 
         for (var row = 0; row < height; row++)
         {
-            // Cancellation is observed between rows, never after the unit's last
-            // row: once every row has been handed to the terminal the unit is
-            // complete, so cancelling there must not report it as aborted.
             cancellationToken.ThrowIfCancellationRequested();
-
-            var text = SoftWrapEmitter.OrderedRowPrefix
-                + SoftWrapEmitter.RenderRowText(surface, row);
+            unitRow = EnsureRoom(unitRow, 1, record, "unit");
+            var rowText = SoftWrapEmitter.RenderRowText(surface, row);
 
             if (faultThreshold >= 0 && unitIndex == faultThreshold && row == 0)
             {
-                // Prototype fault fixture: this unit is written partially and
-                // then abandoned, so the host stream genuinely contains a
-                // truncated line — exactly the uncertainty being reported.
+                // Deliberately compose a truncated row. Disposal still decides
+                // whether those bytes were accepted by the adapter.
+                var text = SoftWrapEmitter.OrderedRowPrefix + rowText;
                 var partial = text.Length > 1 ? text[..^1] : text;
                 _live.WriteTerminalAt(unitRow, partial);
-
-                // The bytes reached the host, so the recovery hand-off must
-                // treat this row as written and never paint over it.
+                unitRow++;
                 emission.RowsWritten++;
+                emission.NextRowOffset = 1;
                 throw new IOException(
                     $"injected history emission failure after {unitIndex} completed unit(s) " +
                     $"({FailAfterRowsVariable})");
             }
 
-            _live.WriteTerminalAt(
-                unitRow + row,
-                row == height - 1 ? text : text + "\r\n");
-            emission.RowsWritten++;
-        }
+            if (row == height - 1)
+            {
+                // The marker is positioned on the final committed row and is
+                // emitted before that row's bytes, matching the qualified
+                // Ghostty native frame ordering.
+                _live.MarkCommittedRow(unitRow);
+            }
 
-        // Track the committed rows as paragraphs so a later resize settle can
-        // recompute the live region's origin with this content included.
-        _live.RecordCommittedRows(surface);
+            // A hard LF clears a soft-wrap flag inherited from the former live
+            // row; CUP and erasing its cells do not. At the bottom, EnsureRoom's
+            // subsequent LF performs that reset while reserving the next row.
+            var newline = unitRow < _live.TerminalHeight - 1;
+            _live.WriteTerminalAt(
+                unitRow,
+                string.Concat(SoftWrapEmitter.OrderedRowPrefix, rowText, newline ? "\r\n" : string.Empty));
+            unitRow++;
+            emission.RowsWritten++;
+            emission.NextRowOffset = newline ? 0 : 1;
+        }
 
         record(
             $"unit {unitIndex} key={unit.RowKey ?? "-"} rows={height} " +
-            $"at={unitRow} width={surface.Width}");
+            $"at={startRow} width={surface.Width}");
     }
 
     /// <summary>
@@ -860,20 +1523,52 @@ internal sealed class FlowCommitCoordinator
     }
 
     /// <summary>
-    /// Per-unit emission progress. The recovery hand-off needs to know which
-    /// rows may already carry bytes when a unit aborts, so it can place the live
-    /// region below them instead of painting over them.
+    /// Where a commit was when it failed. A unit's rows are composed into one
+    /// buffered atomic update, and that update's only hand-off to the write path
+    /// is the scope's dispose — so a failure after composition finished is a
+    /// failed hand-off, and a failure during composition leaves the composed rows
+    /// to the disposal that follows.
     /// </summary>
+    private enum EmissionPhase
+    {
+        /// <summary>Preparing or materializing the current unit; nothing of it composed yet.</summary>
+        Preparing,
+
+        /// <summary>Composing the current unit's rows and repaint into the pending update.</summary>
+        Composing,
+
+        /// <summary>The unit's bytes are in the buffer; the scope's dispose is handing them off.</summary>
+        Handoff,
+
+        /// <summary>Every unit was handed off; the commit is applying the live layout and repainting.</summary>
+        Finalizing,
+    }
+
+    /// <summary>
+    /// Per-unit emission progress: how many rows of the current unit were
+    /// composed into its terminal update when a cancellation or failure aborted
+    /// it, so the recovery hand-off can place the live region below them instead
+    /// of painting over them.
+    /// </summary>
+    /// <remarks>
+    /// This counts composed rows, not confirmed-flushed rows. Rows are composed
+    /// into one buffered update and handed to the write path when the scope is
+    /// disposed, so rows counted here have reached that update but not
+    /// necessarily the adapter — the count is the conservative upper bound of
+    /// what may be on screen, which is what the reservation needs.
+    /// </remarks>
     private sealed class UnitEmission
     {
-        /// <summary>Rows of the current unit already handed to the terminal.</summary>
+        /// <summary>Rows of the current unit already composed into its update.</summary>
         public int RowsWritten { get; set; }
+        public int NextRowOffset { get; set; }
 
-        /// <summary>Clears the tracker before each unit, so an aborted unit's
-        /// row count never includes rows from earlier units.</summary>
+        /// <summary>Clears the tracker after each completed unit, so an aborted
+        /// unit's row count never includes rows from earlier units.</summary>
         public void Reset()
         {
             RowsWritten = 0;
+            NextRowOffset = 0;
         }
     }
 

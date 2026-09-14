@@ -40,7 +40,7 @@ public sealed class Hex1bTerminalBuilder
     private Func<IHex1bTerminalPresentationAdapter?, Hex1bTerminalBuildContext>? _workloadFactory;
     private readonly List<IHex1bTerminalWorkloadFilter> _workloadFilters = [];
     private readonly List<IHex1bTerminalPresentationFilter> _presentationFilters = [];
-    private Func<Hex1bTerminalBuilder, IHex1bTerminalPresentationAdapter> _presentationFactory = 
+    private Func<Hex1bTerminalBuilder, IHex1bTerminalPresentationAdapter> _presentationFactory =
         builder => new ConsolePresentationAdapter(enableMouse: builder._enableMouse, preserveOPost: builder._preserveOPost);
     private int _width = 80;
     private int _height = 24;
@@ -602,14 +602,14 @@ public sealed class Hex1bTerminalBuilder
             Func<CancellationToken, Task<int>> runCallback = async ct =>
             {
                 await adapter.StartAsync(ct);
-                
+
                 // Wait for playback to complete (when Disconnected is fired)
                 var tcs = new TaskCompletionSource<int>();
                 adapter.Disconnected += () => tcs.TrySetResult(0);
-                
+
                 // Also handle cancellation
                 using var registration = ct.Register(() => tcs.TrySetCanceled(ct));
-                
+
                 return await tcs.Task;
             };
 
@@ -669,17 +669,17 @@ public sealed class Hex1bTerminalBuilder
             Func<CancellationToken, Task<int>> runCallback = async ct =>
             {
                 await adapter.StartAsync(ct);
-                
+
                 // Apply initial speed
                 localRecording.Play(speedMultiplier);
-                
+
                 // Wait for playback to complete (when Disconnected is fired)
                 var tcs = new TaskCompletionSource<int>();
                 adapter.Disconnected += () => tcs.TrySetResult(0);
-                
+
                 // Also handle cancellation
                 using var registration = ct.Register(() => tcs.TrySetCanceled(ct));
-                
+
                 return await tcs.Task;
             };
 
@@ -1001,35 +1001,23 @@ public sealed class Hex1bTerminalBuilder
             var options = new Flow.Hex1bFlowOptions();
             configureOptions?.Invoke(options);
 
+            // Keep host identity lazy: the presentation's startup probe runs
+            // when raw mode is entered, after this workload factory is created.
+            // Reading the source later avoids freezing an unprobed/unknown
+            // profile and never starts a second stdin reader.
+            options.HostProfileProvider = presentation is Flow.IFlowTerminalHostProfileSource profileSource
+                ? () => profileSource.FlowHostProfile
+                : null;
             // Auto-detect cursor position if not explicitly provided.
             // This must happen before raw mode is entered (i.e., at Build() time).
+            // Nothing may call the BCL cursor query after the input pump starts: on
+            // Unix Console.GetCursorPosition() writes DSR and reads the reply from
+            // stdin, which deadlocks against the terminal's own pump owning stdin.
+            // Live observation goes through the workload adapter's
+            // ICursorPositionSource seam instead (native presentation observes the
+            // host cursor without a second stdin reader; headless observes the
+            // terminal's applied model).
             options.InitialCursorRow ??= presentation?.GetCursorPosition().Row ?? 0;
-
-            // Wire a live cursor query so the runner can read the current
-            // cursor position at startup (before the input pump begins).
-            // IMPORTANT: on Unix, Console.GetCursorPosition() sends ESC[6n
-            // and reads the response from stdin. It must NOT be called from
-            // within the resize handler because Hex1b's input pump owns stdin
-            // in a background loop — calling it there deadlocks the terminal.
-            // The CursorRowProvider is therefore only used at RunAsync startup,
-            // before the input pump is running. Returns null when presentation
-            // is null (headless/test scenarios) so the runner falls back to
-            // bottom-anchor.
-            if (presentation != null)
-            {
-                var liveCursor = presentation;
-                options.CursorRowProvider ??= () =>
-                {
-                    try
-                    {
-                        return liveCursor.GetCursorPosition().Row;
-                    }
-                    catch
-                    {
-                        return null;
-                    }
-                };
-            }
 
             var runner = new Flow.Hex1bFlowRunner(flowCallback, options, workloadAdapter);
 
@@ -1519,12 +1507,12 @@ public sealed class Hex1bTerminalBuilder
             Metrics = ResolveMetrics(),
             Graphics = _graphicsOptions.Clone(),
         };
-        
+
         foreach (var filter in _workloadFilters)
         {
             options.WorkloadFilters.Add(filter);
         }
-        
+
         foreach (var filter in _presentationFilters)
         {
             options.PresentationFilters.Add(filter);

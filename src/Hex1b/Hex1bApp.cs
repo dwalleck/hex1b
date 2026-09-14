@@ -167,6 +167,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
     // Surface rendering double-buffer
     private Surface? _currentSurface;
     private Surface? _previousSurface;
+    private readonly object _surfaceSnapshotSync = new();
     // Renderer hot-path pools — reused across frames so SurfaceComparer doesn't
     // allocate a fresh diff/list of changed cells or a fresh token list every frame.
     private readonly Surfaces.SurfaceDiff _frameDiff = new();
@@ -384,30 +385,30 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
     /// re-rendering the widget tree.
     /// </summary>
     /// <remarks>
-    /// The render loop reuses its two surfaces: every frame swaps them and clears
-    /// the one it is about to draw into. Handing out the live reference would give
-    /// the caller a buffer that is mutated — and cleared — on the next frame, so
-    /// the cells are copied into a fresh surface here. The copy is region-sized
-    /// and is taken on the caller's thread, so the caller sees one coherent frame.
+    /// Surface reuse and snapshot copying share a lock. Copying on the caller's
+    /// thread alone would race the next frame's clear and produce a torn image.
     /// </remarks>
     internal Surface? SnapshotCurrentSurface()
     {
-        var source = _currentSurface;
-        if (source is null)
+        lock (_surfaceSnapshotSync)
         {
-            return null;
-        }
-
-        var copy = new Surface(source.Width, source.Height, source.CellMetrics);
-        for (var y = 0; y < source.Height; y++)
-        {
-            for (var x = 0; x < source.Width; x++)
+            var source = _currentSurface;
+            if (source is null)
             {
-                copy.TrySetCell(x, y, source.GetCell(x, y));
+                return null;
             }
-        }
 
-        return copy;
+            var copy = new Surface(source.Width, source.Height, source.CellMetrics);
+            for (var y = 0; y < source.Height; y++)
+            {
+                for (var x = 0; x < source.Width; x++)
+                {
+                    copy.TrySetCell(x, y, source.GetCell(x, y));
+                }
+            }
+
+            return copy;
+        }
     }
 
     /// <summary>
@@ -1251,6 +1252,14 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
     }
 
     private bool RenderFrameWithSurfaceCore(int width, int height, TerminalCapabilities caps, out Func<CancellationToken, ValueTask>? asyncWriteWork)
+    {
+        lock (_surfaceSnapshotSync)
+        {
+            return RenderFrameWithSurfaceCoreLocked(width, height, caps, out asyncWriteWork);
+        }
+    }
+
+    private bool RenderFrameWithSurfaceCoreLocked(int width, int height, TerminalCapabilities caps, out Func<CancellationToken, ValueTask>? asyncWriteWork)
     {
         asyncWriteWork = null;
         _surfacePool?.NextFrame();

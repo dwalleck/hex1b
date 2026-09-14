@@ -51,5 +51,27 @@ public readonly record struct WorkloadOutputItem(
     /// owning pool. Decoupled from <see cref="Hex1bApp"/> to avoid a circular type reference.
     /// </summary>
     internal Action<List<AnsiToken>>? PooledTokensReturn { get; init; }
+
+    /// <summary>
+    /// Optional observation barrier. When set, the terminal's output pump completes it as
+    /// soon as this item is consumed from the output channel — before any processing
+    /// decision, including the empty-item frame-boundary path.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The output channel has a single reader that consumes items in order, so a consumed
+    /// barrier proves every item enqueued before it has already been fully applied to the
+    /// terminal. A cursor observation enqueues an empty item carrying this barrier and
+    /// awaits it, which gives an exact FIFO fence over its own queued writes without any
+    /// counter arithmetic or per-item bookkeeping: the only cost on ordinary items is the
+    /// null check that completes them.
+    /// </para>
+    /// <para>
+    /// The terminal completes it with <see langword="true"/>. Adapter disposal and the
+    /// observation's own deadline complete it with <see langword="false"/>, meaning "not
+    /// known to be processed" — never that it was.
+    /// </para>
+    /// </remarks>
+    internal TaskCompletionSource<bool>? ProcessingBarrier { get; init; }
 }
 

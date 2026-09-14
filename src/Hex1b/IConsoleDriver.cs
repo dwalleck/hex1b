@@ -91,4 +91,24 @@ internal interface IConsoleDriver : IDisposable
     /// the same way: fall through to the next discovery source.
     /// </returns>
     bool TryGetWindowPixelSize(out int pixelWidth, out int pixelHeight);
+
+    /// <summary>
+    /// Attempts to read the console's current cursor position directly from the
+    /// operating system (for example, via <c>GetConsoleScreenBufferInfo</c> on
+    /// Windows), bypassing any escape-sequence query/response round trip.
+    /// </summary>
+    /// <param name="column">The cursor column (0-based) when the call succeeds.</param>
+    /// <param name="row">The cursor row (0-based) when the call succeeds.</param>
+    /// <returns>
+    /// <see langword="true"/> when the platform exposes the cursor position out of
+    /// band; <see langword="false"/> otherwise — including Unix, which has no
+    /// cursor-position ioctl, so callers must fall back to a <c>DSR 6</c> query
+    /// serviced by the input reader.
+    /// </returns>
+    bool TryGetCursorPosition(out int column, out int row)
+    {
+        column = 0;
+        row = 0;
+        return false;
+    }
 }

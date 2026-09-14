@@ -257,6 +257,36 @@ public sealed class FlowStep
     /// durable.
     /// </para>
     /// <para>
+    /// The next live layout is applied only when every submitted unit was handed
+    /// off. A commit that stops with units still pending — cancellation, or a
+    /// failure — retains the step's current live layout, because the pending
+    /// content still owns the presentation and the caller decides what becomes of
+    /// it.
+    /// </para>
+    /// <para>
+    /// A cancelled commit leaves the step committable, so the following commit's
+    /// <paramref name="nextLive"/> advances the layout — unless recovering the
+    /// live region after the cancellation also failed, which is reported as
+    /// <see cref="FlowCommitException"/> carrying the cancellation's partial
+    /// progress and suspends further commitment. A failure with an emitted prefix
+    /// suspends commitment the same way, and the step keeps the layout it had: no
+    /// public entry point swaps a layout outside a commit, so a caller that has to
+    /// advance the presentation after such a failure can only do so from inside
+    /// its own still-running live application.
+    /// </para>
+    /// <para>
+    /// Cancellation and partial commitment are reported as separate facts. A
+    /// commit whose cancellation arrives only after the last unit was handed off
+    /// reports <see cref="FlowCommitStatus.Emitted"/> with
+    /// <see cref="FlowCommitResult.CancellationRequested"/> set, because the
+    /// emission outcome — not the cancellation observation — is what
+    /// <see cref="FlowCommitResult.Status"/> describes.
+    /// Cancellation while waiting for readiness or preparing the source cancels
+    /// the task without installing the next layout, unless recovery itself fails.
+    /// Admission failures use <see cref="FlowCommitException"/> with zero hand-off
+    /// counts; a missing safe boundary suspends further commitment.
+    /// </para>
+    /// <para>
     /// Await this from a background task, never from inside the step's own event
     /// handlers: the commit waits for frames produced by the app's render loop,
     /// so blocking that handler would deadlock.
@@ -268,9 +298,13 @@ public sealed class FlowStep
     /// </remarks>
     /// <param name="finalized">Immutable finalized units, in commit order.</param>
     /// <param name="nextLive">Builder for the step's next live layout.</param>
-    /// <param name="cancellationToken">Cancels the commit between units.</param>
+    /// <param name="cancellationToken">Requests cancellation; completed hand-offs remain history.</param>
     /// <exception cref="FlowCommitException">
-    /// Emission failed after content may have reached the terminal.
+    /// Admission, source preparation, emission, or recovery failed. The exception
+    /// reports the completed hand-offs, including zero when nothing was emitted.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">
+    /// Cancellation was observed before source preparation completed and recovery succeeded.
     /// </exception>
     public Task<FlowCommitResult> CommitAsync(
         FlowCommitSource finalized,

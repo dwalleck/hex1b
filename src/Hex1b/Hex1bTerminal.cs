@@ -334,6 +334,23 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         
         _presentation = presentation;
         _workload = workload;
+
+        // Expose the terminal's own applied cursor model to its workload adapter as the
+        // headless observation source — and only for a genuinely headless terminal. An
+        // attached native presentation is observed directly instead, and any other
+        // attached presentation must report no anchor rather than this model, so the
+        // model is never mistaken for host state.
+        if (_presentation is HeadlessPresentationAdapter && workload is Hex1bAppWorkloadAdapter cursorWorkload)
+        {
+            cursorWorkload.HeadlessCursorProvider = () =>
+            {
+                lock (_bufferLock)
+                {
+                    return (_cursorX, _cursorY);
+                }
+            };
+        }
+
         _runCallback = options.RunCallback;
         _workloadFilters = options.WorkloadFilters?.ToList() ?? [];
         _presentationFilters = options.PresentationFilters?.ToList() ?? [];
@@ -1287,6 +1304,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 byte[]? pooledItemBuffer = null;
                 List<AnsiToken>? pooledItemTokens = null;
                 Action<List<AnsiToken>>? pooledItemTokensReturn = null;
+                WorkloadOutputItem readItem = default;
 
                 if (_workload is IHmp1TerminalOutputSource remoteWorkload)
                 {
@@ -1306,11 +1324,19 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     pooledItemBuffer = item.PooledBuffer;
                     pooledItemTokens = item.PooledTokens;
                     pooledItemTokensReturn = item.PooledTokensReturn;
+                    readItem = item;
                 }
                 else
                 {
                     data = await _workload.ReadOutputAsync(ct);
                 }
+
+                // Consumption order is the FIFO proof for a cursor-observation barrier:
+                // this single reader consumes items in order, so once a barrier item has
+                // been read, every item enqueued before it has already been fully applied.
+                // Complete it before any processing decision — including the empty-item
+                // frame-boundary path below, which is exactly where barriers land.
+                readItem.ProcessingBarrier?.TrySetResult(true);
                 
                 if (data.IsEmpty && remoteState is null && animationState is null)
                 {

@@ -194,6 +194,23 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         pixelHeight = 0;
         return false;
     }
+
+    /// <inheritdoc />
+    public bool TryGetCursorPosition(out int column, out int row)
+    {
+        column = 0;
+        row = 0;
+
+        if (!GetConsoleScreenBufferInfo(_outputHandle, out var info))
+            return false;
+
+        // dwCursorPosition is in buffer coordinates; the visible window origin can
+        // be scrolled away from the buffer origin, so translate into window
+        // coordinates the way GetWindowSize() derives its dimensions.
+        column = info.dwCursorPosition.X - info.srWindow.Left;
+        row = info.dwCursorPosition.Y - info.srWindow.Top;
+        return column >= 0 && row >= 0;
+    }
     
     public void EnterRawMode(bool preserveOPost = false)
     {
