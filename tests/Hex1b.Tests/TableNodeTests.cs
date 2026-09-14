@@ -1424,7 +1424,7 @@ public class TableNodeTests
                 .Header(h => [h.Cell("Name")])
                 .Row((r, item, _) => [r.Cell(item)])
                 .Focus(focusedKey)
-                .OnFocusChanged(key => { focusedKey = key; focusHistory.Add(key); })
+                .OnFocusChanged(key => { Volatile.Write(ref focusedKey, key); focusHistory.Add(key); })
                 .FillHeight(),
             new Hex1bAppOptions { WorkloadAdapter = workload }
         );
@@ -1443,6 +1443,8 @@ public class TableNodeTests
         {
             downBuilder.Key(Hex1bKey.DownArrow).Wait(20);
         }
+        downBuilder.WaitUntil(_ => Equals(Volatile.Read(ref focusedKey), "Item 00061"),
+            TimeSpan.FromSeconds(5), "All 60 down keys have been processed");
         await downBuilder.Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
         
         var focusAfterDown = focusedKey;
@@ -1454,6 +1456,8 @@ public class TableNodeTests
         {
             upBuilder.Key(Hex1bKey.UpArrow).Wait(20);
         }
+        upBuilder.WaitUntil(_ => Equals(Volatile.Read(ref focusedKey), "Item 00056"),
+            TimeSpan.FromSeconds(5), "All 5 up keys have been processed");
         await upBuilder.Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
         
         var focusAfterUp = focusedKey;
@@ -1465,6 +1469,8 @@ public class TableNodeTests
         {
             downAgainBuilder.Key(Hex1bKey.DownArrow).Wait(20);
         }
+        downAgainBuilder.WaitUntil(_ => Equals(Volatile.Read(ref focusedKey), "Item 00061"),
+            TimeSpan.FromSeconds(5), "All 5 final down keys have been processed");
         downAgainBuilder.Ctrl().Key(Hex1bKey.C);
         await downAgainBuilder.Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
         
