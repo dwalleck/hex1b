@@ -543,7 +543,7 @@ internal sealed class WindowsShimPtyHandle : IPtyHandle
             ?? throw new InvalidOperationException($"Failed to launch the Windows PTY shim at '{shimPath}'.");
     }
 
-    private static async Task ConnectWithRetriesAsync(Socket socket, EndPoint endpoint, Process helperProcess, CancellationToken ct)
+    internal static async Task ConnectWithRetriesAsync(Socket socket, EndPoint endpoint, Process helperProcess, CancellationToken ct)
     {
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
         Exception? lastError = null;
@@ -567,6 +567,7 @@ internal sealed class WindowsShimPtyHandle : IPtyHandle
             }
         }
 
+        ct.ThrowIfCancellationRequested();
         throw new IOException("Timed out connecting to the Windows PTY shim.", lastError);
     }
 

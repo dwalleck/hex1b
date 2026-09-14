@@ -24,6 +24,22 @@ namespace Hex1b.Tests;
 public class WindowsPtyDisposeTests
 {
     [TestMethod]
+    public async Task ConnectWithRetriesAsync_CanceledBeforeConnect_PreservesCancellationToken()
+    {
+        using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        using var helper = Process.GetCurrentProcess();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        var failure = await Assert.ThrowsExactlyAsync<OperationCanceledException>(() =>
+            WindowsShimPtyHandle.ConnectWithRetriesAsync(socket,
+                new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0), helper, cancellation.Token));
+
+        Assert.AreEqual(cancellation.Token, failure.CancellationToken);
+        Assert.IsFalse(socket.Connected);
+    }
+
+    [TestMethod]
     [TestCategory("Windows")]
     [DataRow(WindowsPtyMode.Direct)]
     [DataRow(WindowsPtyMode.RequireProxy)]
