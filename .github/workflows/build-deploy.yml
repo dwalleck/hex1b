@@ -231,7 +231,7 @@ jobs:
 
       - name: Build native library
         working-directory: src/Hex1b/native
-        run: make
+        run: make all test-startup check-exports
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
@@ -247,7 +247,7 @@ jobs:
 
       - name: Build native library
         working-directory: src/Hex1b/native
-        run: make
+        run: make all test-startup check-exports
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
@@ -263,7 +263,13 @@ jobs:
 
       - name: Build native library (cross-compile x86_64 from ARM64)
         working-directory: src/Hex1b/native
-        run: make TARGET_ARCH=x86_64
+        run: make TARGET_ARCH=x86_64 all check-exports
+
+      - name: Verify Rosetta and run x64 startup tests
+        working-directory: src/Hex1b/native
+        run: |
+          test "$(arch -x86_64 /usr/bin/uname -m)" = "x86_64"
+          make TARGET_ARCH=x86_64 TEST_RUNNER="arch -x86_64" test-startup
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
@@ -279,7 +285,7 @@ jobs:
 
       - name: Build native library
         working-directory: src/Hex1b/native
-        run: make
+        run: make all test-startup check-exports
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6

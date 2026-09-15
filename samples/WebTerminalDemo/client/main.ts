@@ -1,9 +1,10 @@
-import { WebTerminal, MIN_FONT_SIZE, MAX_FONT_SIZE, type TerminalCloseDetails } from "@hex1b/web-terminal";
+import { WebTerminal, MIN_FONT_SIZE, MAX_FONT_SIZE, getCmdlineUrl, linkAction, type TerminalCloseDetails, type TerminalCommandMark } from "@hex1b/web-terminal";
 
 interface TerminalInstance {
   id: string;
   name: string;
   scene: string;
+  reflowStrategy: string;
   columns: number;
   rows: number;
   peerCount: number;
@@ -30,6 +31,19 @@ interface TapePlayback {
   diagnostics: string[];
 }
 
+/**
+ * A single command-mark rail entry, demo-only bookkeeping layered on top of the library's
+ * `onCommandMarkChange` callback. `anchor` captures the viewport coordinates in effect when the
+ * command line started, letting the demo scroll back to (roughly) that point later. It is null
+ * when no viewport snapshot was available yet, in which case the dot cannot be jumped to.
+ */
+interface CommandMarkEntry {
+  phase: TerminalCommandMark["phase"];
+  exitCode: number | null;
+  cmdlineUrl: string | null;
+  anchor: { generation: string; top: number } | null;
+}
+
 interface TerminalView {
   id: string;
   instance: TerminalInstance;
@@ -45,6 +59,7 @@ interface TerminalView {
   transport: "direct" | "hmp1";
   viewport?: WebTerminal["viewport"];
   selection?: WebTerminal["selection"];
+  commandMarks: CommandMarkEntry[];
 }
 
 interface ViewClosure {
@@ -79,8 +94,13 @@ const instancesSelect = select("instances");
 const views = new Map<string, TerminalView>();
 const tapeSelections = new Map<string, string>();
 const pendingTapeActions = new Set<string>();
+const resizeEdges = {
+  n: "top", ne: "top-right", e: "right", se: "bottom-right",
+  s: "bottom", sw: "bottom-left", w: "left", nw: "top-left"
+};
 let instances: TerminalInstance[] = [];
 let selected: TerminalView | undefined;
+let minimalView: TerminalView | undefined;
 let nextView = 0;
 let zIndex = 0;
 let refreshing: Promise<void> | undefined;
@@ -97,6 +117,48 @@ function report(message: string, level = "info") {
   byId("status").dataset.level = level;
 }
 
+function reportLink(view: TerminalView, message: string, level = "info") {
+  const status = elementAt(view.element, ".view-status", HTMLElement);
+  status.textContent = message;
+  status.title = message;
+  status.dataset.level = level;
+  report(`View ${view.id}: ${message}`, level);
+}
+
+function viewLinks(view: TerminalView): Parameters<WebTerminal["setLinks"]>[0] {
+  const mode = elementAt(view.element, ".view-links", HTMLSelectElement).value;
+  if (mode === "disabled") return false;
+  if (mode !== "preview") return { detection: false };
+  const decoration = elementAt(view.element, ".view-link-decoration", HTMLSelectElement).value;
+  const underlineStyle = elementAt(view.element, ".view-link-style", HTMLSelectElement).value;
+  if (decoration !== "always" && decoration !== "hover" && decoration !== "none")
+    throw new Error("Invalid link decoration selection");
+  if (underlineStyle !== "solid" && underlineStyle !== "dashed")
+    throw new Error("Invalid link underline style selection");
+  return {
+    osc8: { action: "demo.previewUri" },
+    detection: {
+      activation: "modifierClick",
+      decoration,
+      underlineStyle,
+      rules: [
+        { id: "web", builtin: "url", action: "demo.previewUri" },
+        { id: "files", builtin: "absolutePath", action: "demo.remoteFile" },
+        { id: "home", builtin: "homePath", action: "demo.remoteFile" },
+        { id: "uris", builtin: "uri", action: "demo.previewUri" },
+        {
+          id: "issues", pattern: /\bPROJ-(?<number>\d+)\b/gu,
+          kind: "custom", text: "logicalLine", action: "demo.issue",
+          resolve(match) {
+            const number = match.groups.number;
+            return number ? { target: number, data: { label: match.text } } : null;
+          }
+        }
+      ]
+    }
+  };
+}
+
 async function api(path: string, method = "GET", body?: object): Promise<unknown> {
   const response = await fetch(path, {
     method,
@@ -111,6 +173,7 @@ function readInstance(value: unknown): TerminalInstance {
       !("id" in value) || typeof value.id !== "string" ||
       !("name" in value) || typeof value.name !== "string" ||
       !("scene" in value) || typeof value.scene !== "string" ||
+      !("reflowStrategy" in value) || typeof value.reflowStrategy !== "string" ||
       !("columns" in value) || typeof value.columns !== "number" ||
       !("rows" in value) || typeof value.rows !== "number" ||
       !("peerCount" in value) || typeof value.peerCount !== "number" ||
@@ -122,7 +185,7 @@ function readInstance(value: unknown): TerminalInstance {
     throw new Error("The server returned an invalid terminal instance");
   }
   return {
-    id: value.id, name: value.name, scene: value.scene,
+    id: value.id, name: value.name, scene: value.scene, reflowStrategy: value.reflowStrategy,
     columns: value.columns, rows: value.rows, peerCount: value.peerCount,
     paused: value.paused, rate: value.rate, batch: value.batch,
     tapes: value.tapes.map(readTape), tapePlayback: readTapePlayback(value.tapePlayback)
@@ -269,7 +332,7 @@ async function loadInstances(preferred?: string) {
   instancesSelect.replaceChildren(...instances.map(instance => {
     const option = document.createElement("option");
     option.value = instance.id;
-    option.textContent = `${instance.name} - ${instance.columns}x${instance.rows}, ${instance.peerCount} peers`;
+    option.textContent = `${instance.name} - ${instance.columns}x${instance.rows}, ${instance.peerCount} peers, reflow: ${instance.reflowStrategy}`;
     return option;
   }));
   if (instances.some(instance => instance.id === selectedId)) instancesSelect.value = selectedId;
@@ -304,6 +367,7 @@ function metrics(view: Pick<TerminalView, "id" | "stats" | "text" | "transport">
 }
 
 function selectView(view: TerminalView) {
+  if (minimalView && minimalView !== view) setMinimalChrome();
   selected?.element.classList.remove("selected");
   selected = view;
   view.element.classList.add("selected");
@@ -313,6 +377,25 @@ function selectView(view: TerminalView) {
     updateInstanceControls();
   }
   metrics(view);
+}
+
+function setMinimalChrome(view?: TerminalView) {
+  const previous = minimalView;
+  if (previous) {
+    previous.element.classList.remove("minimal-chrome");
+    elementAt(previous.element, ".minimal-chrome-toggle", HTMLButtonElement).setAttribute("aria-pressed", "false");
+  }
+  minimalView = view;
+  document.body.classList.toggle("minimal-chrome", !!view);
+  button("restore-chrome").hidden = !view;
+  if (view) {
+    selectView(view);
+    view.element.classList.add("minimal-chrome");
+    elementAt(view.element, ".minimal-chrome-toggle", HTMLButtonElement).setAttribute("aria-pressed", "true");
+  }
+  const target = view ?? previous;
+  if (target?.phase === "connected") target.terminal?.focus();
+  else target?.element.focus({ preventScroll: true });
 }
 
 function updateSizingControls(view: TerminalView) {
@@ -338,6 +421,10 @@ function updateViewControls(view: TerminalView) {
   elementAt(view.element, ".resync", HTMLButtonElement).disabled = !connected;
   elementAt(view.element, ".trigger-failure", HTMLButtonElement).disabled = !connected;
   elementAt(view.element, ".view-failure", HTMLSelectElement).disabled = !connected;
+  elementAt(view.element, ".view-links", HTMLSelectElement).disabled = !connected;
+  const previewLinks = connected && elementAt(view.element, ".view-links", HTMLSelectElement).value === "preview";
+  elementAt(view.element, ".view-link-decoration", HTMLSelectElement).disabled = !previewLinks;
+  elementAt(view.element, ".view-link-style", HTMLSelectElement).disabled = !previewLinks;
   elementAt(view.element, ".thumbnail", HTMLButtonElement).disabled = !!view.closure && !view.closure.reconnect;
   elementAt(view.element, ".reconnect-view", HTMLButtonElement).disabled =
     view.phase !== "closed" || !view.closure?.reconnect;
@@ -373,6 +460,44 @@ function showClosure(view: TerminalView, closure: ViewClosure) {
   return closure;
 }
 
+/** Rebuilds the left-edge command-mark dots for `view` from `view.commandMarks`. */
+function renderCommandMarksRail(view: TerminalView) {
+  const rail = elementAt(view.element, ".command-marks-rail", HTMLElement);
+  rail.replaceChildren(...view.commandMarks.map(entry => {
+    const dot = document.createElement("button");
+    dot.type = "button";
+    dot.className = "command-mark-dot";
+    dot.setAttribute("role", "listitem");
+    dot.dataset.phase = entry.phase;
+    if (entry.exitCode !== null) dot.dataset.exit = entry.exitCode === 0 ? "ok" : "error";
+    const description = entry.phase === "finished"
+      ? `Command finished${entry.exitCode === null ? "" : ` (exit ${entry.exitCode})`}`
+      : entry.phase === "executing" ? "Command running" : "Command entered";
+    const detail = [description, entry.cmdlineUrl ?? ""].filter(Boolean).join("\n");
+    dot.title = entry.anchor ? `${detail}\nClick to jump back to this point.`
+      : `${detail}\nThis point can no longer be located in scrollback.`;
+    dot.setAttribute("aria-label", dot.title.replace(/\n/g, ". "));
+    dot.disabled = entry.anchor === null;
+    dot.addEventListener("click", () => jumpToCommandMark(view, entry));
+    return dot;
+  }));
+}
+
+/**
+ * Scrolls `view`'s terminal back to where `entry.anchor` was captured, using a relative delta from
+ * the current viewport top (the library only exposes relative scrolling). Refuses to jump when the
+ * viewport generation has changed since capture (resize/reflow/reset/history-clear/alt-screen
+ * transition), since row coordinates are no longer comparable at that point.
+ */
+function jumpToCommandMark(view: TerminalView, entry: CommandMarkEntry) {
+  const viewport = view.viewport;
+  if (!view.terminal || !entry.anchor || !viewport?.available || viewport.generation !== entry.anchor.generation) {
+    report("That point is no longer reachable in scrollback (the view was reset, resized, or reflowed since).", "error");
+    return;
+  }
+  view.terminal.scrollLines(entry.anchor.top - viewport.top);
+}
+
 function connectionClosed(view: TerminalView, close: TerminalCloseDetails) {
   const stage = view.phase === "connected" ? "After mounting" : "Before mounting completed";
   const summary = close.code === 4000 ? "The producer has ended. This terminal cannot be reconnected."
@@ -400,30 +525,51 @@ function changeSizing(view: TerminalView, sizing: Parameters<WebTerminal["setSiz
 
 function moveAndResize(view: TerminalView) {
   const signal = view.controller.signal;
-  const handles: [HTMLElement, boolean][] = [
-    [elementAt(view.element, ".view-titlebar", HTMLElement), false],
-    [elementAt(view.element, ".resize-handle", HTMLElement), true]
+  const handles: [HTMLElement, string | null][] = [
+    [elementAt(view.element, ".view-titlebar", HTMLElement), null],
+    ...Object.keys(resizeEdges).map((edge): [HTMLElement, string] =>
+      [elementAt(view.element, `.resize-handle[data-edge="${edge}"]`, HTMLElement), edge])
   ];
-  for (const [handle, resize] of handles) {
-    let gesture: { pointer: number; x: number; y: number; left: number; top: number; width: number; height: number } | undefined;
+  let activePointer: number | undefined;
+  for (const [handle, edge] of handles) {
+    let gesture: {
+      pointer: number; x: number; y: number; left: number; top: number;
+      width: number; height: number; scrollLeft: number; scrollTop: number
+    } | undefined;
     handle.addEventListener("pointerdown", event => {
-      if (event.button !== 0 || event.target instanceof Element && event.target.closest("button")) return;
+      if (activePointer !== undefined || event.button !== 0 ||
+          event.target instanceof Element && event.target.closest("button")) return;
       event.preventDefault();
       selectView(view);
       gesture = {
         pointer: event.pointerId, x: event.clientX, y: event.clientY,
         left: view.element.offsetLeft, top: view.element.offsetTop,
-        width: view.element.offsetWidth, height: view.element.offsetHeight
+        width: view.element.offsetWidth, height: view.element.offsetHeight,
+        scrollLeft: workspace.scrollLeft, scrollTop: workspace.scrollTop
       };
+      activePointer = event.pointerId;
+      handle.dataset.active = "true";
       handle.setPointerCapture(event.pointerId);
     }, { signal });
     handle.addEventListener("pointermove", event => {
       if (!gesture || gesture.pointer !== event.pointerId) return;
-      const dx = event.clientX - gesture.x;
-      const dy = event.clientY - gesture.y;
-      if (resize) {
-        view.element.style.width = `${Math.max(240, Math.min(3200, gesture.width + dx))}px`;
-        view.element.style.height = `${Math.max(180, Math.min(2200, gesture.height + dy))}px`;
+      const dx = event.clientX - gesture.x + workspace.scrollLeft - gesture.scrollLeft;
+      const dy = event.clientY - gesture.y + workspace.scrollTop - gesture.scrollTop;
+      if (edge) {
+        if (edge.includes("e") || edge.includes("w")) {
+          const west = edge.includes("w");
+          const width = Math.max(240, Math.min(west ? Math.min(3200, gesture.left + gesture.width) : 3200,
+            gesture.width + (west ? -dx : dx)));
+          view.element.style.width = `${width}px`;
+          if (west) view.element.style.left = `${gesture.left + gesture.width - width}px`;
+        }
+        if (edge.includes("n") || edge.includes("s")) {
+          const north = edge.includes("n");
+          const height = Math.max(180, Math.min(north ? Math.min(2200, gesture.top + gesture.height) : 2200,
+            gesture.height + (north ? -dy : dy)));
+          view.element.style.height = `${height}px`;
+          if (north) view.element.style.top = `${gesture.top + gesture.height - height}px`;
+        }
       } else {
         view.element.style.left = `${Math.max(0, gesture.left + dx)}px`;
         view.element.style.top = `${Math.max(0, gesture.top + dy)}px`;
@@ -432,15 +578,18 @@ function moveAndResize(view: TerminalView) {
     const end = (event: PointerEvent) => {
       if (!gesture || gesture.pointer !== event.pointerId) return;
       gesture = undefined;
+      activePointer = undefined;
+      delete handle.dataset.active;
       if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
     };
     handle.addEventListener("pointerup", end, { signal });
     handle.addEventListener("pointercancel", end, { signal });
-    handle.addEventListener("lostpointercapture", () => { gesture = undefined; }, { signal });
+    handle.addEventListener("lostpointercapture", end, { signal });
   }
 }
 
 function closeView(view: TerminalView) {
+  if (minimalView === view) setMinimalChrome();
   view.controller.abort();
   view.connectionController?.abort();
   view.terminal?.dispose();
@@ -476,12 +625,34 @@ async function openView(instance: TerminalInstance, { primary = false, thumbnail
   element.innerHTML = `
     <header class="view-titlebar">
       <span class="view-title"></span><span class="view-role">Joining</span>
+      <button class="minimal-chrome-toggle" aria-pressed="false" title="Fill the page with this terminal and hide playground controls">Minimal chrome</button>
       <button class="close-view" title="Close this view; keep the terminal running" aria-label="Close view">Close</button>
     </header>
     <div class="view-tools">
       <button class="take-primary" disabled>Take primary</button>
       <button class="thumbnail">Thumbnail</button>
       <button class="resync" disabled>Resync</button>
+      <label>Links
+        <select class="view-links" disabled aria-label="Local link policy"
+          title="Preview links: Ctrl/Cmd+click shows text only. Paths belong to the remote terminal, not this browser.">
+          <option value="legacy">OSC 8 only (default)</option>
+          <option value="preview">Preview links (opt in)</option>
+          <option value="disabled">All links disabled</option>
+        </select>
+      </label>
+      <label>Underline
+        <select class="view-link-decoration" disabled aria-label="Detected link underline visibility">
+          <option value="always">Always</option>
+          <option value="hover">On hover</option>
+          <option value="none">None</option>
+        </select>
+      </label>
+      <label>Style
+        <select class="view-link-style" disabled aria-label="Detected link underline style">
+          <option value="solid">Solid</option>
+          <option value="dashed">Dashed</option>
+        </select>
+      </label>
       <span class="view-grid"></span>
     </div>
     <div class="view-failures" role="group" aria-label="Connection failure demonstration">
@@ -499,8 +670,11 @@ async function openView(instance: TerminalInstance, { primary = false, thumbnail
       <span class="shell-status">Shell activity unknown</span>
       <progress class="activity-progress" max="100" hidden aria-label="Application progress"></progress>
       <span class="progress-status"></span>
+      <span class="cwd-status"></span>
+      <span class="command-mark-status"></span>
     </div>
     <div class="terminal-stage">
+      <div class="command-marks-rail" role="list" aria-label="Command history"></div>
       <div class="terminal-mount"></div>
       <div class="closed-overlay" hidden>
         <div class="closed-card">
@@ -528,7 +702,8 @@ async function openView(instance: TerminalInstance, { primary = false, thumbnail
         <option value="custom" hidden>Custom</option>
       </select>
     </footer>
-    <span class="resize-handle" title="Drag to resize view" aria-hidden="true"></span>`;
+    ${Object.entries(resizeEdges).map(([edge, label]) =>
+      `<span class="resize-handle" data-edge="${edge}" title="Drag ${label} to resize view" aria-hidden="true"></span>`).join("")}`;
   const header = elementAt(element, ".view-title", HTMLElement);
   const fallbackTitle = `${instance.name} / ${id} / ${transport === "hmp1" ? "HMP1 relay" : "Direct HWT1"}`;
   header.textContent = fallbackTitle;
@@ -541,7 +716,8 @@ async function openView(instance: TerminalInstance, { primary = false, thumbnail
   workspace.append(element);
   workspace.classList.remove("empty");
   const view: TerminalView = {
-    id, instance, element, controller: new AbortController(), phase: "connecting", stats: {}, text: "", transport
+    id, instance, element, controller: new AbortController(), phase: "connecting", stats: {}, text: "", transport,
+    commandMarks: []
   };
   views.set(id, view);
   selectView(view);
@@ -557,11 +733,25 @@ async function openView(instance: TerminalInstance, { primary = false, thumbnail
     if (selected !== view) selectView(view);
   }, { signal: view.controller.signal });
   elementAt(element, ".close-view", HTMLButtonElement).addEventListener("click", () => closeView(view), { signal: view.controller.signal });
+  elementAt(element, ".minimal-chrome-toggle", HTMLButtonElement).addEventListener("click", () => setMinimalChrome(view), { signal: view.controller.signal });
   elementAt(element, ".dismiss-view", HTMLButtonElement).addEventListener("click", () => closeView(view), { signal: view.controller.signal });
   action(elementAt(element, ".thumbnail", HTMLButtonElement), () => openView(instance, { thumbnail: true }),
     () => updateViewControls(view));
   action(elementAt(element, ".take-primary", HTMLButtonElement), () => mounted(view).requestPrimary(), () => updateViewControls(view));
   action(elementAt(element, ".resync", HTMLButtonElement), () => mounted(view).resync(), () => updateViewControls(view));
+  const links = elementAt(element, ".view-links", HTMLSelectElement);
+  const updateLinks = () => {
+    try {
+      mounted(view).setLinks(viewLinks(view));
+      reportLink(view, links.value === "preview"
+        ? "Link previews enabled: Ctrl/Cmd+click. Remote paths are shown only; no navigation or file access."
+        : links.value === "disabled" ? "All local link interactions disabled."
+        : "Detection disabled; legacy allowlisted OSC 8 navigation restored.");
+    } catch (error) { reportLink(view, message(error), "error"); }
+    updateViewControls(view);
+  };
+  for (const selector of [".view-links", ".view-link-decoration", ".view-link-style"])
+    elementAt(element, selector, HTMLSelectElement).addEventListener("change", updateLinks, { signal: view.controller.signal });
   action(elementAt(element, ".reconnect-view", HTMLButtonElement), () => mountView(view), () => updateViewControls(view));
   action(elementAt(element, ".trigger-failure", HTMLButtonElement), async () => {
     if (view.phase !== "connected" || !view.connectionId) throw new Error("Connect this view before triggering a failure");
@@ -596,12 +786,15 @@ async function mountView(view: TerminalView, primary = false, failure = "", focu
   view.closure = undefined;
   view.stats = {};
   view.text = "";
+  view.commandMarks = [];
+  let previousMarkPhase: TerminalCommandMark["phase"] | null = null;
   const { element, instance, id, transport } = view;
   const current = () => !controller.signal.aborted && !view.controller.signal.aborted;
   element.dataset.phase = "connecting";
   element.dataset.connected = "false";
   elementAt(element, ".closed-overlay", HTMLElement).hidden = true;
   elementAt(element, ".terminal-mount", HTMLElement).inert = false;
+  elementAt(element, ".command-marks-rail", HTMLElement).replaceChildren();
   elementAt(element, ".view-role", HTMLElement).textContent = "Joining";
   elementAt(element, ".view-role", HTMLElement).title = "";
   updateViewControls(view);
@@ -621,6 +814,23 @@ async function mountView(view: TerminalView, primary = false, failure = "", focu
       scale: select("scale").value === "auto" ? "auto" : Number(select("scale").value),
       font: select("font").value === "monospace" ? { family: "monospace" } : undefined,
       label: `${instance.name}, view ${id}, terminal input`,
+      links: viewLinks(view),
+      actions: {
+        "demo.previewUri": linkAction((_context, link) => {
+          reportLink(view, `URI preview (not opened): ${link.target}`);
+        }),
+        "demo.remoteFile": linkAction((context, link) => {
+          const cwd = context.terminal.workingDirectory.path ?? "unknown";
+          reportLink(view, `Remote file callback (no file access): ${link.target} / remote cwd: ${cwd}`);
+        }),
+        "demo.issue": linkAction((_context, link) => {
+          reportLink(view, `Issue preview (not fetched): PROJ-${link.target}`);
+        })
+      },
+      onLinkDetectionError(error) {
+        if (current()) reportLink(view,
+          `Link detection ${error.code} / rule ${error.ruleId ?? "all"} / revision ${error.revision}: ${error.message}`, "error");
+      },
       onClose(details) {
         if (current()) connectionClosed(view, details);
       },
@@ -644,6 +854,37 @@ async function mountView(view: TerminalView, primary = false, failure = "", focu
         element.dataset.shellPhase = shell.phase;
         elementAt(element, ".shell-status", HTMLElement).textContent = labels[shell.phase] +
           (shell.lastExitCode === null ? "" : ` / last exit ${shell.lastExitCode}`);
+      },
+      onWorkingDirectoryChange(workingDirectory) {
+        elementAt(element, ".cwd-status", HTMLElement).textContent =
+          workingDirectory.path === null ? "" : `cwd: ${workingDirectory.path}`;
+      },
+      onCommandMarkChange(mark) {
+        const status = elementAt(element, ".command-mark-status", HTMLElement);
+        if (mark === null) {
+          status.textContent = "";
+          previousMarkPhase = null;
+          return;
+        }
+        const cmdlineUrl = getCmdlineUrl(mark);
+        status.textContent = `mark: ${mark.phase}` +
+          (mark.exitCode === null ? "" : ` (exit ${mark.exitCode})`) +
+          (cmdlineUrl === null ? "" : ` / ${cmdlineUrl}`);
+        // A rising edge into "commandLine" starts a new logical command; every other phase update
+        // (executing, finished) refines the same trailing rail entry in place.
+        if (mark.phase === "commandLine" && previousMarkPhase !== "commandLine") {
+          const viewport = view.viewport;
+          const anchor = viewport?.available ? { generation: viewport.generation, top: viewport.top } : null;
+          view.commandMarks.push({ phase: mark.phase, exitCode: mark.exitCode, cmdlineUrl, anchor });
+          if (view.commandMarks.length > 20) view.commandMarks.shift();
+        } else if (view.commandMarks.length > 0) {
+          const entry = view.commandMarks[view.commandMarks.length - 1];
+          entry.phase = mark.phase;
+          entry.exitCode = mark.exitCode;
+          if (cmdlineUrl !== null) entry.cmdlineUrl = cmdlineUrl;
+        }
+        previousMarkPhase = mark.phase;
+        renderCommandMarksRail(view);
       },
       onStatus(message, level) {
         if (!current() || view.closure?.close) return;
@@ -718,11 +959,14 @@ async function mountView(view: TerminalView, primary = false, failure = "", focu
 }
 
 async function createInstance() {
-  const instance = readInstance(await api("/api/terminals", "POST", { scene: select("scene").value, columns: 100, rows: 30 }));
+  const instance = readInstance(await api("/api/terminals", "POST", {
+    scene: select("scene").value, columns: 100, rows: 30, reflowStrategy: select("reflow-strategy").value
+  }));
   await refreshInstances(instance.id);
   await openView(instance, { primary: true });
 }
 
+button("restore-chrome").addEventListener("click", () => setMinimalChrome());
 action(button("create"), createInstance);
 action(button("attach"), () => {
   const instance = instances.find(item => item.id === instancesSelect.value);
@@ -785,11 +1029,17 @@ try {
   const scene = parameters.get("scene");
   const requestedScene = scene !== null && [...select("scene").options].some(option => option.value === scene);
   if (requestedScene) select("scene").value = scene;
+  const reflow = parameters.get("reflow");
+  if (reflow !== null) {
+    if (![...select("reflow-strategy").options].some(option => option.value === reflow))
+      throw new Error("Invalid reflow query parameter");
+    select("reflow-strategy").value = reflow;
+  }
   const scale = parameters.get("scale");
   if (scale !== null && [...select("scale").options].some(option => option.value === scale)) select("scale").value = scale;
   await refreshInstances();
   if (parameters.get("empty") !== "1") {
-    if (instances.length && !requestedScene) await openView(instances[0]);
+    if (instances.length && !requestedScene && reflow === null) await openView(instances[0]);
     else await createInstance();
   }
 } catch (error) {

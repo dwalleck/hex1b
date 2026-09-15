@@ -1,7 +1,8 @@
-import type { InputModifiers, PointerButton, SelectionMode, SelectionRange,
+import type { InputModifiers, PointerButton, SelectionMode, SelectionRange, TerminalLinkUnderlineStyle,
   TerminalBuffer, TerminalFont, TerminalGeometry, TerminalPeer, TerminalSize, TerminalStats,
   TerminalRendererPreference, TerminalStatusLevel, TerminalProgress, TerminalShellIntegration,
-  TerminalCloseDetails } from "./types.js";
+  TerminalWorkingDirectory, TerminalCommandMark, TerminalCloseDetails } from "./types.js";
+import type { LinkDetectionSnapshot } from "./link-detection.js";
 
 export type SelectionText =
   | { status: "valid"; text: string }
@@ -38,6 +39,8 @@ export interface FrameMetadata extends TerminalGeometry {
   title: string;
   progress: TerminalProgress;
   shellIntegration: TerminalShellIntegration;
+  workingDirectory: TerminalWorkingDirectory;
+  commandMark: TerminalCommandMark | null;
   defaultBackground?: number; defaultForeground?: number;
   cursor: { visible: boolean; x: number; y: number; shape: number };
   images: ImageMetadata[]; retainedImages: string[]; placements: ImagePlacement[]; warnings: string[];
@@ -68,6 +71,9 @@ export type WorkerInputMessage =
   | { type: "init"; canvas: OffscreenCanvas; url: string; scale: number; font: TerminalFont;
       renderer: TerminalRendererPreference }
   | ({ type: "viewport" } & TerminalSize)
+  | { type: "linkDetection"; enabled: boolean; generation: number }
+  | { type: "linkDecorations"; revision: number; generation: number; serial: number;
+      ranges: readonly SelectionRange[]; underlineStyle?: TerminalLinkUnderlineStyle }
   | { type: "command"; command: TerminalCommand }
   | { type: "stop" };
 export interface WorkerStats extends TerminalStats {
@@ -87,6 +93,10 @@ export type WorkerOutputMessage =
   | { type: "status"; message: string; level: TerminalStatusLevel }
   | ({ type: "geometry"; peer: TerminalPeer; history: HistoryMetadata | null;
        revision: number; title: string; progress: TerminalProgress; shellIntegration: TerminalShellIntegration;
+       workingDirectory: TerminalWorkingDirectory; commandMark: TerminalCommandMark | null;
+       linkGeneration?: number; linkSnapshot?: LinkDetectionSnapshot;
        text: string; hyperlinks: HyperlinkRange[] } & TerminalGeometry)
+  | { type: "linkSnapshot"; generation: number; snapshot: LinkDetectionSnapshot }
+  | { type: "linkDecorations"; revision: number; generation: number; serial: number }
   | { type: "history"; history: HistoryMetadata | null; revision: number; text: string }
   | { type: "stats"; stats: WorkerStats; text?: string };

@@ -105,6 +105,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     private volatile bool _disposed;
     private bool _inAlternateScreen;
     private TerminalCell[,]? _savedMainScreenBuffer; // Saved main screen when entering alternate screen
+    private bool _alternateScreenSavedPendingWrap;
     private int _alternateScreenSavedCursorX; // Saved cursor X for alternate screen (mode 1049)
     private int _alternateScreenSavedCursorY; // Saved cursor Y for alternate screen (mode 1049)
     private Task? _inputProcessingTask;
@@ -359,7 +360,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         _metrics = options.Metrics ?? Diagnostics.Hex1bMetrics.Default;
         var sixelPolicy = options.CreateSixelPolicy();
         var graphicsBudgets = new TerminalGraphicsRetainedBudgetSet(
-            options.Graphics.MaximumRetainedBytesPerScreen);
+            options.Graphics.MaximumRetainedBytesPerScreen,
+            options.Graphics.MaximumRetainedInputBytesPerImage,
+            options.Graphics.MaximumRasterPixelsPerImage);
         _kgpGraphicsState = new KgpTerminalGraphicsState(graphicsBudgets);
         _sixelColorRegisters = new Sixel.SixelColorRegisters(sixelPolicy);
         _sixelGraphicsState = new SixelGraphicsState(
@@ -406,6 +409,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 OnScrollbackRowPruned);
             _scrollbackCallback = options.ScrollbackCallback;
         }
+        _commandMarkHistoryCapacity = Math.Max(0, options.CommandMarkHistoryCapacity);
         
         _dcsByteStreamParser = new DcsByteStreamParser(sixelPolicy);
         _escapeTimeout = options.EscapeSequenceTimeout ?? TimeSpan.FromMilliseconds(50);
@@ -2259,7 +2263,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 _iconName,
                 includeSavedTitles ? Array.AsReadOnly(_titleStack.ToArray()) : [],
                 _activityState.Progress,
-                _activityState.ShellIntegration);
+                _activityState.ShellIntegration,
+                _activityState.WorkingDirectory,
+                [.. _commandMarks]);
         }
     }
 
@@ -2302,34 +2308,37 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Gets the text content of the screen buffer as a string, with lines separated by newlines.
-    /// Automatically flushes pending output before returning.
+    /// Reads one consistent model state; it does not wait for queued output.
     /// </summary>
     internal string GetScreenText()
     {
         return GetScreenTextInternal();
     }
 
-    // Internal version that doesn't flush (for use after already flushing)
+    // Share the token-application lock so readers cannot observe a partial repaint.
     private string GetScreenTextInternal()
     {
-        var sb = new StringBuilder();
-        for (int y = 0; y < _height; y++)
+        lock (_bufferLock)
         {
-            for (int x = 0; x < _width; x++)
+            var sb = new StringBuilder();
+            for (int y = 0; y < _height; y++)
             {
-                var ch = _screenBuffer[y, x].Character;
-                // Skip empty continuation cells (used for wide characters)
-                if (ch.Length > 0)
+                for (int x = 0; x < _width; x++)
                 {
-                    sb.Append(ch);
+                    var ch = _screenBuffer[y, x].Character;
+                    // Skip empty continuation cells (used for wide characters)
+                    if (ch.Length > 0)
+                    {
+                        sb.Append(ch);
+                    }
+                }
+                if (y < _height - 1)
+                {
+                    sb.AppendLine();
                 }
             }
-            if (y < _height - 1)
-            {
-                sb.AppendLine();
-            }
+            return sb.ToString();
         }
-        return sb.ToString();
     }
 
     /// <summary>
@@ -2582,6 +2591,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             else
             {
                 ResizeWithCrop(newWidth, newHeight);
+                _pendingWrap = false;
             }
             EnsureTabStops(newWidth);
             
@@ -2595,7 +2605,6 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             _scrollTop = 0;
             _scrollBottom = newHeight - 1;
             
-            _pendingWrap = false;
             PublishCaptureResizeUnsafe();
             deferNotification = _deferHmp1ReplayCallbacks;
         }
@@ -2631,7 +2640,11 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             _width, _height, newWidth, newHeight,
             _cursorX, _cursorY, _inAlternateScreen,
             _cursorSaved ? _savedCursorX : null,
-            _cursorSaved ? _savedCursorY : null);
+            _cursorSaved ? _savedCursorY : null)
+        {
+            PendingWrap = _pendingWrap,
+            SavedPendingWrap = _savedPendingWrap
+        };
 
         var kgpReflow = _kgpGraphicsState.PrepareActiveReflow(scrollbackEntries);
         var sixelReflow = _sixelGraphicsState.PrepareActiveReflow(scrollbackEntries);
@@ -2652,15 +2665,6 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         var result = hasKgpLineage
             ? internalResult.Reflow
             : reflowProvider.Reflow(context);
-
-        // Release tracked objects from old screen buffer (all cells)
-        for (int y = 0; y < _height; y++)
-        {
-            for (int x = 0; x < _width; x++)
-            {
-                _screenBuffer[y, x].TrackedHyperlink?.Release();
-            }
-        }
 
         // Apply the reflowed screen buffer
         var newBuffer = new TerminalCell[newHeight, newWidth];
@@ -2716,17 +2720,23 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 DiscardedRowCount: result.ScrollbackRows.Length);
         }
 
+        // Keep the old owners alive until both screen and history have acquired
+        // their replacements, including cells moving between the two.
+        foreach (var cell in _screenBuffer)
+            cell.TrackedHyperlink?.Release();
         _screenBuffer = newBuffer;
         _width = newWidth;
         _height = newHeight;
         _cursorX = Math.Clamp(result.CursorX, 0, newWidth - 1);
         _cursorY = Math.Clamp(result.CursorY, 0, newHeight - 1);
+        _pendingWrap = result.PendingWrap;
 
         // Update saved cursor if the reflow strategy reflowed it
         if (result.NewSavedCursorX.HasValue && result.NewSavedCursorY.HasValue)
         {
             _savedCursorX = Math.Clamp(result.NewSavedCursorX.Value, 0, newWidth - 1);
             _savedCursorY = Math.Clamp(result.NewSavedCursorY.Value, 0, newHeight - 1);
+            _savedPendingWrap = result.SavedPendingWrap;
         }
 
         if (hasKgpLineage)
@@ -2794,6 +2804,12 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             for (int x = 0; x < copyWidth; x++)
             {
                 newBuffer[y, x] = _screenBuffer[y, x];
+            }
+            var edge = newBuffer[y, newWidth - 1];
+            if (!string.IsNullOrEmpty(edge.Character) && DisplayWidth.GetGraphemeWidth(edge.Character) > 1)
+            {
+                edge.TrackedHyperlink?.Release();
+                newBuffer[y, newWidth - 1] = TerminalCell.Empty;
             }
         }
         
@@ -2910,6 +2926,11 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     internal long GraphicsRetainedByteCount =>
         checked(ActiveKgpImageStore.TotalSize + SixelRetainedByteCount);
+
+    internal long GraphicsReservedDecodedByteCount => ActiveKgpImageStore.ReservedDecodedBytes;
+
+    internal long GraphicsChargedByteCount =>
+        checked(ActiveKgpImageStore.ChargedSize + SixelRetainedByteCount);
 
     internal Diagnostics.Hex1bMetrics DiagnosticsMetrics => _metrics;
 
@@ -3770,10 +3791,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     /// only presentation whose
     /// <see cref="IHex1bTerminalPresentationAdapter.AnswersProtocolQueriesDirectly"/>
     /// is <see langword="true"/>, so it is the only presentation this method stays
-    /// silent for — every other presentation (including headless and WebSocket
-    /// adapters) gets a synthesized reply here so a single, deterministic answerer
-    /// always exists and duplicate responses from both Hex1b and a real terminal are
-    /// impossible.
+    /// silent for at the presentation layer. For other presentations (including
+    /// headless and WebSocket adapters), a reply is synthesized unless the workload
+    /// already has an upstream owner, as checked by SendProtocolResponseAsync.
     /// </remarks>
     private void HandleDeviceAttributesQuery()
     {
@@ -3797,7 +3817,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     /// Answers an XTWINOPS window-operation query (<c>CSI 14/16/18 t</c>) on behalf
     /// of the workload, using the terminal's own authoritative size and cell-metric
     /// model, unless the active presentation is a real upstream terminal that will
-    /// already answer it itself.
+    /// already answer it itself. Workloads with an upstream query owner are also
+    /// kept silent by SendProtocolResponseAsync.
     /// </summary>
     /// <remarks>
     /// Only the report-style operations recognized by
@@ -3863,9 +3884,25 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     private async Task SendProtocolResponseAsync(byte[] bytes)
     {
+        var placeholder = _workload as PlaceholderWorkloadAdapter;
+        var target = placeholder?.CaptureProtocolResponseTarget();
+        var responseWorkload = target?.Workload ?? _workload;
+        if (responseWorkload is null || responseWorkload.HandlesProtocolQueries) return;
+
         try
         {
-            await WriteWorkloadInputAsync(bytes, _disposeCts.Token).ConfigureAwait(false);
+            await _workloadInputWriteLock.WaitAsync(_disposeCts.Token).ConfigureAwait(false);
+            try
+            {
+                if (placeholder is not null && target is { } outputOwner)
+                    await placeholder.WriteProtocolResponseAsync(outputOwner, bytes, _disposeCts.Token).ConfigureAwait(false);
+                else
+                    await responseWorkload.WriteInputAsync(bytes, _disposeCts.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                _workloadInputWriteLock.Release();
+            }
         }
         catch (OperationCanceledException) when (_disposeCts.IsCancellationRequested)
         {
@@ -4172,6 +4209,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         spacerCell = spacerCell with
                         {
                             Character = " ",
+                            IsWideWrapPadding = true,
                             TrackedHyperlink = _currentHyperlink,
                             Attributes = spacerCell.Attributes | CellAttributes.SoftWrap
                         };
@@ -5121,6 +5159,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         // This uses separate fields from DECSC/DECRC to avoid conflicts
         _alternateScreenSavedCursorX = _cursorX;
         _alternateScreenSavedCursorY = _cursorY;
+        _alternateScreenSavedPendingWrap = _pendingWrap;
         
         // Always save the main screen buffer for internal state (needed for snapshots)
         // and for presentation adapters that don't handle alternate screen natively
@@ -5160,7 +5199,33 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     private void DoExitAlternateScreen(List<CellImpact>? impacts = null)
     {
-        if (!RestoreMainScreenBuffer(impacts))
+        if (_inAlternateScreen && _savedMainScreenBuffer is { } main &&
+            (main.GetLength(1) != _width || main.GetLength(0) != _height) &&
+            _presentation is ITerminalReflowProvider { ReflowEnabled: true } provider)
+        {
+            var width = _width;
+            var height = _height;
+            foreach (var cell in _screenBuffer)
+                cell.TrackedHyperlink?.Release();
+            _screenBuffer = main;
+            _savedMainScreenBuffer = null;
+            _width = main.GetLength(1);
+            _height = main.GetLength(0);
+            _cursorX = _alternateScreenSavedCursorX;
+            _cursorY = _alternateScreenSavedCursorY;
+            _pendingWrap = _alternateScreenSavedPendingWrap;
+            _kgpGraphicsState.ExitAlternateScreen();
+            _sixelGraphicsState.ExitAlternateScreen();
+            _inAlternateScreen = false;
+            ResizeWithReflow(width, height, provider);
+            if (!Capabilities.HandlesAlternateScreenNatively && impacts is not null)
+            {
+                for (var y = 0; y < height; y++)
+                    for (var x = 0; x < width; x++)
+                        impacts.Add(new CellImpact(x, y, _screenBuffer[y, x]));
+            }
+        }
+        else if (!RestoreMainScreenBuffer(impacts))
             return;
 
         _kgpGraphicsState.ExitAlternateScreen();
@@ -5193,6 +5258,10 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         {
             for (int x = 0; x < restoreWidth; x++)
                 SetCell(y, x, savedBuffer[y, x], restoreImpacts);
+            var edge = _screenBuffer[y, _width - 1];
+            if (restoreWidth == _width && !string.IsNullOrEmpty(edge.Character) &&
+                DisplayWidth.GetGraphemeWidth(edge.Character) > 1)
+                SetCell(y, _width - 1, TerminalCell.Empty, restoreImpacts);
         }
 
         for (int y = 0; y < _height; y++)
@@ -5215,6 +5284,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         _savedMainScreenBuffer = null;
         _cursorX = Math.Clamp(_alternateScreenSavedCursorX, 0, _width - 1);
         _cursorY = Math.Clamp(_alternateScreenSavedCursorY, 0, _height - 1);
+        _pendingWrap = _alternateScreenSavedPendingWrap && _cursorX == _width - 1;
         return true;
     }
 
@@ -6856,7 +6926,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Processes an OSC sequence, handling title sequences (0/1/2/22/23) and hyperlinks (8).
+    /// Processes an OSC sequence, handling title sequences (0/1/2/22/23), hyperlinks (8),
+    /// and shell integration (7/9/133).
     /// </summary>
     /// <remarks>
     /// <para>Supported OSC sequences:</para>
@@ -6864,9 +6935,12 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     ///   <item>OSC 0 - Set icon name AND window title</item>
     ///   <item>OSC 1 - Set icon name only</item>
     ///   <item>OSC 2 - Set window title only</item>
+    ///   <item>OSC 7 - Report working directory</item>
     ///   <item>OSC 8 - Hyperlinks</item>
+    ///   <item>OSC 9;4 - Progress</item>
     ///   <item>OSC 22 - Push current title/icon onto stack, optionally set new values</item>
     ///   <item>OSC 23 - Pop title/icon from stack and restore</item>
+    ///   <item>OSC 133 - Shell integration markers and command marks</item>
     /// </list>
     /// <para>
     /// OSC 0/1/2 do NOT affect the title stack - they only modify current values.
@@ -6899,9 +6973,11 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 ProcessOsc8Hyperlink(parameters, payload);
                 break;
 
+            case "7":
             case "9":
             case "133":
                 SetActivityState(_activityState.ApplyOsc(command, parameters, payload));
+                RecordCommandMarkIfPresent(command, parameters, payload);
                 break;
                 
             case "22":
@@ -7947,7 +8023,10 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             return;
         }
 
-        const int maximumEncodedLength = KgpMaximumEncodedChunkLength;
+        var maximumEncodedLength = pending.Transmission.Compression == KgpParsedCommand.CompressionMode.Zlib
+            ? Math.Min(KgpMaximumEncodedChunkLength,
+                GetMaximumKgpEncodedPayloadLength(ActiveKgpImageStore.RemainingPendingUploadBytes))
+            : KgpMaximumEncodedChunkLength;
         if (!TryDecodeKgpPayload(
                 base64Payload,
                 transmission.MoreData,
@@ -8008,15 +8087,15 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         if (!command.ControlKeys.Contains('m'))
             return false;
 
+        // Kitty tolerates repeated metadata: the pending upload owns all metadata
+        // except m/q. An omitted action also continues a pending animation frame.
         return initialCommand switch
         {
             KgpParsedCommand.Transmit or KgpParsedCommand.TransmitAndDisplay
-                => command is KgpParsedCommand.Transmit &&
-                   command.ControlKeys.IsSubsetOf(KgpImageContinuationControls),
+                => command is KgpParsedCommand.Transmit or KgpParsedCommand.TransmitAndDisplay,
             KgpParsedCommand.AnimationFrame
-                => command is KgpParsedCommand.AnimationFrame &&
-                   command.ControlKeys.Contains('a') &&
-                   command.ControlKeys.IsSubsetOf(KgpFrameContinuationControls),
+                => command is KgpParsedCommand.AnimationFrame ||
+                   command is KgpParsedCommand.Transmit && !command.ControlKeys.Contains('a'),
             _ => false,
         };
     }
@@ -8062,6 +8141,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         var maximumEncodedLength = command.Transmission.MoreData
             ? KgpMaximumEncodedChunkLength
             : GetMaximumKgpEncodedPayloadLength();
+        if (command.Transmission.Compression == KgpParsedCommand.CompressionMode.Zlib)
+            maximumEncodedLength = Math.Min(maximumEncodedLength,
+                GetMaximumKgpEncodedPayloadLength(ActiveKgpImageStore.MaximumCompressedUploadBytes));
         if (!TryDecodeKgpPayload(
                 base64Payload,
                 command.Transmission.MoreData,
@@ -8083,7 +8165,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             var result = ActiveKgpImageStore.ProcessChunk(
                 command,
                 decodedData,
-                info.ExpectedDataLength);
+                command.Transmission.Compression == KgpParsedCommand.CompressionMode.Zlib
+                    ? ActiveKgpImageStore.MaximumCompressedUploadBytes
+                    : info.ExpectedDataLength);
             switch (result.Status)
             {
                 case KgpImageStore.ChunkStatus.Incomplete:
@@ -8129,6 +8213,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         var maximumEncodedLength = transmission.MoreData
             ? KgpMaximumEncodedChunkLength
             : GetMaximumKgpEncodedPayloadLength();
+        if (transmission.Compression == KgpParsedCommand.CompressionMode.Zlib)
+            maximumEncodedLength = Math.Min(maximumEncodedLength,
+                GetMaximumKgpEncodedPayloadLength(ActiveKgpImageStore.MaximumCompressedUploadBytes));
         byte[]? decodedData = null;
         if (!transmission.MoreData)
         {
@@ -8247,7 +8334,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         var message = result.Info.Status ==
             KgpImageStore.AnimationFrameStatus.Success
                 ? "OK"
-                : FormatKgpAnimationFrameError(
+                : result.Error ?? FormatKgpAnimationFrameError(
                     result.Info,
                     decodedData.LongLength);
         SendKgpFrameResponse(
@@ -8264,8 +8351,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         out string error)
     {
         maximumBytes = ActiveKgpImageStore.MaximumPendingUploadBytes;
-        if (transmission.Compression != KgpParsedCommand.CompressionMode.None ||
-            !TryGetExpectedKgpDataSize(transmission, out var expectedSize) ||
+        if (transmission.Compression == KgpParsedCommand.CompressionMode.Zlib)
+            return ActiveKgpImageStore.TryGetCompressedUploadLimit(transmission, out maximumBytes, out error);
+        if (!TryGetExpectedKgpDataSize(transmission, out var expectedSize) ||
             expectedSize == 0)
         {
             error = "";
@@ -8296,7 +8384,12 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 nameof(command));
         }
 
-        if (!TryValidateKgpData(transmission, decodedData, out var validationError))
+        KgpImageData? validatedImage = null;
+        var valid = transmission.Compression == KgpParsedCommand.CompressionMode.Zlib
+            ? ActiveKgpImageStore.TryCreateCompressedImage(transmission, decodedData,
+                out validatedImage, out var validationError)
+            : TryValidateKgpData(transmission, decodedData, out validationError);
+        if (!valid)
         {
             SendKgpTransmissionResponse(
                 transmission,
@@ -8306,7 +8399,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             return;
         }
 
-        var stored = ActiveKgpImageStore.StoreImage(transmission, decodedData);
+        var stored = ActiveKgpImageStore.StoreImage(transmission, decodedData, validatedImage);
         if (stored.Relocation is { } relocation)
             ApplyKgpImageRelocation(relocation);
         if (!stored.Stored)
@@ -8512,8 +8605,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 => "ENOENT:Image not found",
             KgpImageStore.AnimationFrameStatus.UnsupportedMedium
                 => "EINVAL:Animation frame transmission requires direct data",
-            KgpImageStore.AnimationFrameStatus.UnsupportedCompression
-                => "EINVAL:Animation frame compression is not supported",
+            KgpImageStore.AnimationFrameStatus.InvalidCompressedData
+                => "EINVAL:Invalid or incomplete zlib frame data",
             KgpImageStore.AnimationFrameStatus.UnsupportedFormat
                 => "EINVAL:Animation frames require RGB or RGBA data",
             KgpImageStore.AnimationFrameStatus.UnsupportedBaseFormat
@@ -8545,6 +8638,26 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         KgpParsedCommand.QuietMode quiet,
         string base64Payload)
     {
+        if (command.Compression == KgpParsedCommand.CompressionMode.Zlib)
+        {
+            var maximumLength = GetMaximumKgpEncodedPayloadLength(ActiveKgpImageStore.MaximumCompressedUploadBytes);
+            if (!ActiveKgpImageStore.TryGetCompressedUploadLimit(command, out _, out var error))
+            {
+                SendKgpResponse(command.ImageId, command.ImageNumber, error, (int)quiet);
+                return;
+            }
+            if (!TryDecodeKgpPayload(base64Payload, command.MoreData, maximumLength,
+                    out var compressed, out var payloadError))
+            {
+                SendKgpResponse(command.ImageId, command.ImageNumber,
+                    FormatKgpPayloadError(payloadError, maximumLength), (int)quiet);
+                return;
+            }
+            var valid = ActiveKgpImageStore.TryCreateCompressedImage(command, compressed, out _, out error);
+            SendKgpResponse(command.ImageId, command.ImageNumber, valid ? "OK" : error, (int)quiet);
+            return;
+        }
+
         var decodedData = DecodeKgpPayload(base64Payload);
 
         if (TryGetExpectedKgpDataSize(command, out var expectedSize) &&
@@ -9040,8 +9153,10 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     }
 
     private int GetMaximumKgpEncodedPayloadLength()
+        => GetMaximumKgpEncodedPayloadLength(ActiveKgpImageStore.MaximumPendingUploadBytes);
+
+    private static int GetMaximumKgpEncodedPayloadLength(long maximumDecodedLength)
     {
-        var maximumDecodedLength = ActiveKgpImageStore.MaximumPendingUploadBytes;
         var maximumEncodedLength = (maximumDecodedLength + 2) / 3 * 4;
         return checked((int)Math.Min(maximumEncodedLength, int.MaxValue));
     }

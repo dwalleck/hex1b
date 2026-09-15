@@ -4,6 +4,7 @@ using Hex1b;
 using Hex1b.Flow;
 using Hex1b.Reflow;
 using Hex1b.Surfaces;
+using Hex1b.Tokens;
 using Hex1b.Widgets;
 
 namespace Hex1b.Tests.Flow;
@@ -208,6 +209,71 @@ public class FlowCommitResizeOwnershipTests
         }, width: 121, height: 30, settleDelay: settleDelay);
 
         await terminal.RunAsync().WaitAsync(TimeSpan.FromSeconds(30));
+    }
+
+
+    [TestMethod]
+    public async Task ScreenRead_DuringAtomicRepaint_ReturnsCompletedFrame()
+    {
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload).WithHeadless().WithDimensions(20, 3).Build();
+        terminal.ApplyTokens([new TextToken("BEFORE")]);
+        var repaint = new PausedRepaintTokens();
+        var writer = Task.Run(() => terminal.ApplyTokens(repaint));
+        var ct = TestContext.Current.CancellationToken;
+        try
+        {
+            await repaint.Held.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+            var readerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var reader = Task.Run(() =>
+            {
+                readerStarted.SetResult();
+                return ScreenText(terminal);
+            });
+            await readerStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+            await Task.WhenAny(reader, Task.Delay(100, ct));
+            repaint.Release.TrySetResult();
+
+            Assert.Contains("AFTER", await reader.WaitAsync(TimeSpan.FromSeconds(5), ct),
+                "A screen read must not observe the cleared intermediate state of an atomic repaint.");
+        }
+        finally
+        {
+            repaint.Release.TrySetResult();
+            await writer.WaitAsync(TimeSpan.FromSeconds(5), ct);
+        }
+    }
+
+    private sealed class PausedRepaintTokens : IReadOnlyList<AnsiToken>
+    {
+        private readonly AnsiToken[] _tokens =
+        [
+            new CursorPositionToken(1, 1),
+            new TextToken(new string(' ', 20)),
+            new CursorPositionToken(1, 1),
+            new TextToken("AFTER"),
+        ];
+        public TaskCompletionSource Held { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int Count => _tokens.Length;
+        public AnsiToken this[int index] => _tokens[index];
+
+        public IEnumerator<AnsiToken> GetEnumerator()
+        {
+            for (var index = 0; index < _tokens.Length; index++)
+            {
+                if (index == 3)
+                {
+                    Held.TrySetResult();
+                    if (!Release.Task.Wait(TimeSpan.FromSeconds(10)))
+                        throw new TimeoutException("The repaint reader did not release the writer.");
+                }
+                yield return _tokens[index];
+            }
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     // === harness =============================================================

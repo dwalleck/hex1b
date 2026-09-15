@@ -1,3 +1,6 @@
+import type { TerminalLinkOptions, TerminalLinkDetectionError } from "./link-types.js";
+export type * from "./link-types.js";
+
 /** Logical terminal dimensions, confirmed by the producer rather than reflowed locally. */
 export interface TerminalGrid { columns: number; rows: number }
 export interface TerminalSize { width: number; height: number }
@@ -166,10 +169,38 @@ export interface TerminalShellIntegration {
   /** Null means no reported status, not success. Preserved across the next prompt/command. */
   readonly lastExitCode: number | null;
 }
+/** Last reported OSC 7 working directory, or all-null before any is reported. */
+export interface TerminalWorkingDirectory {
+  /** Raw URI as reported by the shell (typically `file://`), or null. */
+  readonly uri: string | null;
+  /** Authority from the URI; "" for a local/unqualified authority. Null when uri is null. */
+  readonly host: string | null;
+  /** Decoded filesystem path from the URI. Null when uri is null. */
+  readonly path: string | null;
+}
+/**
+ * Latest OSC 133 marker, distinct from {@link TerminalShellIntegration}: it additionally carries
+ * any raw trailing `key=value` parameters (e.g. a `cmdline_url` extension on marker C). This is
+ * the single most-recent marker only — the server does not transport a mark history or event
+ * log over this wire; consumers that want their own history should accumulate distinct values
+ * from {@link WebTerminalOptions.onCommandMarkChange} themselves.
+ */
+export interface TerminalCommandMark {
+  readonly phase: TerminalShellIntegrationPhase;
+  readonly exitCode: number | null;
+  /** Verbatim `key=value[;key=value...]` trailing the marker, or null when none was present. */
+  readonly rawParameters: string | null;
+}
 export interface WebTerminalOptions extends InputPolicyOptions {
   url: string | URL;
   /** Optional module-worker entry, resolved against the page URL. Defaults to the bundled worker. */
   workerUrl?: string | URL;
+  /** Optional isolated regex worker entry, resolved against the page URL. */
+  linkDetectionWorkerUrl?: string | URL;
+  /** Per-view link interaction. Detection is opt-in; omitted preserves legacy OSC 8 navigation. */
+  links?: false | TerminalLinkOptions;
+  /** Detection failures are local to this feature and also reported through onStatus. */
+  onLinkDetectionError?: (error: TerminalLinkDetectionError) => void;
   signal?: AbortSignal;
   scale?: number | "auto";
   /** Mount-time backend selection. Defaults to auto; explicit modes never fall back. */
@@ -211,6 +242,18 @@ export interface WebTerminalOptions extends InputPolicyOptions {
    * occur between frames. Replays provide current state, never synthetic command executions.
    */
   onShellIntegrationChange?: (shellIntegration: TerminalShellIntegration) => void;
+  /**
+   * Receives the first authoritative presented working directory before mount resolves, then
+   * distinct presented changes. All-null means none reported yet; a malformed or non-`file` OSC 7
+   * report does not change presented state. No notifications after disposal.
+   */
+  onWorkingDirectoryChange?: (workingDirectory: TerminalWorkingDirectory) => void;
+  /**
+   * Receives the first authoritative presented command mark before mount resolves (null if none
+   * yet reported), then distinct presented changes. Only the latest marker is transmitted, not a
+   * history; entire commands may occur between frames. No notifications after disposal.
+   */
+  onCommandMarkChange?: (commandMark: TerminalCommandMark | null) => void;
   onStats?: (stats: TerminalStats, text: string | undefined) => void;
   onViewportChange?: (viewport: TerminalViewport) => void;
   onSelectionChange?: (selection: TerminalSelection) => void;
@@ -232,6 +275,10 @@ export interface WebTerminalHandle {
   readonly progress: TerminalProgress;
   /** Current presented shell state, initially unknown. Retained on disconnect/dispose. */
   readonly shellIntegration: TerminalShellIntegration;
+  /** Current presented working directory, all-null initially. Retained on disconnect/dispose. */
+  readonly workingDirectory: TerminalWorkingDirectory;
+  /** Latest presented command mark, or null if none reported yet. Retained on disconnect/dispose. */
+  readonly commandMark: TerminalCommandMark | null;
   readonly stats: TerminalStats;
   readonly screenText: string;
   readonly sizing: TerminalSizingState;
@@ -254,6 +301,8 @@ export interface WebTerminalHandle {
    * Hosts must separately enforce permissions on their per-view Hwt1PresentationAdapter.
    */
   setReadOnly(readOnly: boolean): void;
+  /** Atomically replaces link options, cancelling active link gestures and stale detections. */
+  setLinks(options: false | TerminalLinkOptions): void;
   focus(): void;
   requestPrimary(): void;
   resize(columns: number, rows: number): void;
