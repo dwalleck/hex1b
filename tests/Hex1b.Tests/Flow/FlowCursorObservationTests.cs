@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using Hex1b;
@@ -496,6 +498,75 @@ public class FlowCursorObservationTests
         }
     }
 
+    [TestMethod]
+    [DoNotParallelize] // Own the process-wide unobserved-task observer and finalizer drain.
+    public async Task PresentationResize_AfterPumpStops_DoesNotLeaveUnobservedTaskFailure()
+    {
+        using var driver = new ScriptedConsoleDriver();
+        using var workload = new Hex1bAppWorkloadAdapter();
+        await using var presentation = new ConsolePresentationAdapter(driver, kgpProbeTimeout: FastProbeTimeout);
+        await using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload).WithPresentation(presentation).Build();
+        using var lifetime = new CancellationTokenSource();
+        var ct = TestContext.Current.CancellationToken;
+        var run = terminal.RunAsync(lifetime.Token);
+        await lifetime.CancelAsync();
+        await Assert.ThrowsAsync<OperationCanceledException>(() => run.WaitAsync(WaitTimeout, ct));
+        Assert.IsFalse(await workload.QueueResizeAsync(90, 30, ct).WaitAsync(WaitTimeout, ct),
+            "The actual output pump must have stopped before the late presentation event.");
+
+        CollectTaskFailures();
+        var failures = new ConcurrentQueue<Exception>();
+        EventHandler<UnobservedTaskExceptionEventArgs> observer = (_, args) =>
+        {
+            failures.Enqueue(args.Exception);
+            args.SetObserved();
+        };
+        TaskScheduler.UnobservedTaskException += observer;
+        try
+        {
+            RaisePresentationResize(driver);
+            CollectTaskFailures();
+        }
+        finally
+        {
+            TaskScheduler.UnobservedTaskException -= observer;
+        }
+        Assert.IsEmpty(failures, string.Join(Environment.NewLine, failures));
+    }
+
+    [TestMethod]
+    public async Task PresentationResize_NotificationFailure_ReachesTerminalRunCaller()
+    {
+        using var driver = new ScriptedConsoleDriver();
+        using var workload = new Hex1bAppWorkloadAdapter();
+        var failure = new IOException("resize recording failed");
+        var filter = new ResizeFromOutputFilter { ResizeFailure = failure };
+        await using var presentation = new ConsolePresentationAdapter(driver, kgpProbeTimeout: FastProbeTimeout);
+        await using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload).WithPresentation(presentation)
+            .AddWorkloadFilter(filter).Build();
+        using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        lifetime.CancelAfter(WaitTimeout);
+        var run = terminal.RunAsync(lifetime.Token);
+
+        driver.RaiseResized(90, 30);
+
+        var observed = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => run);
+        Assert.AreSame(failure, observed.InnerException);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void RaisePresentationResize(ScriptedConsoleDriver driver) => driver.RaiseResized(90, 30);
+
+    private static void CollectTaskFailures()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+    }
+
     private sealed class ResizeFromOutputFilter : IHex1bTerminalWorkloadFilter
     {
         private bool _held;
@@ -504,6 +575,7 @@ public class FlowCursorObservationTests
         public TaskCompletionSource ResizeRequested { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public Action? Resize { get; set; }
         public Exception? Failure { get; init; }
+        public Exception? ResizeFailure { get; init; }
 
         public async ValueTask OnOutputAsync(IReadOnlyList<AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default)
         {
@@ -524,7 +596,7 @@ public class FlowCursorObservationTests
         public ValueTask OnInputAsync(IReadOnlyList<AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default)
             => ValueTask.CompletedTask;
         public ValueTask OnResizeAsync(int width, int height, TimeSpan elapsed, CancellationToken ct = default)
-            => ValueTask.CompletedTask;
+            => ResizeFailure is null ? ValueTask.CompletedTask : ValueTask.FromException(ResizeFailure);
         public ValueTask OnSessionEndAsync(TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
     }
 

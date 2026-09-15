@@ -432,9 +432,25 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     private int _width;
     private int _height;
 
-    private void OnPresentationResized(int width, int height)
+    private async void OnPresentationResized(int width, int height)
     {
-        _ = ResizeWithWorkloadAsync(width, height);
+        try
+        {
+            if (_workload is Hex1bAppWorkloadAdapter app && _outputProcessingTask is not null)
+            {
+                // A presentation can raise one last event after output processing stops.
+                // Unlike an explicit resize request, a late notification needs no failure.
+                await app.QueueResizeAsync(width, height).ConfigureAwait(false);
+            }
+            else
+            {
+                await ResizeWithWorkloadAsync(width, height).ConfigureAwait(false);
+            }
+        }
+        catch (Exception error)
+        {
+            ReportPumpFault("presentation resize", error);
+        }
     }
 
     /// <summary>
