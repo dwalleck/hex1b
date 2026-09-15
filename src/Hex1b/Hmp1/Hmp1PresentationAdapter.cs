@@ -232,6 +232,7 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
         // The same gate spans a producer output read's forwarding AND application.
         // Composite presentations participate through this lifecycle callback too.
         _ = terminal.Hmp1OutputStateLock;
+        terminal.TakePresentationResizeOwnership();
     }
 
     /// <inheritdoc />
@@ -950,6 +951,7 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
     {
         bool acceptedAsPrimary;
         Hmp1ClientSession[] otherPeers;
+        Task resizeApplied;
         var outputStateLock = _terminal?.Hmp1OutputStateLock;
         if (outputStateLock is not null)
             await outputStateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -974,6 +976,10 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
             _width = width;
             _height = height;
             acceptedAsPrimary = true;
+            // Begin application in the ordered transaction. Control writers below
+            // must not confirm geometry until model and workload notification finish.
+            resizeApplied = _terminal?.ApplyResizeWithWorkloadAsync(
+                width, height, queued: false, cancellationToken) ?? Task.CompletedTask;
 
             // Broadcast Resize to ALL peers (including the sender) so every
             // adapter's CurrentWidth/Height tracks the producer's authoritative
@@ -989,12 +995,15 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
                 var w = width;
                 var h = height;
                 EnqueueControlFrameAsync(p, async s =>
-                    await Hmp1Protocol.WriteResizeAsync(s, w, h, CancellationToken.None).ConfigureAwait(false));
+                {
+                    await resizeApplied.ConfigureAwait(false);
+                    await Hmp1Protocol.WriteResizeAsync(s, w, h, CancellationToken.None).ConfigureAwait(false);
+                });
             }
-            // Apply the producer resize in the same ordered transaction as the
-            // authority update and broadcasts, before another transition or output.
-            Resized?.Invoke(width, height);
         }
+        // Queueing a resize here would deadlock behind output waiting for this gate.
+        await resizeApplied.ConfigureAwait(false);
+        Resized?.Invoke(width, height);
         }
         finally
         {
@@ -1024,6 +1033,7 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
         bool sizeChanged;
         int cols;
         int rows;
+        Task resizeApplied;
         var outputStateLock = _terminal?.Hmp1OutputStateLock;
         if (outputStateLock is not null)
             await outputStateLock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -1047,6 +1057,9 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
             sizeChanged = (_width != cols) || (_height != rows);
             _width = cols;
             _height = rows;
+            resizeApplied = sizeChanged && _terminal is not null
+                ? _terminal.ApplyResizeWithWorkloadAsync(cols, rows, queued: false, cancellationToken)
+                : Task.CompletedTask;
 
             // Snapshot peers AND enqueue RoleChange to each peer's per-client
             // channel WITHIN the lock. This is the critical correctness point
@@ -1064,10 +1077,16 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
             foreach (var p in peers)
             {
                 EnqueueControlFrameAsync(p, async s =>
-                    await Hmp1Protocol.WriteRoleChangeAsync(s, primaryId, w, h, "RequestPrimary", CancellationToken.None).ConfigureAwait(false));
+                {
+                    await resizeApplied.ConfigureAwait(false);
+                    await Hmp1Protocol.WriteRoleChangeAsync(s, primaryId, w, h, "RequestPrimary", CancellationToken.None).ConfigureAwait(false);
+                });
             }
-            if (sizeChanged)
-                Resized?.Invoke(cols, rows);
+        }
+        if (sizeChanged)
+        {
+            await resizeApplied.ConfigureAwait(false);
+            Resized?.Invoke(cols, rows);
         }
         }
         finally

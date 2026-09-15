@@ -415,8 +415,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         _escapeTimeout = options.EscapeSequenceTimeout ?? TimeSpan.FromMilliseconds(50);
         ResetSixelModes();
 
-        // Subscribe to presentation events
-        _presentation.Resized += OnPresentationResized;
+        // Managed presentations apply and await resize through their lifecycle attachment.
+        if (!_presentationOwnsResize)
+            _presentation.Resized += OnPresentationResized;
 
         // Notify filters of session start
         // Note: We fire-and-forget here since the constructor can't be async
@@ -435,6 +436,15 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     private int _width;
     private int _height;
+    private bool _presentationOwnsResize;
+
+    // Lifecycle-aware presentations call this before publishing resize notifications.
+    // They must apply the model/workload change through the appropriate ordered path.
+    internal void TakePresentationResizeOwnership()
+    {
+        _presentationOwnsResize = true;
+        _presentation.Resized -= OnPresentationResized;
+    }
 
     private async void OnPresentationResized(int width, int height)
     {
@@ -483,7 +493,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         await ApplyResizeWithWorkloadAsync(targetWidth, targetHeight, queued: false, ct).ConfigureAwait(false);
     }
 
-    private async Task ApplyResizeWithWorkloadAsync(int width, int height, bool queued, CancellationToken ct)
+    internal async Task ApplyResizeWithWorkloadAsync(int width, int height, bool queued, CancellationToken ct)
     {
         // IMPORTANT: Call Resize() first before updating _width/_height
         // because Resize() needs the OLD dimensions to know how much to copy
@@ -1375,8 +1385,15 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
                 if (readItem.Resize is { } resize)
                 {
+                    var resizeOutputStateLock = _hmp1OutputStateLock;
+                    var resizeOutputStateLockTaken = false;
                     try
                     {
+                        if (resizeOutputStateLock is not null)
+                        {
+                            await resizeOutputStateLock.WaitAsync(ct).ConfigureAwait(false);
+                            resizeOutputStateLockTaken = true;
+                        }
                         await ApplyResizeWithWorkloadAsync(resize.Width, resize.Height, queued: true, ct)
                             .ConfigureAwait(false);
                         readItem.ProcessingBarrier?.TrySetResult(true);
@@ -1389,6 +1406,11 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     catch (Exception error)
                     {
                         readItem.ProcessingBarrier?.TrySetException(error);
+                    }
+                    finally
+                    {
+                        if (resizeOutputStateLockTaken)
+                            resizeOutputStateLock!.Release();
                     }
                     continue;
                 }

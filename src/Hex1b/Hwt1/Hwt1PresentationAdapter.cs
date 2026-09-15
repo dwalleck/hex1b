@@ -360,7 +360,7 @@ public sealed class Hwt1PresentationAdapter :
                 else if (Hmp1Workload is { } remote)
                     await remote.ResizeAsync(columns, rows, linked.Token);
                 else
-                    Resize(columns, rows);
+                    await ResizeAsync(columns, rows, linked.Token);
                 break;
             case "requestPrimary":
                 var primaryColumns = ReadBounded(command, "columns", 20, 300);
@@ -372,7 +372,7 @@ public sealed class Hwt1PresentationAdapter :
                 else if (Hmp1Workload is { IsConnected: true } candidate)
                     await candidate.RequestPrimaryAsync(primaryColumns, primaryRows, linked.Token);
                 else if (Hmp1Workload is null)
-                    Resize(primaryColumns, primaryRows);
+                    await ResizeAsync(primaryColumns, primaryRows, linked.Token);
                 break;
             case "input":
             case "paste":
@@ -435,6 +435,8 @@ public sealed class Hwt1PresentationAdapter :
         if (Interlocked.CompareExchange(ref _terminal, terminal, null) is not null)
             throw new InvalidOperationException("An HWT1 adapter can only be attached to one terminal.");
         _hmp1OutputSource = terminal.Workload as IHmp1TerminalOutputSource;
+        if (_muxer is null)
+            terminal.TakePresentationResizeOwnership();
         terminal.PresentationInvalidated += InvalidatePresentation;
         InvalidatePresentation();
     }
@@ -445,8 +447,9 @@ public sealed class Hwt1PresentationAdapter :
     /// <inheritdoc />
     public void TerminalCompleted(int exitCode) => InvalidatePresentation();
 
-    private void Resize(int columns, int rows)
+    private async Task ResizeAsync(int columns, int rows, CancellationToken cancellationToken)
     {
+        await _terminal!.ResizeWithWorkloadAsync(columns, rows, cancellationToken).ConfigureAwait(false);
         Volatile.Write(ref _width, columns);
         Volatile.Write(ref _height, rows);
         Resized?.Invoke(columns, rows);
