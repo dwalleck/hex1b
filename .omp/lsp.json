@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "omnisharp": { "disabled": true },
+    "csharp-ls": {
+      "command": "csharp-ls",
+      "args": ["--solution", ".omp/csharp-ls.slnx"],
+      "fileTypes": [".cs"],
+      "languageId": "csharp",
+      "rootMarkers": [".git"],
+      "warmupTimeoutMs": 180000
+    }
+  }
+}

@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="../src/Hex1b/Hex1b.csproj" />
+  <Project Path="../src/Hex1b.Analyzers/Hex1b.Analyzers.csproj" />
+  <Project Path="../tests/Hex1b.Tests/Hex1b.Tests.csproj" />
+</Solution>
