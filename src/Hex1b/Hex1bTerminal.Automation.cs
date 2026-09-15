@@ -21,9 +21,6 @@ public sealed partial class Hex1bTerminal
             throw new NotSupportedException(
                 "Awaited automation resizing requires producer confirmation and is not supported for HMP1 workloads.");
 
-        Resize(width, height);
-        await NotifyPresentationFiltersResizeAsync(width, height, ct).ConfigureAwait(false);
-        await NotifyWorkloadFiltersResizeAsync(width, height, ct).ConfigureAwait(false);
-        await _workload.ResizeAsync(width, height, ct).ConfigureAwait(false);
+        await ResizeWithWorkloadAsync(width, height, ct).ConfigureAwait(false);
     }
 }

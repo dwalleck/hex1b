@@ -55,7 +55,7 @@ public class FlowCommitResizeOwnershipTests
 
                 // Shrink: the host re-wraps the committed rows and the settle
                 // pass must repaint only the live region.
-                terminal.ResizeWithWorkload(100, 30);
+                _ = terminal.ResizeWithWorkloadAsync(100, 30);
                 await Task.Delay(600);
                 after = ReadFullBuffer(terminal);
             }
@@ -110,7 +110,7 @@ public class FlowCommitResizeOwnershipTests
 
                 // Same width, shorter viewport: the host does not re-wrap, and
                 // the settled row origin is derived from the authoritative one.
-                terminal.ResizeWithWorkload(121, 24);
+                _ = terminal.ResizeWithWorkloadAsync(121, 24);
                 await Task.Delay(600);
                 after = ReadFullBuffer(terminal);
             }
@@ -152,7 +152,7 @@ public class FlowCommitResizeOwnershipTests
                 // changed frames. This is a liveness fence, not native timing proof.
                 foreach (var width in new[] { 100, 85, 121 })
                 {
-                    terminal.ResizeWithWorkload(width, 30);
+                    _ = terminal.ResizeWithWorkloadAsync(width, 30);
                     liveText = $"{LiveMarker}-EDIT-{width}";
                     step.Invalidate();
                     Assert.IsTrue(
@@ -188,7 +188,7 @@ public class FlowCommitResizeOwnershipTests
             try
             {
                 var resizeStarted = System.Diagnostics.Stopwatch.GetTimestamp();
-                terminal.ResizeWithWorkload(100, 30);
+                _ = terminal.ResizeWithWorkloadAsync(100, 30);
                 Assert.IsTrue(
                     await WaitForScreenTextAsync(terminal, $"{LiveMarker}-WIDTH-100", TimeSpan.FromSeconds(1)),
                     "the resized live frame must be visible before committing");

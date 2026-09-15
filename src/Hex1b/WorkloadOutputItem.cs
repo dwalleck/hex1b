@@ -53,9 +53,9 @@ public readonly record struct WorkloadOutputItem(
     internal Action<List<AnsiToken>>? PooledTokensReturn { get; init; }
 
     /// <summary>
-    /// Optional observation barrier. When set, the terminal's output pump completes it as
-    /// soon as this item is consumed from the output channel — before any processing
-    /// decision, including the empty-item frame-boundary path.
+    /// Optional completion barrier. Empty observation items complete on consumption,
+    /// after all preceding output has been applied. Resize items complete after their
+    /// own model update and workload/filter notifications, propagating notification errors.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -73,5 +73,11 @@ public readonly record struct WorkloadOutputItem(
     /// </para>
     /// </remarks>
     internal TaskCompletionSource<bool>? ProcessingBarrier { get; init; }
+
+    /// <summary>
+    /// In-process model resize, ordered after preceding output application and
+    /// before subsequent observation barriers. Only the owning terminal enqueues it.
+    /// </summary>
+    internal (int Width, int Height)? Resize { get; init; }
 }
 

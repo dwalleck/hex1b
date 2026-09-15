@@ -359,6 +359,8 @@ internal sealed class Hex1bFlowRunner
     {
         Monitor.Enter(_stepOpsLock);
         Monitor.Enter(_terminalWriteLock);
+        if (_parentAdapter is Hex1bAppWorkloadAdapter app)
+            app.OutputGeometryGate.Wait();
         _atomicUpdate.Clear();
         _atomicUpdateThreadId = Environment.CurrentManagedThreadId;
         _atomicUpdateActive = true;
@@ -407,6 +409,8 @@ internal sealed class Hex1bFlowRunner
         finally
         {
             _atomicUpdateActive = false;
+            if (_parentAdapter is Hex1bAppWorkloadAdapter app)
+                app.OutputGeometryGate.Release();
             Monitor.Exit(_terminalWriteLock);
             Monitor.Exit(_stepOpsLock);
         }

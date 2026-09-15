@@ -54,6 +54,12 @@ public sealed class Hex1bAppWorkloadAdapter :
     private int _outputQueueDepth; // Manual tracking since unbounded channels don't support Count
     private readonly int _maxQueuedOutputItems;
 
+    // Resize admission and Flow's final geometry check + enqueue are one transaction.
+    // The consumer never takes this gate: a bounded producer may be waiting for it.
+    internal SemaphoreSlim OutputGeometryGate { get; } = new(1, 1);
+    private long _requestedGeometry; // Packed width/height; zero means no queued resize.
+    private volatile bool _outputProcessingStopped;
+
     // In-flight observation barriers. Each observation enqueues an empty item carrying
     // one of these and awaits it; the terminal completes it when the item is consumed,
     // which proves everything queued before it has been applied. Disposal fails any
@@ -480,17 +486,17 @@ public sealed class Hex1bAppWorkloadAdapter :
     /// <summary>
     /// Reads the current native presentation dimensions when the presentation
     /// itself exposes a live geometry source. Synthetic/static presentations
-    /// intentionally fall back to this adapter's event-delivered dimensions:
-    /// their Width/Height properties are commonly fixed test configuration,
-    /// not an authoritative resize observation.
+    /// use this adapter's dimensions, including the latest admitted model resize.
+    /// A cursor observation fences behind that resize before its position is usable.
+    /// Static presentation Width/Height properties are not resize authorities.
     /// </summary>
     /// <remarks>
     /// Native terminals can apply a resize before their input event reaches this
     /// workload adapter. Flow calls this at its final serialized emission
     /// boundary so cursor placement and width-sensitive bytes use the same
-    /// dimensions the native presentation currently reports. The read is
-    /// side-effect-free; resize events remain responsible for updating this
-    /// adapter's cached dimensions and notifying the live step.
+    /// dimensions the native presentation currently reports. Model resize admission
+    /// publishes its requested geometry atomically with enqueue; the output consumer
+    /// publishes the applied dimensions and notifies the live step afterward.
     /// </remarks>
     (int Width, int Height) Hex1b.Flow.IFlowCurrentGeometrySource.ReadCurrentGeometry()
     {
@@ -499,7 +505,10 @@ public sealed class Hex1bAppWorkloadAdapter :
             return source.ReadCurrentGeometry();
         }
 
-        return (_width, _height);
+        var requested = Volatile.Read(ref _requestedGeometry);
+        return requested == 0
+            ? (_width, _height)
+            : ((int)(requested >> 32), (int)requested);
     }
     /// <summary>
     /// Terminal capabilities. Returns live capabilities from presentation adapter if available,
@@ -690,8 +699,63 @@ public sealed class Hex1bAppWorkloadAdapter :
         return _inputChannel.Writer.TryWrite(evt);
     }
 
+    /// <summary>
+    /// Orders a terminal-owned model resize with accepted output. Admission must
+    /// not block the output pump, which can itself raise a resize notification.
+    /// </summary>
+    internal async Task<bool> QueueResizeAsync(int? width, int? height, CancellationToken ct = default)
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_barrierSync)
+        {
+            if (_disposed || _outputProcessingStopped)
+                return false;
+            _pendingBarriers.Add(completion);
+        }
+        try
+        {
+            await OutputGeometryGate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                if (_disposed || _outputProcessingStopped)
+                    return false;
+                // Resolve partial diagnostics requests under the same admission gate.
+                // Applied dimensions may lag an earlier, already-admitted resize.
+                var requested = Volatile.Read(ref _requestedGeometry);
+                var targetWidth = width ?? (requested == 0 ? _width : (int)(requested >> 32));
+                var targetHeight = height ?? (requested == 0 ? _height : (int)requested);
+                await EnqueueOutputAsync(new WorkloadOutputItem(ReadOnlyMemory<byte>.Empty, null)
+                {
+                    Resize = (targetWidth, targetHeight),
+                    ProcessingBarrier = completion
+                }, ct).ConfigureAwait(false);
+                if (!_disposed && !_outputProcessingStopped)
+                    Volatile.Write(ref _requestedGeometry, ((long)(uint)targetWidth << 32) | (uint)targetHeight);
+            }
+            finally
+            {
+                OutputGeometryGate.Release();
+            }
+            return await completion.Task.WaitAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_barrierSync)
+            {
+                _pendingBarriers.Remove(completion);
+            }
+        }
+    }
+
     /// <inheritdoc />
     public ValueTask ResizeAsync(int width, int height, CancellationToken ct = default)
+    {
+        Volatile.Write(ref _requestedGeometry, 0);
+        return ApplyQueuedResize(width, height);
+    }
+
+    // Does not overwrite requested geometry: a later resize may already be admitted.
+    internal ValueTask ApplyQueuedResize(int width, int height)
     {
         var wasInitialized = _dimensionsInitialized;
         _dimensionsInitialized = true;
@@ -921,32 +985,31 @@ public sealed class Hex1bAppWorkloadAdapter :
         }
     }
 
+    internal void CompleteOutputProcessing()
+    {
+        lock (_barrierSync)
+        {
+            _outputProcessingStopped = true;
+            foreach (var barrier in _pendingBarriers)
+                barrier.TrySetResult(false);
+            _pendingBarriers.Clear();
+        }
+        // Release bounded writers too: their consumer can no longer make space.
+        _outputChannel.Writer.TryComplete();
+    }
+
     /// <inheritdoc />
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
 
-        // Fail outstanding observation barriers: after disposal the terminal will never
-        // consume more output, so a barrier cannot clear and must not be reported as
-        // observed.
-        TaskCompletionSource<bool>[] pending;
-        lock (_barrierSync)
-        {
-            pending = _pendingBarriers.ToArray();
-            _pendingBarriers.Clear();
-        }
-
-        foreach (var barrier in pending)
-        {
-            barrier.TrySetResult(false);
-        }
+        CompleteOutputProcessing();
 
         // Note: ExitTuiMode is NOT called here because Hex1bTerminal handles
         // writing mouse-disable and screen-restore sequences directly to the
         // presentation layer during its disposal to avoid race conditions.
 
-        _outputChannel.Writer.TryComplete();
         _inputChannel.Writer.TryComplete();
         Disconnected?.Invoke();
     }

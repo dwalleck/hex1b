@@ -434,33 +434,55 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     private void OnPresentationResized(int width, int height)
     {
-        ResizeWithWorkload(width, height);
+        _ = ResizeWithWorkloadAsync(width, height);
     }
 
     /// <summary>
-    /// Resizes the terminal buffer and propagates the resize to the workload (PTY child process).
-    /// Used by diagnostics to ensure child processes receive SIGWINCH.
+    /// Orders resize with accepted in-process output and awaits application and
+    /// workload/filter notification. Remote workloads retain producer authority.
     /// </summary>
-    internal void ResizeWithWorkload(int width, int height)
+    internal async Task ResizeWithWorkloadAsync(int? width, int? height, CancellationToken ct = default)
     {
+        if (_workload is Hex1bAppWorkloadAdapter app && _outputProcessingTask is not null)
+        {
+            if (!await app.QueueResizeAsync(width, height, ct).ConfigureAwait(false))
+                throw new InvalidOperationException("The terminal output pump is no longer processing resizes.");
+            return;
+        }
+
+        var targetWidth = width ?? Width;
+        var targetHeight = height ?? Height;
         if (_workload is Hmp1WorkloadAdapter remote)
         {
             // HMP1 owns geometry. Even a primary must wait for the producer's
             // ordered confirmation before resizing its local mirror.
-            _ = remote.ResizeAsync(width, height);
+            await remote.ResizeAsync(targetWidth, targetHeight, ct).ConfigureAwait(false);
             return;
         }
 
+        await ApplyResizeWithWorkloadAsync(targetWidth, targetHeight, queued: false, ct).ConfigureAwait(false);
+    }
+
+    private async Task ApplyResizeWithWorkloadAsync(int width, int height, bool queued, CancellationToken ct)
+    {
         // IMPORTANT: Call Resize() first before updating _width/_height
         // because Resize() needs the OLD dimensions to know how much to copy
         Resize(width, height);
         
-        // Notify filters of resize
-        _ = NotifyPresentationFiltersResizeAsync(width, height);
-        _ = NotifyWorkloadFiltersResizeAsync(width, height);
-        
-        // Notify workload of resize
-        _ = _workload.ResizeAsync(width, height);
+        try
+        {
+            await NotifyPresentationFiltersResizeAsync(width, height, ct).ConfigureAwait(false);
+            await NotifyWorkloadFiltersResizeAsync(width, height, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Once the model changed, a failed recorder/filter must not leave the
+            // workload at the previous geometry or suppress its resize event.
+            if (queued && _workload is Hex1bAppWorkloadAdapter app)
+                await app.ApplyQueuedResize(width, height).ConfigureAwait(false);
+            else
+                await _workload.ResizeAsync(width, height, ct).ConfigureAwait(false);
+        }
     }
 
     // === Configuration ===
@@ -1331,6 +1353,26 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     data = await _workload.ReadOutputAsync(ct);
                 }
 
+                if (readItem.Resize is { } resize)
+                {
+                    try
+                    {
+                        await ApplyResizeWithWorkloadAsync(resize.Width, resize.Height, queued: true, ct)
+                            .ConfigureAwait(false);
+                        readItem.ProcessingBarrier?.TrySetResult(true);
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                    {
+                        readItem.ProcessingBarrier?.TrySetCanceled(ct);
+                        throw;
+                    }
+                    catch (Exception error)
+                    {
+                        readItem.ProcessingBarrier?.TrySetException(error);
+                    }
+                    continue;
+                }
+
                 // Consumption order is the FIFO proof for a cursor-observation barrier:
                 // this single reader consumes items in order, so once a barrier item has
                 // been read, every item enqueued before it has already been fully applied.
@@ -1493,6 +1535,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         }
         finally
         {
+            (_workload as Hex1bAppWorkloadAdapter)?.CompleteOutputProcessing();
             foreach (var boundary in _dcsByteStreamParser.Complete().Frames)
                 RecordDcsFrame(boundary.Frame);
         }

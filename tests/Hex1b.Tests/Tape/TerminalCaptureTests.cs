@@ -461,6 +461,25 @@ public class TerminalCaptureTests
     }
 
     [TestMethod]
+    public async Task QueuedAutomationResize_FilterFailure_PropagatesErrorAndPublishesAppliedGeometry()
+    {
+        var workload = new Hex1bAppWorkloadAdapter();
+        var error = new IOException("resize recording failed");
+        await using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload).WithHeadless().WithDimensions(20, 6)
+            .AddWorkloadFilter(new FailingResizeFilter(error)).Build();
+
+        var observed = await Assert.ThrowsExactlyAsync<IOException>(() =>
+            terminal.ResizeForAutomationAsync(30, 5, Cancellation));
+
+        Assert.AreSame(error, observed);
+        Assert.AreEqual(30, terminal.Width);
+        Assert.AreEqual(5, terminal.Height);
+        Assert.AreEqual(30, workload.Width);
+        Assert.AreEqual(5, workload.Height);
+    }
+
+    [TestMethod]
     public async Task ResizeForAutomationAsync_CancelledBeforeResize_DoesNotChangeGeometry()
     {
         var workload = new ControlledWorkload();

@@ -1,6 +1,12 @@
 using System.Diagnostics;
+using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using Hex1b;
+using Hex1b.Diagnostics;
+using Hex1b.Flow;
+using Hex1b.Reflow;
+using Hex1b.Tokens;
 
 namespace Hex1b.Tests.Flow;
 
@@ -293,6 +299,233 @@ public class FlowCursorObservationTests
         var clamped = resized.GetValueOrDefault();
         Assert.AreEqual(3, clamped.Column);
         Assert.AreEqual(1, clamped.Row);
+    }
+
+    [TestMethod]
+    public async Task Resize_FromOutputFilterWithFullQueue_AppliesAfterPriorOutputWithoutBlockingPump()
+    {
+        using var workload = new Hex1bAppWorkloadAdapter(maxQueuedOutputItems: 1);
+        var gate = new ResizeFromOutputFilter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithHeadless()
+            .WithDimensions(20, 6)
+            .WithReflow(GhosttyReflowStrategy.Instance)
+            .AddWorkloadFilter(gate)
+            .Build();
+        gate.Resize = () => _ = terminal.ResizeWithWorkloadAsync(10, 6);
+        var ct = TestContext.Current.CancellationToken;
+        try
+        {
+            workload.WriteRequired("\x1b[1;1HABCDEFGHIJKLMNO");
+            await gate.Entered.Task.WaitAsync(WaitTimeout, ct);
+            workload.WriteRequired("\x1b[2;1HPQRST"); // Fill the queue while its reader is gated.
+            gate.Release.TrySetResult();
+            await gate.ResizeRequested.Task.WaitAsync(WaitTimeout, ct);
+            var cursor = await ((ICursorPositionSource)workload).ObserveCursorPositionAsync(ct);
+
+            Assert.IsNotNull(cursor);
+            Assert.AreEqual((5, 2), cursor.Value);
+            Assert.AreEqual(10, terminal.Width);
+            var lines = terminal.GetScreenText().Split('\n');
+            Assert.AreEqual("ABCDEFGHIJ", lines[0].TrimEnd());
+            Assert.AreEqual("KLMNO", lines[1].TrimEnd());
+            Assert.AreEqual("PQRST", lines[2].TrimEnd());
+        }
+        finally
+        {
+            gate.Release.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task Resize_DuringGeometryProtectedWrite_CannotOvertakeOldGeometryOutput()
+    {
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithHeadless()
+            .WithDimensions(20, 6)
+            .WithReflow(GhosttyReflowStrategy.Instance)
+            .Build();
+        var ct = TestContext.Current.CancellationToken;
+        Task resize;
+        await workload.OutputGeometryGate.WaitAsync(ct);
+        try
+        {
+            // The same transaction Flow holds from its final geometry read through handoff.
+            var geometry = ((IFlowCurrentGeometrySource)workload).ReadCurrentGeometry();
+            resize = workload.QueueResizeAsync(10, 6);
+            workload.WriteRequired($"\x1b[1;{geometry.Width - 5}HX");
+        }
+        finally
+        {
+            workload.OutputGeometryGate.Release();
+        }
+        await resize.WaitAsync(WaitTimeout, ct);
+        var cursor = await ((ICursorPositionSource)workload).ObserveCursorPositionAsync(ct);
+        Assert.IsNotNull(cursor);
+        Assert.AreEqual((5, 1), cursor.Value);
+        Assert.AreEqual('X', terminal.GetScreenText().Split('\n')[1][4]);
+    }
+
+    [TestMethod]
+    public async Task AutomationResize_AfterQueuedResize_PreservesLatestGeometryAndPriorOutput()
+    {
+        using var workload = new Hex1bAppWorkloadAdapter();
+        var gate = new ResizeFromOutputFilter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithHeadless()
+            .WithDimensions(20, 6)
+            .WithReflow(GhosttyReflowStrategy.Instance)
+            .AddWorkloadFilter(gate)
+            .Build();
+        var ct = TestContext.Current.CancellationToken;
+        try
+        {
+            workload.WriteRequired("\x1b[1;15HX");
+            await gate.Entered.Task.WaitAsync(WaitTimeout, ct);
+            var earlier = terminal.ResizeWithWorkloadAsync(10, 6, ct);
+            var latest = terminal.ResizeForAutomationAsync(12, 8, ct);
+            gate.Release.TrySetResult();
+            await Task.WhenAll(earlier, latest).WaitAsync(WaitTimeout, ct);
+            var cursor = await ((ICursorPositionSource)workload).ObserveCursorPositionAsync(ct);
+
+            Assert.AreEqual(12, terminal.Width);
+            Assert.AreEqual(8, terminal.Height);
+            Assert.IsNotNull(cursor);
+            Assert.AreEqual((3, 1), cursor.Value);
+            Assert.AreEqual('X', terminal.GetScreenText().Split('\n')[1][2]);
+        }
+        finally
+        {
+            gate.Release.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    [DoNotParallelize] // Diagnostics uses one socket path per process.
+    public async Task DiagnosticsResize_WithPendingOutput_ReportsAppliedSizeAndPreservesOmittedAxis()
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        timeout.CancelAfter(WaitTimeout);
+        var ct = timeout.Token;
+        using var workload = new Hex1bAppWorkloadAdapter();
+        var gate = new ResizeFromOutputFilter();
+        await using var diagnostics = new McpDiagnosticsPresentationFilter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithHeadless()
+            .WithDimensions(20, 6)
+            .AddWorkloadFilter(gate)
+            .AddPresentationFilter(diagnostics)
+            .Build();
+
+        async Task<DiagnosticsResponse> RequestAsync(string request)
+        {
+            using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            await socket.ConnectAsync(new UnixDomainSocketEndPoint(diagnostics.SocketPath), ct);
+            await using var stream = new NetworkStream(socket, ownsSocket: false);
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            await using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+            await writer.WriteLineAsync(request.AsMemory(), ct);
+            var line = await reader.ReadLineAsync(ct);
+            Assert.IsNotNull(line);
+            var response = JsonSerializer.Deserialize(line, DiagnosticsJsonContext.Default.DiagnosticsResponse);
+            Assert.IsNotNull(response);
+            return response;
+        }
+
+        try
+        {
+            workload.WriteRequired("prior output");
+            await gate.Entered.Task.WaitAsync(ct);
+            var presentationResize = terminal.ResizeWithWorkloadAsync(30, 6, ct);
+            var heightRequest = RequestAsync("""{"method":"resize","y":8}""");
+            while (((IFlowCurrentGeometrySource)workload).ReadCurrentGeometry().Height != 8)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Task.Yield();
+            }
+            gate.Release.TrySetResult();
+            await presentationResize;
+            var heightResponse = await heightRequest;
+            Assert.IsTrue(heightResponse.Success, heightResponse.Error);
+            Assert.AreEqual(30, heightResponse.Width);
+            Assert.AreEqual(8, heightResponse.Height);
+            Assert.AreEqual(30, terminal.Width);
+            Assert.AreEqual(8, terminal.Height);
+        }
+        finally
+        {
+            gate.Release.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task Resize_WhenOutputPumpFaults_FailsPendingBoundedAndSubsequentRequests()
+    {
+        using var workload = new Hex1bAppWorkloadAdapter(maxQueuedOutputItems: 1);
+        var gate = new ResizeFromOutputFilter { Failure = new IOException("output failed") };
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithHeadless()
+            .WithDimensions(20, 6)
+            .AddWorkloadFilter(gate)
+            .Build();
+        var ct = TestContext.Current.CancellationToken;
+        try
+        {
+            workload.WriteRequired("held output");
+            await gate.Entered.Task.WaitAsync(WaitTimeout, ct);
+            var queued = terminal.ResizeWithWorkloadAsync(30, 6, ct);
+            var waitingForSpace = terminal.ResizeWithWorkloadAsync(40, 8, ct);
+            gate.Release.TrySetResult();
+
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => queued.WaitAsync(WaitTimeout, ct));
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => waitingForSpace.WaitAsync(WaitTimeout, ct));
+            await Assert.ThrowsExactlyAsync<InvalidOperationException>(() =>
+                terminal.ResizeWithWorkloadAsync(50, 9, ct).WaitAsync(WaitTimeout, ct));
+            Assert.AreEqual(20, terminal.Width);
+            Assert.AreEqual(6, terminal.Height);
+        }
+        finally
+        {
+            gate.Release.TrySetResult();
+        }
+    }
+
+    private sealed class ResizeFromOutputFilter : IHex1bTerminalWorkloadFilter
+    {
+        private bool _held;
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ResizeRequested { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Action? Resize { get; set; }
+        public Exception? Failure { get; init; }
+
+        public async ValueTask OnOutputAsync(IReadOnlyList<AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default)
+        {
+            if (_held)
+                return;
+            _held = true;
+            Entered.TrySetResult();
+            await Release.Task.WaitAsync(ct);
+            if (Failure is not null)
+                throw Failure;
+            Resize?.Invoke();
+            ResizeRequested.TrySetResult();
+        }
+
+        public ValueTask OnSessionStartAsync(int width, int height, DateTimeOffset timestamp, CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+        public ValueTask OnFrameCompleteAsync(TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask OnInputAsync(IReadOnlyList<AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+        public ValueTask OnResizeAsync(int width, int height, TimeSpan elapsed, CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+        public ValueTask OnSessionEndAsync(TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
     }
 
     [TestMethod]

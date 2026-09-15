@@ -7,6 +7,7 @@ using Hex1b.Flow;
 using Hex1b.Input;
 using Hex1b.Reflow;
 using Hex1b.Surfaces;
+using Hex1b.Tokens;
 using Hex1b.Widgets;
 
 namespace Hex1b.Tests.Flow;
@@ -156,7 +157,7 @@ public class FlowCommitRecoveryContractTests
                     // Height only: every pending unit's bytes are unchanged, so the
                     // commit must neither re-prepare the source nor re-materialize
                     // the pending unit at the width it was already built for.
-                    terminal.ResizeWithWorkload(OriginalWidth, 20);
+                    _ = terminal.ResizeWithWorkloadAsync(OriginalWidth, 20);
                     await Task.Delay(150);
                 }
             };
@@ -217,7 +218,7 @@ public class FlowCommitRecoveryContractTests
                 if (index == ResizeAtUnit && !resized)
                 {
                     resized = true;
-                    terminal.ResizeWithWorkload(NarrowerWidth, 30);
+                    _ = terminal.ResizeWithWorkloadAsync(NarrowerWidth, 30);
                     await Task.Delay(150);
                 }
             };
@@ -244,6 +245,74 @@ public class FlowCommitRecoveryContractTests
             $"the commit must have observed a width reflow:\n{trace}");
         Assert.IsNotNull(buffer, "the commit must have completed so the buffer can be read");
         AssertEachUnitMarkerExactlyOnce(buffer!, "after a width change mid-commit");
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task WidthChange_WithPreviousFrameAwaitingApplication_RetainsEveryUnit(bool applyBeforeResize)
+    {
+        var outputGate = new PendingUnitOutputGate("UNIT-03");
+        var source = new ContractSource(UnitCount);
+        FlowCommitResult? result = null;
+        string? buffer = null;
+        var resized = false;
+        Hex1bTerminal terminal = null!;
+        using var lifetime = terminal = CreateTerminal(async flow =>
+        {
+            var step = flow.Step(Live, options =>
+            {
+                options.MinHeight = 8;
+                options.MaxHeight = 8;
+            });
+            await step.WaitForReadyAsync();
+            try
+            {
+                result = await step.CommitAsync(source, NextLive);
+                Assert.IsNotNull(await ((ICursorPositionSource)terminal.Workload)
+                    .ObserveCursorPositionAsync(TestContext.Current.CancellationToken));
+                buffer = ReadFullBuffer(terminal);
+            }
+            finally
+            {
+                outputGate.Release.TrySetResult();
+                step.Complete();
+            }
+        }, width: 100, height: 30, outputFilter: outputGate);
+
+        source.Gate = async index =>
+        {
+            if (index != 4 || resized)
+                return;
+            await outputGate.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            resized = true;
+            try
+            {
+                if (applyBeforeResize)
+                {
+                    outputGate.Release.TrySetResult();
+                    Assert.IsNotNull(await ((ICursorPositionSource)terminal.Workload)
+                        .ObserveCursorPositionAsync(TestContext.Current.CancellationToken));
+                }
+                var resizing = terminal.ResizeWithWorkloadAsync(80, 30);
+                outputGate.Release.TrySetResult();
+                await resizing;
+            }
+            finally
+            {
+                outputGate.Release.TrySetResult();
+            }
+        };
+
+        await terminal.RunAsync().WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.IsNotNull(result);
+        Assert.AreEqual(UnitCount, result.CompletedUnits);
+        Assert.AreEqual(80, terminal.Width);
+        AssertEachUnitMarkerExactlyOnce(buffer!, "resize with a dequeued frame still awaiting application");
+        CollectionAssert.AreEqual(
+            Enumerable.Range(0, UnitCount).Select(index => $"UNIT-{index:00}").ToArray(),
+            Regex.Matches(buffer!, @"UNIT-\d{2}").Select(match => match.Value).ToArray(),
+            "resizing must preserve committed unit order");
     }
 
     /// <summary>
@@ -298,13 +367,13 @@ public class FlowCommitRecoveryContractTests
                 if (index == NarrowAtUnit && !narrowed)
                 {
                     narrowed = true;
-                    terminal.ResizeWithWorkload(MiddleWidth, 30);
+                    _ = terminal.ResizeWithWorkloadAsync(MiddleWidth, 30);
                     await Task.Delay(150);
                 }
                 else if (index == NarrowAtUnit && !restored)
                 {
                     restored = true;
-                    terminal.ResizeWithWorkload(OriginalWidth, 30);
+                    _ = terminal.ResizeWithWorkloadAsync(OriginalWidth, 30);
                     await Task.Delay(150);
                 }
             };
@@ -616,7 +685,8 @@ public class FlowCommitRecoveryContractTests
         Func<Hex1bFlowContext, Task> flowCallback,
         int width,
         int height,
-        IHex1bTerminalPresentationAdapter? presentation = null)
+        IHex1bTerminalPresentationAdapter? presentation = null,
+        IHex1bTerminalWorkloadFilter? outputFilter = null)
     {
         var builder = Hex1bTerminal.CreateBuilder()
             .WithHex1bFlow(flowCallback, options =>
@@ -631,6 +701,10 @@ public class FlowCommitRecoveryContractTests
         if (presentation is not null)
         {
             builder.WithPresentation(presentation);
+        }
+        if (outputFilter is not null)
+        {
+            builder.AddWorkloadFilter(outputFilter);
         }
         return builder.Build();
     }
@@ -736,6 +810,30 @@ public class FlowCommitRecoveryContractTests
             v.Text(NextLiveMarker),
             v.Text("committed rows leave this region"),
         ]));
+
+    private sealed class PendingUnitOutputGate(string marker) : IHex1bTerminalWorkloadFilter
+    {
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async ValueTask OnOutputAsync(IReadOnlyList<AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default)
+        {
+            if (AnsiTokenSerializer.Serialize(tokens).Contains(marker, StringComparison.Ordinal))
+            {
+                Entered.TrySetResult();
+                await Release.Task.WaitAsync(ct);
+            }
+        }
+
+        public ValueTask OnSessionStartAsync(int width, int height, DateTimeOffset timestamp, CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+        public ValueTask OnFrameCompleteAsync(TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask OnInputAsync(IReadOnlyList<AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+        public ValueTask OnResizeAsync(int width, int height, TimeSpan elapsed, CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+        public ValueTask OnSessionEndAsync(TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+    }
 
     /// <summary>
     /// Commit source over a fixed unit count, one single-row unit per index. It

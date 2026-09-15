@@ -457,15 +457,15 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         return _terminal.SendInputAsync(data);
     }
 
-    internal Task SendResizeFromSessionAsync(AttachSession session, int width, int height)
+    internal async Task SendResizeFromSessionAsync(AttachSession session, int width, int height)
     {
-        if (_terminal == null) return Task.CompletedTask;
+        if (_terminal == null) return;
 
         bool isLeader;
         lock (_attachLock) { isLeader = _leaderSession == session; }
-        if (!isLeader) return Task.CompletedTask;
+        if (!isLeader) return;
 
-        _terminal.ResizeWithWorkload(width, height);
+        await _terminal.ResizeWithWorkloadAsync(width, height);
 
         // Broadcast new dimensions to all attached sessions except the sender
         var frame = new AttachFrame(AttachFrameType.Resize, $"{width},{height}");
@@ -478,7 +478,6 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
             }
         }
 
-        return Task.CompletedTask;
     }
 
     internal Task ClaimLeadFromSessionAsync(AttachSession session)
@@ -539,7 +538,7 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
             "click" => HandleClickRequest(request.X, request.Y, request.Button),
             "drag" => HandleDragRequest(request.X, request.Y, request.X2, request.Y2, request.Button),
             "tree" => HandleTreeRequest(),
-            "resize" => HandleResizeRequest(request.X, request.Y),
+            "resize" => await HandleResizeRequestAsync(request.X, request.Y),
             "shutdown" => HandleShutdownRequest(),
             "record-start" => await HandleRecordStartRequestAsync(request),
             "record-stop" => await HandleRecordStopRequestAsync(),
@@ -894,17 +893,14 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         return new DiagnosticsResponse { Success = false, Error = "No diagnostic tree provider available" };
     }
 
-    private DiagnosticsResponse HandleResizeRequest(int? width, int? height)
+    private async Task<DiagnosticsResponse> HandleResizeRequestAsync(int? width, int? height)
     {
         if (_terminal == null)
         {
             return new DiagnosticsResponse { Success = false, Error = "Terminal not initialized" };
         }
 
-        var newWidth = width ?? _terminal.Width;
-        var newHeight = height ?? _terminal.Height;
-
-        _terminal.ResizeWithWorkload(newWidth, newHeight);
+        await _terminal.ResizeWithWorkloadAsync(width, height);
 
         return new DiagnosticsResponse
         {

@@ -130,19 +130,19 @@ public class ContinuousHistoryRetentionFenceTests
                 switch (index)
                 {
                     case 15 when scenario is "shrink-grow-shrink" or "shrink":
-                        terminal.ResizeWithWorkload(74, 19);
+                        _ = terminal.ResizeWithWorkloadAsync(74, 19);
                         steps.Add("shrink@15");
                         break;
                     case 15 when scenario is "grow":
-                        terminal.ResizeWithWorkload(138, 37);
+                        _ = terminal.ResizeWithWorkloadAsync(138, 37);
                         steps.Add("grow@15");
                         break;
                     case 71 when scenario is "shrink-grow-shrink":
-                        terminal.ResizeWithWorkload(138, 37);
+                        _ = terminal.ResizeWithWorkloadAsync(138, 37);
                         steps.Add("grow@71");
                         break;
                     case 119 when scenario is "shrink-grow-shrink":
-                        terminal.ResizeWithWorkload(74, 19);
+                        _ = terminal.ResizeWithWorkloadAsync(74, 19);
                         steps.Add("shrink@119");
                         break;
                     default:
@@ -634,7 +634,7 @@ public class ContinuousHistoryRetentionFenceTests
             if (index == 40 && !shrunk)
             {
                 shrunk = true;
-                terminal.ResizeWithWorkload(60, 11);
+                _ = terminal.ResizeWithWorkloadAsync(60, 11);
             }
 
             return Task.CompletedTask;
