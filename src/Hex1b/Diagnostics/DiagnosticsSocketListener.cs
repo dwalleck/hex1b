@@ -24,7 +24,7 @@ namespace Hex1b.Diagnostics;
 ///   <item>Injecting input characters</item>
 /// </list>
 /// </remarks>
-public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentationFilter, IAsyncDisposable
+public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentationFilter, IHex1bTerminalOutputObserver, IAsyncDisposable
 {
     private readonly string _appName;
     private readonly DateTimeOffset _startTime;

@@ -67,6 +67,13 @@ public sealed class Hex1bAppWorkloadAdapter :
     private readonly object _barrierSync = new();
     private readonly HashSet<TaskCompletionSource<bool>> _pendingBarriers = new();
 
+    // In-flight geometry-gated deliveries. Each one is completed by the output pump
+    // once the native presentation has either written the batch or refused it, so a
+    // producer learns the fate of its own bytes rather than of the queue position.
+    // Disposal and shutdown fault every outstanding delivery, because a batch that
+    // was never offered cannot be retried and must not be reported as applied.
+    private readonly HashSet<GeometryGatedDelivery> _pendingDeliveries = new();
+
     /// <summary>
     /// Optional diagnostic tree provider for MCP diagnostics.
     /// Set by Hex1bApp when it starts running.
@@ -302,6 +309,109 @@ public sealed class Hex1bAppWorkloadAdapter :
     {
         ArgumentNullException.ThrowIfNull(text);
         EnqueueOutput(new WorkloadOutputItem(Encoding.UTF8.GetBytes(text), Tokens: null), requireAcceptance: true);
+    }
+
+    /// <summary>
+    /// The presentation adapter this workload delivers to, when one is attached.
+    /// </summary>
+    /// <remarks>
+    /// Used to decide whether this workload's consumer can condition native
+    /// delivery on the geometry the bytes were composed for.
+    /// </remarks>
+    internal IHex1bTerminalPresentationAdapter? PresentationAdapter => _presentationAdapter;
+
+    /// <summary>
+    /// Hands a composed batch to the terminal together with the geometry it was
+    /// composed for, and reports what the presentation did with it.
+    /// </summary>
+    /// <remarks>
+    /// Distinct from <see cref="WriteRequired"/> in what it acknowledges: that one
+    /// returns once the batch is queued, which says nothing about whether the
+    /// native presentation still had the geometry the bytes assume. The returned
+    /// task completes only after the presentation has written the bytes or refused
+    /// them, so a caller can recompose a refused batch and must never recompose an
+    /// applied one.
+    /// </remarks>
+    /// <param name="text">The composed batch.</param>
+    /// <param name="expectedWidth">Columns the batch was composed for.</param>
+    /// <param name="expectedHeight">Rows the batch was composed for.</param>
+    /// <returns>The delivery's outcome.</returns>
+    internal Task<NativeDeliveryOutcome> WriteRequiredIfGeometry(
+        string text,
+        int expectedWidth,
+        int expectedHeight)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        var delivery = new GeometryGatedDelivery(expectedWidth, expectedHeight);
+
+        lock (_barrierSync)
+        {
+            if (_disposed || _outputProcessingStopped)
+            {
+                throw new ObjectDisposedException(nameof(Hex1bAppWorkloadAdapter));
+            }
+
+            _pendingDeliveries.Add(delivery);
+        }
+
+        try
+        {
+            EnqueueOutput(
+                new WorkloadOutputItem(Encoding.UTF8.GetBytes(text), Tokens: null)
+                {
+                    Delivery = delivery
+                },
+                requireAcceptance: true);
+        }
+        catch
+        {
+            lock (_barrierSync)
+            {
+                _pendingDeliveries.Remove(delivery);
+            }
+
+            delivery.Completion.TrySetException(
+                new ObjectDisposedException(nameof(Hex1bAppWorkloadAdapter)));
+            throw;
+        }
+
+        return delivery.Completion.Task;
+    }
+
+    /// <summary>
+    /// Records the presentation's verdict on a gated batch.
+    /// </summary>
+    /// <remarks>
+    /// Called by the terminal's output pump. <paramref name="outcome"/> is
+    /// <see cref="NativeDeliveryOutcome.GeometryChanged"/> only when nothing was
+    /// written.
+    /// </remarks>
+    internal void CompleteDelivery(GeometryGatedDelivery delivery, NativeDeliveryOutcome outcome)
+    {
+        lock (_barrierSync)
+        {
+            _pendingDeliveries.Remove(delivery);
+        }
+
+        delivery.Completion.TrySetResult(outcome);
+    }
+
+    /// <summary>
+    /// Fails a gated batch that could not be offered to the presentation.
+    /// </summary>
+    /// <remarks>
+    /// Always an error rather than a retryable outcome: the pump reaches this only
+    /// when the batch could not be delivered as a whole, so whether any of it
+    /// reached the device is not observable from here.
+    /// </remarks>
+    internal void FaultDelivery(GeometryGatedDelivery delivery, Exception error)
+    {
+        lock (_barrierSync)
+        {
+            _pendingDeliveries.Remove(delivery);
+        }
+
+        delivery.Completion.TrySetException(error);
     }
 
     /// <summary>
@@ -993,6 +1103,17 @@ public sealed class Hex1bAppWorkloadAdapter :
             foreach (var barrier in _pendingBarriers)
                 barrier.TrySetResult(false);
             _pendingBarriers.Clear();
+
+            // A batch that was queued but never offered to the presentation was
+            // never written, so it must fail loudly instead of resolving to an
+            // outcome a producer could mistake for a refusal it may retry.
+            foreach (var delivery in _pendingDeliveries)
+            {
+                delivery.Completion.TrySetException(
+                    new ObjectDisposedException(nameof(Hex1bAppWorkloadAdapter)));
+            }
+
+            _pendingDeliveries.Clear();
         }
         // Release bounded writers too: their consumer can no longer make space.
         _outputChannel.Writer.TryComplete();

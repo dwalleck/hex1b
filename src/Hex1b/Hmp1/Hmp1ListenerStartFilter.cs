@@ -7,7 +7,7 @@ namespace Hex1b;
 /// A presentation filter that starts muxer listeners when the terminal session begins.
 /// Supports multiple stream sources (transports) feeding into a single adapter.
 /// </summary>
-internal sealed class Hmp1ListenerStartFilter : IHex1bTerminalPresentationFilter
+internal sealed class Hmp1ListenerStartFilter : IHex1bTerminalOutputObserver
 {
     private readonly Hmp1PresentationAdapter _adapter;
     private readonly List<(Func<CancellationToken, IAsyncEnumerable<Stream>> Source, Func<Stream, Task<Stream>>? Transform)> _streamSources = [];

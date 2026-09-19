@@ -69,6 +69,18 @@ internal interface IConsoleDriver : IDisposable
     /// Current terminal height in rows.
     /// </summary>
     int Height { get; }
+
+    /// <summary>
+    /// Reads the terminal's width and height as one observation.
+    /// </summary>
+    /// <remarks>
+    /// Defaults to reading <see cref="Width"/> and <see cref="Height"/> separately.
+    /// A driver whose platform can report both from a single query should override
+    /// this, so a resize cannot land between the two reads and produce a size that
+    /// never existed.
+    /// </remarks>
+    /// <returns>The terminal's current size in columns and rows.</returns>
+    (int Width, int Height) GetGeometry() => (Width, Height);
     
     /// <summary>
     /// Raised when terminal is resized.

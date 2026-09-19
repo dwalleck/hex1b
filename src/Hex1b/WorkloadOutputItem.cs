@@ -79,5 +79,16 @@ public readonly record struct WorkloadOutputItem(
     /// before subsequent observation barriers. Only the owning terminal enqueues it.
     /// </summary>
     internal (int Width, int Height)? Resize { get; init; }
+
+    /// <summary>
+    /// Present when this batch must be delivered only if the native presentation
+    /// still reports the geometry it was composed for.
+    /// </summary>
+    /// <remarks>
+    /// The terminal delivers such a batch, and only then brings the model and the
+    /// presentation observers up to date, so a refused batch leaves no trace on
+    /// either. The receipt is what a producer retries against.
+    /// </remarks>
+    internal GeometryGatedDelivery? Delivery { get; init; }
 }
 

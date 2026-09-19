@@ -35,7 +35,58 @@ internal interface IAtomicTerminalUpdate : IDisposable
     /// has no hand-off to fail.
     /// </remarks>
     bool FlushCompleted { get; }
+
+    /// <summary>
+    /// True when this scope can hand its bytes off conditionally, so a batch
+    /// composed for a superseded native geometry is refused instead of written.
+    /// </summary>
+    bool SupportsGeometryGatedDelivery { get; }
+
+    /// <summary>
+    /// Releases the scope and offers its composed bytes for delivery only if the
+    /// native presentation still reports the geometry they were composed for.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Returns once the bytes have been <em>offered</em>, not written, and must be
+    /// called from the thread that opened the scope. The returned task is the
+    /// delivery's outcome and completes later, outside the scope's locks, so a
+    /// caller never waits on the output path while holding the step and terminal
+    /// write locks.
+    /// </para>
+    /// <para>
+    /// A scope that composed nothing has nothing to offer and returns
+    /// <see langword="null"/>.
+    /// </para>
+    /// </remarks>
+    /// <param name="expectedWidth">Columns the composed bytes assume.</param>
+    /// <param name="expectedHeight">Rows the composed bytes assume.</param>
+    /// <returns>The delivery's outcome, or null when the scope was empty.</returns>
+    Task<NativeDeliveryOutcome>? SubmitIfGeometry(int expectedWidth, int expectedHeight);
 }
+
+/// <summary>
+/// The flow bookkeeping an atomic terminal update can move while it composes.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Captured before composing and restored when the native presentation refuses the
+/// batch: the bytes never reached the device, so any position, scroll offset or
+/// live-region geometry the composition advanced describes a screen that was never
+/// painted. Retrying from the pre-composition state is what keeps a refused batch
+/// from leaving the flow's model one step ahead of the host.
+/// </para>
+/// <para>
+/// The output epoch is deliberately absent. It only ever increases, and restoring
+/// it would let the live adapter replay a frame the new origin already invalidated.
+/// </para>
+/// </remarks>
+internal readonly record struct FlowAtomicCheckpoint(
+    int CursorRow,
+    int InitialRowOrigin,
+    int StepRowOrigin,
+    int StepHeight,
+    int StepTerminalWidth);
 
 /// <summary>
 /// Live-step operations the continuous-history committer needs from the flow
@@ -81,6 +132,29 @@ internal interface ILiveStepHandle
     /// provider remain permitted.
     /// </summary>
     void EnsureHistoryCommitSupported();
+
+    /// <summary>
+    /// True when this step's presentation can refuse bytes composed for a
+    /// superseded native geometry, so a commitment can retry a refused batch
+    /// instead of writing it against the wrong viewport.
+    /// </summary>
+    bool SupportsGeometryGatedDelivery { get; }
+
+    /// <summary>
+    /// Captures the bookkeeping an atomic terminal update can move while composing.
+    /// </summary>
+    FlowAtomicCheckpoint CaptureAtomicCheckpoint();
+
+    /// <summary>
+    /// Restores a checkpoint taken before an atomic update whose delivery the
+    /// presentation refused.
+    /// </summary>
+    /// <remarks>
+    /// Must be called after the refused scope has released its locks, because it
+    /// re-enters the step-lock it protects.
+    /// </remarks>
+    /// <param name="checkpoint">The checkpoint to restore.</param>
+    void RestoreAtomicCheckpoint(FlowAtomicCheckpoint checkpoint);
 
     /// <summary>
     /// Acquires live-output ownership, cancels pending resize work, and observes
@@ -332,6 +406,17 @@ internal sealed class FlowCommitCoordinator
     private const string FailAfterRowsVariable = "HEX1B_PROTOTYPE_FAIL_AFTER_ROWS";
 
     /// <summary>
+    /// How many consecutive geometry refusals one unit may absorb before the
+    /// commitment gives up.
+    /// </summary>
+    /// <remarks>
+    /// A refusal is retryable, but only while the geometry settles. A host that
+    /// keeps changing size cannot be composed against at all, and an unbounded
+    /// retry would spin instead of reporting that.
+    /// </remarks>
+    private const int MaxDeliveryRejectionsPerUnit = 8;
+
+    /// <summary>
     /// Prototype fault injection, configured by
     /// <c>HEX1B_PROTOTYPE_FAIL_AFTER_ROWS</c>. Read per history commit, so a
     /// harness can arm and disarm it around a single run; unset the variable to
@@ -507,6 +592,10 @@ internal sealed class FlowCommitCoordinator
         // was accepted. The failure path reports this, because a unit that was
         // composed without a hand-off may not have reached the adapter at all.
         var unitFlushed = false;
+        // Consecutive geometry refusals for the unit in flight. Reset whenever a unit
+        // is counted, so a long commit that survives an occasional resize is not
+        // failed by an accumulated total.
+        var rejectedAttempts = 0;
         // The surface of the unit in flight, so the failure paths can record the
         // rows it had already composed in the reflow model (see RecordComposedRows).
         Surface? unitSurface = null;
@@ -656,6 +745,33 @@ internal sealed class FlowCommitCoordinator
                 var unitHeight = Math.Max(1, unit.Surface.Height);
                 unitSurface = unit.Surface;
 
+                // Composing against the geometry that is in force is only half the
+                // requirement: the native host can resize before those bytes reach
+                // the device, and the bytes are then positioned for a viewport that
+                // no longer exists. At a shrunken viewport the reservation's
+                // bottom-row linefeed becomes a clamped clear whose linefeeds
+                // scroll live rows into history; at a grown one it stops scrolling
+                // altogether and the erase that follows destroys the row it was
+                // meant to push out. When the presentation can refuse such a batch,
+                // offer it conditionally and compose it again from the state the
+                // attempt started in.
+                var gated = _live.SupportsGeometryGatedDelivery;
+                Task<NativeDeliveryOutcome>? delivery = null;
+                FlowAtomicCheckpoint checkpoint = default;
+                var checkpointAppendRow = appendRow;
+                var checkpointRowsWritten = emission.RowsWritten;
+                var checkpointNextRowOffset = emission.NextRowOffset;
+
+                if (gated)
+                {
+                    // Read before the scope opens: the scope holds the step lock the
+                    // checkpoint needs, and the restore below re-enters it.
+                    checkpoint = _live.CaptureAtomicCheckpoint();
+                    checkpointAppendRow = appendRow;
+                    checkpointRowsWritten = emission.RowsWritten;
+                    checkpointNextRowOffset = emission.NextRowOffset;
+                }
+
                 // Compose history plus live repaint as one serialized write.
                 // Adapter acceptance is not a host-presentation acknowledgement.
                 var scope = _live.BeginAtomicTerminalUpdate();
@@ -729,7 +845,17 @@ internal sealed class FlowCommitCoordinator
                             }
                         }
 
-                        scope.Dispose();
+                        if (gated && compositionFailure is null && wholeUnitComposed)
+                        {
+                            // Offer rather than write. Only this path can report that
+                            // the device refused the batch, which is the only fact
+                            // that lets the same unit be composed again safely.
+                            delivery = scope.SubmitIfGeometry(committedWidth, committedHeight);
+                        }
+                        else
+                        {
+                            scope.Dispose();
+                        }
                     }
                     catch (Exception handoffEx)
                     {
@@ -750,6 +876,39 @@ internal sealed class FlowCommitCoordinator
                     }
                 }
 
+                if (delivery is not null)
+                {
+                    // Awaited outside the scope's locks: the resize admission this
+                    // delivery is checking against needs them to publish the new
+                    // geometry in the first place.
+                    var outcome = await delivery.ConfigureAwait(false);
+                    if (outcome == NativeDeliveryOutcome.GeometryChanged)
+                    {
+                        // Refused, so nothing was written and nothing may be
+                        // described. Put the flow back exactly where the attempt
+                        // started and compose the same unit against the geometry
+                        // that is actually there.
+                        _live.RestoreAtomicCheckpoint(checkpoint);
+                        appendRow = checkpointAppendRow;
+                        emission.RowsWritten = checkpointRowsWritten;
+                        emission.NextRowOffset = checkpointNextRowOffset;
+                        rejectedAttempts++;
+                        if (rejectedAttempts >= MaxDeliveryRejectionsPerUnit)
+                        {
+                            throw new IOException(
+                                $"The native presentation refused {rejectedAttempts} consecutive " +
+                                "history updates because its geometry kept changing.");
+                        }
+
+                        Record(
+                            $"delivery-refused unit={completedUnits} attempt={rejectedAttempts} " +
+                            $"expected={committedWidth}x{committedHeight}");
+                        continue;
+                    }
+
+                    unitFlushed = true;
+                }
+
                 if (unitFlushed && wholeUnitComposed)
                 {
                     // Count accepted units even if their subsequent live repaint
@@ -761,6 +920,7 @@ internal sealed class FlowCommitCoordinator
                     completedRows += unitHeight;
                     rowKeys.Add(unit.RowKey);
                     emittedInTurn++;
+                    rejectedAttempts = 0;
                     _live.RecordCommittedRows(unit.Surface);
                 }
 
@@ -788,7 +948,7 @@ internal sealed class FlowCommitCoordinator
                 if (emittedInTurn >= UnitsPerTurn && completedUnits < totalUnits)
                 {
                     emittedInTurn = 0;
-                    Record($"turn yield after unit {completedUnits} origin={appendRow} liveHeight={EffectiveLiveHeight()}");
+                    Record($"turn yield after unit {completedUnits} origin={appendRow} liveHeight={EffectiveLiveHeight(_live.TerminalHeight)}");
                     await Task.Yield();
                 }
             }
@@ -821,67 +981,98 @@ internal sealed class FlowCommitCoordinator
             }
 
             appendRow = await ObserveBoundaryAsync(appendRow, 0, token).ConfigureAwait(false);
-            // Reserve and paint only after a bounded geometry-stability check.
-            // A host resize can land between the boundary observation and
-            // reservation; preserve the adjusted append row from any scroll
-            // rather than querying the cursor after EnsureRoom has parked it
-            // on the bottom row.
+            // Reserve and paint as ONE geometry-qualified batch. The reservation's
+            // linefeeds and the repaint that follows them only mean anything
+            // together: composed into the same update, a delivery the device refuses
+            // discards both. A reservation written on its own would already have
+            // moved the host's rows, and nothing could take that back.
+            var gatedFinal = _live.SupportsGeometryGatedDelivery;
             var finalLiveHeight = 0;
             var liveOrigin = 0;
             var finalWidth = 0;
-            var finalReserved = false;
-            for (var geometryAttempt = 0; geometryAttempt < 4; geometryAttempt++)
+            var finalAttempts = 0;
+            while (true)
             {
-                var geometryBefore = _live.ReadCurrentGeometry();
-                var versionBefore = _live.ResizeVersion;
-                finalLiveHeight = Math.Clamp(
-                    Math.Max(1, _live.LiveHeight),
-                    1,
-                    Math.Max(1, geometryBefore.Height));
-                liveOrigin = EnsureRoom(
-                    appendRow,
-                    finalLiveHeight,
-                    Record,
-                    "live-region",
-                    geometryBefore.Height);
-                var geometryAfter = _live.ReadCurrentGeometry();
-                if (geometryBefore.Width != geometryAfter.Width
-                    || geometryBefore.Height != geometryAfter.Height
-                    || versionBefore != _live.ResizeVersion)
+                finalAttempts++;
+                var finalCheckpoint = gatedFinal ? _live.CaptureAtomicCheckpoint() : default;
+                var finalAttemptAppendRow = appendRow;
+                Task<NativeDeliveryOutcome>? finalDelivery = null;
+                var finalStable = true;
+
+                var reanchorUpdate = _live.BeginAtomicTerminalUpdate();
+                try
                 {
-                    // EnsureRoom may have scrolled before the host published
-                    // the new geometry. Preserve its adjusted append row;
-                    // the cursor now points at the scroll position, not the
-                    // live boundary.
-                    appendRow = Math.Max(0, liveOrigin);
-                    continue;
+                    var geometryBefore = _live.ReadCurrentGeometry();
+                    var versionBefore = _live.ResizeVersion;
+                    finalWidth = Math.Max(1, geometryBefore.Width);
+                    finalLiveHeight = Math.Clamp(
+                        Math.Max(1, _live.LiveHeight),
+                        1,
+                        Math.Max(1, geometryBefore.Height));
+                    liveOrigin = EnsureRoom(
+                        appendRow,
+                        finalLiveHeight,
+                        Record,
+                        "live-region",
+                        geometryBefore.Height);
+
+                    var geometryAfter = _live.ReadCurrentGeometry();
+                    if (geometryBefore.Width != geometryAfter.Width
+                        || geometryBefore.Height != geometryAfter.Height
+                        || versionBefore != _live.ResizeVersion)
+                    {
+                        // The reservation was composed against a geometry the host
+                        // has already left. Nothing of this attempt has been written,
+                        // so discard it whole and reserve again.
+                        finalStable = false;
+                    }
+                    else
+                    {
+                        finalWidth = Math.Max(1, geometryAfter.Width);
+                        finalLiveHeight = Math.Clamp(
+                            finalLiveHeight, 1, Math.Max(1, geometryAfter.Height));
+                        _live.ResizeLive(finalWidth, finalLiveHeight);
+                        _live.ReanchorLive(
+                            liveOrigin,
+                            finalLiveHeight,
+                            _live.SnapshotLiveSurface() ?? EmptySurface(finalWidth));
+                        liveOrigin = _live.RowOrigin;
+
+                        if (gatedFinal)
+                        {
+                            finalDelivery = reanchorUpdate.SubmitIfGeometry(
+                                finalWidth, geometryAfter.Height);
+                        }
+                    }
+                }
+                finally
+                {
+                    reanchorUpdate.Dispose();
                 }
 
-                finalWidth = Math.Max(1, geometryAfter.Width);
-                finalLiveHeight = Math.Clamp(
-                    finalLiveHeight, 1, Math.Max(1, geometryAfter.Height));
-                finalReserved = true;
-                break;
-            }
+                if (finalStable && finalDelivery is null)
+                {
+                    break;
+                }
 
-            if (!finalReserved)
-            {
-                throw new InvalidOperationException(
-                    "The terminal geometry kept changing while reserving the live region.");
-            }
+                if (finalStable)
+                {
+                    var finalOutcome = await finalDelivery!.ConfigureAwait(false);
+                    if (finalOutcome == NativeDeliveryOutcome.Applied)
+                    {
+                        break;
+                    }
+                }
 
-            var reanchorUpdate = _live.BeginAtomicTerminalUpdate();
-            try
-            {
-                _live.ResizeLive(finalWidth, finalLiveHeight);
-                _live.ReanchorLive(
-                    liveOrigin,
-                    finalLiveHeight,
-                    _live.SnapshotLiveSurface() ?? EmptySurface(finalWidth));
-            }
-            finally
-            {
-                reanchorUpdate.Dispose();
+                _live.RestoreAtomicCheckpoint(finalCheckpoint);
+                appendRow = finalAttemptAppendRow;
+                if (finalAttempts >= MaxDeliveryRejectionsPerUnit)
+                {
+                    throw new InvalidOperationException(
+                        "The terminal geometry kept changing while reserving the live region.");
+                }
+
+                Record($"live-region-attempt-discarded attempt={finalAttempts} stable={finalStable}");
             }
 
             // Drop every frame the app queued while muted — the region is painted
@@ -1175,63 +1366,97 @@ internal sealed class FlowCommitCoordinator
             appendRow, observedRowOffset, _flowCancellationToken).ConfigureAwait(false);
 
         // The frame the app rendered may be a different height than the region
-        // was, so the reservation is computed from a stable geometry snapshot.
+        // was, so the reservation and the repaint it feeds are composed as one
+        // geometry-qualified batch: a reservation written on its own would already
+        // have moved the host's rows before the repaint could be refused.
+        var gatedRecovery = _live.SupportsGeometryGatedDelivery;
         var liveHeight = 0;
         var liveOrigin = 0;
         var recoveryWidth = 0;
-        var recoveryReserved = false;
-        for (var geometryAttempt = 0; geometryAttempt < 4; geometryAttempt++)
+        var recoveryAttempts = 0;
+        while (true)
         {
-            var geometryBefore = _live.ReadCurrentGeometry();
-            var versionBefore = _live.ResizeVersion;
-            liveHeight = Math.Clamp(
-                Math.Max(1, _live.LiveHeight),
-                1,
-                Math.Max(1, geometryBefore.Height));
-            liveOrigin = EnsureRoom(
-                appendRow,
-                liveHeight,
-                record,
-                "recovery-live-region",
-                geometryBefore.Height);
-            var geometryAfter = _live.ReadCurrentGeometry();
-            if (geometryBefore.Width != geometryAfter.Width
-                || geometryBefore.Height != geometryAfter.Height
-                || versionBefore != _live.ResizeVersion)
+            recoveryAttempts++;
+            var recoveryCheckpoint = gatedRecovery ? _live.CaptureAtomicCheckpoint() : default;
+            var recoveryAttemptAppendRow = appendRow;
+            Task<NativeDeliveryOutcome>? recoveryDelivery = null;
+            var recoveryStable = true;
+
+            var reanchorUpdate = _live.BeginAtomicTerminalUpdate();
+            try
             {
-                // EnsureRoom may have scrolled before the host published the
-                // new geometry. Preserve that adjusted append row; querying
-                // the cursor now would observe the bottom-row scroll cursor,
-                // not the live boundary.
-                appendRow = Math.Max(0, liveOrigin);
-                continue;
+                var geometryBefore = _live.ReadCurrentGeometry();
+                var versionBefore = _live.ResizeVersion;
+                liveHeight = Math.Clamp(
+                    Math.Max(1, _live.LiveHeight),
+                    1,
+                    Math.Max(1, geometryBefore.Height));
+                liveOrigin = EnsureRoom(
+                    appendRow,
+                    liveHeight,
+                    record,
+                    "recovery-live-region",
+                    geometryBefore.Height);
+
+                var geometryAfter = _live.ReadCurrentGeometry();
+                if (geometryBefore.Width != geometryAfter.Width
+                    || geometryBefore.Height != geometryAfter.Height
+                    || versionBefore != _live.ResizeVersion)
+                {
+                    // The reservation was composed against a geometry the host has
+                    // already left. Nothing of this attempt was written, so discard
+                    // it whole rather than keeping a scroll that never happened.
+                    recoveryStable = false;
+                }
+                else
+                {
+                    recoveryWidth = Math.Max(1, geometryAfter.Width);
+                    liveHeight = Math.Clamp(
+                        liveHeight, 1, Math.Max(1, geometryAfter.Height));
+                    _live.ResizeLive(recoveryWidth, liveHeight);
+                    _live.ReanchorLive(
+                        liveOrigin,
+                        liveHeight,
+                        _live.SnapshotLiveSurface() ?? EmptySurface(recoveryWidth));
+                    liveOrigin = _live.RowOrigin;
+
+                    if (gatedRecovery)
+                    {
+                        recoveryDelivery = reanchorUpdate.SubmitIfGeometry(
+                            recoveryWidth, geometryAfter.Height);
+                    }
+                }
+            }
+            finally
+            {
+                reanchorUpdate.Dispose();
             }
 
-            recoveryWidth = Math.Max(1, geometryAfter.Width);
-            liveHeight = Math.Clamp(
-                liveHeight, 1, Math.Max(1, geometryAfter.Height));
-            recoveryReserved = true;
-            break;
-        }
+            if (recoveryStable && recoveryDelivery is null)
+            {
+                break;
+            }
 
-        if (!recoveryReserved)
-        {
-            throw new InvalidOperationException(
-                "The terminal geometry kept changing while reserving the recovery region.");
-        }
+            if (recoveryStable)
+            {
+                var recoveryOutcome = await recoveryDelivery!.ConfigureAwait(false);
+                if (recoveryOutcome == NativeDeliveryOutcome.Applied)
+                {
+                    break;
+                }
+            }
 
-        var reanchorUpdate = _live.BeginAtomicTerminalUpdate();
-        try
-        {
-            _live.ResizeLive(recoveryWidth, liveHeight);
-            _live.ReanchorLive(
-                liveOrigin,
-                liveHeight,
-                _live.SnapshotLiveSurface() ?? EmptySurface(recoveryWidth));
-        }
-        finally
-        {
-            reanchorUpdate.Dispose();
+            _live.RestoreAtomicCheckpoint(recoveryCheckpoint);
+            appendRow = recoveryAttemptAppendRow;
+            if (recoveryAttempts >= MaxDeliveryRejectionsPerUnit)
+            {
+                throw new InvalidOperationException(
+                    "The terminal geometry kept changing while reserving the recovery region.");
+            }
+
+            record(
+                $"recovery-live-region-attempt-discarded attempt={recoveryAttempts} " +
+                $"stable={recoveryStable}");
         }
 
         // Drop every frame the app queued while muted: the region's bookkeeping
@@ -1317,8 +1542,8 @@ internal sealed class FlowCommitCoordinator
     /// append cursor above the screen and the next units stacked onto the bottom
     /// row; the native shrink leg is what caught that.
     /// </remarks>
-    private int EffectiveLiveHeight()
-        => Math.Clamp(Math.Max(1, _live.LiveHeight), 1, Math.Max(1, _live.TerminalHeight));
+    private int EffectiveLiveHeight(int terminalHeight)
+        => Math.Clamp(Math.Max(1, _live.LiveHeight), 1, Math.Max(1, terminalHeight));
 
     /// <summary>
     /// Scrolls the viewport up until <paramref name="height"/> rows fit below
@@ -1352,14 +1577,36 @@ internal sealed class FlowCommitCoordinator
     /// </summary>
     private int RepaintLiveRegion(int appendRow, Action<string> record)
     {
-        var liveHeight = EffectiveLiveHeight();
-        var origin = EnsureRoom(appendRow, liveHeight, record, "live-region");
-        var (width, _) = _live.ReadCurrentGeometry();
-        _live.ReanchorLive(
-            origin,
-            liveHeight,
-            _live.SnapshotLiveSurface() ?? EmptySurface(Math.Max(1, width)));
-        return origin;
+        // Use the same bounded reservation check as final hand-off and recovery.
+        // A shared snapshot prevents over-reserving; checking it again prevents
+        // a late shrink from turning the repaint's clamp into a payload erase.
+        for (var geometryAttempt = 0; geometryAttempt < 4; geometryAttempt++)
+        {
+            var geometryBefore = _live.ReadCurrentGeometry();
+            var versionBefore = _live.ResizeVersion;
+            var liveHeight = EffectiveLiveHeight(geometryBefore.Height);
+            var origin = EnsureRoom(
+                appendRow, liveHeight, record, "live-region", geometryBefore.Height);
+            var geometryAfter = _live.ReadCurrentGeometry();
+            if (geometryBefore.Width != geometryAfter.Width
+                || geometryBefore.Height != geometryAfter.Height
+                || versionBefore != _live.ResizeVersion)
+            {
+                // Keep any scroll already composed. The cursor may now be at
+                // the scroll position rather than the live boundary.
+                appendRow = Math.Max(0, origin);
+                continue;
+            }
+
+            _live.ReanchorLive(
+                origin,
+                liveHeight,
+                _live.SnapshotLiveSurface() ?? EmptySurface(Math.Max(1, geometryAfter.Width)));
+            return _live.RowOrigin;
+        }
+
+        throw new InvalidOperationException(
+            "The terminal geometry kept changing while reserving the live region.");
     }
 
     private async Task<int> ObserveBoundaryAsync(

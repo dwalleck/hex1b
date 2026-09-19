@@ -467,7 +467,7 @@ internal sealed class AttachTuiApp : IAsyncDisposable
     /// <summary>
     /// Presentation filter that detects display terminal resize events.
     /// </summary>
-    private sealed class ResizeFilter(AttachTuiApp app) : IHex1bTerminalPresentationFilter
+    private sealed class ResizeFilter(AttachTuiApp app) : IHex1bTerminalOutputObserver
     {
         public ValueTask OnSessionStartAsync(int width, int height, DateTimeOffset timestamp, CancellationToken ct)
         {

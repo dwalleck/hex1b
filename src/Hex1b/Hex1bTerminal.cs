@@ -1340,6 +1340,185 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         return modifiers;
     }
     
+    /// <summary>
+    /// Delivers one geometry-gated batch: the native write happens first, and the
+    /// internal model and the presentation observers only follow a write that
+    /// actually happened.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The order is the point. A batch composed for a superseded geometry must not
+    /// reach the device, and it cannot be refused after the model has already been
+    /// updated either, because the terminal would then describe output that was
+    /// never written. So the receipt is completed from the presentation's own
+    /// verdict, and only an applied write is described.
+    /// </para>
+    /// <para>
+    /// Once the bytes are on the device the delivery reports applied no matter what
+    /// happens while catching up, because a producer must never replay bytes the
+    /// terminal may already be showing. A failure in that phase still propagates:
+    /// the terminal is left in an unknown state, which is a fault, not a refusal.
+    /// </para>
+    /// </remarks>
+    private async ValueTask DeliverGeometryGatedAsync(
+        GeometryGatedDelivery delivery,
+        ReadOnlyMemory<byte> data,
+        IReadOnlyList<AnsiToken>? preTokenizedTokens,
+        byte[]? pooledBuffer,
+        List<AnsiToken>? pooledTokens,
+        Action<List<AnsiToken>>? pooledTokensReturn,
+        CancellationToken ct)
+    {
+        var adapter = _workload as Hex1bAppWorkloadAdapter
+            ?? throw new InvalidOperationException(
+                "Geometry-gated delivery requires the in-process application workload adapter.");
+
+        try
+        {
+            if (_presentation is not IGeometryGatedPresentationAdapter gated)
+            {
+                throw new NotSupportedException(
+                    "Geometry-gated delivery requires a presentation adapter that can refuse " +
+                    "bytes composed for a superseded native geometry.");
+            }
+
+            // Observers run after the write, so one that transformed output would
+            // desynchronize the screen from the model. Refusing here, before anything
+            // is written, names the offending filter instead of letting the divergence
+            // surface as corrupted output much later.
+            foreach (var filter in _presentationFilters)
+            {
+                if (filter is not IHex1bTerminalOutputObserver)
+                {
+                    throw new NotSupportedException(
+                        $"Geometry-gated delivery writes its composed bytes before presentation " +
+                        $"filters run, so every installed presentation filter must be an " +
+                        $"{nameof(IHex1bTerminalOutputObserver)}. '{filter.GetType().Name}' is not.");
+                }
+            }
+
+            var outcome = await gated
+                .WriteOutputIfGeometryAsync(data, delivery.ExpectedWidth, delivery.ExpectedHeight, ct)
+                .ConfigureAwait(false);
+
+            if (outcome == NativeDeliveryOutcome.GeometryChanged)
+            {
+                // Nothing was written and nothing is described; the producer
+                // recomposes against the geometry that is actually there.
+                adapter.CompleteDelivery(delivery, outcome);
+                return;
+            }
+
+            try
+            {
+                await DescribeDeliveredOutputAsync(data, preTokenizedTokens).ConfigureAwait(false);
+            }
+            finally
+            {
+                adapter.CompleteDelivery(delivery, NativeDeliveryOutcome.Applied);
+            }
+        }
+        catch (Exception error)
+        {
+            adapter.FaultDelivery(delivery, error);
+            throw;
+        }
+        finally
+        {
+            if (pooledBuffer is not null)
+                System.Buffers.ArrayPool<byte>.Shared.Return(pooledBuffer);
+            if (pooledTokens is not null && pooledTokensReturn is not null)
+                pooledTokensReturn(pooledTokens);
+        }
+    }
+
+    /// <summary>
+    /// Brings the terminal's model and the presentation observers up to output that
+    /// has already been written to the device.
+    /// </summary>
+    private async ValueTask DescribeDeliveredOutputAsync(
+        ReadOnlyMemory<byte> data,
+        IReadOnlyList<AnsiToken>? preTokenizedTokens)
+    {
+        IReadOnlyList<AnsiToken> tokens;
+        IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs = null;
+
+        if (preTokenizedTokens != null &&
+            !_dcsByteStreamParser.HasPendingInput &&
+            string.IsNullOrEmpty(_incompleteSequenceBuffer))
+        {
+            tokens = NormalizePreTokenizedTokens(preTokenizedTokens);
+        }
+        else
+        {
+            var tokenization = TokenizeRawWorkloadOutput(data.Span);
+            tokens = tokenization.Tokens;
+            framedDcs = tokenization.FramedDcs;
+        }
+
+        _metrics.TerminalOutputTokens.Record(tokens.Count);
+
+        await NotifyWorkloadFiltersOutputAsync(tokens).ConfigureAwait(false);
+
+        if (_presentationFilters.Count == 0)
+        {
+            ApplyTokens(tokens, framedDcs);
+        }
+        else
+        {
+            var appliedTokens = ApplyTokensWithImpacts(tokens, framedDcs);
+            var observedTokens = await NotifyPresentationFiltersOutputAsync(appliedTokens)
+                .ConfigureAwait(false);
+            VerifyObserversPreservedOutput(appliedTokens, observedTokens);
+        }
+
+        _metrics.TerminalOutputBytes.Record(data.Length);
+    }
+
+    /// <summary>
+    /// Fails when a presentation observer changed the output it was shown.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Compared as tokens rather than as re-serialized bytes: the bytes are already
+    /// on the device, so what matters here is whether the observers altered the
+    /// stream, not whether the serializer happens to round-trip. A serializer
+    /// difference would say nothing about the observers and would turn a benign
+    /// normalization into a false fault.
+    /// </para>
+    /// <para>
+    /// The bytes cannot be repaired by dropping them, so the divergence is raised
+    /// as a fault rather than left silent.
+    /// </para>
+    /// </remarks>
+    private static void VerifyObserversPreservedOutput(
+        IReadOnlyList<AppliedToken> appliedTokens,
+        IReadOnlyList<AnsiToken> observedTokens)
+    {
+        if (appliedTokens.Count == observedTokens.Count)
+        {
+            var unchanged = true;
+            for (var i = 0; i < appliedTokens.Count; i++)
+            {
+                if (appliedTokens[i].Token != observedTokens[i])
+                {
+                    unchanged = false;
+                    break;
+                }
+            }
+
+            if (unchanged)
+            {
+                return;
+            }
+        }
+
+        throw new InvalidOperationException(
+            "A presentation observer changed the output it was shown. Geometry-gated " +
+            "delivery writes its bytes before observers run, so an observer must not " +
+            "transform output.");
+    }
+
     private async Task PumpWorkloadOutputAsync(CancellationToken ct)
     {
         try
@@ -1443,6 +1622,19 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 }
 
                 Interlocked.Add(ref _outputBytesRead, data.Length);
+
+                if (readItem.Delivery is { } gatedDelivery)
+                {
+                    await DeliverGeometryGatedAsync(
+                        gatedDelivery,
+                        data,
+                        preTokenizedTokens,
+                        pooledItemBuffer,
+                        pooledItemTokens,
+                        pooledItemTokensReturn,
+                        ct).ConfigureAwait(false);
+                    continue;
+                }
 
                 var outputStateLock = _workload is IHmp1TerminalOutputSource ? Hmp1OutputStateLock : _hmp1OutputStateLock;
                 var outputStateLockTaken = false;

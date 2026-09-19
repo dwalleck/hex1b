@@ -175,6 +175,15 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
     
     public int Width => GetWindowSize().width;
     public int Height => GetWindowSize().height;
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <see cref="Width"/> and <see cref="Height"/> each issue their own
+    /// <c>GetConsoleScreenBufferInfo</c>, so reading them as a pair can straddle a
+    /// resize and report a size the window never had. This reads one snapshot.
+    /// </remarks>
+    public (int Width, int Height) GetGeometry() => GetWindowSize();
+
     public Encoding InputEncoding => Encoding.UTF8;
     
     public event Action<int, int>? Resized;

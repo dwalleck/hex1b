@@ -149,6 +149,34 @@ public class ConsolePresentationAdapterTests
     }
 
     [TestMethod]
+    public async Task WriteOutputIfGeometryAsync_RefusesBytesComposedForASupersededGeometry()
+    {
+        // The delivery boundary exists for exactly this window: the producer's bytes
+        // are correct for the geometry it sampled, and the device has already left it.
+        using var driver = new FakeConsoleDriver { TerminalSize = (80, 24) };
+        await using var adapter = new ConsolePresentationAdapter(
+            driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25));
+        var gated = (IGeometryGatedPresentationAdapter)adapter;
+        var payload = Encoding.UTF8.GetBytes("PAYLOAD\r\n");
+
+        driver.TerminalSize = (80, 11);
+        var refused = await gated.WriteOutputIfGeometryAsync(
+            payload, 80, 24, TestContext.Current.CancellationToken);
+
+        Assert.AreEqual(NativeDeliveryOutcome.GeometryChanged, refused);
+        Assert.AreEqual(string.Empty, driver.WrittenText,
+            "A refused batch must not reach the device at all — not even partially, " +
+            "because a partial write cannot be taken back.");
+
+        var applied = await gated.WriteOutputIfGeometryAsync(
+            payload, 80, 11, TestContext.Current.CancellationToken);
+
+        Assert.AreEqual(NativeDeliveryOutcome.Applied, applied);
+        Assert.AreEqual("PAYLOAD\r\n", driver.WrittenText,
+            "A batch composed for the geometry the device reports must be written.");
+    }
+
+    [TestMethod]
     public async Task EnterRawModeAsync_WhenKgpQueryResponds_EnablesKgpSupport()
     {
         using var driver = new FakeConsoleDriver($"\x1b_Gi=2147483647;OK\x1b\\");
@@ -460,9 +488,21 @@ internal sealed class FakeConsoleDriver : IConsoleDriver
 
     public bool DataAvailable => _readChunks.Count > 0;
 
-    public int Width => 80;
+    /// <summary>
+    /// The size this driver reports to its consumer.
+    /// </summary>
+    /// <remarks>
+    /// Settable so a test can change the device's geometry between the moment a
+    /// producer samples it and the moment it writes.
+    /// </remarks>
+    public (int Width, int Height) TerminalSize { get; set; } = (80, 24);
 
-    public int Height => 24;
+    public int Width => TerminalSize.Width;
+
+    public int Height => TerminalSize.Height;
+
+    /// <inheritdoc />
+    public (int Width, int Height) GetGeometry() => TerminalSize;
 
     public Encoding InputEncoding { get; init; } = Console.InputEncoding;
 

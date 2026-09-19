@@ -15,6 +15,7 @@ namespace Hex1b;
 /// </remarks>
 public sealed class ConsolePresentationAdapter :
     IHex1bTerminalPresentationAdapter,
+    IGeometryGatedPresentationAdapter,
     ITerminalReflowProvider,
     IInternalTerminalReflowProvider,
     ICursorPositionSource,
@@ -357,8 +358,46 @@ public sealed class ConsolePresentationAdapter :
         return ValueTask.CompletedTask;
     }
 
+    /// <summary>
+    /// Writes output only when the console still reports the geometry the bytes
+    /// were composed for.
+    /// </summary>
+    /// <remarks>
+    /// The whole check-and-write runs under the same lock as the rendering path,
+    /// so a cursor query or another frame cannot interleave between the geometry
+    /// read and the write. The read and the write remain two console calls: a
+    /// resize applied between them is still written. The guarantee is the other
+    /// direction — bytes composed for a geometry the console no longer reports
+    /// are never written — which is what keeps a shrunken or grown viewport from
+    /// turning a composed clear loop or bottom-row linefeed into real scrolling.
+    /// </remarks>
+    ValueTask<NativeDeliveryOutcome> IGeometryGatedPresentationAdapter.WriteOutputIfGeometryAsync(
+        ReadOnlyMemory<byte> data,
+        int expectedWidth,
+        int expectedHeight,
+        CancellationToken ct)
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(ConsolePresentationAdapter));
+        }
+
+        lock (_driverWriteSync)
+        {
+            var (width, height) = _driver.GetGeometry();
+            if (width != expectedWidth || height != expectedHeight)
+            {
+                return ValueTask.FromResult(NativeDeliveryOutcome.GeometryChanged);
+            }
+
+            _driver.Write(data.Span);
+            _driver.Flush();
+            return ValueTask.FromResult(NativeDeliveryOutcome.Applied);
+        }
+    }
+
     /// <inheritdoc />
-    public async ValueTask<ReadOnlyMemory<byte>> ReadInputAsync(CancellationToken ct = default)
+    public async ValueTask<ReadOnlyMemory<byte>> ReadInputAsync(CancellationToken ct)
     {
         if (_disposed) return ReadOnlyMemory<byte>.Empty;
 

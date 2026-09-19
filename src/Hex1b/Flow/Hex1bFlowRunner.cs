@@ -417,6 +417,114 @@ internal sealed class Hex1bFlowRunner
     }
 
     /// <summary>
+    /// Closes an atomic update scope, offering its composed bytes for delivery only
+    /// if the native presentation still reports the geometry they assume.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Returns as soon as the bytes have been offered, so the caller awaits the
+    /// outcome outside both step locks and the output geometry gate. Holding them
+    /// across that wait would block the resize admission and the live pump that the
+    /// resize path needs in order to publish the very geometry this delivery is
+    /// checking against.
+    /// </para>
+    /// <para>
+    /// The caller must treat only <see cref="NativeDeliveryOutcome.GeometryChanged"/>
+    /// as retryable: it is the one outcome that means nothing was written.
+    /// </para>
+    /// </remarks>
+    /// <param name="expectedWidth">Columns the composed bytes assume.</param>
+    /// <param name="expectedHeight">Rows the composed bytes assume.</param>
+    /// <returns>The delivery's outcome, or null when the scope composed nothing.</returns>
+    private Task<NativeDeliveryOutcome>? EndAtomicTerminalUpdateIfGeometry(
+        int expectedWidth,
+        int expectedHeight)
+    {
+        try
+        {
+            if (_atomicUpdate.Length > 0)
+            {
+                _atomicUpdate.Insert(0, SyncUpdateBegin);
+                _atomicUpdate.Append(SyncUpdateEnd);
+                var payload = _atomicUpdate.ToString();
+                _atomicUpdate.Clear();
+
+                if (_parentAdapter is Hex1bAppWorkloadAdapter app)
+                {
+                    return app.WriteRequiredIfGeometry(payload, expectedWidth, expectedHeight);
+                }
+
+                // Nothing to condition on: this parent has no device that can
+                // disagree with the composed geometry.
+                _parentAdapter.Write(payload);
+                return Task.FromResult(NativeDeliveryOutcome.Applied);
+            }
+
+            return null;
+        }
+        finally
+        {
+            _atomicUpdateActive = false;
+            if (_parentAdapter is Hex1bAppWorkloadAdapter app)
+                app.OutputGeometryGate.Release();
+            Monitor.Exit(_terminalWriteLock);
+            Monitor.Exit(_stepOpsLock);
+        }
+    }
+
+    /// <summary>
+    /// Captures the flow bookkeeping an atomic terminal update can move.
+    /// </summary>
+    /// <remarks>
+    /// Read without a lock: the caller only ever captures before it opens the
+    /// scope, and the scope's own lock hand-off is what makes the restore atomic.
+    /// </remarks>
+    private FlowAtomicCheckpoint CaptureAtomicCheckpoint(InlineStepAdapter stepAdapter, FlowStep step) => new(
+        _cursorRow,
+        _initialRowOrigin,
+        stepAdapter.RowOrigin,
+        step.StepHeight,
+        step.TerminalWidth);
+
+    /// <summary>
+    /// Restores a checkpoint taken before an atomic update whose delivery the
+    /// presentation refused.
+    /// </summary>
+    /// <remarks>
+    /// Takes the step lock, so it must run after the refused scope has released
+    /// it, and never while holding it across a different scope.
+    /// </remarks>
+    private void RestoreAtomicCheckpoint(
+        InlineStepAdapter stepAdapter,
+        FlowStep step,
+        FlowAtomicCheckpoint checkpoint)
+    {
+        lock (_stepOpsLock)
+        {
+            _cursorRow = checkpoint.CursorRow;
+            _initialRowOrigin = checkpoint.InitialRowOrigin;
+            stepAdapter.RowOrigin = checkpoint.StepRowOrigin;
+            step.StepHeight = checkpoint.StepHeight;
+            step.TerminalWidth = checkpoint.StepTerminalWidth;
+        }
+    }
+
+    /// <summary>
+    /// True when the parent presentation can refuse bytes composed for a
+    /// superseded native geometry.
+    /// </summary>
+    /// <remarks>
+    /// Only an in-process app workload attached to a geometry-gated presentation can
+    /// report what the device actually did with a batch. Headless and custom adapters
+    /// have no device to disagree with, and keep the unconditional path.
+    /// </remarks>
+    private bool GuardedDeliveryAvailable =>
+        _parentAdapter is Hex1bAppWorkloadAdapter
+        {
+            PresentationAdapter: IGeometryGatedPresentationAdapter
+        };
+
+    /// <summary>
     /// Admission state shared by one live step's output pump, resize machinery
     /// and commit-preparation hook.
     /// </summary>
@@ -712,6 +820,26 @@ internal sealed class Hex1bFlowRunner
         /// taken, which is the fact the exception alone cannot carry.
         /// </summary>
         public bool FlushCompleted { get; private set; }
+
+        /// <inheritdoc />
+        public bool SupportsGeometryGatedDelivery => runner.GuardedDeliveryAvailable;
+
+        /// <inheritdoc />
+        public Task<NativeDeliveryOutcome>? SubmitIfGeometry(int expectedWidth, int expectedHeight)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(AtomicTerminalUpdateScope));
+            }
+
+            _disposed = true;
+            var delivery = runner.EndAtomicTerminalUpdateIfGeometry(expectedWidth, expectedHeight);
+
+            // No hand-off happened, so nothing can have failed: an empty scope
+            // writes nothing, which is the same fact Dispose records.
+            FlushCompleted = delivery is null;
+            return delivery;
+        }
 
         public void Dispose()
         {
@@ -1365,6 +1493,9 @@ internal sealed class Hex1bFlowRunner
 
                         resizeToken.ThrowIfCancellationRequested();
                         var retry = false;
+                        Task<NativeDeliveryOutcome>? repaintDelivery = null;
+                        var repaintCheckpoint = default(FlowAtomicCheckpoint);
+                        var repaintAttemptHeight = 0;
                         lock (_stepOpsLock)
                         {
                             if (generation != Interlocked.Read(ref resizeGeneration))
@@ -1398,6 +1529,8 @@ internal sealed class Hex1bFlowRunner
                                     0,
                                     Math.Max(0, terminalHeight - liveHeight));
 
+                                repaintCheckpoint = CaptureAtomicCheckpoint(stepAdapter, step);
+                                repaintAttemptHeight = desiredHeight;
                                 desiredHeight = liveHeight;
                                 step.StepHeight = liveHeight;
                                 step.TerminalWidth = width;
@@ -1426,12 +1559,50 @@ internal sealed class Hex1bFlowRunner
                                     {
                                         SetTerminalCursorRow(anchor);
                                     }
+
+                                    if (GuardedDeliveryAvailable)
+                                    {
+                                        // A repaint for a viewport the host has
+                                        // already left would clear and scroll the
+                                        // wrong rows, so offer it against the
+                                        // geometry it was composed for. The outcome
+                                        // is awaited below, outside this lock.
+                                        repaintDelivery = scope.SubmitIfGeometry(width, terminalHeight);
+                                    }
                                 }
                                 finally
                                 {
                                     scope.Dispose();
                                 }
+                            }
+                        }
 
+                        if (repaintDelivery is not null
+                            && await repaintDelivery.ConfigureAwait(false)
+                                == NativeDeliveryOutcome.GeometryChanged)
+                        {
+                            // Nothing was written. Undo the retarget — unless the
+                            // resize or a new commitment has already superseded this
+                            // attempt, in which case the newer owner decides the
+                            // anchor and this repaint must not overwrite it.
+                            lock (_stepOpsLock)
+                            {
+                                if (generation == Interlocked.Read(ref resizeGeneration)
+                                    && !CommitInFlightNow())
+                                {
+                                    _cursorRow = repaintCheckpoint.CursorRow;
+                                    _initialRowOrigin = repaintCheckpoint.InitialRowOrigin;
+                                    stepAdapter.RowOrigin = repaintCheckpoint.StepRowOrigin;
+                                    step.StepHeight = repaintCheckpoint.StepHeight;
+                                    step.TerminalWidth = repaintCheckpoint.StepTerminalWidth;
+                                    desiredHeight = repaintAttemptHeight;
+                                    retry = true;
+                                }
+                            }
+
+                            if (!retry)
+                            {
+                                return;
                             }
                         }
 
@@ -2520,6 +2691,14 @@ internal sealed class Hex1bFlowRunner
             => _runner.ReadFreshGeometryForEmission();
         public void EnsureHistoryCommitSupported() =>
             _runner.EnsureHistoryCommitSupported();
+
+        public bool SupportsGeometryGatedDelivery => _runner.GuardedDeliveryAvailable;
+
+        public FlowAtomicCheckpoint CaptureAtomicCheckpoint() =>
+            _runner.CaptureAtomicCheckpoint(_stepAdapter, _step);
+
+        public void RestoreAtomicCheckpoint(FlowAtomicCheckpoint checkpoint) =>
+            _runner.RestoreAtomicCheckpoint(_stepAdapter, _step, checkpoint);
 
         /// <summary>
         /// Prepares the live step for a commit that has already been admitted:
