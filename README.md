@@ -146,13 +146,21 @@ dotnet run --project apphost.cs
 
 ### Prerequisites
 
-- [.NET 10.0 SDK](https://dotnet.microsoft.com/download) (preview)
+- [.NET SDK 10.0.401](https://dotnet.microsoft.com/download), pinned by `global.json` for the repository's Roslyn 5.9 analyzers
 - A terminal emulator with good ANSI support
+- On Linux: GCC and Make for the native interop library
 
 ### Building
 
 ```bash
 dotnet build
+```
+
+On Linux, rebuild the native library from the same source revision before running
+PTY or native interop tests; the managed build does not compile the C source:
+
+```bash
+make -C src/Hex1b/native all check-exports
 ```
 
 ### Running Tests

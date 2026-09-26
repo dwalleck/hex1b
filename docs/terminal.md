@@ -423,3 +423,30 @@ Located in `src/Hex1b/Reflow/`:
   Call `.WithReflow(strategy)` to enable.
 - `ConsolePresentationAdapter`: implements `ITerminalReflowProvider`, reflow disabled by default.
   Call `.WithReflow()` (auto-detect) or `.WithReflow(strategy)` to enable.
+
+### Flow history-commit delivery
+
+Flow can request geometry-gated delivery when every presentation filter is an
+`IHex1bTerminalOutputObserver`. Presentations with transforming filters retain the
+ordinary, unconditional output path.
+
+- A native gated presentation checks its current geometry immediately before
+  writing. On Unix, Flow geometry observations use a fresh cell-size
+  `TIOCGWINSZ` read rather than the resize-notification cache. This does not make
+  the operating-system resize and terminal write atomic.
+- For a model-backed presentation, workload filters run before admission. The
+  geometry check and model application share the terminal's resize lock, and
+  accepted output still reaches the ordinary presentation path. Observer output
+  must preserve the applied tokens.
+- `GeometryChanged` means the batch was refused before model application or
+  forwarding; Flow can restore its checkpoint and recompose the same unit.
+  A reentrant callback that resizes during application, including a resize away
+  and back, faults the delivery as uncertain instead. A partially applied batch
+  is not acknowledged as `Applied` or advertised as safe to replay.
+- The coordinator observes an emission boundary only after materializing a
+  unit that is valid for the current width. Resize-invalidated materialization
+  is prepared again before observation and emission.
+
+These delivery checks do not separate history append from live-region repaint,
+and do not establish native retention for every resize or concurrent-input
+scenario.
