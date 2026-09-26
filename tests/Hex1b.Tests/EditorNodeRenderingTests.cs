@@ -529,7 +529,8 @@ public class EditorNodeRenderingTests
         node.ScrollOffset = 10;
         node.Render(context);
 
-        var pattern = new CellPatternSearcher().Find("Line10");
+        // Rendering queues row writes; the first row does not mean the viewport is complete.
+        var pattern = new CellPatternSearcher().Find("Line14");
         await new Hex1bTerminalInputSequenceBuilder()
             .WaitUntil(s => s.SearchPattern(pattern).HasMatches,
                 TimeSpan.FromSeconds(2), "lines 10-14 visible")
