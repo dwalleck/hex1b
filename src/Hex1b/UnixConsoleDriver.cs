@@ -65,6 +65,20 @@ internal sealed class UnixConsoleDriver : IConsoleDriver
     public int Height => Console.WindowHeight;
 
     /// <inheritdoc />
+    public (int Width, int Height) GetGeometry()
+    {
+        // Console.WindowWidth/Height can remain cached until SIGWINCH is handled.
+        // Query both dimensions together at the native delivery boundary.
+        if (UnixTerminalInterop.GetWindowSize(STDOUT_FILENO, out var width, out var height) != 0)
+        {
+            var errno = Marshal.GetLastPInvokeError();
+            throw new InvalidOperationException($"ioctl(TIOCGWINSZ) failed with errno {errno}");
+        }
+
+        return (width, height);
+    }
+
+    /// <inheritdoc />
     public bool TryGetWindowPixelSize(out int pixelWidth, out int pixelHeight)
     {
         if (UnixTerminalInterop.GetWindowPixelSize(STDOUT_FILENO, out pixelWidth, out pixelHeight) == 0 &&

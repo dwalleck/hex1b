@@ -293,7 +293,7 @@ public sealed class ConsolePresentationAdapter :
     /// <inheritdoc />
     public int Height => _driver.Height;
     (int Width, int Height) IFlowCurrentGeometrySource.ReadCurrentGeometry() =>
-        (_driver.Width, _driver.Height);
+        _driver.GetGeometry();
 
     /// <inheritdoc />
     public TerminalCapabilities Capabilities => _capabilities;

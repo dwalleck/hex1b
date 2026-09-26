@@ -92,6 +92,28 @@ public class UnixTerminalInteropTests
     }
 
     [TestMethod]
+    public void GetWindowSize_PrivatePty_ReturnsCurrentCellDimensionsAfterResize()
+    {
+        using var pty = new PtyPair();
+        Assert.AreEqual(0, UnixTerminalInterop.GetWindowSize(pty.Slave, out var width, out var height));
+        Assert.AreEqual((80, 24), (width, height));
+
+        Assert.AreEqual(0, Resize(pty.Master, 48, 11));
+        Assert.AreEqual(0, UnixTerminalInterop.GetWindowSize(pty.Slave, out width, out height));
+        Assert.AreEqual((48, 11), (width, height));
+    }
+
+    [TestMethod]
+    public void GetWindowSize_InvalidDescriptor_ReturnsErrorAndZeroDimensions()
+    {
+        var result = UnixTerminalInterop.GetWindowSize(-1, out var width, out var height);
+        var error = Marshal.GetLastPInvokeError();
+        Assert.AreEqual(-1, result);
+        Assert.AreNotEqual(0, error);
+        Assert.AreEqual((0, 0), (width, height));
+    }
+
+    [TestMethod]
     public void GetWindowPixelSize_PrivatePty_ReturnsNativeDimensions()
     {
         using var pty = new PtyPair();
@@ -169,6 +191,9 @@ public class UnixTerminalInteropTests
         public short Events;
         public short ReturnedEvents;
     }
+
+    [DllImport("hex1binterop", EntryPoint = "hex1b_resize", SetLastError = true)]
+    private static extern int Resize(int master, int width, int height);
 
     [DllImport("libc", EntryPoint = "openpty", SetLastError = true)]
     private static extern int OpenMacPty(out int master, out int slave, nint name, nint termios, ref WinSize size);

@@ -14,7 +14,7 @@ for name in \
     hex1b_poll_startup hex1b_abort_startup \
     hex1b_resize hex1b_wait \
     hex1b_termios_size hex1b_termios_get hex1b_termios_make_raw hex1b_termios_set \
-    hex1b_get_window_pixel_size; do
+    hex1b_get_window_size hex1b_get_window_pixel_size; do
     if ! grep -Fxq "$name" <<< "$symbols"; then
         echo "Missing native export: $name in $library" >&2
         exit 1

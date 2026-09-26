@@ -33,6 +33,9 @@ internal static partial class UnixTerminalInterop
     [LibraryImport("hex1binterop", EntryPoint = "hex1b_termios_set", SetLastError = true)]
     private static partial int SetTermios(int fd, byte[] buffer, nuint capacity);
 
+    [LibraryImport("hex1binterop", EntryPoint = "hex1b_get_window_size", SetLastError = true)]
+    internal static partial int GetWindowSize(int fd, out int width, out int height);
+
     [LibraryImport("hex1binterop", EntryPoint = "hex1b_get_window_pixel_size", SetLastError = true)]
     internal static partial int GetWindowPixelSize(int fd, out int pixelWidth, out int pixelHeight);
 }

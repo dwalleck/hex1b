@@ -355,6 +355,22 @@ int hex1b_termios_set(int fd, const void* buffer, size_t capacity)
     return tcsetattr(fd, TCSAFLUSH, &attributes);
 }
 
+int hex1b_get_window_size(int fd, int* width, int* height)
+{
+    if (width == NULL || height == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    *width = 0;
+    *height = 0;
+    struct winsize size = {0};
+    if (ioctl(fd, TIOCGWINSZ, &size) != 0)
+        return -1;
+    *width = size.ws_col;
+    *height = size.ws_row;
+    return 0;
+}
+
 int hex1b_get_window_pixel_size(int fd, int* pixel_width, int* pixel_height)
 {
     if (pixel_width == NULL || pixel_height == NULL) {
