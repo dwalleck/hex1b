@@ -447,6 +447,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     private int _width;
     private int _height;
+    // Monotonic model geometry identity used by delivery gates. Dimensions can be
+    // resized away and back while a re-entrant callback is still applying tokens.
+    private long _bufferGeometryVersion;
     private bool _presentationOwnsResize;
 
     // Lifecycle-aware presentations call this before publishing resize notifications.
@@ -1763,7 +1766,17 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                             false,
                             rawGated.ExpectedWidth,
                             rawGated.ExpectedHeight,
-                            out _);
+                            out _,
+                            out var geometryChangedDuringApplication);
+                        if (geometryChangedDuringApplication)
+                        {
+                            acceptedDelivery = null;
+                            (_workload as Hex1bAppWorkloadAdapter)?.FaultDelivery(
+                                rawGated,
+                                new InvalidOperationException(
+                                    "Model geometry changed during geometry-gated output application."));
+                            continue;
+                        }
                         if (gatedOutcome is null)
                         {
                             acceptedDelivery = null;
@@ -1825,7 +1838,17 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         PresentationRequiresAppliedTokens,
                         gated.ExpectedWidth,
                         gated.ExpectedHeight,
-                        out appliedTokens);
+                        out appliedTokens,
+                        out var geometryChangedDuringApplication);
+                    if (geometryChangedDuringApplication)
+                    {
+                        acceptedDelivery = null;
+                        (_workload as Hex1bAppWorkloadAdapter)?.FaultDelivery(
+                            gated,
+                            new InvalidOperationException(
+                                "Model geometry changed during geometry-gated output application."));
+                        continue;
+                    }
                     if (gatedOutcome is null)
                     {
                         acceptedDelivery = null;
@@ -1871,7 +1894,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         // Run through presentation filters first if any
                         if (_presentationFilters.Count > 0)
                         {
-                            await NotifyPresentationFiltersOutputAsync(appliedTokens);
+                            var observedTokens = await NotifyPresentationFiltersOutputAsync(appliedTokens);
                             if (_disposed)
                             {
                                 if (acceptedDelivery is { } skipped)
@@ -1883,6 +1906,11 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                                 }
                                 continue;
                             }
+
+                            // Model-gated delivery writes only after the model has applied the
+                            // batch, so observers must preserve the exact applied token stream.
+                            if (acceptedDelivery is not null)
+                                VerifyObserversPreservedOutput(appliedTokens, observedTokens);
                         }
                         // Send applied tokens with impacts directly to the adapter
                         await impactAware.WriteOutputWithImpactsAsync(appliedTokens, ct);
@@ -1902,10 +1930,24 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                             }
                             continue;
                         }
+                        if (acceptedDelivery is not null)
+                            VerifyObserversPreservedOutput(appliedTokens, filteredTokens);
+
                         var filteredBytes = Tokens.AnsiTokenUtf8Serializer.Serialize(filteredTokens);
                         await _presentation.WriteOutputAsync(filteredBytes, ct);
                         _metrics.TerminalOutputBytes.Record(filteredBytes.Length);
                     }
+                    else if (acceptedDelivery is not null)
+                    {
+                        // Accepted model-gated raw output was intentionally held back before
+                        // tokenization; forward the original bytes only after model application.
+                        var passthroughStarted = Stopwatch.GetTimestamp();
+                        await _presentation.WriteOutputAsync(data, ct);
+                        _metrics.TerminalRawPassthroughDuration.Record(
+                            Stopwatch.GetElapsedTime(passthroughStarted).TotalMilliseconds);
+                        _metrics.TerminalOutputBytes.Record(data.Length);
+                    }
+
                 }
 
                 if (acceptedDelivery is { } applied)
@@ -3033,6 +3075,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     private void ResizeWithReflow(int newWidth, int newHeight, ITerminalReflowProvider reflowProvider)
     {
+        var geometryChanged = _width != newWidth || _height != newHeight;
+
         var textAnchors = PrepareTextAnchorReflow();
         if (_width != newWidth || _height != newHeight)
             InvalidateTextCoordinates();
@@ -3150,6 +3194,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         _screenBuffer = newBuffer;
         _width = newWidth;
         _height = newHeight;
+        if (geometryChanged)
+            _bufferGeometryVersion++;
+
         _cursorX = Math.Clamp(result.CursorX, 0, newWidth - 1);
         _cursorY = Math.Clamp(result.CursorY, 0, newHeight - 1);
         _pendingWrap = result.PendingWrap;
@@ -3210,6 +3257,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     private void ResizeWithCrop(int newWidth, int newHeight)
     {
+        var geometryChanged = _width != newWidth || _height != newHeight;
+
         var newBuffer = new TerminalCell[newHeight, newWidth];
         
         // Initialize with empty cells
@@ -3255,6 +3304,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         _screenBuffer = newBuffer;
         _width = newWidth;
         _height = newHeight;
+        if (geometryChanged)
+            _bufferGeometryVersion++;
+
         _cursorX = Math.Min(_cursorX, newWidth - 1);
         _cursorY = Math.Min(_cursorY, newHeight - 1);
         if (_inAlternateScreen)
@@ -3560,8 +3612,12 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             if (_disposed)
                 return [];
 
-            var result = ApplyTokensWithImpactsUnsafe(tokens, framedDcs, collectImpacts);
-            PresentationInvalidated?.Invoke();
+            var result = ApplyTokensWithImpactsUnsafe(
+                tokens,
+                framedDcs,
+                collectImpacts,
+                expectedGeometryVersion: null,
+                out _);
             return result;
         }
     }
@@ -3582,8 +3638,10 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         bool collectImpacts,
         int expectedWidth,
         int expectedHeight,
-        out IReadOnlyList<AppliedToken> appliedTokens)
+        out IReadOnlyList<AppliedToken> appliedTokens,
+        out bool geometryChangedDuringApplication)
     {
+        geometryChangedDuringApplication = false;
         lock (_bufferLock)
         {
             if (_disposed)
@@ -3598,18 +3656,25 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 return NativeDeliveryOutcome.GeometryChanged;
             }
 
-            appliedTokens = ApplyTokensWithImpactsUnsafe(tokens, framedDcs, collectImpacts);
+            var expectedGeometryVersion = _bufferGeometryVersion;
+            appliedTokens = ApplyTokensWithImpactsUnsafe(
+                tokens,
+                framedDcs,
+                collectImpacts,
+                expectedGeometryVersion,
+                out geometryChangedDuringApplication);
+            return NativeDeliveryOutcome.Applied;
         }
-
-        PresentationInvalidated?.Invoke();
-        return NativeDeliveryOutcome.Applied;
     }
 
     private IReadOnlyList<AppliedToken> ApplyTokensWithImpactsUnsafe(
         IReadOnlyList<AnsiToken> tokens,
         IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs,
-        bool collectImpacts)
+        bool collectImpacts,
+        long? expectedGeometryVersion,
+        out bool geometryChangedDuringApplication)
     {
+        geometryChangedDuringApplication = false;
         using var application = new CaptureApplication(this);
         // Capture publication uses the successfully applied prefix, not the input batch.
         collectImpacts |= _captures is not null;
@@ -3655,12 +3720,28 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     GraphicsImpacts = graphicsImpacts
                 });
             }
+            if (expectedGeometryVersion is { } version
+                && _bufferGeometryVersion != version)
+            {
+                geometryChangedDuringApplication = true;
+                break;
+            }
+
         }
 
         CollectExpiredTextAnchors();
         RefreshKgpAnimationTimerUnsafe();
         if (_captures is not null)
             PublishCaptureOutputUnsafe(result.Select(item => item.Token).ToArray(), framedDcs);
+        // Keep capture/application state alive through invalidation callbacks. A callback can
+        // re-enter Resize() while this lock is held; the gated caller checks the version after
+        // the callback and faults instead of forwarding an uncertain suffix.
+        PresentationInvalidated?.Invoke();
+        if (expectedGeometryVersion is { } finalVersion
+            && _bufferGeometryVersion != finalVersion)
+        {
+            geometryChangedDuringApplication = true;
+        }
         return result;
     }
 
@@ -5721,6 +5802,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             _savedMainScreenBuffer = null;
             _width = main.GetLength(1);
             _height = main.GetLength(0);
+            _bufferGeometryVersion++;
+
             _cursorX = _alternateScreenSavedCursorX;
             _cursorY = _alternateScreenSavedCursorY;
             _pendingWrap = _alternateScreenSavedPendingWrap;
