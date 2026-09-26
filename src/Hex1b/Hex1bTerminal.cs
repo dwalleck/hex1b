@@ -420,6 +420,16 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         if (!_presentationOwnsResize)
             _presentation.Resized += OnPresentationResized;
 
+        // A geometry-gated batch is enforceable only when every presentation filter is an
+        // observer. Native adapters write before filters run, and model-backed adapters must
+        // apply under the model's resize lock without bypassing a filter that could transform
+        // the batch. A transforming filter therefore keeps Flow on the ordinary path.
+        if (_workload is Hex1bAppWorkloadAdapter gatedWorkload)
+        {
+            gatedWorkload.GeometryGatedDeliveryEnforceable =
+                _presentationFilters.All(filter => filter is IHex1bTerminalOutputObserver);
+        }
+
         // Notify filters of session start
         // Note: We fire-and-forget here since the constructor can't be async
         // Filters should handle this gracefully
@@ -1378,6 +1388,10 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         {
             if (_presentation is not IGeometryGatedPresentationAdapter gated)
             {
+                // Defensive: the consumer loop routes a delivery here only when the presentation
+                // can refuse at write time. An in-process model gate is handled in the loop,
+                // where an accepted batch can still take the ordinary path and reach the
+                // presentation instead of being written here.
                 throw new NotSupportedException(
                     "Geometry-gated delivery requires a presentation adapter that can refuse " +
                     "bytes composed for a superseded native geometry.");
@@ -1608,6 +1622,15 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 
                 if (data.IsEmpty && remoteState is null && animationState is null)
                 {
+                    if (readItem.Delivery is { } emptyDelivery
+                        && _workload is Hex1bAppWorkloadAdapter emptyAdapter)
+                    {
+                        emptyAdapter.FaultDelivery(
+                            emptyDelivery,
+                            new InvalidOperationException(
+                                "A geometry-gated delivery contained no output and was not applied."));
+                    }
+
                     if (pooledItemBuffer is not null)
                         System.Buffers.ArrayPool<byte>.Shared.Return(pooledItemBuffer);
                     if (pooledItemTokens is not null && pooledItemTokensReturn is not null)
@@ -1628,17 +1651,43 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
                 Interlocked.Add(ref _outputBytesRead, data.Length);
 
+                GeometryGatedDelivery? acceptedDelivery = null;
                 if (readItem.Delivery is { } gatedDelivery)
                 {
-                    await DeliverGeometryGatedAsync(
-                        gatedDelivery,
-                        data,
-                        preTokenizedTokens,
-                        pooledItemBuffer,
-                        pooledItemTokens,
-                        pooledItemTokensReturn,
-                        ct).ConfigureAwait(false);
-                    continue;
+                    if (_presentation is IGeometryGatedPresentationAdapter)
+                    {
+                        await DeliverGeometryGatedAsync(
+                            gatedDelivery,
+                            data,
+                            preTokenizedTokens,
+                            pooledItemBuffer,
+                            pooledItemTokens,
+                            pooledItemTokensReturn,
+                            ct).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    var modelAdapter = _workload as Hex1bAppWorkloadAdapter;
+                    if (modelAdapter is null || !modelAdapter.GeometryGatedDeliveryEnforceable)
+                    {
+                        // Direct callers can still offer an unsupported delivery. Flow never
+                        // does so because it consults the capability published by the terminal.
+                        modelAdapter?.FaultDelivery(
+                            gatedDelivery,
+                            new NotSupportedException(
+                                "Geometry-gated delivery is not enforceable for this presentation " +
+                                "and its filters."));
+                        if (pooledItemBuffer is not null)
+                            System.Buffers.ArrayPool<byte>.Shared.Return(pooledItemBuffer);
+                        if (pooledItemTokens is not null && pooledItemTokensReturn is not null)
+                            pooledItemTokensReturn(pooledItemTokens);
+                        continue;
+                    }
+
+                    // The model-backed device checks geometry together with model application
+                    // below, after asynchronous workload filters have settled. This keeps the
+                    // check under the same buffer lock used by Resize().
+                    acceptedDelivery = gatedDelivery;
                 }
 
                 var outputStateLock = _workload is IHmp1TerminalOutputSource ? Hmp1OutputStateLock : _hmp1OutputStateLock;
@@ -1670,10 +1719,10 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 var rawProcessingFastPath =
                     _workloadFilters.Count == 0 &&
                     rawPresentationPassthrough;
-                if (rawPresentationPassthrough && !_disposed && _presentation is not null)
+                if (rawPresentationPassthrough && acceptedDelivery is null && !_disposed && _presentation is not null)
                 {
                     // Native/raw presentations own the original workload bytes. Forward each
-                    // read before framing, decoding, filters, raster work, or snapshots.
+                    // ordinary read before framing, decoding, filters, raster work, or snapshots.
                     var passthroughStarted = Stopwatch.GetTimestamp();
                     await _presentation.WriteOutputAsync(data, ct);
                     _metrics.TerminalRawPassthroughDuration.Record(
@@ -1701,22 +1750,117 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 
                 // FAST PATH: If no filters are active AND presentation doesn't need cell impacts,
                 // apply tokens to buffer and forward bytes directly.
-                // This is crucial for programs like tmux that are sensitive to output timing
+                // This is crucial for programs like tmux that are sensitive to output timing.
+                // A model-gated batch is deliberately applied before its presentation write so
+                // refusal remains before any forward, while ordinary reads retain the raw route.
                 if (rawProcessingFastPath)
                 {
-                    // Still apply tokens to internal buffer so CreateSnapshot() works
+                    if (acceptedDelivery is { } rawGated)
+                    {
+                        var gatedOutcome = ApplyTokensWithImpactsIfGeometry(
+                            tokens,
+                            framedDcs,
+                            false,
+                            rawGated.ExpectedWidth,
+                            rawGated.ExpectedHeight,
+                            out _);
+                        if (gatedOutcome is null)
+                        {
+                            acceptedDelivery = null;
+                            (_workload as Hex1bAppWorkloadAdapter)?.FaultDelivery(
+                                rawGated,
+                                new ObjectDisposedException(nameof(Hex1bTerminal)));
+                            continue;
+                        }
+
+                        if (gatedOutcome == NativeDeliveryOutcome.GeometryChanged)
+                        {
+                            acceptedDelivery = null;
+                            (_workload as Hex1bAppWorkloadAdapter)?.CompleteDelivery(
+                                rawGated,
+                                NativeDeliveryOutcome.GeometryChanged);
+                            continue;
+                        }
+
+                        if (_disposed)
+                        {
+                            acceptedDelivery = null;
+                            (_workload as Hex1bAppWorkloadAdapter)?.FaultDelivery(
+                                rawGated,
+                                new ObjectDisposedException(nameof(Hex1bTerminal)));
+                            continue;
+                        }
+
+                        var passthroughStarted = Stopwatch.GetTimestamp();
+                        await (_presentation ?? throw new InvalidOperationException(
+                            "A model-gated delivery requires a presentation adapter."))
+                            .WriteOutputAsync(data, ct);
+                        _metrics.TerminalRawPassthroughDuration.Record(
+                            Stopwatch.GetElapsedTime(passthroughStarted).TotalMilliseconds);
+                        _metrics.TerminalOutputBytes.Record(data.Length);
+                        acceptedDelivery = null;
+                        (_workload as Hex1bAppWorkloadAdapter)?.CompleteDelivery(
+                            rawGated,
+                            NativeDeliveryOutcome.Applied);
+                        continue;
+                    }
+
+                    // Still apply tokens to internal buffer so CreateSnapshot() works.
                     ApplyTokens(tokens, framedDcs);
                     continue;
                 }
                 
-                // Notify workload filters with tokens
+                // Notify workload filters with tokens before the model gate. A filter may
+                // synchronously resize the terminal, so the gate must be checked only by the
+                // lock-coupled application below.
                 await NotifyWorkloadFiltersOutputAsync(tokens);
                 
                 // HWT reads authoritative snapshots but still needs its per-batch callback.
-                var appliedTokens = ApplyTokensWithImpacts(tokens, framedDcs,
-                    collectImpacts: PresentationRequiresAppliedTokens);
+                IReadOnlyList<AppliedToken> appliedTokens;
+                if (acceptedDelivery is { } gated)
+                {
+                    var gatedOutcome = ApplyTokensWithImpactsIfGeometry(
+                        tokens,
+                        framedDcs,
+                        PresentationRequiresAppliedTokens,
+                        gated.ExpectedWidth,
+                        gated.ExpectedHeight,
+                        out appliedTokens);
+                    if (gatedOutcome is null)
+                    {
+                        acceptedDelivery = null;
+                        (_workload as Hex1bAppWorkloadAdapter)?.FaultDelivery(
+                            gated,
+                            new ObjectDisposedException(nameof(Hex1bTerminal)));
+                        continue;
+                    }
+
+                    if (gatedOutcome == NativeDeliveryOutcome.GeometryChanged)
+                    {
+                        acceptedDelivery = null;
+                        (_workload as Hex1bAppWorkloadAdapter)?.CompleteDelivery(
+                            gated,
+                            NativeDeliveryOutcome.GeometryChanged);
+                        continue;
+                    }
+                }
+                else
+                {
+                    appliedTokens = ApplyTokensWithImpacts(tokens, framedDcs,
+                        collectImpacts: PresentationRequiresAppliedTokens);
+                }
+
                 if (_disposed)
+                {
+                    if (acceptedDelivery is { } skipped)
+                    {
+                        acceptedDelivery = null;
+                        (_workload as Hex1bAppWorkloadAdapter)?.FaultDelivery(
+                            skipped,
+                            new ObjectDisposedException(nameof(Hex1bTerminal)));
+                    }
                     continue;
+                }
                 
                 // Forward to presentation if present
                 if (_presentation != null)
@@ -1729,7 +1873,16 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         {
                             await NotifyPresentationFiltersOutputAsync(appliedTokens);
                             if (_disposed)
+                            {
+                                if (acceptedDelivery is { } skipped)
+                                {
+                                    acceptedDelivery = null;
+                                    (_workload as Hex1bAppWorkloadAdapter)?.FaultDelivery(
+                                        skipped,
+                                        new ObjectDisposedException(nameof(Hex1bTerminal)));
+                                }
                                 continue;
+                            }
                         }
                         // Send applied tokens with impacts directly to the adapter
                         await impactAware.WriteOutputWithImpactsAsync(appliedTokens, ct);
@@ -1739,15 +1892,39 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         // Pass through presentation filters, serialize and send
                         var filteredTokens = await NotifyPresentationFiltersOutputAsync(appliedTokens);
                         if (_disposed)
+                        {
+                            if (acceptedDelivery is { } skipped)
+                            {
+                                acceptedDelivery = null;
+                                (_workload as Hex1bAppWorkloadAdapter)?.FaultDelivery(
+                                    skipped,
+                                    new ObjectDisposedException(nameof(Hex1bTerminal)));
+                            }
                             continue;
+                        }
                         var filteredBytes = Tokens.AnsiTokenUtf8Serializer.Serialize(filteredTokens);
                         await _presentation.WriteOutputAsync(filteredBytes, ct);
                         _metrics.TerminalOutputBytes.Record(filteredBytes.Length);
                     }
                 }
+
+                if (acceptedDelivery is { } applied)
+                {
+                    // The batch was composed for the geometry this terminal still has, and the
+                    // ordinary path has now applied and forwarded it.
+                    acceptedDelivery = null;
+                    (_workload as Hex1bAppWorkloadAdapter)?.CompleteDelivery(
+                        applied, NativeDeliveryOutcome.Applied);
                 }
+                }
+
                 catch (Exception error)
                 {
+                    if (acceptedDelivery is { } faulted)
+                    {
+                        acceptedDelivery = null;
+                        (_workload as Hex1bAppWorkloadAdapter)?.FaultDelivery(faulted, error);
+                    }
                     remoteSource?.CompleteInitialReplay(error);
                     throw;
                 }
@@ -1762,6 +1939,15 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         System.Buffers.ArrayPool<byte>.Shared.Return(pooledItemBuffer);
                     if (pooledItemTokens is not null && pooledItemTokensReturn is not null)
                         pooledItemTokensReturn(pooledItemTokens);
+                    if (acceptedDelivery is { } unclaimed)
+                    {
+                        // Never infer Applied from control-flow cleanup. In particular, disposal
+                        // can skip the presentation write after a model-gated item was accepted.
+                        acceptedDelivery = null;
+                        (_workload as Hex1bAppWorkloadAdapter)?.FaultDelivery(
+                            unclaimed,
+                            new ObjectDisposedException(nameof(Hex1bTerminal)));
+                    }
                 }
             }
         }
@@ -3374,60 +3560,108 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             if (_disposed)
                 return [];
 
-            using var application = new CaptureApplication(this);
-            // Capture publication uses the successfully applied prefix, not the input batch.
-            collectImpacts |= _captures is not null;
-            var result = new List<AppliedToken>(collectImpacts ? tokens.Count : 0);
-            
-            foreach (var token in tokens)
-            {
-                if (_disposed)
-                    break;
-
-                int cursorXBefore = _cursorX;
-                int cursorYBefore = _cursorY;
-                
-                var impacts = collectImpacts ? new List<CellImpact>() : null;
-                var graphicsImpacts = collectImpacts ? new List<TerminalGraphicsImpact>() : null;
-                _currentGraphicsImpacts = graphicsImpacts;
-                bool applied;
-                try
-                {
-                    applied = ApplyToken(token, impacts, framedDcs);
-                }
-                finally
-                {
-                    _currentGraphicsImpacts = null;
-                }
-
-                if (!applied)
-                {
-                    if (_captures is not null)
-                        FailCapturesUnsafe(new InvalidOperationException("Output application was interrupted during capture."));
-                    RestoreValidCursorAfterAbortedScroll(cursorXBefore, cursorYBefore);
-                    break;
-                }
-                
-                if (impacts is not null && graphicsImpacts is not null)
-                {
-                    result.Add(new AppliedToken(
-                        token,
-                        impacts,
-                        cursorXBefore, cursorYBefore,
-                        _cursorX, _cursorY)
-                    {
-                        GraphicsImpacts = graphicsImpacts
-                    });
-                }
-            }
-
-            CollectExpiredTextAnchors();
-            RefreshKgpAnimationTimerUnsafe();
-            if (_captures is not null)
-                PublishCaptureOutputUnsafe(result.Select(item => item.Token).ToArray(), framedDcs);
+            var result = ApplyTokensWithImpactsUnsafe(tokens, framedDcs, collectImpacts);
             PresentationInvalidated?.Invoke();
             return result;
         }
+    }
+
+    /// <summary>
+    /// Applies a gated batch only when the model still has the geometry it was
+    /// composed for. The geometry check and model application share the buffer
+    /// lock used by <see cref="Resize"/>, so a direct or re-entrant resize cannot
+    /// land between them.
+    /// </summary>
+    /// <returns>
+    /// <see langword="null"/> when disposal won before application; otherwise the
+    /// delivery outcome describing whether the geometry matched.
+    /// </returns>
+    private NativeDeliveryOutcome? ApplyTokensWithImpactsIfGeometry(
+        IReadOnlyList<AnsiToken> tokens,
+        IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs,
+        bool collectImpacts,
+        int expectedWidth,
+        int expectedHeight,
+        out IReadOnlyList<AppliedToken> appliedTokens)
+    {
+        lock (_bufferLock)
+        {
+            if (_disposed)
+            {
+                appliedTokens = [];
+                return null;
+            }
+
+            if (_width != expectedWidth || _height != expectedHeight)
+            {
+                appliedTokens = [];
+                return NativeDeliveryOutcome.GeometryChanged;
+            }
+
+            appliedTokens = ApplyTokensWithImpactsUnsafe(tokens, framedDcs, collectImpacts);
+        }
+
+        PresentationInvalidated?.Invoke();
+        return NativeDeliveryOutcome.Applied;
+    }
+
+    private IReadOnlyList<AppliedToken> ApplyTokensWithImpactsUnsafe(
+        IReadOnlyList<AnsiToken> tokens,
+        IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs,
+        bool collectImpacts)
+    {
+        using var application = new CaptureApplication(this);
+        // Capture publication uses the successfully applied prefix, not the input batch.
+        collectImpacts |= _captures is not null;
+        var result = new List<AppliedToken>(collectImpacts ? tokens.Count : 0);
+
+        foreach (var token in tokens)
+        {
+            if (_disposed)
+                break;
+
+            int cursorXBefore = _cursorX;
+            int cursorYBefore = _cursorY;
+
+            var impacts = collectImpacts ? new List<CellImpact>() : null;
+            var graphicsImpacts = collectImpacts ? new List<TerminalGraphicsImpact>() : null;
+            _currentGraphicsImpacts = graphicsImpacts;
+            bool applied;
+            try
+            {
+                applied = ApplyToken(token, impacts, framedDcs);
+            }
+            finally
+            {
+                _currentGraphicsImpacts = null;
+            }
+
+            if (!applied)
+            {
+                if (_captures is not null)
+                    FailCapturesUnsafe(new InvalidOperationException("Output application was interrupted during capture."));
+                RestoreValidCursorAfterAbortedScroll(cursorXBefore, cursorYBefore);
+                break;
+            }
+
+            if (impacts is not null && graphicsImpacts is not null)
+            {
+                result.Add(new AppliedToken(
+                    token,
+                    impacts,
+                    cursorXBefore, cursorYBefore,
+                    _cursorX, _cursorY)
+                {
+                    GraphicsImpacts = graphicsImpacts
+                });
+            }
+        }
+
+        CollectExpiredTextAnchors();
+        RefreshKgpAnimationTimerUnsafe();
+        if (_captures is not null)
+            PublishCaptureOutputUnsafe(result.Select(item => item.Token).ToArray(), framedDcs);
+        return result;
     }
 
     /// <summary>

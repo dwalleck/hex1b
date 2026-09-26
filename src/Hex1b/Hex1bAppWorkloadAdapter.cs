@@ -321,6 +321,26 @@ public sealed class Hex1bAppWorkloadAdapter :
     internal IHex1bTerminalPresentationAdapter? PresentationAdapter => _presentationAdapter;
 
     /// <summary>
+    /// Whether a composed batch can be refused before it is applied, so the delivery receipt
+    /// reports what the terminal did with the batch rather than only that it was queued.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Set by the terminal that owns the presentation and its filters, because that is where
+    /// both enforcement points are known: a native presentation can refuse at write time
+    /// against the device, while an in-process presentation can check and apply the batch under
+    /// the model's resize lock before forwarding it. Both paths require every presentation
+    /// filter to be an observer; a filter that can transform output keeps the ordinary route.
+    /// </para>
+    /// <para>
+    /// A producer must consult this before offering a batch through
+    /// <see cref="WriteRequiredIfGeometry"/>: when it is false the unconditional write path is
+    /// the only correct one, and a gated delivery would fault instead of degrading.
+    /// </para>
+    /// </remarks>
+    internal bool GeometryGatedDeliveryEnforceable { get; set; }
+
+    /// <summary>
     /// Hands a composed batch to the terminal together with the geometry it was
     /// composed for, and reports what the presentation did with it.
     /// </summary>

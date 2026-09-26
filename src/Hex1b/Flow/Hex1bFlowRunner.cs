@@ -510,19 +510,30 @@ internal sealed class Hex1bFlowRunner
     }
 
     /// <summary>
-    /// True when the parent presentation can refuse bytes composed for a
-    /// superseded native geometry.
+    /// True when the committed bytes can be refused instead of written once the
+    /// geometry they were composed for is gone.
     /// </summary>
     /// <remarks>
-    /// Only an in-process app workload attached to a geometry-gated presentation can
-    /// report what the device actually did with a batch. Headless and custom adapters
-    /// have no device to disagree with, and keep the unconditional path.
+    /// <para>
+    /// An in-process app workload has an enforcement point whenever the terminal that owns it
+    /// says so: a native presentation refuses the batch at write time against the device, and
+    /// an emulated one refuses it at dequeue against the model's own geometry before anything
+    /// is applied.
+    /// </para>
+    /// <para>
+    /// The terminal is also where the preconditions are known, so a presentation it cannot
+    /// check — for example one carrying a presentation filter that transforms output — keeps
+    /// the unconditional write path instead of failing when the delivery is offered.
+    /// </para>
+    /// <para>
+    /// What the refusal buys is direction, not a closed window: the geometry read and the
+    /// write are separate operations, so a resize applied between them is still written.
+    /// Bytes composed for a superseded geometry are never *applied* once the geometry change
+    /// was observed, which is the direction that destroys retained history.
+    /// </para>
     /// </remarks>
     private bool GuardedDeliveryAvailable =>
-        _parentAdapter is Hex1bAppWorkloadAdapter
-        {
-            PresentationAdapter: IGeometryGatedPresentationAdapter
-        };
+        _parentAdapter is Hex1bAppWorkloadAdapter { GeometryGatedDeliveryEnforceable: true };
 
     /// <summary>
     /// Admission state shared by one live step's output pump, resize machinery

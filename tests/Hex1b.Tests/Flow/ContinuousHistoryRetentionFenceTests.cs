@@ -187,6 +187,162 @@ public class ContinuousHistoryRetentionFenceTests
     }
 
     /// <summary>
+    /// A presentation that refuses exactly one composed batch, the way a device refuses one
+    /// composed for a geometry it no longer has, and reports the settled geometry from then on.
+    /// </summary>
+    /// <remarks>
+    /// It exists so the product's refuse → restore-checkpoint → recompose path is exercised
+    /// deterministically, instead of depending on a resize winning a race: the runner holds the
+    /// resize-admission gate for the whole of an atomic update, so in-process a stale frame is
+    /// never even queued.
+    /// </remarks>
+    private sealed class ScriptedRefusingPresentation :
+        IHex1bTerminalPresentationAdapter,
+        IGeometryGatedPresentationAdapter,
+        ITerminalReflowProvider,
+        IInternalTerminalReflowProvider
+    {
+        private readonly HeadlessPresentationAdapter _inner;
+        private readonly string _refuseOnMarker;
+        private readonly int _width;
+        private readonly int _height;
+        private int _refused;
+
+        public ScriptedRefusingPresentation(int width, int height, string refuseOnMarker)
+        {
+            _inner = new HeadlessPresentationAdapter(width, height).WithReflow(GhosttyReflowStrategy.Instance);
+            _width = width;
+            _height = height;
+            _refuseOnMarker = refuseOnMarker;
+        }
+
+        public bool Refused => Volatile.Read(ref _refused) != 0;
+
+        public int Width => _width;
+        public int Height => _height;
+        public TerminalCapabilities Capabilities => _inner.Capabilities;
+        public bool ReflowEnabled => _inner.ReflowEnabled;
+        public bool ShouldClearSoftWrapOnAbsolutePosition => _inner.ShouldClearSoftWrapOnAbsolutePosition;
+
+        public event Action<int, int>? Resized
+        {
+            add => _inner.Resized += value;
+            remove => _inner.Resized -= value;
+        }
+
+        public event Action? Disconnected
+        {
+            add => _inner.Disconnected += value;
+            remove => _inner.Disconnected -= value;
+        }
+
+        public ValueTask WriteOutputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
+            => _inner.WriteOutputAsync(data, ct);
+
+        public ValueTask<ReadOnlyMemory<byte>> ReadInputAsync(CancellationToken ct = default)
+            => _inner.ReadInputAsync(ct);
+
+        public ValueTask FlushAsync(CancellationToken ct = default) => _inner.FlushAsync(ct);
+        public ValueTask EnterRawModeAsync(CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask ExitRawModeAsync(CancellationToken ct = default) => ValueTask.CompletedTask;
+        public (int Row, int Column) GetCursorPosition() => _inner.GetCursorPosition();
+
+        public ReflowResult Reflow(ReflowContext context) => _inner.Reflow(context);
+
+        bool IInternalTerminalReflowProvider.TryReflowWithAnchors(
+            ReflowContext context,
+            IReadOnlyList<TerminalReflowAnchor> anchors,
+            out InternalReflowResult result)
+            => ((IInternalTerminalReflowProvider)_inner).TryReflowWithAnchors(context, anchors, out result);
+
+        public ValueTask<NativeDeliveryOutcome> WriteOutputIfGeometryAsync(
+            ReadOnlyMemory<byte> data,
+            int expectedWidth,
+            int expectedHeight,
+            CancellationToken ct = default)
+        {
+            var text = Encoding.UTF8.GetString(data.Span);
+            if (Volatile.Read(ref _refused) == 0
+                && text.Contains(_refuseOnMarker, StringComparison.Ordinal)
+                && Interlocked.Exchange(ref _refused, 1) == 0)
+            {
+                // Refuse once without moving the reported geometry: this isolates the refusal
+                // machinery (refuse -> restore checkpoint -> recompose) from the separate
+                // question of what a host does to already-committed content when it reflows,
+                // which the shrink/grow fence already covers.
+                return ValueTask.FromResult(NativeDeliveryOutcome.GeometryChanged);
+            }
+
+            return ValueTask.FromResult(NativeDeliveryOutcome.Applied);
+        }
+
+        public ValueTask DisposeAsync() => _inner.DisposeAsync();
+    }
+
+    /// <summary>
+    /// A refused batch is not a lost unit: the coordinator restores the checkpoint it captured
+    /// before composing and composes the same unit again, so the refusal is invisible in the
+    /// committed content.
+    /// </summary>
+    [TestMethod]
+    public async Task RefusedBatch_IsRecomposedAndEveryPayloadKeySurvivesExactlyOnce()
+    {
+        var tracePath = Path.Combine(Path.GetTempPath(), $"hex1b-refusal-{Guid.NewGuid():N}.jsonl");
+        Environment.SetEnvironmentVariable("HEX1B_FLOW_COMMIT_EVENTS", tracePath);
+        try
+        {
+            var presentation = new ScriptedRefusingPresentation(
+                width: 68, height: 21, refuseOnMarker: $"{CommitId}:r05");
+            var source = new FenceCommitSource(CommitId, PayloadRows);
+            FlowCommitResult? result = null;
+            Exception? failure = null;
+            Hex1bTerminal terminal = null!;
+
+            using var terminalLifetime = terminal = CreateTerminal(async flow =>
+            {
+                var step = flow.Step(BuildLive, options =>
+                {
+                    options.MinHeight = 14;
+                    options.MaxHeight = 14;
+                });
+                await step.WaitForReadyAsync();
+                try
+                {
+                    result = await step.CommitAsync(source, BuildLive);
+                }
+                catch (Exception ex)
+                {
+                    failure = ex;
+                }
+                finally
+                {
+                    step.Complete();
+                }
+            }, width: 68, height: 21, presentation: presentation);
+
+            await terminal.RunAsync().WaitAsync(TimeSpan.FromSeconds(60));
+            var trace = File.Exists(tracePath) ? File.ReadAllText(tracePath) : "";
+
+            Assert.IsTrue(presentation.Refused, "the scripted refusal must have fired");
+            Assert.IsNull(failure, $"commit failed: {failure}\n{trace}");
+            Assert.IsNotNull(result);
+            Assert.IsTrue(
+                Regex.IsMatch(trace, Regex.Escape("delivery-refused unit=6")),
+                $"the refused unit must be recorded with its rejected attempt\n{trace}");
+            Assert.AreEqual(PayloadRows + 2, result!.CompletedUnits);
+            AssertKeysExactlyOnce(ReadFullBuffer(terminal), CommitId, PayloadRows, trace);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("HEX1B_FLOW_COMMIT_EVENTS", null);
+            if (File.Exists(tracePath))
+            {
+                File.Delete(tracePath);
+            }
+        }
+    }
+
+    /// <summary>
     /// The real impact-aware handle must never publish a presentable frame that
     /// loses the live prompt while the coordinator completes normally or recovers
     /// from an emission failure.
@@ -893,7 +1049,8 @@ public class ContinuousHistoryRetentionFenceTests
 
     private static Hex1bTerminal CreateTerminal(
         Func<Hex1bFlowContext, Task> flowCallback, int width, int height,
-        FlowTerminalHostProfile? hostProfile = null)
+        FlowTerminalHostProfile? hostProfile = null,
+        IHex1bTerminalPresentationAdapter? presentation = null)
     {
         var builder = Hex1bTerminal.CreateBuilder()
             .WithHex1bFlow(flowCallback, options =>
@@ -903,7 +1060,11 @@ public class ContinuousHistoryRetentionFenceTests
             })
             .WithDimensions(width, height);
 
-        if (hostProfile is { } profile)
+        if (presentation is { } supplied)
+        {
+            builder.WithPresentation(supplied);
+        }
+        else if (hostProfile is { } profile)
         {
             builder.WithPresentation(
                 new ProfiledHeadlessPresentationAdapter(width, height, profile)

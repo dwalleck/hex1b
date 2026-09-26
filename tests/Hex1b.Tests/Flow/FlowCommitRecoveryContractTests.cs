@@ -247,6 +247,19 @@ public class FlowCommitRecoveryContractTests
         AssertEachUnitMarkerExactlyOnce(buffer!, "after a width change mid-commit");
     }
 
+    /// <summary>
+    /// A width change with a previous frame still awaiting application is a configuration
+    /// detail, not a universal one: it is reachable only where the delivery cannot be refused,
+    /// because a gated delivery resolves its receipt in the consumer and a producer that awaits
+    /// it cannot run ahead of the frame at all.
+    /// </summary>
+    /// <remarks>
+    /// The transforming presentation filter below is what pins this test to that
+    /// configuration: a filter that is not an <see cref="IHex1bTerminalOutputObserver"/> cannot
+    /// be bypassed by a geometry-checked model write, so the terminal reports no enforceable
+    /// gate for this host and commitment keeps the unconditional write path. The gated
+    /// semantics have their own coverage in the retention fence's refused-batch test.
+    /// </remarks>
     [TestMethod]
     [DataRow(false)]
     [DataRow(true)]
@@ -278,7 +291,7 @@ public class FlowCommitRecoveryContractTests
                 outputGate.Release.TrySetResult();
                 step.Complete();
             }
-        }, width: 100, height: 30, outputFilter: outputGate);
+        }, width: 100, height: 30, outputFilter: outputGate, presentationFilter: new TransformingPresentationFilter());
 
         source.Gate = async index =>
         {
@@ -686,7 +699,8 @@ public class FlowCommitRecoveryContractTests
         int width,
         int height,
         IHex1bTerminalPresentationAdapter? presentation = null,
-        IHex1bTerminalWorkloadFilter? outputFilter = null)
+        IHex1bTerminalWorkloadFilter? outputFilter = null,
+        IHex1bTerminalPresentationFilter? presentationFilter = null)
     {
         var builder = Hex1bTerminal.CreateBuilder()
             .WithHex1bFlow(flowCallback, options =>
@@ -705,6 +719,10 @@ public class FlowCommitRecoveryContractTests
         if (outputFilter is not null)
         {
             builder.AddWorkloadFilter(outputFilter);
+        }
+        if (presentationFilter is not null)
+        {
+            builder.AddPresentationFilter(presentationFilter);
         }
         return builder.Build();
     }
@@ -810,6 +828,35 @@ public class FlowCommitRecoveryContractTests
             v.Text(NextLiveMarker),
             v.Text("committed rows leave this region"),
         ]));
+
+    /// <summary>
+    /// A presentation filter that passes output through but is not an
+    /// <see cref="IHex1bTerminalOutputObserver"/>, which is what keeps a host on the
+    /// unconditional write path: the terminal cannot apply a batch to its model under a
+    /// geometry check without bypassing a filter that could have transformed it, so it reports
+    /// no enforceable gate.
+    /// </summary>
+    private sealed class TransformingPresentationFilter : IHex1bTerminalPresentationFilter
+    {
+        public ValueTask OnSessionStartAsync(int width, int height, DateTimeOffset timestamp, CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask<IReadOnlyList<AnsiToken>> OnOutputAsync(
+            IReadOnlyList<AppliedToken> appliedTokens,
+            TimeSpan elapsed,
+            CancellationToken ct = default)
+            => ValueTask.FromResult<IReadOnlyList<AnsiToken>>(
+                appliedTokens.Select(applied => applied.Token).ToArray());
+
+        public ValueTask OnInputAsync(IReadOnlyList<AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask OnResizeAsync(int width, int height, TimeSpan elapsed, CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask OnSessionEndAsync(TimeSpan elapsed, CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+    }
 
     private sealed class PendingUnitOutputGate(string marker) : IHex1bTerminalWorkloadFilter
     {
