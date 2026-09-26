@@ -187,6 +187,40 @@ public sealed class FlowCommitReservationTests
         Assert.Contains("PAYLOAD-1", durable);
     }
 
+    [TestMethod]
+    public async Task CommitAsync_ResizeDuringObservation_RepaintsWithinCursorRoundTripBudget()
+    {
+        using var cancellation = new CancellationTokenSource();
+        using var live = new ReservationLiveHandle(cancellation)
+        {
+            SupportsGeometryGatedDelivery = true,
+            SupportsCursorObservation = true,
+            AcceptLiveLayout = true,
+            CancelOnFirstReanchor = false,
+            ResizeDuringFirstObservation = (30, 11),
+            SimulatedCursorRoundTrip = TimeSpan.FromMilliseconds(30),
+        };
+        await using var parent = new RecordingParentAdapter(40, 34);
+        var coordinator = new FlowCommitCoordinator(live, parent, CancellationToken.None);
+
+        var result = await coordinator.CommitAsync(
+            new TwoRowSource(), UnexpectedNextLayout, cancellation.Token);
+
+        Assert.AreEqual(FlowCommitStatus.Emitted, result.Status);
+        Assert.AreEqual(2, result.CompletedUnits);
+        Assert.AreEqual(30, live.TerminalWidth);
+        Assert.AreEqual(11, live.TerminalHeight);
+        Assert.IsNotNull(live.FirstRepaintAfterResize,
+            "The resized device must receive both the payload and the retained live image.");
+        Assert.IsTrue(live.FirstRepaintAfterResize <= TimeSpan.FromMilliseconds(100),
+            $"The first complete repaint incurred {live.FirstRepaintAfterResize} of " +
+            "serialized cursor-response latency; superseded observations must not delay it.");
+        AssertCleanHistory(live);
+        var durable = live.ReadHistory() + live.ScreenText;
+        Assert.Contains("PAYLOAD-0", durable);
+        Assert.Contains("PAYLOAD-1", durable);
+    }
+
     private static Task<Hex1bWidget> UnexpectedNextLayout(FlowStepContext context)
         => throw new InvalidOperationException("A cancelled prefix must retain its current live layout.");
 
@@ -229,6 +263,9 @@ public sealed class FlowCommitReservationTests
         private bool _firstReanchor = true;
         private bool _muted;
         private int _terminalHeight = 34;
+        private int _terminalWidth = Width;
+        private TimeSpan _observationElapsed;
+        private bool _measureResizeRepaint;
 
         public ReservationLiveHandle(CancellationTokenSource cancellation, int initialTerminalHeight = 34)
         {
@@ -266,6 +303,9 @@ public sealed class FlowCommitReservationTests
         /// </remarks>
         public bool CancelOnFirstReanchor { get; init; } = true;
         public bool ShrinkObserved { get; private set; }
+        public (int Width, int Height)? ResizeDuringFirstObservation { get; set; }
+        public TimeSpan SimulatedCursorRoundTrip { get; init; }
+        public TimeSpan? FirstRepaintAfterResize { get; private set; }
         public List<int> ScrollRequests { get; } = [];
         public string ScreenText => _terminal.GetScreenText();
         public int TerminalWidth => ReadCurrentGeometry().Width;
@@ -358,7 +398,7 @@ public sealed class FlowCommitReservationTests
 
         public (int Width, int Height) ReadCurrentGeometry()
         {
-            var observed = (Width, _terminalHeight);
+            var observed = (_terminalWidth, _terminalHeight);
             if (_shrinkArmed)
             {
                 _shrinkArmed = false;
@@ -390,7 +430,7 @@ public sealed class FlowCommitReservationTests
         {
             _terminalHeight = height;
             ResizeVersion++;
-            _terminal.Resize(Width, height);
+            _terminal.Resize(_terminalWidth, height);
         }
 
         public Surface SnapshotLiveSurface() => _liveSurface;
@@ -461,7 +501,20 @@ public sealed class FlowCommitReservationTests
             FrameCount++;
         }
         public Task<int?> ObserveCursorRowAsync(CancellationToken cancellationToken)
-            => Task.FromResult<int?>(RowOrigin);
+        {
+            if (ResizeDuringFirstObservation is { } geometry)
+            {
+                ResizeDuringFirstObservation = null;
+                _terminalWidth = geometry.Width;
+                ResizeDevice(geometry.Height);
+                _measureResizeRepaint = true;
+            }
+
+            // Virtual response time isolates the serial round-trip cost from
+            // scheduler jitter. No response is withheld and no wall clock sleeps.
+            _observationElapsed += SimulatedCursorRoundTrip;
+            return Task.FromResult<int?>(RowOrigin);
+        }
         public void RecordCommittedRows(Surface surface) { }
         public int DiscardQueuedLiveOutput() => 0;
         public void RequestLiveFrame() => FrameCount++;
@@ -496,7 +549,16 @@ public sealed class FlowCommitReservationTests
                 _pendingOutput.Append(text);
         }
 
-        private void Apply(string text) => _terminal.ApplyTokens(AnsiTokenizer.Tokenize(text));
+        private void Apply(string text)
+        {
+            _terminal.ApplyTokens(AnsiTokenizer.Tokenize(text));
+            if (_measureResizeRepaint && FirstRepaintAfterResize is null
+                && ScreenText.Contains("MUTABLE-LIVE-00", StringComparison.Ordinal)
+                && (ReadHistory() + ScreenText).Contains("PAYLOAD-0", StringComparison.Ordinal))
+            {
+                FirstRepaintAfterResize = _observationElapsed;
+            }
+        }
 
         public void Dispose()
         {

@@ -364,12 +364,11 @@ internal sealed class FlowCommitCoordinator
                             "Resizing during history commitment requires cursor observation.");
                     }
 
-                    appendRow = await ObserveBoundaryAsync(appendRow, 0, token).ConfigureAwait(false);
                     committedVersion = _live.ResizeVersion;
                     committedHeight = currentHeight;
                     Record(
                         $"reflow when={when} width={currentWidth} height={currentHeight} units={totalUnits} " +
-                        $"appendRow={appendRow} resizeVersion={committedVersion} " +
+                        $"pendingAppendRow={appendRow} resizeVersion={committedVersion} " +
                         $"geometryOnly={(widthChanged ? "false" : "true")}");
                     return widthChanged;
                 }
@@ -414,13 +413,22 @@ internal sealed class FlowCommitCoordinator
                     unit = await MaterializeAsync(completedUnits, materializationWidth, token)
                         .ConfigureAwait(false);
                     await ReflowIfNeededAsync("pre-write").ConfigureAwait(false);
+                    // A re-prepare invalidated these bytes. Materialize at the
+                    // new width before paying for the authoritative observation.
+                    if (materializationWidth != committedWidth)
+                    {
+                        token.ThrowIfCancellationRequested();
+                        continue;
+                    }
+
+                    // This observation also fences any output preceding the
+                    // boundary; reflow/retry paths must reach it before emission.
                     appendRow = await ObserveBoundaryAsync(appendRow, 0, token).ConfigureAwait(false);
 
                     // Observation itself can span a resize. Reuse an existing
                     // materialization only when its width and the final geometry
                     // still agree; height-only changes never rebuild the unit.
-                    if (materializationWidth == committedWidth
-                        && committedWidth == _live.ReadCurrentGeometry().Width
+                    if (committedWidth == _live.ReadCurrentGeometry().Width
                         && committedHeight == _live.ReadCurrentGeometry().Height
                         && committedVersion == _live.ResizeVersion)
                     {
@@ -483,8 +491,6 @@ internal sealed class FlowCommitCoordinator
                     _live.ResizeLiveToTerminalGeometry(
                         freshGeometry.Width,
                         freshGeometry.Height);
-                    appendRow = await ObserveBoundaryAsync(appendRow, 0, token)
-                        .ConfigureAwait(false);
                     continue;
                 }
 
