@@ -203,6 +203,231 @@ public class GeometryGatedDeliveryEnforcementTests
         Assert.Contains(transformedMarker, presentation.OutputText);
     }
 
+    [TestMethod]
+    public async Task AcceptedModelDelivery_WithWorkloadFilter_ForwardsThroughRawManagedPresentation()
+    {
+        var presentation = new RecordingManagedPresentation(68, 21);
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithPresentation(presentation)
+            .AddWorkloadFilter(new PassiveWorkloadFilter())
+            .WithDimensions(68, 21)
+            .Build();
+
+        var delivery = workload.WriteRequiredIfGeometry(
+            ComposedBatch(),
+            expectedWidth: 68,
+            expectedHeight: 21);
+        var outcome = await delivery.WaitAsync(
+            TimeSpan.FromSeconds(5),
+            TestContext.Current.CancellationToken);
+
+        Assert.AreEqual(NativeDeliveryOutcome.Applied, outcome);
+        Assert.IsTrue(terminal.GetScreenText().Contains(Marker, StringComparison.Ordinal));
+        Assert.Contains(
+            Marker,
+            presentation.OutputText,
+            "an accepted model-gated batch must still reach a raw managed presentation");
+    }
+
+    [TestMethod]
+    public async Task ModelGatedObserverMutation_IsFaultedBeforePresentationForwarding()
+    {
+        var presentation = new RecordingManagedPresentation(68, 21);
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithPresentation(presentation)
+            .AddPresentationFilter(new MutatingObserver())
+            .WithDimensions(68, 21)
+            .Build();
+
+        var delivery = workload.WriteRequiredIfGeometry(
+            ComposedBatch(),
+            expectedWidth: 68,
+            expectedHeight: 21);
+
+        var failure = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            async () => await delivery);
+
+        Assert.Contains("observer", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.IsTrue(terminal.GetScreenText().Contains(Marker, StringComparison.Ordinal));
+        Assert.AreEqual(
+            string.Empty,
+            presentation.OutputText,
+            "a model-gated observer that changes output must fault before presentation forwarding");
+    }
+
+    [TestMethod]
+    public async Task ReentrantResizeDuringModelApplication_IsFaultedWithoutForwardingSuffix()
+    {
+        const string suffix = "REENTRANT-RESIZE-SUFFIX";
+        var presentation = new RecordingManagedPresentation(68, 21);
+        using var workload = new Hex1bAppWorkloadAdapter();
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithPresentation(presentation)
+            .WithDimensions(68, 21)
+            .Build();
+
+        terminal.WindowTitleChanged += _ =>
+        {
+            terminal.Resize(48, 11);
+            terminal.Resize(68, 21);
+        };
+
+        var delivery = workload.WriteRequiredIfGeometry(
+            $"\x1b]2;reentrant-title\x07{suffix}",
+            expectedWidth: 68,
+            expectedHeight: 21);
+
+        var failure = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            async () => await delivery);
+
+        Assert.Contains("geometry", failure.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.IsFalse(
+            terminal.GetScreenText().Contains(suffix, StringComparison.Ordinal),
+            "a re-entrant resize must stop the gated batch before its suffix is applied");
+        Assert.IsFalse(
+            presentation.OutputText.Contains(suffix, StringComparison.Ordinal),
+            "a partially applied batch must never be forwarded as Applied");
+    }
+
+    private sealed class PassiveWorkloadFilter : IHex1bTerminalWorkloadFilter
+    {
+        public ValueTask OnSessionStartAsync(
+            int width,
+            int height,
+            DateTimeOffset timestamp,
+            CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask OnSessionEndAsync(
+            TimeSpan elapsed,
+            CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask OnResizeAsync(
+            int width,
+            int height,
+            TimeSpan elapsed,
+            CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask OnInputAsync(
+            IReadOnlyList<AnsiToken> tokens,
+            TimeSpan elapsed,
+            CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask OnFrameCompleteAsync(
+            TimeSpan elapsed,
+            CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask OnOutputAsync(
+            IReadOnlyList<AnsiToken> tokens,
+            TimeSpan elapsed,
+            CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+    }
+
+    private sealed class RecordingManagedPresentation(int width, int height) :
+        IHex1bTerminalPresentationAdapter
+    {
+        private readonly object _sync = new();
+        private readonly StringBuilder _output = new();
+
+        internal string OutputText
+        {
+            get
+            {
+                lock (_sync)
+                    return _output.ToString();
+            }
+        }
+
+        public int Width => width;
+        public int Height => height;
+        public TerminalCapabilities Capabilities => TerminalCapabilities.Modern;
+        public event Action<int, int>? Resized
+        {
+            add { }
+            remove { }
+        }
+        public event Action? Disconnected
+        {
+            add { }
+            remove { }
+        }
+
+        public ValueTask WriteOutputAsync(
+            ReadOnlyMemory<byte> data,
+            CancellationToken ct = default)
+        {
+            lock (_sync)
+                _output.Append(Encoding.UTF8.GetString(data.Span));
+            return ValueTask.CompletedTask;
+        }
+
+        public ValueTask<ReadOnlyMemory<byte>> ReadInputAsync(
+            CancellationToken ct = default)
+            => ValueTask.FromResult(ReadOnlyMemory<byte>.Empty);
+
+        public ValueTask FlushAsync(CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask EnterRawModeAsync(CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask ExitRawModeAsync(CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public (int Row, int Column) GetCursorPosition() => (0, 0);
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+    }
+
+
+    private sealed class MutatingObserver : IHex1bTerminalOutputObserver
+    {
+        public ValueTask<IReadOnlyList<AnsiToken>> OnOutputAsync(
+            IReadOnlyList<AppliedToken> appliedTokens,
+            TimeSpan elapsed,
+            CancellationToken ct = default)
+        {
+            var output = appliedTokens.Select(item => item.Token).ToList();
+            output.Add(new TextToken("OBSERVER-MUTATION"));
+            return ValueTask.FromResult<IReadOnlyList<AnsiToken>>(output);
+        }
+
+        public ValueTask OnSessionStartAsync(
+            int width,
+            int height,
+            DateTimeOffset timestamp,
+            CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask OnInputAsync(
+            IReadOnlyList<AnsiToken> tokens,
+            TimeSpan elapsed,
+            CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask OnResizeAsync(
+            int width,
+            int height,
+            TimeSpan elapsed,
+            CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+
+        public ValueTask OnSessionEndAsync(
+            TimeSpan elapsed,
+            CancellationToken ct = default)
+            => ValueTask.CompletedTask;
+    }
+
     private sealed class ResizeDuringOutputFilter(int width, int height) :
         IHex1bTerminalWorkloadFilter
     {
