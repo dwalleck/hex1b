@@ -1,5 +1,17 @@
 import type { TerminalLinkOptions, TerminalLinkDetectionError } from "./link-types.js";
+import type { TerminalTransport, TerminalTransportCloseDetails } from "./transport-types.js";
+export type * from "./transport-types.js";
+import type { TerminalColorMode, TerminalPalette } from "./terminal-palette.js";
+export type { TerminalColorMode, TerminalPalette } from "./terminal-palette.js";
+import type { TerminalLayout, TerminalMarker, TerminalMarkerOptions, TerminalPadding, TerminalInsets,
+  TerminalScrollbar, TerminalScrollbarConfiguration } from "./scrollbar-types.js";
 export type * from "./link-types.js";
+export type { TerminalRectangle, TerminalInsets, TerminalPadding, TerminalLayout, TerminalTextPosition,
+  TerminalMarker, TerminalMarkerOptions, TerminalScrollbarMarker, TerminalScrollbarInteraction,
+  TerminalScrollbarFrame, TerminalScrollbarRenderer, TerminalScrollbarOptions,
+  TerminalScrollbarConfiguration, TerminalScrollbar, TerminalScrollbarTooltipContext,
+  TerminalScrollbarTooltipRenderer } from "./scrollbar-types.js";
+export type * from "./scrollbar-appearance.js";
 
 /** Logical terminal dimensions, confirmed by the producer rather than reflowed locally. */
 export interface TerminalGrid { columns: number; rows: number }
@@ -16,7 +28,7 @@ export interface TerminalPeer {
   primaryId: string | null;
   isPrimary: boolean;
 }
-/** Font size is an integer from 8 to 32; fixed grids allow 20–300 columns and 10–100 rows. */
+/** Font size is an integer from 8 to 32; fixed grids allow 1–300 columns and 1–100 rows. */
 export type TerminalSizing =
   | { mode: "auto"; fontSize?: number }
   | { mode: "fixed"; fontSize?: number; columns: number; rows: number };
@@ -34,7 +46,11 @@ export type TerminalViewport = (
       liveTop: number; top: number; requestId: number; rowIds: readonly string[]; revision: number }
   | { available: false; generation?: undefined; buffer?: undefined; totalRows?: undefined;
       liveTop?: undefined; top?: undefined; requestId?: undefined; rowIds?: readonly string[]; revision?: undefined }
-) & { following: boolean; pending: boolean; followTail: boolean; offset: number };
+) & {
+  following: boolean; pending: boolean; followTail: boolean; offset: number;
+  /** Producer rejection of the last absolute navigation request, cleared by the next request. */
+  navigationError?: string;
+};
 export type TerminalSelection = (
   | { status: "valid"; text: string; requestId: number; revision: number }
   | { status: "none" | "invalidated"; text: null; requestId: number; revision: number }
@@ -181,9 +197,9 @@ export interface TerminalWorkingDirectory {
 /**
  * Latest OSC 133 marker, distinct from {@link TerminalShellIntegration}: it additionally carries
  * any raw trailing `key=value` parameters (e.g. a `cmdline_url` extension on marker C). This is
- * the single most-recent marker only — the server does not transport a mark history or event
- * log over this wire; consumers that want their own history should accumulate distinct values
- * from {@link WebTerminalOptions.onCommandMarkChange} themselves.
+ * the single most-recent marker only. Use {@link WebTerminalHandle.markers} for retained
+ * producer-backed positions and {@link WebTerminalHandle.getCommandMarkDetails} for their
+ * raw parameters; do not reconstruct command history from coalesced activity callbacks.
  */
 export interface TerminalCommandMark {
   readonly phase: TerminalShellIntegrationPhase;
@@ -191,11 +207,37 @@ export interface TerminalCommandMark {
   /** Verbatim `key=value[;key=value...]` trailing the marker, or null when none was present. */
   readonly rawParameters: string | null;
 }
-export interface WebTerminalOptions extends InputPolicyOptions {
-  url: string | URL;
-  /** Optional module-worker entry, resolved against the page URL. Defaults to the bundled worker. */
+/**
+ * Supply exactly one live transport. url is shorthand for createWebSocketTransport(url).
+ * onClose receives actual transport close details once, with the view already disconnected,
+ * even before the first frame. A pending mount rejects after notification. No close is
+ * synthesized for abort, disposal, initialization failure, or timeout, and none runs after
+ * disposal. Callback exceptions reach the host. Transport close is not workload completion.
+ */
+export type WebTerminalOptions = WebTerminalCommonOptions & (
+  | { url: string | URL; transport?: never;
+      /** Receives native WebSocket close details, including failed connection attempts. */
+      onClose?: (details: TerminalCloseDetails) => void }
+  | { url?: never; transport: TerminalTransport;
+      /** Custom closes carry a reason without invented WebSocket codes or handshake status. */
+      onClose?: (details: TerminalTransportCloseDetails) => void }
+);
+interface WebTerminalCommonOptions extends InputPolicyOptions {
+  /** Local terminal palette selection. Defaults to dark; system follows prefers-color-scheme. */
+  colorMode?: TerminalColorMode;
+  lightModePalette?: TerminalPalette;
+  darkModePalette?: TerminalPalette;
+  /** Canvas2D scrollbar: overlay auto-hides (default); beside stays visible. False enables host-owned chrome. */
+  scrollbar?: TerminalScrollbar;
+  /** Outer CSS-pixel padding around the content and scrollbar. Defaults to zero. */
+  padding?: TerminalPadding;
+  /** Coherent local layout, including displayed cell dimensions, for external UI. */
+  onLayoutChange?: (layout: TerminalLayout) => void;
+  /** Retained producer-backed markers, not a stream of shell executions. */
+  onMarkersChange?: (markers: readonly TerminalMarker[]) => void;
+  /** Optional module-worker entry, resolved against the page URL. Defaults to this bundle with #hex1b-terminal-worker. */
   workerUrl?: string | URL;
-  /** Optional isolated regex worker entry, resolved against the page URL. */
+  /** Optional isolated regex worker entry, resolved against the page URL. Defaults to this bundle with #hex1b-link-detection-worker. */
   linkDetectionWorkerUrl?: string | URL;
   /** Per-view link interaction. Detection is opt-in; omitted preserves legacy OSC 8 navigation. */
   links?: false | TerminalLinkOptions;
@@ -211,15 +253,6 @@ export interface WebTerminalOptions extends InputPolicyOptions {
   /** Initial per-view input policy. Change it later with setReadOnly; not a server authorization boundary. */
   readOnly?: boolean;
   onStatus?: (message: string, level: TerminalStatusLevel) => void;
-  /**
-   * Receives the native WebSocket close details once, including connection failures and closes
-   * before the first frame. The view is disconnected before this callback; a pending mount
-   * rejects after notification. No callback is synthesized for abort, disposal, initialization
-   * failure, or mount timeout, and none runs after disposal. This client never reconnects
-   * automatically. Interpret application close codes in the host; even 1000 is not proof of
-   * workload completion. Callback exceptions reach the host and are not retried.
-   */
-  onClose?: (details: TerminalCloseDetails) => void;
   onGeometry?: (geometry: TerminalGeometry) => void;
   onSizingChange?: (sizing: TerminalSizingState) => void;
   onRoleChange?: (peer: TerminalPeer) => void;
@@ -251,7 +284,8 @@ export interface WebTerminalOptions extends InputPolicyOptions {
   /**
    * Receives the first authoritative presented command mark before mount resolves (null if none
    * yet reported), then distinct presented changes. Only the latest marker is transmitted, not a
-   * history; entire commands may occur between frames. No notifications after disposal.
+   * history; entire commands may occur between frames. Use onMarkersChange for the retained
+   * inventory. No notifications after disposal.
    */
   onCommandMarkChange?: (commandMark: TerminalCommandMark | null) => void;
   onStats?: (stats: TerminalStats, text: string | undefined) => void;
@@ -261,9 +295,15 @@ export interface WebTerminalOptions extends InputPolicyOptions {
   /** Must return undefined synchronously; async handlers cannot claim default UI ownership. */
   onSelectionUI?: (event: SelectionUIEvent) => undefined;
 }
-/** Owns only the appended element and browser connection, not the server terminal. */
+/** Owns only the appended element and transport connection, not the server terminal. */
 export interface WebTerminalHandle {
   readonly element: HTMLDivElement;
+  readonly colorMode: TerminalColorMode;
+  readonly resolvedColorMode: "light" | "dark";
+  /** Recolors retained indexed/default text without reconnecting or changing explicit RGB colors. */
+  setColorMode(mode: TerminalColorMode): void;
+  /** Replaces one mode's palette. The active mode repaints immediately. */
+  setPalette(mode: "light" | "dark", palette: TerminalPalette): void;
   readonly geometry: TerminalGeometry;
   readonly peer: TerminalPeer;
   readonly connected: boolean;
@@ -285,10 +325,26 @@ export interface WebTerminalHandle {
   readonly inputBindings: InputBinding[];
   readonly inputContext: TerminalInputContext;
   readonly viewport: TerminalViewport;
+  readonly layout: TerminalLayout;
+  readonly padding: TerminalInsets;
+  readonly scrollbar: false | TerminalScrollbarConfiguration;
+  readonly markers: readonly TerminalMarker[];
   readonly selection: TerminalSelection;
   runAction: RunTerminalAction;
   scrollLines(delta: number): void;
+  /** Request an absolute row in the currently presented history coordinate space. */
+  scrollToRow(top: number): void;
   scrollToLive(): void;
+  /** Resolve a retained marker on the producer; rejects unavailable or removed anchors. */
+  scrollToMarker(id: string): Promise<void>;
+  /** Register a per-view, reflow-aware marker. The server enforces the per-view quota. */
+  addMarker(options: TerminalMarkerOptions): Promise<TerminalMarker>;
+  removeMarker(id: string): Promise<void>;
+  getCommandMarkDetails(id: string): Promise<TerminalCommandMark>;
+  setPadding(padding: TerminalPadding): void;
+  setScrollbar(scrollbar: TerminalScrollbar): void;
+  /** Repaint after changing host-owned painter state or embedding theme colors. */
+  refreshScrollbar(): void;
   clearSelection(): void;
   refreshSelectionUI(): void;
   copySelection(options?: CopySelectionOptions): Promise<string>;

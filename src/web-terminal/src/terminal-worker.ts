@@ -1,9 +1,14 @@
 import { decodeFrame, screenText } from "./protocol.js";
 import { TerminalRenderer } from "./renderer.js";
 import { LinkPresentation } from "./link-presentation.js";
+import { MarkerPages } from "./marker-pages.js";
 import type { TerminalSize, TerminalStatusLevel } from "./types.js";
 import type { FrameMetadata, TerminalCell, TerminalCommand, WorkerInputMessage, WorkerOutputMessage, WorkerStats } from "./wire-types.js";
 import { errorMessage } from "./validation.js";
+import { compilePalette, defaultDarkPalette, normalizePalette } from "./terminal-palette.js";
+import { createWebSocketTransport } from "./websocket-transport.js";
+import { TransportSession } from "./transport-session.js";
+import type { TerminalTransportConnection, TerminalTransportContext } from "./transport-types.js";
 
 // This module is only executed as a dedicated worker. Keeping its global local to
 // this module avoids leaking worker/WebGPU ambient dependencies to public declarations.
@@ -17,7 +22,10 @@ declare const self: {
 };
 
 let renderer: TerminalRenderer | undefined;
-let socket: WebSocket | undefined;
+let transport: TransportSession | undefined;
+let bridge: TerminalTransportContext | undefined;
+let bridgeReady: ReturnType<typeof Promise.withResolvers<TerminalTransportConnection>> | undefined;
+let bridgeSent: ReturnType<typeof Promise.withResolvers<void>> | undefined;
 let failed = false;
 let stopped = false;
 let processing = false;
@@ -36,6 +44,10 @@ let metricsTimer: ReturnType<typeof setInterval> | undefined;
 let blinkTimer: ReturnType<typeof setInterval> | undefined;
 let viewport: TerminalSize | undefined;
 const links = new LinkPresentation();
+const markerPages = new MarkerPages();
+let awaitingFull = false;
+let requestedColorEncoding = false;
+let palette = compilePalette(defaultDarkPalette);
 const stats: WorkerStats = {
   revision: 0, fullFrames: 0, frames: 0, presentations: 0,
   changedCells: 0, lastChangedCells: 0, discardedFrames: 0,
@@ -53,7 +65,7 @@ function postStatus(message: string, level: TerminalStatusLevel = "info"): void 
 }
 
 function send(message: TerminalCommand): void {
-  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+  if (stats.connected && !failed && !stopped) void transport?.send(JSON.stringify(message)).catch(fail);
 }
 
 function emitStats(text?: string): void {
@@ -69,7 +81,7 @@ function fail(error: unknown): void {
   stats.connected = false;
   clearInterval(metricsTimer);
   clearInterval(blinkTimer);
-  socket?.close();
+  transport?.dispose();
   emitStats();
   postStatus(message, "error");
   renderer?.dispose();
@@ -87,11 +99,11 @@ self.addEventListener("unhandledrejection", event => {
 /** At most one state frame, one decode, and one GPU submission are outstanding. */
 function scheduleRender() {
   needsRender = true;
-  if (scheduled || drawing || processing || failed || stopped || !metadata) return;
+  if (scheduled || drawing || processing || failed || stopped || !metadata || markerPages.pending || awaitingFull) return;
   scheduled = true;
   self.requestAnimationFrame(() => {
     scheduled = false;
-    if (processing || drawing || failed || stopped) return;
+    if (processing || drawing || failed || stopped || markerPages.pending || awaitingFull) return;
     renderPromise = drawFrame();
   });
 }
@@ -106,7 +118,7 @@ async function drawFrame() {
     const linkSubmission = links.submission();
     renderer.resize(metadata.columns, metadata.rows, viewport);
     const blink = Math.floor(performance.now() / 600) % 2 === 0;
-    const result = renderer.render(cells, metadata, blink, linkSubmission.mask);
+    const result = renderer.render(cells, metadata, blink, linkSubmission.mask, palette);
     // This is bounded completion/backpressure, not GPU readback or a GPU timing measurement.
     await renderer.idle();
     if (failed || stopped) return;
@@ -170,10 +182,19 @@ async function receiveFrame(buffer: ArrayBuffer): Promise<void> {
   try {
     const frame = decodeFrame(buffer);
     const next = frame.metadata;
-    if (!next.full && (next.baseRevision !== localRevision || next.revision <= localRevision ||
-        !metadata || next.columns !== metadata.columns || next.rows !== metadata.rows)) {
+    if (!requestedColorEncoding && next.colorEncodings?.includes("indexed-v1")) {
+      requestedColorEncoding = true;
+      send({ type: "colorEncoding", value: "indexed-v1" });
+    }
+    if (!next.full && (awaitingFull || next.baseRevision !== localRevision || next.revision <= localRevision ||
+        !metadata || next.columns !== metadata.columns || next.rows !== metadata.rows ||
+        (next.colorEncoding ?? null) !== (metadata.colorEncoding ?? null))) {
       stats.discardedFrames++;
       frameInFlight = false;
+      markerPages.reset();
+      awaitingFull = true;
+      needsRender = false;
+      pendingFrame = undefined;
       // A discarded frame must release the server's one-in-flight gate before resync.
       send({ type: "ack", revision: next.revision });
       send({ type: "resync" });
@@ -194,10 +215,23 @@ async function receiveFrame(buffer: ArrayBuffer): Promise<void> {
     cells = nextCells;
     metadata = next;
     localRevision = next.revision;
-    pendingFrame = { revision: next.revision, full: next.full, changedCells: frame.cells.length };
+    const wasPaging = markerPages.pending && !next.full;
+    const history = markerPages.accept(next.history);
+    awaitingFull = false;
+    pendingFrame = { revision: next.revision,
+      full: next.full || (wasPaging && !!pendingFrame?.full),
+      changedCells: frame.cells.length + (wasPaging ? pendingFrame?.changedCells ?? 0 : 0) };
     hasBlink = cells.some(cell => cell && (cell.attributes & 16) && !(cell.attributes & 64)) ||
       (next.cursor.visible && (next.cursor.shape === 0 || next.cursor.shape % 2 === 1));
     stats.preparationCpuMs = performance.now() - preparationStart;
+    if (history === undefined) {
+      // Acknowledge an inventory fragment, but expose/draw only the completed snapshot.
+      needsRender = false;
+      frameInFlight = false;
+      send({ type: "ack", revision: next.revision });
+      return;
+    }
+    next.history = history;
     needsRender = true;
   } finally {
     processing = false;
@@ -206,7 +240,8 @@ async function receiveFrame(buffer: ArrayBuffer): Promise<void> {
 }
 
 async function initialize(message: Extract<WorkerInputMessage, { type: "init" }>): Promise<void> {
-  if (renderer || socket) throw new Error("Worker is already initialized");
+  if (renderer || transport) throw new Error("Worker is already initialized");
+  palette = compilePalette(normalizePalette(message.palette === undefined ? defaultDarkPalette : message.palette));
   if (typeof self.requestAnimationFrame !== "function") {
     throw new Error("This browser does not support requestAnimationFrame in a dedicated OffscreenCanvas worker");
   }
@@ -222,41 +257,28 @@ async function initialize(message: Extract<WorkerInputMessage, { type: "init" }>
   const rendererName = renderer.backend.kind === "webgpu" ? "WebGPU" : "WebGL2";
   if (renderer.fallbackReason) postStatus(`Using WebGL2: ${renderer.fallbackReason}`);
   postStatus(`${rendererName} ready. Attaching terminal view...`);
-  const url = new URL(message.url);
-  if (!["ws:", "wss:"].includes(url.protocol)) {
-    throw new Error("The terminal WebSocket URL must use ws: or wss:");
-  }
-  socket = new WebSocket(url);
-  socket.binaryType = "arraybuffer";
-  socket.addEventListener("open", () => {
-    if (failed || stopped) return;
-    stats.connected = true;
-    self.postMessage({ type: "connected" });
-    postStatus(`Connected · ${rendererName} worker · server-authoritative cells and graphics`, "ready");
-    emitStats();
-  });
-  socket.addEventListener("message", event => {
-    if (!(event.data instanceof ArrayBuffer)) {
-      fail(new Error(`Expected binary HWT1 frame, received ${String(event.data).slice(0, 200)}`));
-      return;
-    }
-    receiveFrame(event.data).catch(fail);
-  });
-  // WebSocket errors are followed by close, which carries the browser's actual status.
-  // Rejecting mount on error would terminate this worker before that status can be delivered.
-  socket.addEventListener("close", event => {
-    stats.connected = false;
-    if (!failed && !stopped) {
+  transport = new TransportSession({
+    onReady() {
+      if (failed || stopped) return;
+      stats.connected = true;
+      self.postMessage({ type: "connected" });
+      postStatus(`Connected · ${rendererName} worker · server-authoritative cells and graphics`, "ready");
+      emitStats();
+    },
+    onFrame: receiveFrame,
+    onError: fail,
+    onClose(details) {
+      if (failed || stopped) return;
+      stats.connected = false;
       stats.gpu = "stopped";
       stats.fps = 0;
       stopped = true;
       clearInterval(metricsTimer);
       clearInterval(blinkTimer);
       renderer?.dispose();
-      self.postMessage({ type: "closed", details: {
-        code: event.code, reason: event.reason, wasClean: event.wasClean
-      } });
-      postStatus(`View disconnected (${event.code}${event.reason ? `: ${event.reason}` : ""}). Attach another view to reconnect.`, "error");
+      self.postMessage({ type: "closed", details });
+      postStatus(`View disconnected (${details.code === undefined ? details.reason :
+        `${details.code}${details.reason ? `: ${details.reason}` : ""}`}). Attach another view to reconnect.`, "error");
       emitStats();
     }
   });
@@ -273,17 +295,49 @@ async function initialize(message: Extract<WorkerInputMessage, { type: "init" }>
     const blinkOn = Math.floor(performance.now() / 600) % 2 === 0;
     if (hasBlink && blinkOn !== lastBlink) scheduleRender();
   }, 100);
+  transport.start(message.transport.type === "websocket" ? createWebSocketTransport(message.transport.url) : {
+    connect(context) {
+      bridge = context;
+      bridgeReady = Promise.withResolvers<TerminalTransportConnection>();
+      context.signal.addEventListener("abort", () => {
+        bridgeReady?.reject(context.signal.reason);
+        bridgeSent?.reject(context.signal.reason);
+      }, { once: true });
+      self.postMessage({ type: "transportConnect" });
+      return bridgeReady.promise;
+    }
+  });
 }
 
 self.addEventListener("message", event => {
   const message = event.data;
   if (message.type === "init") {
     initialize(message).catch(fail);
+  } else if (message.type === "transportConnected" && bridge && !failed && !stopped) {
+    bridgeReady?.resolve({
+      send(control) {
+        bridgeSent = Promise.withResolvers<void>();
+        self.postMessage({ type: "transportSend", control });
+        return bridgeSent.promise;
+      },
+      dispose() {}
+    });
+  } else if (message.type === "transportFrame" && bridge && !failed && !stopped) {
+    void bridge.onFrame(message.buffer).then(() => {
+      if (!failed && !stopped) self.postMessage({ type: "transportReceived" });
+    }).catch(fail);
+  } else if (message.type === "transportSent" && !failed && !stopped) {
+    bridgeSent?.resolve();
+    bridgeSent = undefined;
+  } else if (message.type === "transportClosed") {
+    bridge?.onClose(message.details);
+  } else if (message.type === "transportError") {
+    bridge?.onError(new Error(message.message));
   } else if (message.type === "stop") {
     stopped = true;
     clearInterval(metricsTimer);
     clearInterval(blinkTimer);
-    socket?.close(1000, "View detached");
+    transport?.dispose();
     renderer?.dispose();
     self.close();
   } else if (message.type === "viewport" && !failed && !stopped) {
@@ -296,6 +350,11 @@ self.addEventListener("message", event => {
     scheduleRender();
   } else if (message.type === "command" && !failed && !stopped) {
     send(message.command);
+  } else if (message.type === "palette" && !failed && !stopped) {
+    try {
+      palette = compilePalette(normalizePalette(message.palette));
+      scheduleRender();
+    } catch (error) { fail(error); }
   } else if (message.type === "linkDetection" && !failed && !stopped) {
     try {
       if (!links.configure(message.enabled, message.generation)) return;

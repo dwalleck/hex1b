@@ -90,6 +90,19 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
     public int Height => _height;
 
     /// <summary>
+    /// Gets or sets whether new clients may negotiate retained scrollback transfer.
+    /// Defaults to true. Configure before accepting clients. Producers without
+    /// scrollback storage and peers without the extension use screen-only replay.
+    /// </summary>
+    public bool EnableScrollbackHistory { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets whether new clients may negotiate retained OSC 133 mark transfer.
+    /// Defaults to true. Configure before accepting clients.
+    /// </summary>
+    public bool EnableCommandMarkHistory { get; set; } = true;
+
+    /// <summary>
     /// Enables producer-side reflow using the specified strategy.
     /// By default, resize crops the screen without reflow.
     /// </summary>
@@ -303,6 +316,15 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
 
         try
         {
+            session.CommandMarkHistory = clientHello.CommandMarkHistoryVersion == Hmp1CommandMarkState.Version &&
+                EnableCommandMarkHistory && _terminal is not null;
+            if (clientHello.ScrollbackHistoryVersion == Hmp1ScrollbackState.Version &&
+                EnableScrollbackHistory && _terminal?.Scrollback is not null)
+            {
+                if (clientHello.ScrollbackHistoryRows <= 0 || clientHello.ScrollbackHistoryRows > Hmp1ScrollbackState.MaxRows)
+                    throw new InvalidDataException("Invalid requested scrollback history limit.");
+                session.ScrollbackHistoryRows = clientHello.ScrollbackHistoryRows;
+            }
             return await CompleteClientHandshakeAsync(session, ct).ConfigureAwait(false);
         }
         catch
@@ -407,6 +429,8 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
         Hmp1ClientSession[] existingPeers;
         byte[] syncBytes;
         Hmp1ActivityState activityState;
+        Hmp1ScrollbackState? scrollbackState = null;
+        Hmp1CommandMarkState? commandMarkState = null;
         IReadOnlyList<KgpPlacement> kgpPlacements;
         IReadOnlyDictionary<uint, KgpImageData> kgpImages;
         DateTimeOffset? kgpAnimationTimestamp;
@@ -434,7 +458,10 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
             {
                 // A peer must also receive unplaced images: future output can
                 // place or animate retained pixels without transmitting them again.
-                using var snap = _terminal.CreateSnapshot(includeAllKgpImages: true, includeSavedTitles: true);
+                using var snap = _terminal.CaptureHmp1Snapshot(session.ScrollbackHistoryRows, session.CommandMarkHistory,
+                    out scrollbackState, out commandMarkState);
+                widthSnapshot = snap.Width;
+                heightSnapshot = snap.Height;
                 var prefix = BuildStateReplayPrefix(snap);
                 var ansi = snap.ToAnsi(new TerminalAnsiOptions
                 {
@@ -471,6 +498,8 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
             }
             else
             {
+                widthSnapshot = _width;
+                heightSnapshot = _height;
                 activityState = Hmp1ActivityState.Default;
                 syncBytes = [];
                 kgpPlacements = [];
@@ -484,8 +513,6 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
             }
 
             primarySnapshot = _primaryPeerId;
-            widthSnapshot = _width;
-            heightSnapshot = _height;
 
             if (kgpImages.Count > 0)
             {
@@ -586,10 +613,15 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
         // pump hasn't started yet). Failures here are propagated because the caller
         // hasn't yet received a handle.
         await Hmp1Protocol.WriteHelloAsync(
-            stream, widthSnapshot, heightSnapshot, peerId, primarySnapshot, roster, ct).ConfigureAwait(false);
+            stream, widthSnapshot, heightSnapshot, peerId, primarySnapshot, roster, ct,
+            session.ScrollbackHistoryRows, session.CommandMarkHistory).ConfigureAwait(false);
 
         await Hmp1Protocol.WriteFrameAsync(stream, Hmp1FrameType.StateSync, syncBytes, ct).ConfigureAwait(false);
         await Hmp1Protocol.WriteActivityStateAsync(stream, activityState, ct).ConfigureAwait(false);
+        if (scrollbackState is not null)
+            await scrollbackState.WriteAsync(stream, session.ScrollbackHistoryRows, ct).ConfigureAwait(false);
+        if (commandMarkState is not null)
+            await commandMarkState.WriteAsync(stream, scrollbackState?.Rows.Count ?? 0, ct).ConfigureAwait(false);
 
         ct.ThrowIfCancellationRequested();
         // Always enter the pumps so their finally blocks clean up even if the
@@ -737,6 +769,8 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
     public ValueTask WriteOutputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
     {
         var replayActivity = _terminal?.Hmp1ReplayActivityState;
+        var replayScrollback = _terminal?.Hmp1ReplayScrollbackState ?? Hmp1ScrollbackState.Unavailable;
+        var replayCommands = _terminal?.Hmp1ReplayCommandMarkState ?? Hmp1CommandMarkState.Unavailable;
         if (_disposed || (data.IsEmpty && replayActivity is null)) return ValueTask.CompletedTask;
 
         // Enqueue to each client's write channel (non-blocking).
@@ -766,6 +800,13 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
                             .ConfigureAwait(false);
                         await Hmp1Protocol.WriteActivityStateAsync(stream, replayActivity, session.Cts.Token)
                             .ConfigureAwait(false);
+                        if (session.ScrollbackHistoryRows > 0)
+                            await replayScrollback.WriteAsync(stream, session.ScrollbackHistoryRows, session.Cts.Token)
+                                .ConfigureAwait(false);
+                        if (session.CommandMarkHistory)
+                            await replayCommands.WriteAsync(stream,
+                                Math.Min(replayScrollback.Rows.Count, session.ScrollbackHistoryRows), session.Cts.Token)
+                                .ConfigureAwait(false);
                     });
                 if (!session.OutputChannel.Writer.TryWrite(work))
                 {
@@ -1295,6 +1336,8 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
         public int Disposed;
         public int RemoteWidth { get; set; }
         public int RemoteHeight { get; set; }
+        public int ScrollbackHistoryRows { get; set; }
+        public bool CommandMarkHistory { get; set; }
 
         /// <summary>
         /// Per-client outbound queue. When full, the client is disconnected rather than

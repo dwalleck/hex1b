@@ -126,8 +126,8 @@ async page => {
     await test.waitForFunction(() => {
       const [a, b] = [...webTerminalViews.values()];
       const box = a.element.querySelector(".terminal-mount").getBoundingClientRect();
-      const columns = Math.max(20, Math.min(300, Math.floor(box.width / 10)));
-      const rows = Math.max(10, Math.min(100, Math.floor(box.height / 20)));
+      const columns = Math.max(1, Math.min(300, Math.floor(box.width / 10)));
+      const rows = Math.max(1, Math.min(100, Math.floor(box.height / 20)));
       return a.terminal.geometry.columns === columns && a.terminal.geometry.rows === rows &&
         b.terminal.geometry.columns === columns && b.terminal.geometry.rows === rows &&
         a.stats.columns === columns && a.stats.rows === rows && b.stats.columns === columns && b.stats.rows === rows;
@@ -139,6 +139,7 @@ async page => {
     check(sent.filter(command => command.type === "resize").length === noEcho, `Geometry update caused resize loop: ${JSON.stringify(sent.filter(command => command.type === "resize"))}`);
 
     // Explicit takeover changes the grid to the new primary's host box.
+    await second.focus();
     await second.locator(".view-title").click();
     await second.locator(".take-primary").click();
     await test.waitForFunction(() => {

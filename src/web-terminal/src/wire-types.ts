@@ -1,8 +1,10 @@
 import type { InputModifiers, PointerButton, SelectionMode, SelectionRange, TerminalLinkUnderlineStyle,
   TerminalBuffer, TerminalFont, TerminalGeometry, TerminalPeer, TerminalSize, TerminalStats,
   TerminalRendererPreference, TerminalStatusLevel, TerminalProgress, TerminalShellIntegration,
-  TerminalWorkingDirectory, TerminalCommandMark, TerminalCloseDetails } from "./types.js";
+  TerminalWorkingDirectory, TerminalCommandMark, TerminalTransportCloseDetails } from "./types.js";
 import type { LinkDetectionSnapshot } from "./link-detection.js";
+import type { TerminalPalette } from "./terminal-palette.js";
+import type { MarkerResult, TerminalMarker } from "./scrollbar-types.js";
 
 export type SelectionText =
   | { status: "valid"; text: string }
@@ -15,6 +17,10 @@ export interface HistoryMetadata {
   following: boolean; requestId: number; rowIds: string[];
   selection: HistorySelection;
   copy: (SelectionText & { requestId: number }) | null;
+  markers?: TerminalMarker[];
+  markerResult?: MarkerResult | null;
+  viewportError?: string | null;
+  markerPage?: { revision: string; offset: number; total: number } | null;
 }
 export interface TerminalCell {
   index: number; foreground: number; background: number; underlineColor: number;
@@ -35,6 +41,8 @@ export interface ImagePlacement {
 }
 export interface FrameMetadata extends TerminalGeometry {
   version: 1; full: boolean; revision: number; baseRevision: number;
+  colorEncodings?: string[];
+  colorEncoding?: "indexed-v1" | null;
   peer: TerminalPeer; history: HistoryMetadata | null;
   title: string;
   progress: TerminalProgress;
@@ -58,8 +66,12 @@ export type InputCommand =
   | { type: "key"; key: string; ctrl: boolean; alt: boolean; shift: boolean }
   | MouseCommand;
 export type TerminalCommand = InputCommand
+  | { type: "colorEncoding"; value: "indexed-v1" }
   | { type: "viewport"; requestId: number; delta?: number; live?: boolean;
+      top?: number; generation?: string; originRowId?: string; originTop?: number;
       extend?: { row: number; column: number } }
+  | { type: "marker"; action: "add" | "remove" | "jump" | "details"; requestId: number;
+      id: string; generation?: string; rowId?: string; column?: number }
   | { type: "selection"; action: "clear"; requestId: number }
   | { type: "selection"; action: "start" | "extend"; mode: SelectionMode;
       requestId: number; generation: string; rowId: string; column: number }
@@ -68,8 +80,15 @@ export type TerminalCommand = InputCommand
   | { type: "resync" }
   | { type: "ack"; revision: number };
 export type WorkerInputMessage =
-  | { type: "init"; canvas: OffscreenCanvas; url: string; scale: number; font: TerminalFont;
-      renderer: TerminalRendererPreference }
+  | { type: "init"; canvas: OffscreenCanvas;
+      transport: { type: "websocket"; url: string } | { type: "custom" }; scale: number; font: TerminalFont;
+      renderer: TerminalRendererPreference; palette?: TerminalPalette }
+  | { type: "transportConnected" }
+  | { type: "transportFrame"; buffer: ArrayBuffer }
+  | { type: "transportSent" }
+  | { type: "transportClosed"; details: TerminalTransportCloseDetails }
+  | { type: "transportError"; message: string }
+  | { type: "palette"; palette: TerminalPalette }
   | ({ type: "viewport" } & TerminalSize)
   | { type: "linkDetection"; enabled: boolean; generation: number }
   | { type: "linkDecorations"; revision: number; generation: number; serial: number;
@@ -89,7 +108,10 @@ export interface WorkerStats extends TerminalStats {
 }
 export type WorkerOutputMessage =
   | { type: "connected" }
-  | { type: "closed"; details: TerminalCloseDetails }
+  | { type: "transportConnect" }
+  | { type: "transportSend"; control: string }
+  | { type: "transportReceived" }
+  | { type: "closed"; details: TerminalTransportCloseDetails }
   | { type: "status"; message: string; level: TerminalStatusLevel }
   | ({ type: "geometry"; peer: TerminalPeer; history: HistoryMetadata | null;
        revision: number; title: string; progress: TerminalProgress; shellIntegration: TerminalShellIntegration;

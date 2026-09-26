@@ -535,6 +535,31 @@ Not every widget needs every combination, but consider which dimensions are rele
 
 ## Low-Level API Testing (Isolation)
 
+### Output-Pump Allocation Regressions
+
+Measure `GC.GetAllocatedBytesForCurrentThread()` around a synchronous application
+region, not across awaits or for the whole process. A workload filter returning
+`ValueTask.CompletedTask` can start the measurement after parsing; the terminal's
+`PresentationInvalidated` callback can finish it. Assert both callbacks used the
+same thread. Use a large batch of allocation-free tokens (such as SGR resets)
+and a byte budget that excludes per-token bookkeeping but allows fixed overhead.
+Keep parsing and HWT frame generation outside the measured region, then separately
+verify frame delivery and batch accounting. See `Hwt1ImpactCollectionTests` for
+raw, pre-tokenized, and HMP StateSync coverage. Confirm the guard fails when the
+optimization is disabled; behavior-only assertions do not prove allocation removal.
+
+### Keyboard Wire Conformance
+
+Use literal expected bytes independent of the production key/text mapper. For
+example, Alt+Shift+E is `1B45`, while Ctrl+Alt+E is `1B05` in Hex1b's legacy
+automation profile. Exercise the public automator and sequence builder against a
+recording workload, asserting immediately after awaited sends rather than sleeping.
+See `TerminalKeyboardMatrixTests` for the key/modifier/cursor-mode/keypad-mode
+matrix and completeness checks that fail when an enum grows. Include modifier
+reset, overlap, ordering, and replay after mode changes; constructing a sequence
+must not freeze its wire encoding. Keep physical layout, AltGr/IME, and negotiated
+keyboard protocols distinct from this logical-key encoding contract.
+
 ### Native Windows Console Probes
 
 Run native console tests in a child process under `WindowsProxyPtyHandle`, not

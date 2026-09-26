@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Worker as NodeWorker } from "node:worker_threads";
-import { LinkDetection } from "../dist/link-detection.js";
-import { scanLinks } from "../dist/link-detection-worker.js";
-import { LINK_LIMITS } from "../dist/link-options.js";
+import { LinkDetection } from "../.build/link-detection.js";
+import { scanLinks } from "../.build/link-detection-worker.js";
+import { LINK_LIMITS } from "../.build/link-options.js";
 
 function snapshot(text = " foo ", revision = 1) {
   return { revision, columns: text.length, rows: 1, hyperlinks: [],
@@ -252,8 +252,9 @@ test("cache eviction accounts for captured result payload rather than keys alone
   assert.equal(state.worker().messages.length, 1, "Captured payload should have forced cache eviction");
 });
 
-test("real isolated worker terminates pathological regex and recovers unrelated rules", async t => {
+test("real isolated worker terminates stalled scanner and recovers unrelated rules", async t => {
   const workers = [];
+  const stallPattern = /__hex1b_timeout__/g;
   class BrowserWorker {
     constructor(url) {
       this.worker = new NodeWorker(new URL(`data:text/javascript,${encodeURIComponent(`
@@ -263,7 +264,13 @@ test("real isolated worker terminates pathological regex and recovers unrelated 
         let onmessage;
         globalThis.addEventListener = (type, listener) => { if (type === "message") onmessage = listener; };
         const ready = import(workerData);
-        parentPort.on("message", async data => { await ready; onmessage({ data }); });
+        parentPort.on("message", async data => {
+          await ready;
+          if (data?.rule?.source === ${JSON.stringify(stallPattern.source)}) {
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
+          }
+          onmessage({ data });
+        });
       `)}`), { workerData: url.href, execArgv: [] });
       workers.push(this);
       this.worker.on("message", data => this.onmessage?.({ data }));
@@ -282,6 +289,7 @@ test("real isolated worker terminates pathological regex and recovers unrelated 
   const completion = Promise.withResolvers();
   const errors = [];
   const detector = new LinkDetection({ actions: new Set(["open"]),
+    workerUrl: new URL("../.build/link-detection-worker.js", import.meta.url),
     onChange: (_, links) => { if (links.length) completion.resolve(links); },
     onError: error => {
       errors.push(error);
@@ -292,8 +300,8 @@ test("real isolated worker terminates pathological regex and recovers unrelated 
   const timer = setTimeout(() => completion.reject(
     new Error(`Detection recovery timed out: ${JSON.stringify(errors)}`)), 3000);
   try {
-    detector.configure({ rules: [rule("evil", { pattern: /(a+)+$/ }), rule("good")] });
-    detector.update(snapshot(` ${"a".repeat(10000)}! foo `));
+    detector.configure({ rules: [rule("evil", { pattern: stallPattern }), rule("good")] });
+    detector.update(snapshot(" foo "));
     const links = await completion.promise;
     assert.equal(errors[0].code, "timeout");
     assert.equal(errors[0].ruleId, "evil");

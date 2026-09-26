@@ -24,9 +24,34 @@ namespace Hex1b;
 /// change without backward-compatibility or deprecation guarantees; its name and
 /// version field do not imply cross-release compatibility. This API is also experimental.
 /// The current client-requested profile uses 10x20 logical-pixel cells,
-/// 20..300 columns, and 10..100 rows. A directly attached
+/// 1..300 columns, and 1..100 rows. A directly attached
 /// <see cref="Hmp1WorkloadAdapter"/> supplies authoritative geometry and primary
 /// ownership instead; producer dimensions are not clamped to this request profile.
+/// An HMP1-backed terminal must enable its own scrollback, for example with
+/// <see cref="Hex1bTerminalBuilder.WithScrollback"/>; its capacity remains authoritative.
+/// Optional HMP1 history negotiation transfers a bounded suffix of retained main-buffer
+/// text after the screen and mandatory activity checkpoint. The complete checkpoint is
+/// validated before screen, activity, history, and negotiated command marks are atomically applied. History replaces
+/// rather than appends, so reconnects and resyncs do not duplicate retained rows.
+/// <see cref="Hmp1ClientOptions.ScrollbackHistoryRows"/> defaults to 10,000; zero opts out.
+/// The producer must retain scrollback and enable
+/// <see cref="Hmp1PresentationAdapter.EnableScrollbackHistory"/> (true by default).
+/// Without scrollback negotiation, existing HMP1 peers keep screen-only text replay and a fresh replica
+/// has only subsequent locally observed history. An unavailable history checkpoint
+/// does not additionally replace local history; explicit clearing operations in
+/// the screen replay still take effect. An available empty checkpoint clears history.
+/// Main-buffer history received during an alternate screen stays hidden until returning.
+/// Retained OSC 133 command marks are negotiated independently through
+/// <see cref="Hmp1ClientOptions.EnableCommandMarkHistory"/> and
+/// <see cref="Hmp1PresentationAdapter.EnableCommandMarkHistory"/> (true by default).
+/// Eligible marks restore raw details, phase, status, positions, IDs, and the ID high-water
+/// mark without synthesizing command events. Repeated checkpoints replace command history;
+/// local capacities and backing-text lifetime still apply. Missing negotiation falls back
+/// independently of text history. Historical graphics and custom/browser-owned markers are
+/// not transferred; marks on an untransferred saved main screen are omitted.
+/// Producer-backed views created with
+/// <see cref="Hmp1PresentationAdapter.CreateBrowserViewAsync"/> instead read retained
+/// history directly from the shared producer.
 /// Frames support up to 1024 columns, 512 rows, and 262144 total cells.
 /// Larger authoritative grids fail projection without resizing the producer.
 /// Reconnection requires a new adapter; resync repairs the existing connection only.
@@ -58,6 +83,8 @@ public sealed class Hwt1PresentationAdapter :
         new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite });
     private readonly Hwt1RenderProjection _projection = new();
     private readonly object _projectionLock = new();
+    internal const int MarkerPageSize = 2048;
+    private readonly Queue<(byte[] Bytes, uint Revision)> _markerFrames = new();
     private readonly object _ackLock = new();
     private readonly CancellationTokenSource _disposedCancellation = new();
     private readonly TimeProvider _timeProvider;
@@ -71,6 +98,7 @@ public sealed class Hwt1PresentationAdapter :
     private TaskCompletionSource? _ack;
     private uint _awaitedRevision;
     private int _forceFull = 1;
+    private bool _indexedColors;
     private int _reading;
     private int _disposed;
     private bool _isReadOnly;
@@ -82,8 +110,8 @@ public sealed class Hwt1PresentationAdapter :
     private TimeSpan _acknowledgementTimeout = TimeSpan.FromMinutes(2);
 
     /// <summary>Creates an HWT1 presentation adapter with the initial grid dimensions.</summary>
-    /// <param name="width">Initial width, from 20 to 300 columns.</param>
-    /// <param name="height">Initial height, from 10 to 100 rows.</param>
+    /// <param name="width">Initial width, from 1 to 300 columns.</param>
+    /// <param name="height">Initial height, from 1 to 100 rows.</param>
     /// <exception cref="ArgumentOutOfRangeException">A dimension is outside the draft profile's bounds.</exception>
     public Hwt1PresentationAdapter(int width = 80, int height = 24)
         : this(width, height, TimeProvider.System)
@@ -92,9 +120,9 @@ public sealed class Hwt1PresentationAdapter :
 
     internal Hwt1PresentationAdapter(int width, int height, TimeProvider timeProvider)
     {
-        ArgumentOutOfRangeException.ThrowIfLessThan(width, 20);
+        ArgumentOutOfRangeException.ThrowIfLessThan(width, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(width, 300);
-        ArgumentOutOfRangeException.ThrowIfLessThan(height, 10);
+        ArgumentOutOfRangeException.ThrowIfLessThan(height, 1);
         ArgumentOutOfRangeException.ThrowIfGreaterThan(height, 100);
         _width = width;
         _height = height;
@@ -240,6 +268,15 @@ public sealed class Hwt1PresentationAdapter :
             if (acknowledgement is not null)
                 await acknowledgement.WaitAsync(AcknowledgementTimeout, _timeProvider, linked.Token);
 
+            lock (_projectionLock)
+            {
+                linked.Token.ThrowIfCancellationRequested();
+                if (_markerFrames.TryDequeue(out var next))
+                {
+                    PrepareAcknowledgement(next.Revision);
+                    return next.Bytes;
+                }
+            }
             _ = await _dirty.Reader.ReadAsync(linked.Token);
             consumedInvalidation = true;
             linked.Token.ThrowIfCancellationRequested();
@@ -281,14 +318,33 @@ public sealed class Hwt1PresentationAdapter :
             lock (_projectionLock)
             {
                 linked.Token.ThrowIfCancellationRequested();
-                bytes = _projection.Encode(snapshot, Capabilities, terminal.OutputBytesRead,
-                    Interlocked.Read(ref _outputBatches), Stopwatch.GetElapsedTime(_started).TotalMilliseconds,
-                    Interlocked.Exchange(ref _forceFull, 0) != 0, snapshotMs, peer, history);
-            }
-            lock (_ackLock)
-            {
-                _awaitedRevision = _projection.Revision;
-                _ack = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                var full = Interlocked.Exchange(ref _forceFull, 0) != 0;
+                if (history.Markers.Length > MarkerPageSize)
+                {
+                    var revision = checked(_projection.Revision + 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    for (var offset = 0; offset < history.Markers.Length; offset += MarkerPageSize)
+                    {
+                        var page = history with
+                        {
+                            Markers = history.Markers.Skip(offset).Take(MarkerPageSize).ToArray(),
+                            MarkerPage = new(revision, offset, history.Markers.Length)
+                        };
+                        var encoded = _projection.Encode(snapshot, Capabilities, terminal.OutputBytesRead,
+                            Interlocked.Read(ref _outputBatches), Stopwatch.GetElapsedTime(_started).TotalMilliseconds,
+                            full && offset == 0, snapshotMs, peer, page, _indexedColors);
+                        _markerFrames.Enqueue((encoded, _projection.Revision));
+                    }
+                    var first = _markerFrames.Dequeue();
+                    bytes = first.Bytes;
+                    PrepareAcknowledgement(first.Revision);
+                }
+                else
+                {
+                    bytes = _projection.Encode(snapshot, Capabilities, terminal.OutputBytesRead,
+                        Interlocked.Read(ref _outputBatches), Stopwatch.GetElapsedTime(_started).TotalMilliseconds,
+                        full, snapshotMs, peer, history, _indexedColors);
+                    PrepareAcknowledgement(_projection.Revision);
+                }
             }
             return bytes;
         }
@@ -303,9 +359,18 @@ public sealed class Hwt1PresentationAdapter :
         }
     }
 
+    private void PrepareAcknowledgement(uint revision)
+    {
+        lock (_ackLock)
+        {
+            _awaitedRevision = revision;
+            _ack = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+    }
+
     /// <summary>Processes one complete UTF-8 HWT1 client JSON message.</summary>
     /// <param name="utf8Json">An acknowledgement, resync, resize, requestPrimary, input, paste, key, mouse,
-    /// viewport, selection, or copy message, at most 64 KiB.</param>
+    /// viewport, marker, selection, copy, or colorEncoding message, at most 64 KiB.</param>
     /// <param name="cancellationToken">Cancels processing and workload input writes.</param>
     /// <returns>A task that completes when the message has been handled.</returns>
     /// <remarks>
@@ -319,6 +384,16 @@ public sealed class Hwt1PresentationAdapter :
     /// secondary peers can still send keyboard, mouse, and paste input.
     /// When <see cref="IsReadOnly"/> is enabled, producer-mutating commands are validated
     /// but ignored without changing this view's viewport or selection.
+    /// Every frame advertises colorEncodings: ["indexed-v1"]. Clients should wait for this
+    /// advertisement before sending a colorEncoding command, so older servers remain usable.
+    /// A colorEncoding message with value "indexed-v1" opts this connection into color
+    /// references, forcing a full frame after any outstanding acknowledgement. Repeated
+    /// opt-ins are harmless. Legacy connections retain resolved RGBA colors.
+    /// Opt-in frames carry colorEncoding: "indexed-v1" in their metadata. Cell colors
+    /// encode RGB as 0xFFBBGGRR, palette indices as 0x01000000 | index, default foreground
+    /// as 0x02000000, default background as 0x03000000, and inherited underline foreground
+    /// as 0x04000000. Reverse and dim remain unapplied attributes for the browser to resolve;
+    /// metadata defaultForeground and defaultBackground remain packed RGBA fallbacks.
     /// </remarks>
     /// <exception cref="InvalidOperationException">The adapter is unattached or a JSON field has the wrong type.</exception>
     /// <exception cref="InvalidDataException">The command, its values, or its size are unsupported.</exception>
@@ -347,12 +422,29 @@ public sealed class Hwt1PresentationAdapter :
                 }
                 break;
             case "resync":
-                Interlocked.Exchange(ref _forceFull, 1);
+                lock (_projectionLock)
+                {
+                    _markerFrames.Clear();
+                    Interlocked.Exchange(ref _forceFull, 1);
+                }
+                InvalidatePresentation();
+                break;
+            case "colorEncoding":
+                if (command.GetProperty("value").GetString() != "indexed-v1")
+                    throw new InvalidDataException("Unsupported HWT1 color encoding.");
+                lock (_projectionLock)
+                {
+                    if (_indexedColors)
+                        break;
+                    _indexedColors = true;
+                    _markerFrames.Clear();
+                    Interlocked.Exchange(ref _forceFull, 1);
+                }
                 InvalidatePresentation();
                 break;
             case "resize":
-                var columns = ReadBounded(command, "columns", 20, 300);
-                var rows = ReadBounded(command, "rows", 10, 100);
+                var columns = ReadBounded(command, "columns", 1, 300);
+                var rows = ReadBounded(command, "rows", 1, 100);
                 if (IsReadOnly)
                     break;
                 if (_muxer is not null)
@@ -363,8 +455,8 @@ public sealed class Hwt1PresentationAdapter :
                     await ResizeAsync(columns, rows, linked.Token);
                 break;
             case "requestPrimary":
-                var primaryColumns = ReadBounded(command, "columns", 20, 300);
-                var primaryRows = ReadBounded(command, "rows", 10, 100);
+                var primaryColumns = ReadBounded(command, "columns", 1, 300);
+                var primaryRows = ReadBounded(command, "rows", 1, 100);
                 if (IsReadOnly)
                     break;
                 if (_muxer is not null)
@@ -403,6 +495,7 @@ public sealed class Hwt1PresentationAdapter :
             case "viewport":
             case "selection":
             case "copy":
+            case "marker":
                 terminal.HandleBrowserHistoryMessage(_view, command);
                 InvalidatePresentation();
                 break;
@@ -509,11 +602,15 @@ public sealed class Hwt1PresentationAdapter :
             _width = terminal.Width;
             _height = terminal.Height;
             terminal.PresentationInvalidated -= InvalidatePresentation;
+            terminal.ReleaseBrowserMarkers(_view);
         }
         _disposedCancellation.Cancel();
         _dirty.Writer.TryComplete();
         lock (_projectionLock)
+        {
+            _markerFrames.Clear();
             _projection.Clear();
+        }
         var muxer = _muxer;
         var session = _session;
         _terminal = null;

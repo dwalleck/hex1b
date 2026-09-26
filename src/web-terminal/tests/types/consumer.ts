@@ -1,10 +1,61 @@
 import {
-  WebTerminal, InputRoute, TerminalAction, defaultInputBindings, MIN_FONT_SIZE, MAX_FONT_SIZE, linkAction,
+  WebTerminal, InputRoute, TerminalAction, defaultInputBindings, MIN_FONT_SIZE, MAX_FONT_SIZE, linkAction, renderDefaultScrollbar,
   type WebTerminalOptions, type WebTerminalHandle, type TerminalInput, type InputBinding,
   type TerminalSelection, type TerminalViewport, type SelectionUIEvent, type TerminalStats,
   type TerminalRendererKind, type TerminalRendererPreference, type TerminalProgress,
   type TerminalShellIntegration, type TerminalCloseDetails
 } from "@hex1b/web-terminal";
+import {
+  createWebSocketTransport, type TerminalTransport, type TerminalTransportContext,
+  type TerminalTransportConnection, type TerminalTransportCloseDetails
+} from "@hex1b/web-terminal";
+
+const transport: TerminalTransport = {
+  async connect(context: TerminalTransportContext): Promise<TerminalTransportConnection> {
+    context.signal.throwIfAborted();
+    const close: TerminalTransportCloseDetails = { reason: "host detached" };
+    console.log(close);
+    return { async send(control: string) { console.log(control); }, dispose() {} };
+  }
+};
+const customOptions: WebTerminalOptions = {
+  transport,
+  onClose(details) {
+    const code: number | undefined = details.code;
+    console.log(code, details.reason);
+  }
+};
+const socketOptions: WebTerminalOptions = { transport: createWebSocketTransport("/ws") };
+// @ts-expect-error Exactly one live transport is required.
+const missingTransport: WebTerminalOptions = {};
+// @ts-expect-error URL is shorthand, not an override of an explicit transport.
+const conflictingTransport: WebTerminalOptions = { url: "/ws", transport };
+// @ts-expect-error connect must provide a ready connection.
+const invalidTransport: TerminalTransport = { connect() {} };
+console.log(customOptions, socketOptions, missingTransport, conflictingTransport, invalidTransport);
+import { defaultDarkPalette, defaultLightPalette, type TerminalPalette, type TerminalColorMode } from "@hex1b/web-terminal";
+import {
+  createDefaultScrollbarRenderer, renderDefaultScrollbarTooltip,
+  type TerminalScrollbarAppearance, type TerminalScrollbarTooltipContext, type TerminalScrollbarTooltipRenderer
+} from "@hex1b/web-terminal";
+
+const appearance: TerminalScrollbarAppearance = {
+  track: { color: "#112233", opacity: 0.3 }, thumb: { opacity: 0.9 },
+  markers: { color: "gold", errorColor: "red", opacity: 0.8 }
+};
+const styledScrollbar = createDefaultScrollbarRenderer(appearance);
+const tooltip: TerminalScrollbarTooltipRenderer = context => {
+  const snapshot: TerminalScrollbarTooltipContext = context;
+  const element = renderDefaultScrollbarTooltip(snapshot);
+  snapshot.signal.addEventListener("abort", () => element.remove(), { once: true });
+  const raw: string | null | undefined = snapshot.details?.rawParameters;
+  console.log(snapshot.anchor, snapshot.layout, raw, snapshot.loading, snapshot.error);
+  // @ts-expect-error Tooltip marker snapshots are readonly.
+  snapshot.marker.label = "Changed";
+  return element;
+};
+// @ts-expect-error Tooltip renderers must synchronously provide their DOM element.
+const asyncTooltip: TerminalScrollbarTooltipRenderer = async context => renderDefaultScrollbarTooltip(context);
 
 const container = document.createElement("div");
 const minimumFontSize: 8 = MIN_FONT_SIZE;
@@ -12,9 +63,12 @@ const maximumFontSize: 32 = MAX_FONT_SIZE;
 console.log(minimumFontSize, maximumFontSize);
 const bindings: InputBinding[] = defaultInputBindings();
 const options: WebTerminalOptions = {
+  colorMode: "system",
+  lightModePalette: defaultLightPalette,
+  darkModePalette: { ...defaultDarkPalette, selectionForeground: "#ffffff", selectionBackground: "#334455" },
   url: new URL("wss://example.test/terminal"),
-  workerUrl: new URL("/web-terminal/terminal-worker.js", "https://example.test"),
-  linkDetectionWorkerUrl: "/web-terminal/link-detection-worker.js",
+  workerUrl: new URL("/web-terminal/index.js#hex1b-terminal-worker", "https://example.test"),
+  linkDetectionWorkerUrl: "/web-terminal/index.js#hex1b-link-detection-worker",
   links: { detection: { underlineStyle: "dashed", decoration: "hover", rules: [
     { id: "web", builtin: "url", action: "preview" },
     { id: "custom", pattern: /\bPROJ-(?<id>\d+)\b/gu, kind: "custom", text: "viewport",
@@ -49,6 +103,12 @@ const options: WebTerminalOptions = {
     { id: "inspect", match: input => input.type === "pointer" && input.button === "left", action: "inspect" }
   ],
   onInput(input, context) {
+    const palette: TerminalPalette = { ...defaultDarkPalette, extended: { 42: "#123456" } };
+    const mode: TerminalColorMode = context.terminal.colorMode;
+    context.terminal.setPalette("dark", palette);
+    context.terminal.setColorMode(mode);
+    // @ts-expect-error System is a mode selector, not a palette slot.
+    context.terminal.setPalette("system", palette);
     if (input.type === "key") {
       const repeat: boolean = input.repeat;
       if (repeat) return InputRoute.Consume;
@@ -63,6 +123,32 @@ const options: WebTerminalOptions = {
     const renderer: TerminalRendererKind | undefined = stats.renderer;
     const reason: string | undefined = stats.rendererFallbackReason;
     console.log(revision, mirror, renderer, reason);
+  },
+  padding: { top: 8, right: 12, bottom: 8, left: 16 },
+  scrollbar: {
+    placement: "beside",
+    tooltip,
+    render(frame) {
+      styledScrollbar(frame);
+      console.log(frame.hoveredMarker?.marker.id);
+      frame.context.fillRect(frame.track.left, frame.track.top, frame.track.width, frame.track.height);
+      // @ts-expect-error Painters cannot mutate authoritative viewport state.
+      frame.layout.cellHeight = 1;
+      return renderDefaultScrollbar(frame);
+    }
+  },
+  onLayoutChange(layout) {
+    const height: number = layout.cellHeight;
+    const gutter: number | undefined = layout.scrollbar?.width;
+    console.log(height, gutter);
+  },
+  onMarkersChange(markers) {
+    // @ts-expect-error Retained marker inventories are readonly.
+    markers.push({});
+    for (const marker of markers) {
+      const row: number | null = marker.row;
+      console.log(marker.id, row);
+    }
   },
   onTitleChange(title) {
     const currentTitle: string = title;

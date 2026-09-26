@@ -1,8 +1,22 @@
 import { captureMouse } from "./mouse-input.js";
+import { defaultWorkerUrl } from "./worker-url.js";
+import { selectTransport, workerWebSocketUrl } from "./websocket-transport.js";
+import { TransportSession } from "./transport-session.js";
+import type { TerminalTransport } from "./transport-types.js";
+import { randomId } from "./random-id.js";
 import { normalizeFont } from "./terminal-font.js";
 import { normalizeRenderer } from "./renderer-options.js";
-import { dimensions, normalizeSizing, requestedGrid, fittedScale } from "./terminal-sizing.js";
+import { defaultDarkPalette, defaultLightPalette, normalizeColorMode, normalizePalette } from "./terminal-palette.js";
+import type { TerminalColorMode, TerminalPalette } from "./terminal-palette.js";
+import { paletteScrollbarColors } from "./scrollbar-colors.js";
+import { dimensions, normalizeSizing, requestedGrid } from "./terminal-sizing.js";
 import { HistoryState } from "./history-state.js";
+import { MarkerState } from "./marker-state.js";
+import { normalizePadding, contentSpace, terminalLayout } from "./terminal-layout.js";
+import { normalizeScrollbar, ScrollbarController } from "./scrollbar.js";
+import { ScrollbarTooltip } from "./scrollbar-tooltip.js";
+import type { TerminalInsets, TerminalLayout, TerminalMarker, TerminalMarkerOptions, TerminalPadding,
+  TerminalScrollbar, TerminalScrollbarConfiguration } from "./scrollbar-types.js";
 import { terminalThemeCss } from "./terminal-theme.js";
 import { InputPolicy, InputRoute, TerminalAction, inputModifiers } from "./input-policy.js";
 import { assertCommandSize } from "./protocol.js";
@@ -35,7 +49,16 @@ function requiredElement<T extends Element>(root: ParentNode, selector: string, 
 export class WebTerminal implements WebTerminalHandle {
   readonly element: HTMLDivElement;
   #options: WebTerminalOptions;
+  #transport: TerminalTransport;
+  #transportSession: TransportSession | undefined;
+  #transportFrame: ReturnType<typeof Promise.withResolvers<void>> | undefined;
   #renderer: TerminalRendererPreference;
+  #colorMode: TerminalColorMode;
+  #palettes: { light: TerminalPalette; dark: TerminalPalette };
+  #colorScheme: MediaQueryList | undefined;
+  #systemColorChanged = () => {
+    if (!this.#disposed && this.#colorMode === "system") this.#applyPalette();
+  };
   // DOM and worker fields are initialized by mount before a handle is returned.
   #worker!: Worker;
   #surface!: HTMLDivElement;
@@ -69,6 +92,14 @@ export class WebTerminal implements WebTerminalHandle {
   #commandMark: TerminalCommandMark | null = null;
   #hasActivity = false;
   #history: HistoryState;
+  #markerState: MarkerState;
+  #padding: TerminalInsets;
+  #scrollbar: false | TerminalScrollbarConfiguration;
+  #layout: TerminalLayout;
+  #scrollbarController: ScrollbarController | undefined;
+  #scrollbarTooltip: ScrollbarTooltip | undefined;
+  #layoutNotification = false;
+  #markerNotification = false;
   #highlights!: HTMLDivElement;
   #inspection!: HTMLDivElement;
   #inspectionError = "";
@@ -99,7 +130,7 @@ export class WebTerminal implements WebTerminalHandle {
   /** Resolves after a connected terminal frame is presented. Supply signal to cancel mounting. */
   static async mount(container: HTMLElement, options: WebTerminalOptions): Promise<WebTerminal> {
     if (!(container instanceof HTMLElement)) throw new TypeError("A terminal container HTMLElement is required");
-    if (!options?.url) throw new TypeError("A terminal WebSocket URL is required");
+    const transport = selectTransport(options);
     if (options.signal?.aborted) throw options.signal.reason;
     if (normalizeRenderer(options.renderer) === "webgpu" && (!window.isSecureContext || !navigator.gpu)) {
       throw new Error("The requested WebGPU renderer requires WebGPU over HTTPS or localhost");
@@ -108,7 +139,7 @@ export class WebTerminal implements WebTerminalHandle {
         !HTMLCanvasElement.prototype.transferControlToOffscreen) {
       throw new Error("WebTerminal requires module workers, ResizeObserver, and a transferable OffscreenCanvas");
     }
-    const terminal = new WebTerminal(options);
+    const terminal = new WebTerminal(options, transport);
     try {
       await Promise.all([terminal.#ready.promise, Promise.resolve().then(() => terminal.#start(container))]);
       return terminal;
@@ -118,12 +149,21 @@ export class WebTerminal implements WebTerminalHandle {
     }
   }
 
-  private constructor(options: WebTerminalOptions) {
+  private constructor(options: WebTerminalOptions, transport = selectTransport(options)) {
     this.#options = options;
+    this.#transport = transport;
     if (options.readOnly !== undefined && typeof options.readOnly !== "boolean")
       throw new TypeError("readOnly must be a boolean");
     this.#readOnly = options.readOnly ?? false;
     this.#renderer = normalizeRenderer(options.renderer);
+    this.#colorMode = normalizeColorMode(options.colorMode);
+    this.#palettes = {
+      light: normalizePalette(options.lightModePalette === undefined ? defaultLightPalette : options.lightModePalette),
+      dark: normalizePalette(options.darkModePalette === undefined ? defaultDarkPalette : options.darkModePalette),
+    };
+    this.#padding = normalizePadding(options.padding);
+    this.#scrollbar = normalizeScrollbar(options.scrollbar);
+    this.#layout = terminalLayout(this.#size, this.#geometry, false, this.#sizing, this.#padding, this.#scrollbar);
     if (options.workerUrl !== undefined && !(options.workerUrl instanceof URL) &&
         (typeof options.workerUrl !== "string" || !options.workerUrl.trim()))
       throw new TypeError("workerUrl must be a nonempty URL string or URL");
@@ -155,6 +195,7 @@ export class WebTerminal implements WebTerminalHandle {
     });
     this.#linkDetector.configure(this.#links ? this.#links.detection : false);
     this.#history = new HistoryState(command => this.#send(command), () => this.#inspectionChanged());
+    this.#markerState = new MarkerState(command => this.#send(command), () => this.#markersChanged());
     this.element = document.createElement("div");
     this.element.className = "hex1b-terminal";
     this.element.tabIndex = -1;
@@ -174,6 +215,10 @@ export class WebTerminal implements WebTerminalHandle {
   get stats(): TerminalStats { return { ...this.#stats }; }
   get screenText() { return this.#screenText; }
   get sizing(): TerminalSizingState { return { ...this.#sizing }; }
+  get layout(): TerminalLayout { return this.#layout; }
+  get padding(): TerminalInsets { return this.#padding; }
+  get scrollbar(): false | TerminalScrollbarConfiguration { return this.#scrollbar; }
+  get markers(): readonly TerminalMarker[] { return this.#markerState.markers; }
   get inputBindings(): InputBinding[] { return this.#policy.bindings; }
   get viewport(): TerminalViewport {
     const viewport = this.#history.viewport;
@@ -188,10 +233,7 @@ export class WebTerminal implements WebTerminalHandle {
 
   #start(container: HTMLElement): void {
     if (this.#options.signal?.aborted) throw this.#options.signal.reason;
-    const url = new URL(this.#options.url, location.href);
-    if (url.protocol === "https:") url.protocol = "wss:";
-    if (url.protocol === "http:") url.protocol = "ws:";
-    if (!["ws:", "wss:"].includes(url.protocol)) throw new TypeError("A ws: or wss: URL is required");
+    const url = workerWebSocketUrl(this.#transport);
     const scale = this.#options.scale === undefined || this.#options.scale === "auto"
       ? Math.min(3, Math.max(0.5, window.devicePixelRatio || 1)) : this.#options.scale;
     if (!Number.isFinite(scale) || scale < 0.5 || scale > 3) throw new RangeError("Backing scale must be 0.5-3 or 'auto'");
@@ -203,10 +245,13 @@ export class WebTerminal implements WebTerminalHandle {
         ${terminalThemeCss}
         :host { display: block; }
         .viewport { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; overflow: hidden; }
-        .surface { position: relative; flex: none; overflow: hidden; }
+        .surface { position: absolute; flex: none; overflow: hidden; }
         canvas { display: block; width: 100%; height: 100%; user-select: none; touch-action: none; }
+        .scrollbar-canvas { position: absolute; inset: 0; pointer-events: none; }
+        .scrollbar-tooltip-slot { position: absolute; inset: 0; display: block; pointer-events: none; }
+        .scrollbar-accessibility { position: absolute; pointer-events: none; outline: none; }
         .highlights { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
-        .highlight { position: absolute; background: var(--cp-view-accent); opacity: .3; }
+        .highlight { position: absolute; }
         .selection-ui-slot { position: absolute; inset: 0; display: block; pointer-events: none; font: 11px/1.4 var(--cp-view-font-family); color: var(--cp-view-text); }
         .inspection { position: absolute; right: 4px; bottom: 4px; left: 4px; display: flex; flex-wrap: wrap; gap: 4px; justify-content: end; align-items: center; pointer-events: none; font: 11px/1.4 var(--cp-view-font-family); }
         .inspection [hidden] { display: none; }
@@ -224,7 +269,11 @@ export class WebTerminal implements WebTerminalHandle {
         <div class="highlights" part="selection-highlights" aria-hidden="true"></div>
         <textarea autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
         <slot name="selection-ui" class="selection-ui-slot"></slot>
-      </div><div class="inspection">
+      </div>
+      <canvas class="scrollbar-canvas" aria-hidden="true"></canvas>
+      <div class="scrollbar-accessibility" role="scrollbar" aria-label="Terminal scrollback" aria-orientation="vertical" tabindex="0"></div>
+      <slot name="scrollbar-tooltip" class="scrollbar-tooltip-slot"></slot>
+      <div class="inspection">
         <span class="inspection-message" role="status" aria-live="polite" hidden></span>
         <button class="copy-selection" part="selection-copy-button" hidden disabled>Copy</button>
         <button class="return-live" hidden>Return to live</button>
@@ -234,6 +283,39 @@ export class WebTerminal implements WebTerminalHandle {
     this.#input = requiredElement(shadow, "textarea", HTMLTextAreaElement);
     this.#highlights = requiredElement(shadow, ".highlights", HTMLDivElement);
     this.#inspection = requiredElement(shadow, ".inspection", HTMLDivElement);
+    this.#canvas.id = `hex1b-content-${randomId()}`;
+    const scrollbarAccessibility = requiredElement(shadow, ".scrollbar-accessibility", HTMLDivElement);
+    scrollbarAccessibility.setAttribute("aria-controls", this.#canvas.id);
+    const tooltipOverlay = document.createElement("div");
+    tooltipOverlay.slot = "scrollbar-tooltip";
+    tooltipOverlay.className = "hex1b-scrollbar-tooltip-overlay";
+    tooltipOverlay.style.cssText = "position:relative;width:100%;height:100%;pointer-events:none";
+    this.element.append(tooltipOverlay);
+    this.#scrollbarTooltip = new ScrollbarTooltip({
+      overlay: tooltipOverlay, getDetails: id => this.getCommandMarkDetails(id),
+      reportError: error => {
+        this.#inspectionError = `Scrollbar tooltip: ${errorMessage(error)}`;
+        this.#renderInspectionStatus();
+        this.#options.onStatus?.(this.#inspectionError, "error");
+      }
+    });
+    this.#scrollbarController = new ScrollbarController({
+      element: requiredElement(shadow, ".viewport", HTMLDivElement),
+      canvas: requiredElement(shadow, ".scrollbar-canvas", HTMLCanvasElement),
+      accessibility: scrollbarAccessibility,
+      getState: () => ({ layout: this.layout, viewport: this.viewport, markers: this.markers,
+        connected: this.#connected, configuration: this.#scrollbar }),
+      scrollToRow: top => this.scrollToRow(top),
+      scrollToLive: () => this.scrollToLive(),
+      scrollToMarker: id => this.scrollToMarker(id),
+      onMarkerHover: marker => this.#scrollbarTooltip?.update(marker, this.layout,
+        this.#scrollbar ? this.#scrollbar.tooltip : false),
+      reportError: error => {
+        this.#inspectionError = `Scrollbar: ${errorMessage(error)}`;
+        this.#renderInspectionStatus();
+        this.#options.onStatus?.(this.#inspectionError, "error");
+      }
+    });
     this.#selectionOverlay = document.createElement("div");
     this.#selectionOverlay.slot = "selection-ui";
     this.#selectionOverlay.className = "hex1b-selection-overlay";
@@ -266,7 +348,10 @@ export class WebTerminal implements WebTerminalHandle {
         selection: this.selection }),
       begin: (point, selection) => inspect(() => this.#history.begin(point, selection)),
       extend: point => inspect(() => this.#history.extend(point)),
-      scroll: (delta, endpoint) => inspect(() => this.#history.scroll(delta, endpoint)),
+      scroll: (delta, endpoint) => inspect(() => {
+        this.#history.scroll(delta, endpoint);
+        this.#scrollbarController?.activity();
+      }),
       end: cancelled => this.#history.endGesture(cancelled),
       resolve: input => this.#resolveInput(input),
       execute: (decision, input) => this.#executeInputAction(decision, input),
@@ -305,7 +390,7 @@ export class WebTerminal implements WebTerminalHandle {
     this.#options.signal?.addEventListener("abort", () => this.dispose(), { once: true, signal: this.#listeners.signal });
     this.#readyTimer = setTimeout(() => this.#fail(new Error("Timed out waiting for the terminal's first frame")), 30000);
     this.#worker = this.#options.workerUrl === undefined
-      ? new Worker(new URL("./terminal-worker.js", import.meta.url), { type: "module", name: "Hex1b WebTerminal" })
+      ? new Worker(defaultWorkerUrl("terminal"), { type: "module", name: "Hex1b WebTerminal" })
       : new Worker(new URL(this.#options.workerUrl, location.href), { type: "module", name: "Hex1b WebTerminal" });
     this.#worker.addEventListener("message", (event: MessageEvent<WorkerOutputMessage>) => this.#message(event.data));
     this.#worker.addEventListener("error", event => {
@@ -314,14 +399,42 @@ export class WebTerminal implements WebTerminalHandle {
     });
     this.#worker.addEventListener("messageerror", () => this.#fail(new Error("Terminal worker message could not be decoded")));
     const canvas = this.#canvas.transferControlToOffscreen();
-    this.#post({ type: "init", canvas, url: url.href, scale, font,
-      renderer: this.#renderer }, [canvas]);
+    this.#colorScheme = window.matchMedia?.("(prefers-color-scheme: dark)");
+    this.#colorScheme?.addEventListener("change", this.#systemColorChanged);
+    this.#post({ type: "init", canvas, transport: url === undefined ? { type: "custom" } : { type: "websocket", url }, scale, font,
+      renderer: this.#renderer, palette: this.#palettes[this.resolvedColorMode] }, [canvas]);
+    this.#applyPalette();
     this.#postLinkConfiguration();
   }
 
   #message(message: WorkerOutputMessage): void {
     if (this.#disposed) return;
-    if (message.type === "connected") {
+    if (message.type === "transportConnect") {
+      if (this.#transportSession) { this.#fail(new Error("Transport is already initialized")); return; }
+      this.#transportSession = new TransportSession({
+        onReady: () => this.#post({ type: "transportConnected" }),
+        onFrame: buffer => {
+          this.#transportFrame = Promise.withResolvers<void>();
+          this.#post({ type: "transportFrame", buffer }, [buffer]);
+          return this.#transportFrame.promise;
+        },
+        onClose: details => this.#post({ type: "transportClosed", details }),
+        onError: error => this.#post({ type: "transportError", message: error.message })
+      });
+      this.#transportSession.start(this.#transport);
+    } else if (message.type === "transportSend") {
+      // An ACK can be emitted while accepting an inventory fragment. Release the
+      // inbound bridge slot before the adapter can synchronously deliver its reply.
+      void Promise.resolve(this.#transportFrame?.promise)
+        .then(() => this.#transportSession?.send(message.control))
+        .then(() => this.#post({ type: "transportSent" }))
+        .catch(error => {
+          if (!this.#disposed) this.#post({ type: "transportError", message: errorMessage(error) });
+        });
+    } else if (message.type === "transportReceived") {
+      this.#transportFrame?.resolve();
+      this.#transportFrame = undefined;
+    } else if (message.type === "connected") {
       this.#connected = true;
       this.#input.disabled = !this.#canInput();
     } else if (message.type === "closed") {
@@ -330,13 +443,19 @@ export class WebTerminal implements WebTerminalHandle {
       clearTimeout(this.#readyTimer);
       try {
         this.#disconnect();
-        if (!this.#disposed) this.#options.onClose?.(Object.freeze({ ...message.details }));
+        if (!this.#disposed) {
+          const details = Object.freeze({ ...message.details });
+          if (this.#options.transport !== undefined) this.#options.onClose?.(details);
+          else if (details.code !== undefined) this.#options.onClose?.(details);
+        }
       } finally {
-        this.#ready.reject(new Error(`Terminal WebSocket closed (${message.details.code}${
-          message.details.reason ? `: ${message.details.reason}` : ""}) before mounting completed`));
+        this.#ready.reject(new Error(`Terminal ${message.details.code === undefined ? "transport" : "WebSocket"} closed (${
+          message.details.code === undefined ? message.details.reason :
+            `${message.details.code}${message.details.reason ? `: ${message.details.reason}` : ""}`}) before mounting completed`));
       }
     } else if (message.type === "status") {
       if (message.level === "error") {
+        this.#stopTransport();
         this.#disconnect();
         this.#ready.reject(new Error(message.message));
       }
@@ -374,6 +493,7 @@ export class WebTerminal implements WebTerminalHandle {
       if (this.#lastRequested === `${message.columns}x${message.rows}`) this.#lastRequested = undefined;
       if (Object.hasOwn(message, "history")) {
         this.#screenText = message.text;
+        this.#markerState.accept(message.history, message.revision);
         this.#history.accept(message.history, message.revision);
       }
       if (message.linkGeneration === this.#linkGeneration) {
@@ -427,6 +547,7 @@ export class WebTerminal implements WebTerminalHandle {
       }
     } else if (message.type === "history") {
       this.#screenText = message.text;
+      this.#markerState.accept(message.history, message.revision);
       this.#history.accept(message.history, message.revision);
     } else if (message.type === "stats") {
       this.#stats = message.stats;
@@ -441,21 +562,32 @@ export class WebTerminal implements WebTerminalHandle {
   }
 
   #fit() {
-    const width = this.#geometry.columns * this.#geometry.cellWidth;
-    const height = this.#geometry.rows * this.#geometry.cellHeight;
-    const scale = fittedScale(this.#size, this.#geometry, this.#peer.isPrimary, this.#sizing);
-    this.#surface.style.width = `${width * scale}px`;
-    this.#surface.style.height = `${height * scale}px`;
+    const next = terminalLayout(this.#size, this.#geometry, this.#peer.isPrimary, this.#sizing, this.#padding, this.#scrollbar);
+    const changed = JSON.stringify(next) !== JSON.stringify(this.#layout);
+    this.#layout = next;
+    const { width, height, left, top } = next.content;
+    this.#surface.style.width = `${width}px`;
+    this.#surface.style.height = `${height}px`;
+    this.#surface.style.left = `${left}px`;
+    this.#surface.style.top = `${top}px`;
     // Overlay positions use layout pixels, before any ancestor CSS transforms.
     const style = getComputedStyle(this.#surface);
     this.#canvasSize = { width: Number.parseFloat(style.width), height: Number.parseFloat(style.height) };
     this.#selectionUI?.refresh();
+    this.#scrollbarController?.refresh();
+    if (changed && !this.#layoutNotification) {
+      this.#layoutNotification = true;
+      queueMicrotask(() => {
+        this.#layoutNotification = false;
+        if (!this.#disposed) this.#options.onLayoutChange?.(this.layout);
+      });
+    }
     const dpr = window.devicePixelRatio || 1;
-    this.#post({ type: "viewport", width: Math.ceil(width * scale * dpr), height: Math.ceil(height * scale * dpr) });
+    this.#post({ type: "viewport", width: Math.ceil(width * dpr), height: Math.ceil(height * dpr) });
   }
 
   #fittedGrid() {
-    return requestedGrid(this.#size, this.#geometry, this.#sizing);
+    return requestedGrid(contentSpace(this.#size, this.#padding, this.#scrollbar), this.#geometry, this.#sizing);
   }
 
   #queueResize(includeFixed = false) {
@@ -514,12 +646,51 @@ export class WebTerminal implements WebTerminalHandle {
       this.#renderInspectionStatus();
     }
     if (!this.#disposed) this.#selectionUI?.refresh();
+    this.#scrollbarController?.refresh();
     this.#options.onViewportChange?.(viewport);
     this.#options.onSelectionChange?.(selection);
   }
 
-  scrollLines(delta: number): void { this.#history.scroll(delta); }
-  scrollToLive() { this.#history.live(); }
+  scrollLines(delta: number): void { this.#history.scroll(delta); this.#scrollbarController?.activity(); }
+  scrollToRow(top: number): void { this.#history.scrollTo(top); this.#scrollbarController?.activity(); }
+  scrollToLive() { this.#history.live(); this.#scrollbarController?.activity(); }
+  scrollToMarker(id: string): Promise<void> {
+    this.#scrollbarController?.activity();
+    return this.#markerState.jump(id);
+  }
+  addMarker(options: TerminalMarkerOptions): Promise<TerminalMarker> { return this.#markerState.add(options); }
+  removeMarker(id: string): Promise<void> { return this.#markerState.remove(id); }
+  getCommandMarkDetails(id: string): Promise<TerminalCommandMark> { return this.#markerState.details(id); }
+
+  #markersChanged(): void {
+    this.#scrollbarController?.activity();
+    if (this.#markerNotification) return;
+    this.#markerNotification = true;
+    queueMicrotask(() => {
+      this.#markerNotification = false;
+      if (!this.#disposed) this.#options.onMarkersChange?.(this.markers);
+    });
+  }
+
+  setPadding(padding: TerminalPadding): void {
+    if (this.#disposed) throw new Error("Terminal view is disposed");
+    this.#padding = normalizePadding(padding);
+    this.#fit();
+    this.#queueResize(true);
+  }
+
+  setScrollbar(scrollbar: TerminalScrollbar): void {
+    if (this.#disposed) throw new Error("Terminal view is disposed");
+    this.#scrollbar = normalizeScrollbar(scrollbar);
+    this.#scrollbarController?.cancel();
+    this.#fit();
+    this.#queueResize(true);
+  }
+
+  refreshScrollbar(): void {
+    if (this.#disposed) throw new Error("Terminal view is disposed");
+    this.#scrollbarController?.invalidate();
+  }
   clearSelection() { this.#inspectionError = ""; this.#history.clear(); }
 
   /** Re-notifies selection UI hosts after an external styling/policy change. */
@@ -533,11 +704,11 @@ export class WebTerminal implements WebTerminalHandle {
     const selection = this.selection;
     const viewport = this.viewport;
     const status = requiredElement(this.#inspection, ".inspection-message", HTMLSpanElement);
-    status.textContent = this.#selectionUIError || this.#inspectionError ||
+    status.textContent = this.#selectionUIError || this.#inspectionError || viewport.navigationError ||
       (selection.status === "unavailable" ? "" : selection.message) ||
       (viewport.available && !viewport.following ? `${viewport.liveTop - viewport.top} rows above live` : "");
     status.hidden = !status.textContent;
-    status.dataset.level = this.#selectionUIError || this.#inspectionError ||
+    status.dataset.level = this.#selectionUIError || this.#inspectionError || viewport.navigationError ||
       selection.status === "invalidated" ? "error" : "info";
   }
 
@@ -677,6 +848,36 @@ export class WebTerminal implements WebTerminalHandle {
       throw new Error("Terminal input, selection, focus, or buffer changed while reading the clipboard. Paste again.");
     this.paste(text);
     return text;
+  }
+
+  get colorMode(): TerminalColorMode { return this.#colorMode; }
+  get resolvedColorMode(): "light" | "dark" {
+    return this.#colorMode === "system" ? (this.#colorScheme?.matches ? "dark" : "light") : this.#colorMode;
+  }
+
+  setColorMode(mode: TerminalColorMode): void {
+    if (this.#disposed) throw new Error("Terminal view is disposed");
+    if (mode === undefined) throw new TypeError("A color mode is required");
+    this.#colorMode = normalizeColorMode(mode);
+    this.#applyPalette();
+  }
+
+  setPalette(mode: "light" | "dark", palette: TerminalPalette): void {
+    if (this.#disposed) throw new Error("Terminal view is disposed");
+    if (mode !== "light" && mode !== "dark") throw new TypeError('Palette mode must be "light" or "dark"');
+    this.#palettes[mode] = normalizePalette(palette);
+    if (this.resolvedColorMode === mode) this.#applyPalette();
+  }
+
+  #applyPalette(): void {
+    const palette = this.#palettes[this.resolvedColorMode];
+    this.element.dataset.theme = this.resolvedColorMode;
+    this.element.style.colorScheme = this.resolvedColorMode;
+    this.element.style.backgroundColor = palette.background;
+    for (const [name, color] of Object.entries(paletteScrollbarColors(palette)))
+      this.element.style.setProperty(`--cp-terminal-scrollbar-${name}`, color);
+    this.#post({ type: "palette", palette });
+    this.#scrollbarController?.refresh();
   }
 
   /** Changes per-view input policy without reconnecting; server authorization remains host-owned. */
@@ -953,12 +1154,16 @@ export class WebTerminal implements WebTerminalHandle {
     if (this.#input) this.#input.disabled = true;
     this.#mouse?.update(1, 1, 0);
     this.#history.disconnect();
+    this.#markerState.disconnect();
+    this.#scrollbarController?.cancel();
     this.#inspectionChanged();
     clearTimeout(this.#resizeTimer);
     this.#resizeTimer = undefined;
   }
 
   #fail(error: Error): void {
+    if (this.#disposed) return;
+    this.#stopTransport();
     this.#disconnect();
     this.#ready.reject(error);
     this.#options.onStatus?.(error.message, "error");
@@ -969,16 +1174,26 @@ export class WebTerminal implements WebTerminalHandle {
   dispose() {
     if (this.#disposed) return;
     this.#disposed = true;
+    this.#stopTransport();
     this.#disconnect();
     this.#linkDetector.dispose();
     this.#ready.reject(new DOMException("Terminal view was disposed", "AbortError"));
     clearTimeout(this.#readyTimer);
     clearTimeout(this.#compositionTimer);
     this.#observer?.disconnect();
+    this.#colorScheme?.removeEventListener("change", this.#systemColorChanged);
     this.#mouse?.dispose();
+    this.#scrollbarController?.dispose();
+    this.#scrollbarTooltip?.dispose();
     this.#listeners.abort();
     this.#post({ type: "stop" });
     this.#worker?.terminate();
     this.element.remove();
+  }
+
+  #stopTransport(): void {
+    this.#transportSession?.dispose();
+    this.#transportFrame?.reject(new DOMException("Terminal transport was disposed or closed", "AbortError"));
+    this.#transportFrame = undefined;
   }
 }
