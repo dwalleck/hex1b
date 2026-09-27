@@ -112,13 +112,28 @@ public class NanoExploratoryTests
         /// Creates a test context with a real bash PTY process.
         /// </summary>
         public static PtyTerminalTestContext Create(int width = 80, int height = 24)
+            => CreateProcess("bash", new[] { "--norc", "--noprofile" }, width, height);
+
+        public static PtyTerminalTestContext CreateProcess(
+            string fileName,
+            string[] arguments,
+            int width = 80,
+            int height = 24)
         {
             var terminal = Hex1bTerminal.CreateBuilder()
                 .WithDimensions(width, height)
-                .WithPtyProcess("bash", "--norc", "--noprofile")
+                .WithPtyProcess(options =>
+                {
+                    options.FileName = fileName;
+                    options.Arguments = arguments;
+                    options.Environment = new Dictionary<string, string>
+                    {
+                        ["TERM"] = "xterm-256color"
+                    };
+                })
                 .WithTerminalWidget(out var handle)
                 .Build();
-            
+
             return new PtyTerminalTestContext(terminal, handle);
         }
         
@@ -479,76 +494,103 @@ public class NanoExploratoryTests
     [UnixPtyCondition(true)]
     public async Task Nano_BufferContent_Diagnostic()
     {
-        // Arrange
-        await using var ctx = PtyTerminalTestContext.Create(80, 24);
-        ctx.Start();
-        
-        await Task.Delay(500);
-        
-        // Launch nano
-        await ctx.TypeAsync("nano /tmp/nanotest.txt\n");
-        await Task.Delay(2000);
-        
-        // Get both the terminal's internal buffer and the handle's buffer
-        var terminalBuffer = ctx.Terminal.GetScreenBuffer();
-        var (handleBuffer, _, height) = ctx.Handle.GetScreenBufferSnapshot();
-        
-        // Build diagnostic output
-        var sb = new System.Text.StringBuilder();
-        sb.AppendLine("=== TERMINAL INTERNAL BUFFER ===");
-        for (int y = 0; y < height; y++)
+        var testId = Guid.NewGuid().ToString("N");
+        var fileName = $"nano-{testId}.txt";
+        var filePath = Path.Combine(Path.GetTempPath(), fileName);
+        var marker = $"NANO_EDITOR_MARKER_{testId}";
+
+        try
         {
-            var rowContent = new System.Text.StringBuilder();
-            for (int x = 0; x < 70; x++)
+            await File.WriteAllTextAsync(
+                filePath,
+                $"{marker}\nKnown content loaded by the real nano editor.\n",
+                TestContext.Current.CancellationToken);
+
+            // Direct launch prevents shell command echo from satisfying readiness.
+            await using var ctx = PtyTerminalTestContext.CreateProcess(
+                "nano",
+                new[] { "-I", filePath },
+                80,
+                24);
+            ctx.Start();
+            await ctx.WaitForTextAsync(fileName, TimeSpan.FromSeconds(5));
+            await ctx.WaitForTextAsync(marker, TimeSpan.FromSeconds(5));
+
+            var terminalBuffer = ctx.Terminal.GetScreenBuffer();
+            var (handleBuffer, _, height) = ctx.Handle.GetScreenBufferSnapshot();
+
+            var sb = new StringBuilder();
+            sb.AppendLine("=== TERMINAL INTERNAL BUFFER ===");
+            for (int y = 0; y < height; y++)
             {
-                var c = terminalBuffer[y, x].Character;
-                rowContent.Append(string.IsNullOrEmpty(c) ? ' ' : c[0]);
+                var rowContent = new StringBuilder();
+                for (int x = 0; x < Math.Min(70, terminalBuffer.GetLength(1)); x++)
+                {
+                    var c = terminalBuffer[y, x].Character;
+                    rowContent.Append(string.IsNullOrEmpty(c) ? ' ' : c[0]);
+                }
+                var trimmed = rowContent.ToString().TrimEnd();
+                if (!string.IsNullOrEmpty(trimmed) || y < 3 || y >= height - 3)
+                {
+                    sb.AppendLine($"Row {y,2}: [{trimmed}]");
+                }
             }
-            var trimmed = rowContent.ToString().TrimEnd();
-            if (!string.IsNullOrEmpty(trimmed) || y < 3 || y >= height - 3)
+
+            sb.AppendLine();
+            sb.AppendLine("=== HANDLE BUFFER ===");
+            for (int y = 0; y < height; y++)
             {
-                sb.AppendLine($"Row {y,2}: [{trimmed}]");
+                var rowContent = new StringBuilder();
+                for (int x = 0; x < Math.Min(70, handleBuffer.GetLength(1)); x++)
+                {
+                    var c = handleBuffer[y, x].Character;
+                    rowContent.Append(string.IsNullOrEmpty(c) ? ' ' : c[0]);
+                }
+                var trimmed = rowContent.ToString().TrimEnd();
+                if (!string.IsNullOrEmpty(trimmed) || y < 3 || y >= height - 3)
+                {
+                    sb.AppendLine($"Row {y,2}: [{trimmed}]");
+                }
+            }
+
+            var row0 = GetRowText(handleBuffer, 0);
+            var bodyHasMarker = ContainsInEditorBody(handleBuffer, height, marker);
+            sb.AppendLine();
+            sb.AppendLine($"Handle row 0: '{row0}'");
+            sb.AppendLine($"Cursor: ({ctx.Handle.CursorX}, {ctx.Handle.CursorY})");
+
+            // Both APIs expose the same authoritative model; assert one snapshot.
+            Assert.IsTrue(
+                row0.Contains(fileName, StringComparison.Ordinal),
+                $"Expected the widget handle's row 0 to contain '{fileName}', but got:\n{sb}");
+            Assert.IsTrue(
+                bodyHasMarker,
+                $"Expected the widget handle's editor body to contain '{marker}', but got:\n{sb}");
+        }
+        finally
+        {
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
             }
         }
-        
-        sb.AppendLine();
-        sb.AppendLine("=== HANDLE BUFFER ===");
-        for (int y = 0; y < height; y++)
+
+        static bool ContainsInEditorBody(TerminalCell[,] buffer, int height, string text)
         {
-            var rowContent = new System.Text.StringBuilder();
-            for (int x = 0; x < 70; x++)
+            for (int row = 1; row < height - 3; row++)
             {
-                var c = handleBuffer[y, x].Character;
-                rowContent.Append(string.IsNullOrEmpty(c) ? ' ' : c[0]);
+                if (GetRowText(buffer, row).Contains(text, StringComparison.Ordinal))
+                {
+                    return true;
+                }
             }
-            var trimmed = rowContent.ToString().TrimEnd();
-            if (!string.IsNullOrEmpty(trimmed) || y < 3 || y >= height - 3)
-            {
-                sb.AppendLine($"Row {y,2}: [{trimmed}]");
-            }
+
+            return false;
         }
-        
-        sb.AppendLine();
-        sb.AppendLine($"Cursor: ({ctx.Handle.CursorX}, {ctx.Handle.CursorY})");
-        
-        // Nano should have the title at row 0 and help at the bottom
-        var row0 = GetRowText(terminalBuffer, 0);
-        var row22 = GetRowText(terminalBuffer, 22);
-        var row23 = GetRowText(terminalBuffer, 23);
-        
-        sb.AppendLine();
-        sb.AppendLine($"Row 0: '{row0}'");
-        sb.AppendLine($"Row 22: '{row22}'");
-        sb.AppendLine($"Row 23: '{row23}'");
-        
-        // Verify nano's UI is in the correct positions
-        // Title should be at row 0 and should contain "nano" or "GNU"
-        Assert.IsTrue(row0.Contains("nano", StringComparison.OrdinalIgnoreCase) || 
-            row0.Contains("GNU", StringComparison.OrdinalIgnoreCase), $"Expected row 0 to contain nano title, but got:\n{sb}");
-        
+
         static string GetRowText(TerminalCell[,] buffer, int row)
         {
-            var sb = new System.Text.StringBuilder();
+            var sb = new StringBuilder();
             for (int x = 0; x < buffer.GetLength(1); x++)
             {
                 var c = buffer[row, x].Character;

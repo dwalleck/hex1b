@@ -106,6 +106,8 @@ dotnet test --filter "FullyQualifiedName~ButtonNodeTests"
 - Test files are in `tests/Hex1b.Tests/`
 - Use `IHex1bTerminal` interface for mocking terminal interactions
 - Follow the naming convention: `MethodName_Scenario_ExpectedBehavior`
+- Real-PTY application fixtures must pin the child's terminal capabilities and application configuration, then await meaningful screen content rather than startup delays.
+- Asynchronous terminal waits must inspect their captured snapshot, not unlocked live counters. Presentation output can precede model application; retain the independent state and accounting assertions after readiness.
 
 Example:
 ```csharp

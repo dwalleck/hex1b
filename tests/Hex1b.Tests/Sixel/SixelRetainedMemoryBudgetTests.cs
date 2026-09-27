@@ -102,7 +102,7 @@ public class SixelRetainedMemoryBudgetTests
                 .ToArray(),
             cancellationToken: TestContext.Current.CancellationToken);
         await terminal.WaitForAsync(
-            _ => terminal.Terminal.SixelPlacementCount == 2,
+            snapshot => ActiveSixelPlacementCount(snapshot) == 2,
             "deduplicated placement",
             TestContext.Current.CancellationToken);
 
@@ -153,7 +153,7 @@ public class SixelRetainedMemoryBudgetTests
                 .ToArray(),
             cancellationToken: TestContext.Current.CancellationToken);
         await terminal.WaitForAsync(
-            _ => terminal.Terminal.SixelPlacementCount == 2,
+            snapshot => ActiveSixelPlacementCount(snapshot) == 2,
             "two images before dense materialization",
             TestContext.Current.CancellationToken);
 
@@ -212,7 +212,7 @@ public class SixelRetainedMemoryBudgetTests
             cancellationToken: TestContext.Current.CancellationToken);
         await terminal.WaitForAsync(
             snapshot => snapshot.InAlternateScreen &&
-                terminal.Terminal.SixelPlacementCount == 1,
+                ActiveSixelPlacementCount(snapshot) == 1,
             "alternate image",
             TestContext.Current.CancellationToken);
         Assert.IsGreaterThan(0L, terminal.Terminal.SixelRetainedByteCount);
@@ -251,7 +251,7 @@ public class SixelRetainedMemoryBudgetTests
                 [RisToken.Instance],
                 TestContext.Current.CancellationToken);
             await terminal.WaitForAsync(
-                _ => terminal.Terminal.SixelRetainedByteCount == 0,
+                snapshot => snapshot.SixelImages.Count == 0,
                 "retained bytes cleared by RIS",
                 TestContext.Current.CancellationToken);
             Assert.AreEqual(0L, terminal.Terminal.SixelRetainedByteCount);
@@ -282,7 +282,7 @@ public class SixelRetainedMemoryBudgetTests
             Encoding.ASCII.GetBytes("\x1b[2J"),
             cancellationToken: TestContext.Current.CancellationToken);
         await terminal.WaitForAsync(
-            _ => terminal.Terminal.SixelPlacementCount == 0,
+            snapshot => ActiveSixelPlacementCount(snapshot) == 0,
             "live image evicted",
             TestContext.Current.CancellationToken);
 
@@ -308,7 +308,7 @@ public class SixelRetainedMemoryBudgetTests
                 .ToArray(),
             cancellationToken: TestContext.Current.CancellationToken);
         await terminal.WaitForAsync(
-            _ => terminal.Terminal.SixelPlacementCount == 2,
+            snapshot => ActiveSixelPlacementCount(snapshot) == 2,
             "two images before read-only materialization",
             TestContext.Current.CancellationToken);
         var before = terminal.Terminal.SixelRetainedByteCount;
@@ -524,7 +524,7 @@ public class SixelRetainedMemoryBudgetTests
             Encoding.ASCII.GetBytes("\x1b[2J"),
             cancellationToken: TestContext.Current.CancellationToken);
         await damageTerminal.WaitForAsync(
-            _ => damageTerminal.Terminal.SixelPlacementCount == 0,
+            snapshot => ActiveSixelPlacementCount(snapshot) == 0,
             "damaged image cleared",
             TestContext.Current.CancellationToken);
         Assert.AreEqual(0L, damageTerminal.Terminal.SixelRetainedByteCount);
@@ -538,7 +538,7 @@ public class SixelRetainedMemoryBudgetTests
             Encoding.ASCII.GetBytes("\x1b[2;1H\n"),
             cancellationToken: TestContext.Current.CancellationToken);
         await historyTerminal.WaitForAsync(
-            _ => historyTerminal.Terminal.SixelHistoryPlacementCount > 0,
+            snapshot => HistorySixelPlacementCount(snapshot) > 0,
             "image moved into history",
             TestContext.Current.CancellationToken);
         Assert.IsGreaterThan(0L, historyTerminal.Terminal.SixelRetainedByteCount);
@@ -547,7 +547,7 @@ public class SixelRetainedMemoryBudgetTests
             Encoding.ASCII.GetBytes("\x1b[3J"),
             cancellationToken: TestContext.Current.CancellationToken);
         await historyTerminal.WaitForAsync(
-            _ => historyTerminal.Terminal.SixelHistoryPlacementCount == 0,
+            snapshot => HistorySixelPlacementCount(snapshot) == 0,
             "history image cleared",
             TestContext.Current.CancellationToken);
         Assert.AreEqual(0L, historyTerminal.Terminal.SixelRetainedByteCount);
@@ -585,7 +585,7 @@ public class SixelRetainedMemoryBudgetTests
             cancellationToken: TestContext.Current.CancellationToken);
         await terminal.WaitForAsync(
             snapshot => snapshot.ContainsText("Z") &&
-                terminal.Terminal.SixelPlacementCount == expectedPlacements,
+                ActiveSixelPlacementCount(snapshot) == expectedPlacements,
             $"{expectedPlacements} retained placements",
             TestContext.Current.CancellationToken);
     }
@@ -677,6 +677,16 @@ public class SixelRetainedMemoryBudgetTests
             terminal.Terminal.GraphicsRetainedByteCount);
         return (terminal, first, second, sixelBytes);
     }
+
+    // Wait predicates must use the captured state, not unlocked live counters.
+    // Snapshot rows place history before the active viewport.
+    private static int ActiveSixelPlacementCount(Hex1bTerminalSnapshot snapshot) =>
+        snapshot.SixelPlacements.Count(
+            placement => placement.Row >= snapshot.ScrollbackLineCount);
+
+    private static int HistorySixelPlacementCount(Hex1bTerminalSnapshot snapshot) =>
+        snapshot.SixelPlacements.Count(
+            placement => placement.Row < snapshot.ScrollbackLineCount);
 
     private static void AssertAccountingMatchesSnapshot(Hex1bTerminal terminal)
     {
