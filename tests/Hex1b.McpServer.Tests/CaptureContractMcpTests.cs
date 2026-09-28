@@ -138,14 +138,19 @@ public class CaptureContractMcpTests : McpServerTestBase
         var engine = new TerminalDiagnostics(terminal, "McpRaw");
         try
         {
-            var staticCapture = (await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = attached })).GetProperty("capture");
+            var staticResult = await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = attached });
+            Assert.IsFalse(staticResult.GetProperty("message").GetString()!.Contains("partially applied"), "a complete model was called partial");
+            var staticCapture = staticResult.GetProperty("capture");
             Assert.AreEqual(engine.Capture(new DiagnosticCaptureRequest()).Identity!.ModelSequence,
                 staticCapture.GetProperty("identity").GetProperty("modelSequence").GetInt64(),
                 "MCP and the in-process engine disagree on a static model");
 
             terminal.ApplyTokens(AnsiTokenizer.Tokenize("\x1b[?2026h"));
             var enginePending = engine.Capture(new DiagnosticCaptureRequest());
-            var pending = (await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = attached })).GetProperty("capture");
+            var pendingResult = await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = attached });
+            StringAssert.Contains(pendingResult.GetProperty("message").GetString(), "partially applied",
+                "the MCP message presented partial content as a screen");
+            var pending = pendingResult.GetProperty("capture");
             Assert.IsTrue(pending.TryGetProperty("synchronizedUpdate", out var sync), "missing synchronizedUpdate");
             Assert.IsTrue(sync.GetProperty("active").GetBoolean(), "MCP did not disclose the pending synchronized update");
             Assert.AreEqual(enginePending.SynchronizedUpdate!.StartedAtSequence, sync.GetProperty("startedAtSequence").GetInt64());

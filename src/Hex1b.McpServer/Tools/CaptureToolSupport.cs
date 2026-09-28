@@ -35,8 +35,9 @@ internal static class CaptureToolSupport
                 $"Capture {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}");
 
         var geometry = result.Geometry is { } size ? $"{size.Columns}x{size.Rows}" : "unknown-size";
+        var partial = TerminalDiagnostics.DescribePartialContent(result) is { } note ? " " + note : "";
         if (string.IsNullOrEmpty(savePath))
-            return Create(result, sessionId, processId, $"Captured {geometry} terminal model as {format.ToLowerInvariant()}.");
+            return Create(result, sessionId, processId, $"Captured {geometry} terminal model as {format.ToLowerInvariant()}.{partial}");
 
         var directory = Path.GetDirectoryName(savePath);
         if (!string.IsNullOrEmpty(directory))
@@ -44,7 +45,7 @@ internal static class CaptureToolSupport
         await File.WriteAllTextAsync(savePath, result.Content, ct);
 
         return Create(result with { Content = null }, sessionId, processId,
-            $"Captured {geometry} terminal model to {savePath}; content is in the file, not capture.content.", savePath);
+            $"Captured {geometry} terminal model to {savePath}; content is in the file, not capture.content.{partial}", savePath);
     }
 
     /// <summary>

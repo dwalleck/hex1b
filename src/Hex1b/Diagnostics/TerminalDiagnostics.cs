@@ -220,6 +220,15 @@ public sealed class TerminalDiagnostics
     };
 
     /// <summary>
+    /// Human-readable disclosure that a result's content is a partially applied synchronized update,
+    /// or <c>null</c> when it is not. Clients show it wherever they present content as text.
+    /// </summary>
+    internal static string? DescribePartialContent(DiagnosticCaptureResult result) =>
+        result.SynchronizedUpdate is { Active: true } update
+            ? $"Synchronized update pending since model sequence {update.StartedAtSequence}; the content is partially applied, not a completed frame."
+            : null;
+
+    /// <summary>
     /// Creates a result for an operation that produced no observation.
     /// </summary>
     internal static DiagnosticCaptureResult Problem(DiagnosticOutcome outcome, string code, string message) => new()

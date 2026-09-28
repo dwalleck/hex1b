@@ -89,6 +89,10 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
         if (result.Outcome != DiagnosticOutcome.Captured)
             return WriteFailure(result, json);
 
+        // Stdout carries only content or JSON; the partial-content warning goes to stderr in every mode.
+        if (TerminalDiagnostics.DescribePartialContent(result) is { } partial)
+            Formatter.WriteError(partial);
+
         if (isPng)
         {
             var pngBytes = SvgToPngConverter.Convert(result.Content!);

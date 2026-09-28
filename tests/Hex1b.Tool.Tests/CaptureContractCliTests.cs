@@ -126,6 +126,7 @@ public class CaptureContractCliTests
         var engineStatic = engine.Capture(new DiagnosticCaptureRequest());
 
         Assert.AreEqual(0, staticExit, staticErr);
+        Assert.IsFalse(staticErr.Contains("partially applied", StringComparison.Ordinal), "a complete model was called partial");
         using (var json = JsonDocument.Parse(staticOut))
         {
             Assert.AreEqual(engineStatic.Identity!.ModelSequence,
@@ -139,6 +140,10 @@ public class CaptureContractCliTests
         var (pendingExit, pendingOut, pendingErr) = await RunCliAsync("capture", "screenshot", Pid, "--json");
 
         Assert.AreEqual(0, pendingExit, pendingErr);
+        StringAssert.Contains(pendingErr, "partially applied", "--json capture did not warn on stderr about partial content");
+        var (textExit, _, textErr) = await RunCliAsync("capture", "screenshot", Pid);
+        Assert.AreEqual(0, textExit, textErr);
+        StringAssert.Contains(textErr, "partially applied", "text capture printed partial content without saying so");
         using (var json = JsonDocument.Parse(pendingOut))
         {
             Assert.IsTrue(json.RootElement.TryGetProperty("synchronizedUpdate", out var sync), "missing synchronizedUpdate");
