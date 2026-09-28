@@ -1091,6 +1091,80 @@ public class InputMilestoneTests
     }
 
     [TestMethod]
+    public async Task SendTurn_ATaskForkedDuringAPinnedWriteLosesTheTurnWithThePin()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 3).Build();
+        var diagnostics = new TerminalDiagnostics(terminal, "pinfork");
+        var tracker = terminal.InputMilestones!;
+        var go = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await tracker.WaitForSendTurnAsync(ct);
+        Task<(bool OwnsTurn, DiagnosticAcceptedInput? Send)> fork;
+        using (tracker.BeginSend())
+        {
+            // As a write under the input lock does: pin the send's turn, and fork a task meanwhile.
+            using (tracker.PinOwnTurn())
+            {
+                fork = Task.Run(async () =>
+                {
+                    await go.Task;
+                    return (tracker.OwnsTurn, await diagnostics.TrackSendAsync(() => terminal.SendInputAsync("f"u8.ToArray()), "text"));
+                });
+            }
+        }
+
+        go.SetResult();
+        var (ownsTurn, send) = await fork.WaitAsync(TimeSpan.FromSeconds(5), ct);
+
+        Assert.IsFalse(ownsTurn, "a task forked during a pinned write kept the turn after the pin was released");
+        Assert.AreEqual((1L, 1L), (send!.FirstId, send.LastId), "the fork could not start its own send");
+    }
+
+    [TestMethod]
+    public async Task SendTurn_ASendCannotEndWhileAForkIsAcceptingInsideIt()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tracker = new InputMilestoneTracker();
+        var trackerLock = typeof(InputMilestoneTracker)
+            .GetField("_sync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(tracker)!;
+        using var held = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        // Parks the fork's accept between its ownership check and the write.
+        var holder = new Thread(() =>
+        {
+            lock (trackerLock)
+            {
+                held.Set();
+                release.Wait();
+            }
+        });
+        holder.Start();
+        held.Wait(ct);
+
+        await tracker.WaitForSendTurnAsync(ct);
+        Task<bool> fork;
+        var sendA = tracker.BeginSend();
+        fork = Task.Run(() => tracker.Accept(Key(), _ => true));
+        await Task.Delay(100, ct);
+        sendA.Dispose();
+        Task nextTurn;
+        using (ExecutionContext.SuppressFlow())
+            nextTurn = Task.Run(() => tracker.WaitForSendTurnAsync(ct));
+        await Task.Delay(100, ct);
+        var nextTookTheTurn = nextTurn.IsCompleted;
+        release.Set();
+        holder.Join();
+        Assert.IsTrue(await fork.WaitAsync(TimeSpan.FromSeconds(5), ct));
+        await nextTurn.WaitAsync(TimeSpan.FromSeconds(5), ct);
+        tracker.BeginSend().Dispose();
+
+        Assert.IsFalse(nextTookTheTurn, "the next send took the turn while a fork of the ended send was still accepting inside it");
+    }
+
+    [TestMethod]
     public async Task SendTurn_WaitIsCancellable()
     {
         var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };

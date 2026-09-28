@@ -27,8 +27,9 @@ internal sealed class InputMilestoneTracker
     // The current diagnostic send, collected across the events it enqueues.
     private static readonly AsyncLocal<SendScope?> CurrentSend = new();
 
-    // The scope this async flow pinned for a write in progress; only that flow keeps an ended send's turn.
-    private static readonly AsyncLocal<SendScope?> PinnedScope = new();
+    // The pin this async flow holds for a write in progress: only while it is live does the flow keep
+    // an ended send's turn. A task forked during the write inherits it, and loses the turn with it.
+    private static readonly AsyncLocal<TurnPin?> CurrentPin = new();
 
     private readonly object _sync = new();
 
@@ -110,20 +111,23 @@ internal sealed class InputMilestoneTracker
     {
         if (CurrentSend.Value is not { } send || !ReferenceEquals(send.Tracker, this) || !send.TryPin())
             return null;
-        PinnedScope.Value = send;
-        return new TurnPin(send);
+        var pin = new TurnPin(send);
+        CurrentPin.Value = pin;
+        return pin;
     }
 
-    private sealed class TurnPin(SendScope scope) : IDisposable
+    internal sealed class TurnPin(SendScope scope) : IDisposable
     {
         private int _released;
+
+        internal bool ActiveFor(SendScope send) => ReferenceEquals(scope, send) && Volatile.Read(ref _released) == 0;
 
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _released, 1) != 0)
                 return;
-            if (ReferenceEquals(PinnedScope.Value, scope))
-                PinnedScope.Value = null;
+            if (ReferenceEquals(CurrentPin.Value, this))
+                CurrentPin.Value = null;
             scope.Unpin();
         }
     }
@@ -154,7 +158,10 @@ internal sealed class InputMilestoneTracker
     /// </summary>
     internal bool Accept(Hex1bEvent evt, Func<Hex1bEvent, bool> write)
     {
-        var send = OwnSend();
+        // The send is held for the whole accept, so it cannot end, and hand the turn to the next send,
+        // between this check and the write.
+        var send = CurrentSend.Value is { } candidate && ReferenceEquals(candidate.Tracker, this)
+            && candidate.TryHold(CurrentPin.Value) ? candidate : null;
         if (send is null)
             _sendGate.Wait();
         try
@@ -185,6 +192,8 @@ internal sealed class InputMilestoneTracker
         {
             if (send is null)
                 _sendGate.Release();
+            else
+                send.Unpin();
         }
     }
 
@@ -484,7 +493,7 @@ internal sealed class InputMilestoneTracker
     // A task forked inside a send inherits its scope; once the send ends, the scope no longer applies.
     private SendScope? OwnSend() =>
         CurrentSend.Value is { } send && ReferenceEquals(send.Tracker, this)
-            && (!send.Disposed || ReferenceEquals(PinnedScope.Value, send)) ? send : null;
+            && (!send.Disposed || CurrentPin.Value?.ActiveFor(send) == true) ? send : null;
 
     private static void RemoveLast(Queue<Tracked> occurrences)
     {
@@ -588,6 +597,18 @@ internal sealed class InputMilestoneTracker
             lock (_sync)
             {
                 if (_disposed)
+                    return false;
+                _pins++;
+                return true;
+            }
+        }
+
+        // Holds the turn for one accept: while the send is live, or while the caller's own pin is.
+        internal bool TryHold(TurnPin? pin)
+        {
+            lock (_sync)
+            {
+                if (_disposed && pin?.ActiveFor(this) != true)
                     return false;
                 _pins++;
                 return true;
