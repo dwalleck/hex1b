@@ -305,17 +305,20 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
             var timeout = TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 1, 60));
             var found = await target.WaitForTextAsync(text, timeout, ct);
             string? currentText = null;
+            var partial = "";
             if (!found)
             {
                 var current = await target.CaptureAsync(new DiagnosticCaptureRequest { Format = DiagnosticCaptureFormat.Text }, ct);
                 currentText = current.Content;
+                if (TerminalDiagnostics.DescribePartialContent(current) is { } note)
+                    partial = " " + note;
             }
 
             return new WaitForTextResult
             {
                 Success = true,
                 SessionId = sessionId,
-                Message = found ? $"Found text '{text}'" : $"Text '{text}' not found within {timeout.TotalSeconds:0}s",
+                Message = found ? $"Found text '{text}'" : $"Text '{text}' not found within {timeout.TotalSeconds:0}s.{partial}",
                 Found = found,
                 CurrentText = currentText
             };

@@ -225,7 +225,8 @@ public sealed class TerminalDiagnostics
     /// </summary>
     internal static string? DescribePartialContent(DiagnosticCaptureResult result) =>
         result.SynchronizedUpdate is { Active: true } update
-            ? $"Synchronized update pending since model sequence {update.StartedAtSequence}; the content is partially applied, not a completed frame."
+            ? (update.StartedAtSequence is { } start ? $"Synchronized update pending since model sequence {start}" : "Synchronized update pending") +
+              "; the content is partially applied, not a completed frame."
             : null;
 
     /// <summary>

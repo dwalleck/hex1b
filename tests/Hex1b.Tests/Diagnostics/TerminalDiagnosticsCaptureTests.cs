@@ -327,6 +327,17 @@ public class TerminalDiagnosticsCaptureTests
     }
 
     [TestMethod]
+    public async Task Capture_PendingSynchronizedUpdate_ExplainsEveryAbsentField()
+    {
+        await using var source = await StartAsync("\x1b[?2026hPART", waitFor: "PART");
+
+        var result = new TerminalDiagnostics(source.Terminal, "pending").Capture(new DiagnosticCaptureRequest());
+
+        Assert.IsTrue(result.SynchronizedUpdate!.Active);
+        AssertEveryNullFieldIsExplained(result);
+    }
+
+    [TestMethod]
     public async Task Capture_InvalidRequest_ReturnsInvalidRequestWithoutContent()
     {
         await using var source = await StartAsync("x", waitFor: "x");

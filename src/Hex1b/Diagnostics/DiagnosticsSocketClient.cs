@@ -120,12 +120,13 @@ internal sealed class DiagnosticsSocketClient
     // outcome carries every field the contract promises for it.
     private static DiagnosticCaptureResult Validate(DiagnosticCaptureResult result)
     {
-        // Deserialization leaves omitted collections null despite their initializers.
+        // Deserialization leaves omitted top-level lists null despite their initializers, and a
+        // malformed target can send null entries; neither reaches callers.
         result = result with
         {
-            ContentCoverage = result.ContentCoverage ?? [],
-            UnavailableFields = result.UnavailableFields ?? [],
-            Limitations = result.Limitations ?? [],
+            ContentCoverage = (result.ContentCoverage ?? []).Where(entry => entry is not null).ToArray(),
+            UnavailableFields = (result.UnavailableFields ?? []).Where(entry => entry is not null).ToArray(),
+            Limitations = (result.Limitations ?? []).Where(entry => entry is not null).ToArray(),
         };
 
         if (result.ContractVersion != TerminalDiagnostics.ContractVersion)

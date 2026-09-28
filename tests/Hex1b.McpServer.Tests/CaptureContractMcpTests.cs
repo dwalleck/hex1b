@@ -164,6 +164,11 @@ public class CaptureContractMcpTests : McpServerTestBase
             });
             var wait = await CallAsync(client, "wait_for_terminal_text", new() { ["sessionId"] = local, ["text"] = "SEQOUT", ["timeoutSeconds"] = 10 });
             Assert.IsTrue(wait.GetProperty("found").GetBoolean(), wait.ToString());
+            var partialWait = await CallAsync(client, "wait_for_terminal_text", new() { ["sessionId"] = attached, ["text"] = "NEVER", ["timeoutSeconds"] = 1 });
+            Assert.IsFalse(partialWait.GetProperty("found").GetBoolean());
+            StringAssert.Contains(partialWait.GetProperty("message").GetString(), "partially applied",
+                "wait_for_terminal_text returned partial currentText without saying so");
+
             var localCapture = (await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = local })).GetProperty("capture");
             Assert.IsTrue(localCapture.GetProperty("identity").GetProperty("modelSequence").GetInt64() > beforeOutput,
                 "PTY output reached the local session's model without advancing its sequence");

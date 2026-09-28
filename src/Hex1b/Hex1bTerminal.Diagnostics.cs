@@ -6,8 +6,8 @@ public sealed partial class Hex1bTerminal
     internal Guid DiagnosticSessionId { get; } = Guid.NewGuid();
 
     // Counts model events: output application batches, geometry changes, and synchronized-update
-    // timeout releases. Advanced and
-    // read only under _bufferLock, so a model read names exactly the state it copied.
+    // timeout releases. Advanced and read only under _bufferLock, so a model read names exactly
+    // the state it copied.
     private long _modelSequence;
 
     private void AdvanceModelSequenceUnsafe() => _modelSequence++;

@@ -131,6 +131,39 @@ public class DiagnosticsSocketClientTests
     }
 
     [TestMethod]
+    public async Task Capture_MalformedNullListEntries_AreDroppedNotThrown()
+    {
+        await using var server = await FakeServer.StartAsync(_ =>
+            """
+            {"success":true,"capture":{"contractVersion":1,"outcome":"captured","format":"text","content":"x",
+            "geometry":{"columns":1,"rows":1},"history":{"requestedRows":0,"returnedRows":0},
+            "identity":{"processId":1,"sessionId":"s","sourceLayer":"terminal-model","modelSequence":3},
+            "synchronizedUpdate":{"active":false},
+            "unavailableFields":[null],"contentCoverage":[null],"limitations":[null]}}
+            """.ReplaceLineEndings(""));
+
+        var result = await new DiagnosticsSocketClient().CaptureAsync(server.Path, new DiagnosticCaptureRequest(),
+            TestContext.Current.CancellationToken);
+
+        Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome);
+        Assert.IsFalse(result.UnavailableFields.Any(f => f is null) || result.ContentCoverage.Any(c => c is null) ||
+            result.Limitations.Any(l => l is null), "null list entries reached the caller");
+    }
+
+    [TestMethod]
+    public void DescribePartialContent_WithoutStartSequence_DoesNotRenderAnEmptyValue()
+    {
+        var note = TerminalDiagnostics.DescribePartialContent(new DiagnosticCaptureResult
+        {
+            Outcome = DiagnosticOutcome.Captured,
+            SynchronizedUpdate = new DiagnosticSynchronizedUpdate { Active = true },
+        });
+
+        StringAssert.Contains(note, "partially applied");
+        Assert.IsFalse(note!.Contains("sequence ;", StringComparison.Ordinal), $"rendered an absent start sequence: {note}");
+    }
+
+    [TestMethod]
     public async Task Capabilities_LegacyTarget_IsIncompatible()
     {
         await using var server = await FakeServer.StartAsync(_ => """{"success":false,"error":"Unknown method: capabilities"}""");
