@@ -76,7 +76,8 @@ export default defineConfig({
           text: 'Tools',
           items: [
             { text: 'CLI Tool', link: '/guide/cli' },
-            { text: 'MCP Server', link: '/guide/mcp-server' }
+            { text: 'MCP Server', link: '/guide/mcp-server' },
+            { text: 'Diagnostic Capture', link: '/guide/diagnostic-capture' }
           ]
         }
       ],
@@ -90,8 +91,7 @@ export default defineConfig({
         {
           text: 'CLI Reference',
           items: [
-            { text: 'hex1b', link: '/reference/cli' },
-            { text: 'Diagnostic capture', link: '/reference/diagnostic-capture' }
+            { text: 'hex1b', link: '/reference/cli' }
           ]
         },
         {

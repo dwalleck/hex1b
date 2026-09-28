@@ -34,7 +34,7 @@ internal static class CaptureToolSupport
             return Create(result, sessionId, processId,
                 $"Capture {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}");
 
-        var geometry = $"{result.Geometry!.Columns}x{result.Geometry.Rows}";
+        var geometry = result.Geometry is { } size ? $"{size.Columns}x{size.Rows}" : "unknown-size";
         if (string.IsNullOrEmpty(savePath))
             return Create(result, sessionId, processId, $"Captured {geometry} terminal model as {format.ToLowerInvariant()}.");
 

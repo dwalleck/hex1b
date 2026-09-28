@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using Hex1b.Diagnostics;
 
 namespace Hex1b.McpServer;
 
@@ -73,7 +74,7 @@ public sealed class TerminalSessionManager : IAsyncDisposable
         if (_disposed)
             throw new ObjectDisposedException(nameof(TerminalSessionManager));
 
-        var socketDir = GetSocketDirectory();
+        var socketDir = McpDiagnosticsPresentationFilter.GetSocketDirectory();
         var newTargets = new List<RemoteTerminalTarget>();
 
         if (!Directory.Exists(socketDir))
@@ -96,7 +97,7 @@ public sealed class TerminalSessionManager : IAsyncDisposable
                 continue;
 
             // Check if process is still running
-            if (!IsProcessRunning(pid))
+            if (!ProcessLiveness.IsRunning(pid))
             {
                 // Clean up stale socket
                 try { File.Delete(socketPath); }
@@ -133,25 +134,6 @@ public sealed class TerminalSessionManager : IAsyncDisposable
 
         await target.DisposeAsync();
         return true;
-    }
-
-    private static string GetSocketDirectory()
-    {
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        return Path.Combine(home, ".hex1b", "sockets");
-    }
-
-    private static bool IsProcessRunning(int pid)
-    {
-        try
-        {
-            var process = System.Diagnostics.Process.GetProcessById(pid);
-            return !process.HasExited;
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     /// <summary>

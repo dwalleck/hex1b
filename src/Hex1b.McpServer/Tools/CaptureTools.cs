@@ -78,7 +78,7 @@ public class CaptureTools(TerminalSessionManager sessionManager)
                 Capture = result.Capture
             };
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return new CaptureToolResult
             {
@@ -86,67 +86,6 @@ public class CaptureTools(TerminalSessionManager sessionManager)
                 SessionId = sessionId,
                 Message = $"Failed to save capture: {ex.Message}",
                 Capture = CaptureToolSupport.ToJson(TerminalDiagnostics.Problem(DiagnosticOutcome.Failed, "save-failed", ex.Message))
-            };
-        }
-    }
-
-    /// <summary>
-    /// Waits for specific text to appear on the terminal screen.
-    /// </summary>
-    [McpServerTool, Description("Wait for specific text to appear on the terminal screen. Useful for waiting for prompts or output.")]
-    public async Task<WaitForTextResult> WaitForTerminalText(
-        [Description("The session ID returned by start_terminal")] string sessionId,
-        [Description("The text to wait for")] string text,
-        [Description("Maximum seconds to wait (default: 10)")] int timeoutSeconds = 10,
-        CancellationToken ct = default)
-    {
-        var session = sessionManager.GetSession(sessionId);
-        if (session == null)
-        {
-            return new WaitForTextResult
-            {
-                Success = false,
-                SessionId = sessionId,
-                Message = $"Session '{sessionId}' not found.",
-                Found = false
-            };
-        }
-
-        try
-        {
-            var timeout = TimeSpan.FromSeconds(Math.Max(1, Math.Min(timeoutSeconds, 60)));
-            var found = await session.WaitForTextAsync(text, timeout, ct);
-
-            if (found)
-            {
-                return new WaitForTextResult
-                {
-                    Success = true,
-                    SessionId = sessionId,
-                    Message = $"Text '{text}' found on terminal.",
-                    Found = true
-                };
-            }
-            else
-            {
-                return new WaitForTextResult
-                {
-                    Success = true,
-                    SessionId = sessionId,
-                    Message = $"Text '{text}' not found within {timeoutSeconds} seconds.",
-                    Found = false,
-                    CurrentText = session.Diagnostics.Capture(new DiagnosticCaptureRequest()).Content
-                };
-            }
-        }
-        catch (Exception ex)
-        {
-            return new WaitForTextResult
-            {
-                Success = false,
-                SessionId = sessionId,
-                Message = $"Failed to wait for text: {ex.Message}",
-                Found = false
             };
         }
     }

@@ -244,7 +244,7 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
         {
             return await CaptureToolSupport.CaptureAsync(target.CaptureAsync, format, historyRows, authorize, savePath, ct, sessionId);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return new CaptureToolResult
             {
@@ -281,7 +281,7 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
     /// <summary>
     /// Waits for specific text to appear on the terminal screen.
     /// </summary>
-    [McpServerTool, Description("Waits for specific text to appear on the terminal screen. Useful for waiting for prompts or specific output. Works with both local and remote terminals.")]
+    [McpServerTool, Description("Waits for specific text to appear on the terminal screen (1-60 seconds). Useful for waiting for prompts or specific output. Works with both local and remote terminals; an unobservable target fails instead of reporting the text as not found.")]
     public async Task<WaitForTextResult> WaitForTerminalText(
         [Description("Session ID of the terminal target")] string sessionId,
         [Description("The text to wait for")] string text,
@@ -302,14 +302,22 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
 
         try
         {
-            var found = await target.WaitForTextAsync(text, TimeSpan.FromSeconds(timeoutSeconds), ct);
-            
+            var timeout = TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 1, 60));
+            var found = await target.WaitForTextAsync(text, timeout, ct);
+            string? currentText = null;
+            if (!found)
+            {
+                var current = await target.CaptureAsync(new DiagnosticCaptureRequest { Format = DiagnosticCaptureFormat.Text }, ct);
+                currentText = current.Content;
+            }
+
             return new WaitForTextResult
             {
                 Success = true,
                 SessionId = sessionId,
-                Message = found ? $"Found text '{text}'" : $"Text '{text}' not found within {timeoutSeconds}s",
-                Found = found
+                Message = found ? $"Found text '{text}'" : $"Text '{text}' not found within {timeout.TotalSeconds:0}s",
+                Found = found,
+                CurrentText = currentText
             };
         }
         catch (Exception ex)

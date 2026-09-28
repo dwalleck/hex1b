@@ -170,7 +170,7 @@ Capture terminal output including screenshots and recordings.
 
 ### `capture screenshot`
 
-Capture the terminal model through the shared [diagnostic capture contract](/reference/diagnostic-capture).
+Capture the terminal model through the shared [diagnostic capture contract](/guide/diagnostic-capture).
 
 ```bash
 hex1b capture screenshot <id> [options]
@@ -187,12 +187,14 @@ hex1b capture screenshot <id> [options]
 | `--wait` | string | | Wait for text to appear before capturing |
 | `--timeout` | int | `30` | Timeout in seconds for `--wait` |
 | `--scrollback` | int | `0` | Rows of retained terminal-model history to include (not native scrollback) |
-| `--authorize` | string | | Opt in to `non-screen-metadata`, `editor-text`, or `raw-input` (repeatable) |
+| `--authorize` | string | | Opt in to `non-screen-metadata`, `editor-text`, or `raw-input` (repeatable or comma-separated) |
 
 Without `--json`, the command writes the rendered content (or saves it with `--output`). With
 `--json`, it writes the full contract result: outcome, content, geometry, history coverage,
-identity, content coverage, unavailable fields, and limitations. A non-`captured` outcome exits
-with code `1` and writes `outcome (code): message` to stderr.
+identity, content coverage, unavailable fields, and limitations. When `--output` is also given,
+the content is only in the file and is omitted from the JSON; `png` is rasterized locally from
+the SVG capture that the JSON describes. A non-`captured` outcome exits with code `1` and writes
+`outcome (code): message` to stderr.
 
 **Examples:**
 

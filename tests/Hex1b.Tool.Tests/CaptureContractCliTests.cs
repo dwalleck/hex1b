@@ -158,6 +158,44 @@ public class CaptureContractCliTests
     }
 
     [TestMethod]
+    public async Task Screenshot_AuthorizeBeforeIdAndCommaSeparated_ParseAsAuthorizations()
+    {
+        await using var target = await StartAttachedAppAsync();
+
+        var (exitCode, stdout, stderr) = await RunCliAsync(
+            "capture", "screenshot", "--authorize", "non-screen-metadata,editor-text", Pid, "--json");
+
+        Assert.AreEqual(0, exitCode, stderr);
+        using var json = JsonDocument.Parse(stdout);
+        AssertCoverage(json.RootElement, "window-title", "included");
+        AssertCoverage(json.RootElement, "editor-text", "unavailable");
+    }
+
+    [TestMethod]
+    public async Task Screenshot_JsonWithOutput_SavesContentAndOmitsItFromJson()
+    {
+        await using var target = await StartAttachedAppAsync();
+        var outputPath = Path.Combine(Path.GetTempPath(), $"hex1b-cli-{Guid.NewGuid():N}.ansi");
+        try
+        {
+            var (exitCode, stdout, stderr) = await RunCliAsync(
+                "capture", "screenshot", Pid, "--format", "ansi", "--output", outputPath, "--json");
+
+            Assert.AreEqual(0, exitCode, stderr);
+            using var json = JsonDocument.Parse(stdout);
+            Assert.AreEqual("captured", json.RootElement.GetProperty("outcome").GetString());
+            Assert.IsFalse(json.RootElement.TryGetProperty("content", out _), "saved content repeated on stdout");
+            StringAssert.Contains(stderr, outputPath);
+            using var model = ApplyToModel(await File.ReadAllTextAsync(outputPath), 40, 5);
+            Assert.AreEqual(200, FindCell(model, "STYLED").Foreground!.Value.R);
+        }
+        finally
+        {
+            File.Delete(outputPath);
+        }
+    }
+
+    [TestMethod]
     public async Task Screenshot_UnreachableSocket_ReportsUnavailableOutcome()
     {
         var socketPath = Path.Combine(McpDiagnosticsPresentationFilter.GetSocketDirectory(), "999999999.diagnostics.socket");

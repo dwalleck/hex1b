@@ -28,18 +28,23 @@ Tools exposed via MCP:
 - start_pwsh_terminal    → Create new PowerShell session
 - send_terminal_input    → Send text/commands to terminal
 - send_terminal_key      → Send special keys (Enter, Tab, Arrows)
-- capture_terminal       → Get current screen content
+- capture_terminal_screen → Capture screen content (text, styled ANSI, SVG, HTML)
+- get_terminal_diagnostic_capabilities → Describe capture support and limits
 - list_terminals         → List active sessions
 - stop_terminal          → Stop a session
 ```
 
 ### Screen Capture
 
-AI agents can read the current terminal state:
+AI agents can read the current terminal state through the shared
+[diagnostic capture contract](/guide/diagnostic-capture), the same one the CLI uses:
 
 - **Text capture** — Get screen content as plain text
-- **Accessibility snapshot** — Structured representation of UI elements
-- **SVG capture** — Visual representation with colors and styling
+- **ANSI capture** — Screen content with cell colors and attributes preserved
+- **SVG and HTML capture** — Visual representations with colors and styling
+
+Every capture reports its outcome, geometry, retained model-history coverage, correlation
+identity, and which content was included, excluded, or unavailable.
 
 ### Input Simulation
 
@@ -179,7 +184,8 @@ When exposing terminals to AI agents, consider:
 | `start_pwsh_terminal` | Start a new PowerShell session |
 | `send_terminal_input` | Send text input to terminal |
 | `send_terminal_key` | Send special key (Enter, Tab, etc.) |
-| `capture_terminal` | Capture screen as text or SVG |
+| `capture_terminal_screen` | Capture screen as text, ANSI, SVG, or HTML with contract metadata |
+| `get_terminal_diagnostic_capabilities` | Describe supported capture formats, authorizations, and evidence layers |
 | `wait_for_terminal_text` | Wait for specific text to appear |
 | `list_terminals` | List all active sessions |
 | `stop_terminal` | Stop a terminal session |

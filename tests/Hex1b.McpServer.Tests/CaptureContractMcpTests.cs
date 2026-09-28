@@ -208,6 +208,31 @@ public class CaptureContractMcpTests : McpServerTestBase
     }
 
     [TestMethod]
+    public async Task WaitForTerminalText_UnreachableAttachedTarget_ReportsFailureNotNotFound()
+    {
+        var terminal = await StartAttachedAppAsync();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var sessionId = await ConnectAttachedAsync(client);
+        await terminal.DisposeAsync();
+        var socketPath = McpDiagnosticsPresentationFilter.GetSocketPath();
+        for (var attempt = 0; attempt < 100 && File.Exists(socketPath); attempt++)
+            await Task.Delay(50);
+
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        var wait = await CallAsync(client, "wait_for_terminal_text", new()
+        {
+            ["sessionId"] = sessionId,
+            ["text"] = "STYLED",
+            ["timeoutSeconds"] = 10
+        });
+
+        Assert.IsFalse(wait.GetProperty("success").GetBoolean(), wait.ToString());
+        StringAssert.Contains(wait.GetProperty("message").GetString(), "target-unreachable");
+        Assert.IsTrue(started.Elapsed < TimeSpan.FromSeconds(5), "an unreachable target was polled until the deadline");
+    }
+
+    [TestMethod]
     public async Task GetTerminalDiagnosticCapabilities_LocalAndAttachedDiscloseTheirLayers()
     {
         await using var terminal = await StartAttachedAppAsync();

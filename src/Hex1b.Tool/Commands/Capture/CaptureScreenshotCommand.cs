@@ -23,8 +23,7 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
     private static readonly Option<int> s_scrollbackOption = new("--scrollback") { DefaultValueFactory = _ => 0, Description = "Rows of retained terminal-model history to include (not native scrollback)" };
     private static readonly Option<string[]> s_authorizeOption = new("--authorize")
     {
-        Description = "Opt in to content beyond the rendered screen: non-screen-metadata, editor-text, or raw-input (repeatable)",
-        AllowMultipleArgumentsPerToken = true
+        Description = "Opt in to content beyond the rendered screen: non-screen-metadata, editor-text, or raw-input (repeatable or comma-separated)"
     };
 
     public CaptureScreenshotCommand(
@@ -54,7 +53,8 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
         var waitText = parseResult.GetValue(s_waitOption);
         var timeout = parseResult.GetValue(s_timeoutOption);
         var scrollback = parseResult.GetValue(s_scrollbackOption);
-        var authorizations = parseResult.GetValue(s_authorizeOption);
+        var authorizations = parseResult.GetValue(s_authorizeOption)?
+            .SelectMany(value => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         var json = parseResult.GetValue(RootCommand.JsonOption);
 
         var isPng = string.Equals(format, "png", StringComparison.OrdinalIgnoreCase);
@@ -99,12 +99,29 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
             await File.WriteAllTextAsync(outputPath, result.Content, cancellationToken);
         }
 
-        if (json)
+        if (outputPath != null)
+        {
+            // Saved content is not repeated on stdout, matching the MCP tools. PNG is rasterized
+            // here from the SVG capture that the result describes.
+            var note = isPng ? $"Saved PNG rasterized from the SVG capture to {outputPath}" : $"Saved to {outputPath}";
+            if (json)
+            {
+                WriteResult(result with { Content = null });
+                Formatter.WriteError(note);
+            }
+            else
+            {
+                Formatter.WriteLine(note);
+            }
+        }
+        else if (json)
+        {
             WriteResult(result);
-        else if (outputPath != null)
-            Formatter.WriteLine($"Saved to {outputPath}");
+        }
         else
+        {
             Console.Write(result.Content);
+        }
 
         return 0;
     }

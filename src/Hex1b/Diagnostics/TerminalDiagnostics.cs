@@ -35,6 +35,8 @@ public sealed class TerminalDiagnostics
         "Terminal-model evidence only: it describes neither the native host's scrollback nor what a native host displayed.";
     private const string CoherenceLimitation =
         "Coherence of cells, geometry, cursor, modes, and history across one model observation is not yet a declared guarantee of this operation.";
+    private const string ConcealedLimitation =
+        "Concealed (SGR 8) text is withheld from every format; its cells are returned blank.";
     private const string ObservationalLimitation =
         "Capture issues no repaint, terminal query, or control sequence and sends no input.";
 
@@ -53,7 +55,7 @@ public sealed class TerminalDiagnostics
         "What a native terminal host physically displayed is not observable by Hex1b.";
 
     private static readonly IReadOnlyList<string> CaptureLimitations =
-        [ContentMaySecretsLimitation, ImmediateLimitation, ModelOnlyLimitation, CoherenceLimitation, ObservationalLimitation];
+        [ContentMaySecretsLimitation, ImmediateLimitation, ModelOnlyLimitation, CoherenceLimitation, ConcealedLimitation, ObservationalLimitation];
 
     private static readonly IReadOnlyList<string> AnsiCaptureLimitations = [.. CaptureLimitations, AnsiRenditionLimitation];
 
@@ -61,6 +63,9 @@ public sealed class TerminalDiagnostics
         ?? typeof(Hex1bTerminal).Assembly.GetName().Version?.ToString() ?? "unknown";
 
     private static readonly Lazy<(DateTimeOffset? StartedAt, string? Reason)> ProcessStart = new(ReadProcessStart);
+
+    private static readonly Lazy<string?> EntryAssemblyVersion =
+        new(() => Assembly.GetEntryAssembly() is { } entry ? ReadInformationalVersion(entry) : null);
 
     private readonly Hex1bTerminal _terminal;
     private readonly string _applicationName;
@@ -101,19 +106,23 @@ public sealed class TerminalDiagnostics
         if (_terminal.IsDisposed)
             return Problem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
 
-        var startTimestamp = Stopwatch.GetTimestamp();
-        var wallClockStart = DateTimeOffset.UtcNow;
         var nonScreen = authorizations.Contains(DiagnosticAuthorization.NonScreenMetadata);
         try
         {
+            // The acquisition interval brackets only the model read; rendering happens afterwards.
+            var startTimestamp = Stopwatch.GetTimestamp();
+            var wallClockStart = DateTimeOffset.UtcNow;
             var state = _terminal.CaptureSnapshotState(request.HistoryRows, ScrollbackWidth.CurrentTerminal);
-            using var snapshot = new Hex1bTerminalSnapshot(_terminal, state, ScrollbackWidth.CurrentTerminal, TerminalCell.Empty);
-            var content = Render(snapshot, request, nonScreen);
             var endTimestamp = Stopwatch.GetTimestamp();
             var wallClockEnd = DateTimeOffset.UtcNow;
 
+            var croppedRows = CountCroppedRows(state);
+            using var snapshot = new Hex1bTerminalSnapshot(_terminal, ApplyContentPolicy(state, nonScreen),
+                ScrollbackWidth.CurrentTerminal, TerminalCell.Empty);
+            var content = Render(snapshot, request, nonScreen);
+
             var unavailable = new List<DiagnosticUnavailableField>();
-            var history = DescribeHistory(request.HistoryRows, state, snapshot.ScrollbackLineCount, unavailable);
+            var history = DescribeHistory(request.HistoryRows, state, snapshot.ScrollbackLineCount, croppedRows, unavailable);
             var identity = DescribeIdentity(new DiagnosticAcquisition
             {
                 ClockDomain = "process-monotonic",
@@ -153,14 +162,19 @@ public sealed class TerminalDiagnostics
         }
         catch (Exception error)
         {
-            return Problem(DiagnosticOutcome.Failed, "capture-failed", error.Message);
+            // Keep the failure diagnosable: the result carries the exception type, and the full
+            // exception goes to trace listeners.
+            Trace.TraceError($"Hex1b diagnostic capture failed: {error}");
+            return Problem(DiagnosticOutcome.Failed, "capture-failed", $"{error.GetType().FullName}: {error.Message}");
         }
     }
 
     /// <summary>
     /// Describes the operations and evidence layers this target supports.
     /// </summary>
-    public DiagnosticCapabilities GetCapabilities() => new()
+    public DiagnosticCapabilities GetCapabilities() => _terminal.IsDisposed
+        ? CapabilitiesProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.")
+        : new()
     {
         Outcome = DiagnosticOutcome.Captured,
         Operations =
@@ -208,6 +222,69 @@ public sealed class TerminalDiagnostics
         Problem = new DiagnosticProblem { Code = code, Message = message },
     };
 
+    // Applies the content policy to the snapshot's private cell copies once, so every renderer
+    // sees only permitted content. Scrollback rows share cell arrays with the live model, so
+    // they are copied before redaction. Hyperlink references the snapshot will no longer hold
+    // are released here to balance the references taken when the state was captured.
+    private static Hex1bTerminalSnapshotState ApplyContentPolicy(Hex1bTerminalSnapshotState state, bool keepHyperlinks)
+    {
+        var screen = state.ScreenBuffer;
+        for (var y = 0; y < state.TerminalHeight; y++)
+            for (var x = 0; x < state.TerminalWidth; x++)
+                screen[y, x] = RedactCell(screen[y, x], keepHyperlinks);
+
+        var rows = new ScrollbackRow[state.ScrollbackRows.Length];
+        for (var i = 0; i < rows.Length; i++)
+        {
+            var row = state.ScrollbackRows[i];
+            var cells = new TerminalCell[Math.Min(row.Cells.Length, state.TerminalWidth)];
+            for (var x = 0; x < cells.Length; x++)
+                cells[x] = RedactCell(row.Cells[x], keepHyperlinks);
+            rows[i] = row with { Cells = cells };
+        }
+
+        return state with
+        {
+            ScreenBuffer = screen,
+            ScrollbackRows = rows,
+            ActiveHyperlink = keepHyperlinks ? state.ActiveHyperlink : null,
+        };
+    }
+
+    private static TerminalCell RedactCell(TerminalCell cell, bool keepHyperlinks)
+    {
+        if (!keepHyperlinks && cell.TrackedHyperlink is { } hyperlink)
+        {
+            hyperlink.Release();
+            cell = cell with { TrackedHyperlink = null };
+        }
+
+        if ((cell.Attributes & CellAttributes.Hidden) != 0 && !string.IsNullOrEmpty(cell.Character) && cell.Character != " ")
+            cell = cell with { Character = new string(' ', Math.Max(1, DisplayWidth.GetGraphemeWidth(cell.Character))) };
+
+        return cell;
+    }
+
+    // Returned history rows that lose non-blank retained content when cropped to the screen width.
+    private static int CountCroppedRows(Hex1bTerminalSnapshotState state)
+    {
+        var cropped = 0;
+        foreach (var row in state.ScrollbackRows)
+        {
+            for (var x = state.TerminalWidth; x < row.Cells.Length; x++)
+            {
+                var character = row.Cells[x].Character;
+                if (!string.IsNullOrEmpty(character) && character != " " && character != "\0" && character != "\uE000")
+                {
+                    cropped++;
+                    break;
+                }
+            }
+        }
+
+        return cropped;
+    }
+
     private static string Render(Hex1bTerminalSnapshot snapshot, DiagnosticCaptureRequest request, bool nonScreen)
     {
         switch (request.Format)
@@ -220,15 +297,15 @@ public sealed class TerminalDiagnostics
                     ? snapshot.ToAnsi(ansiOptions, includeHyperlinks: true)
                     : snapshot.ToAnsi(ansiOptions);
             default:
-                var options = new TerminalSvgOptions { ShowCellGrid = false, IncludeHyperlinkTargets = nonScreen };
+                var options = new TerminalSvgOptions { ShowCellGrid = false };
                 if (request.FontFamily is { } fontFamily)
                     options.FontFamily = $"'{fontFamily}'";
                 return request.Format == DiagnosticCaptureFormat.Svg ? snapshot.ToSvg(options) : snapshot.ToHtml(options);
         }
     }
 
-    private DiagnosticHistoryCoverage DescribeHistory(
-        int requested, Hex1bTerminalSnapshotState state, int returned, List<DiagnosticUnavailableField> unavailable)
+    private DiagnosticHistoryCoverage DescribeHistory(int requested, Hex1bTerminalSnapshotState state, int returned,
+        int croppedRows, List<DiagnosticUnavailableField> unavailable)
     {
         var capacity = _terminal.HistoryRetentionCapacity;
         string? reason = null;
@@ -243,6 +320,10 @@ public sealed class TerminalDiagnostics
             reason = "The alternate screen is active; retained primary-screen history is not part of this observation.";
             available = null;
         }
+        else if (croppedRows > 0)
+        {
+            reason = $"{croppedRows} returned row(s) held content wider than the current {state.TerminalWidth} columns and were cropped.";
+        }
 
         if (available is null)
             unavailable.Add(new DiagnosticUnavailableField { Field = "history.availableRows", Reason = reason! });
@@ -252,7 +333,8 @@ public sealed class TerminalDiagnostics
             RequestedRows = requested,
             AvailableRows = available,
             ReturnedRows = returned,
-            Truncated = available is int count && returned < Math.Min(requested, count),
+            CroppedRows = croppedRows,
+            Truncated = croppedRows > 0 || (available is int count && returned < Math.Min(requested, count)),
             RetentionCapacity = capacity,
             Reason = reason,
         };
@@ -269,7 +351,7 @@ public sealed class TerminalDiagnostics
         string? applicationVersion = null;
         if (workload is Hex1bAppWorkloadAdapter)
         {
-            applicationVersion = Assembly.GetEntryAssembly() is { } entry ? ReadInformationalVersion(entry) : null;
+            applicationVersion = EntryAssemblyVersion.Value;
             if (applicationVersion is null)
                 unavailable.Add(new DiagnosticUnavailableField
                 {
@@ -331,6 +413,8 @@ public sealed class TerminalDiagnostics
         return
         [
             Included(DiagnosticContentClass.RenderedScreen),
+            Coverage(DiagnosticContentClass.ConcealedText, DiagnosticCoverageState.Excluded,
+                "Concealed (SGR 8) text is not rendered; captures return its cells blank."),
             request.HistoryRows == 0
                 ? Coverage(DiagnosticContentClass.RenderedHistory, DiagnosticCoverageState.Excluded, "No history rows were requested.")
                 : history.AvailableRows is null

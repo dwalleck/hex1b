@@ -1,5 +1,4 @@
 using System.ComponentModel;
-using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Hex1b.Diagnostics;
@@ -44,7 +43,7 @@ public class DiagnosticsTools
             if (!int.TryParse(pidStr, out var pid))
                 continue;
 
-            if (!IsProcessRunning(pid))
+            if (!ProcessLiveness.IsRunning(pid))
             {
                 // Clean up stale socket
                 try { File.Delete(socketPath); }
@@ -116,7 +115,7 @@ public class DiagnosticsTools
                 (request, token) => Client.CaptureAsync(socketPath, request, token),
                 format, historyRows, authorize, savePath, ct, processId: processId);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return new CaptureToolResult
             {
@@ -188,7 +187,8 @@ public class DiagnosticsTools
 
         try
         {
-            var response = await Client.SendAsync(socketPath, new DiagnosticsRequest { Method = "tree" }, ct);
+            var response = await Client.SendAsync(socketPath, new DiagnosticsRequest { Method = "tree" }, ct,
+                DiagnosticsSocketClient.DefaultObservationTimeout);
             if (!response.Success)
             {
                 return new GetHex1bTreeResult
@@ -229,11 +229,11 @@ public class DiagnosticsTools
     // Returns why the target cannot be reached, or null when its socket is live.
     private static string? CheckTarget(int processId, out string socketPath)
     {
-        socketPath = Path.Combine(McpDiagnosticsPresentationFilter.GetSocketDirectory(), $"{processId}.diagnostics.socket");
+        socketPath = McpDiagnosticsPresentationFilter.GetSocketPath(processId);
         if (!File.Exists(socketPath))
             return $"No diagnostics socket found for process {processId}. Ensure the application is running with WithDiagnostics() enabled.";
 
-        if (IsProcessRunning(processId))
+        if (ProcessLiveness.IsRunning(processId))
             return null;
 
         try { File.Delete(socketPath); }
@@ -251,19 +251,6 @@ public class DiagnosticsTools
             .Replace("\\x1b", "\x1b")
             .Replace("\\e", "\x1b")
             .Replace("\\\\", "\\");
-    }
-
-    private static bool IsProcessRunning(int pid)
-    {
-        try
-        {
-            var process = Process.GetProcessById(pid);
-            return !process.HasExited;
-        }
-        catch
-        {
-            return false;
-        }
     }
 }
 

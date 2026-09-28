@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Hex1b.Diagnostics;
 
 namespace Hex1b.McpServer;
@@ -8,6 +7,8 @@ namespace Hex1b.McpServer;
 /// </summary>
 public sealed class RemoteTerminalTarget : ITerminalTarget
 {
+    private static readonly TimeSpan InfoTimeout = TimeSpan.FromSeconds(5);
+
     private readonly DiagnosticsSocketClient _client = new();
     private readonly string _socketPath;
     private readonly string _id;
@@ -34,7 +35,7 @@ public sealed class RemoteTerminalTarget : ITerminalTarget
     public int ProcessId { get; private set; }
 
     /// <inheritdoc />
-    public bool IsAlive => !_disposed && IsProcessRunning(ProcessId);
+    public bool IsAlive => !_disposed && ProcessLiveness.IsRunning(ProcessId);
 
     /// <inheritdoc />
     public DateTimeOffset StartedAt { get; private set; }
@@ -86,18 +87,14 @@ public sealed class RemoteTerminalTarget : ITerminalTarget
     /// <summary>
     /// Gets the socket path for a given process ID.
     /// </summary>
-    public static string GetSocketPath(int pid)
-    {
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        return Path.Combine(home, ".hex1b", "sockets", $"{pid}.diagnostics.socket");
-    }
+    public static string GetSocketPath(int pid) => McpDiagnosticsPresentationFilter.GetSocketPath(pid);
 
     /// <summary>
     /// Refreshes the info from the remote target.
     /// </summary>
     public async Task RefreshInfoAsync(CancellationToken ct = default)
     {
-        var response = await _client.SendAsync(_socketPath, new DiagnosticsRequest { Method = "info" }, ct);
+        var response = await _client.SendAsync(_socketPath, new DiagnosticsRequest { Method = "info" }, ct, InfoTimeout);
         if (response.Success)
         {
             Name = response.AppName ?? "Unknown";
@@ -157,7 +154,14 @@ public sealed class RemoteTerminalTarget : ITerminalTarget
             while (!cts.Token.IsCancellationRequested)
             {
                 var capture = await CaptureAsync(new DiagnosticCaptureRequest { Format = DiagnosticCaptureFormat.Text }, cts.Token);
-                if (capture.Content?.Contains(text) == true)
+                if (capture.Outcome != DiagnosticOutcome.Captured)
+                {
+                    // A target that cannot be observed is a failure, not "text not found yet".
+                    throw new InvalidOperationException(
+                        $"Capture {DiagnosticContractNames.Of(capture.Outcome)} ({capture.Problem?.Code}): {capture.Problem?.Message}");
+                }
+
+                if (capture.Content!.Contains(text))
                     return true;
 
                 await Task.Delay(100, cts.Token);
@@ -169,19 +173,6 @@ public sealed class RemoteTerminalTarget : ITerminalTarget
         }
 
         return false;
-    }
-
-    private static bool IsProcessRunning(int pid)
-    {
-        try
-        {
-            var process = Process.GetProcessById(pid);
-            return !process.HasExited;
-        }
-        catch
-        {
-            return false;
-        }
     }
 
     /// <inheritdoc />

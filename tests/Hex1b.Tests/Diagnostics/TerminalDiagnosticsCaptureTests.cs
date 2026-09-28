@@ -139,6 +139,7 @@ public class TerminalDiagnosticsCaptureTests
             Assert.IsFalse(result.Content.Contains("Secret Title", StringComparison.Ordinal), $"{format} leaked the title");
             Assert.IsNull(result.NonScreenMetadata);
             AssertCoverage(result, DiagnosticContentClass.RenderedScreen, DiagnosticCoverageState.Included);
+            AssertCoverage(result, DiagnosticContentClass.ConcealedText, DiagnosticCoverageState.Excluded);
             AssertCoverage(result, DiagnosticContentClass.HyperlinkTargets, DiagnosticCoverageState.Excluded);
             AssertCoverage(result, DiagnosticContentClass.WindowTitle, DiagnosticCoverageState.Excluded);
             AssertCoverage(result, DiagnosticContentClass.EditorText, DiagnosticCoverageState.Excluded);
@@ -188,6 +189,85 @@ public class TerminalDiagnosticsCaptureTests
         });
         AssertCoverage(text, DiagnosticContentClass.HyperlinkTargets, DiagnosticCoverageState.Unavailable);
         Assert.AreEqual("Visible Title", text.NonScreenMetadata!.WindowTitle);
+    }
+
+    [TestMethod]
+    public async Task Capture_ConcealedText_IsWithheldFromEveryFormat()
+    {
+        await using var source = await StartAsync("\x1b[8mHUNTER2\x1b[0m visible", waitFor: "visible", scrollback: 10);
+        var diagnostics = new TerminalDiagnostics(source.Terminal, "concealed");
+
+        foreach (var format in Enum.GetValues<DiagnosticCaptureFormat>())
+        {
+            var result = diagnostics.Capture(new DiagnosticCaptureRequest
+            {
+                Format = format,
+                Authorizations = [DiagnosticAuthorization.NonScreenMetadata]
+            });
+
+            Assert.IsFalse(result.Content!.Contains("HUNTER2", StringComparison.Ordinal), $"{format} leaked concealed text");
+            foreach (var letter in "HUNTER2".Distinct().Except("visible"))
+                Assert.IsFalse(result.Content.Contains($"{letter}", StringComparison.Ordinal) && format == DiagnosticCaptureFormat.Text,
+                    $"{format} leaked a concealed glyph '{letter}'");
+            AssertCoverage(result, DiagnosticContentClass.ConcealedText, DiagnosticCoverageState.Excluded);
+        }
+
+        var text = diagnostics.Capture(new DiagnosticCaptureRequest()).Content!;
+        StringAssert.StartsWith(text, "        visible", "concealed cells must stay blank without shifting later text");
+    }
+
+    [TestMethod]
+    public async Task Capture_WithheldHyperlinks_DoNotLeakModelReferences()
+    {
+        await using var source = await StartAsync(
+            "\x1b]8;;https://example.invalid/r\x1b\\LINK\x1b]8;;\x1b\\\r\n" + string.Concat(Enumerable.Repeat("x\r\n", 8)),
+            waitFor: "x", scrollback: 20);
+        var link = FindTrackedHyperlink(source.Terminal);
+        var baseline = link.RefCount;
+        var diagnostics = new TerminalDiagnostics(source.Terminal, "refs");
+
+        foreach (var format in Enum.GetValues<DiagnosticCaptureFormat>())
+        {
+            diagnostics.Capture(new DiagnosticCaptureRequest { Format = format, HistoryRows = 20 });
+            diagnostics.Capture(new DiagnosticCaptureRequest
+            {
+                Format = format,
+                HistoryRows = 20,
+                Authorizations = [DiagnosticAuthorization.NonScreenMetadata]
+            });
+        }
+
+        Assert.AreEqual(baseline, link.RefCount, "captures changed the model's hyperlink reference count");
+    }
+
+    [TestMethod]
+    public async Task Capture_HistoryCroppedToNarrowerScreen_ReportsTruncation()
+    {
+        await using var source = await StartAsync(
+            new string('W', 38) + "END\r\n" + string.Concat(Enumerable.Repeat("x\r\n", 8)), waitFor: "x", scrollback: 20);
+        source.Terminal.Resize(20, 6);
+        var diagnostics = new TerminalDiagnostics(source.Terminal, "crop");
+
+        var result = diagnostics.Capture(new DiagnosticCaptureRequest { HistoryRows = 20 });
+
+        Assert.IsTrue(result.History!.CroppedRows >= 1, "cropped wide history was not reported");
+        Assert.IsTrue(result.History.Truncated);
+        StringAssert.Contains(result.History.Reason, "cropped");
+        Assert.IsFalse(result.Content!.Contains("END", StringComparison.Ordinal), "fixture did not crop");
+    }
+
+    [TestMethod]
+    public async Task Capabilities_DisposedTerminal_AreUnavailable()
+    {
+        var source = await StartAsync("x", waitFor: "x");
+        var diagnostics = new TerminalDiagnostics(source.Terminal, "t");
+        await source.DisposeAsync();
+
+        var capabilities = diagnostics.GetCapabilities();
+
+        Assert.AreEqual(DiagnosticOutcome.Unavailable, capabilities.Outcome);
+        Assert.AreEqual("target-disposed", capabilities.Problem!.Code);
+        Assert.AreEqual(0, capabilities.Operations.Count);
     }
 
     [TestMethod]
@@ -397,6 +477,18 @@ public class TerminalDiagnosticsCaptureTests
             if (!json.GetProperty("identity").TryGetProperty(name, out _))
                 AssertUnavailableField(result, $"identity.{name}");
         }
+    }
+
+    private static TrackedObject<HyperlinkData> FindTrackedHyperlink(Hex1bTerminal terminal)
+    {
+        using var snapshot = terminal.CreateSnapshot(20);
+        for (var y = 0; y < snapshot.Height; y++)
+            for (var x = 0; x < snapshot.Width; x++)
+                if (snapshot.GetCell(x, y).TrackedHyperlink is { } link)
+                    return link;
+
+        Assert.Fail("no hyperlink in the model");
+        return null!;
     }
 
     private static TerminalCell FindCell(Hex1bTerminalSnapshot snapshot, string text)

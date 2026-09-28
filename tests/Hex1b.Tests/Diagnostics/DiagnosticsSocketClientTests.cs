@@ -70,7 +70,7 @@ public class DiagnosticsSocketClientTests
         await using var server = await FakeServer.StartAsync(line =>
         {
             received = line;
-            return """{"success":false,"error":"x","capture":{"outcome":"invalid-request","problem":{"code":"c","message":"m"}}}""";
+            return """{"success":false,"error":"x","capture":{"contractVersion":1,"outcome":"invalid-request","problem":{"code":"c","message":"m"}}}""";
         });
 
         var result = await new DiagnosticsSocketClient().CaptureAsync(server.Path, new DiagnosticCaptureRequest
@@ -82,7 +82,7 @@ public class DiagnosticsSocketClientTests
 
         StringAssert.Contains(received, "\"method\":\"capture\"");
         StringAssert.Contains(received, "\"capture\":{\"format\":\"html\",\"historyRows\":7,\"authorizations\":[\"non-screen-metadata\"]}");
-        Assert.AreEqual(DiagnosticOutcome.InvalidRequest, result.Outcome, "the target's own outcome must be preserved");
+        Assert.AreEqual(DiagnosticOutcome.InvalidRequest, result.Outcome, $"the target's own outcome must be preserved: {result.Problem?.Code} {result.Problem?.Message}");
         Assert.AreEqual("c", result.Problem!.Code);
     }
 
@@ -105,10 +105,78 @@ public class DiagnosticsSocketClientTests
         await using var server = await FakeServer.StartAsync(_ => null);
 
         var error = await Assert.ThrowsExactlyAsync<TimeoutException>(() =>
-            new DiagnosticsSocketClient(TimeSpan.FromMilliseconds(200)).SendAsync(
-                server.Path, new DiagnosticsRequest { Method = "shutdown" }, TestContext.Current.CancellationToken));
+            new DiagnosticsSocketClient().SendAsync(
+                server.Path, new DiagnosticsRequest { Method = "info" }, TestContext.Current.CancellationToken,
+                TimeSpan.FromMilliseconds(200)));
 
         StringAssert.Contains(error.Message, "did not respond");
+    }
+
+    [TestMethod]
+    public async Task Send_WithoutTimeout_WaitsForASlowTargetInsteadOfReportingFailure()
+    {
+        // Non-idempotent requests must not be reported failed while the target is still applying them.
+        await using var server = await FakeServer.StartAsync(_ =>
+        {
+            Thread.Sleep(400);
+            return """{"success":true,"data":"Sent 3 bytes"}""";
+        });
+
+        var response = await new DiagnosticsSocketClient(TimeSpan.FromMilliseconds(100)).SendAsync(
+            server.Path, new DiagnosticsRequest { Method = "input", Data = "abc" }, TestContext.Current.CancellationToken);
+
+        Assert.IsTrue(response.Success);
+    }
+
+    [TestMethod]
+    public async Task Capture_ResultWithoutContractVersion_IsIncompatible()
+    {
+        await using var server = await FakeServer.StartAsync(_ =>
+            """{"success":false,"capture":{"outcome":"invalid-request","problem":{"code":"c","message":"m"}}}""");
+
+        var result = await new DiagnosticsSocketClient().CaptureAsync(server.Path, new DiagnosticCaptureRequest(),
+            TestContext.Current.CancellationToken);
+
+        Assert.AreEqual("incompatible-target", result.Problem!.Code);
+    }
+
+    [TestMethod]
+    public async Task Capture_OtherContractVersion_IsIncompatible()
+    {
+        await using var server = await FakeServer.StartAsync(_ =>
+            """{"success":true,"capture":{"contractVersion":2,"outcome":"captured","format":"text","content":"x"}}""");
+
+        var result = await new DiagnosticsSocketClient().CaptureAsync(server.Path, new DiagnosticCaptureRequest(),
+            TestContext.Current.CancellationToken);
+
+        Assert.AreEqual(DiagnosticOutcome.Failed, result.Outcome);
+        Assert.AreEqual("incompatible-target", result.Problem!.Code);
+        StringAssert.Contains(result.Problem.Message, "version 2");
+    }
+
+    [TestMethod]
+    public async Task Capture_CapturedWithoutRequiredFields_IsProtocolError()
+    {
+        await using var server = await FakeServer.StartAsync(_ =>
+            """{"success":true,"capture":{"contractVersion":1,"outcome":"captured","format":"text","content":"x"}}""");
+
+        var result = await new DiagnosticsSocketClient().CaptureAsync(server.Path, new DiagnosticCaptureRequest(),
+            TestContext.Current.CancellationToken);
+
+        Assert.AreEqual(DiagnosticOutcome.Failed, result.Outcome);
+        Assert.AreEqual("protocol-error", result.Problem!.Code);
+    }
+
+    [TestMethod]
+    public async Task Capture_InvalidEndpoint_IsTransportFailureNotAnException()
+    {
+        var tooLong = Path.Combine(Path.GetTempPath(), new string('p', 400) + ".socket");
+
+        var result = await new DiagnosticsSocketClient().CaptureAsync(tooLong, new DiagnosticCaptureRequest(),
+            TestContext.Current.CancellationToken);
+
+        Assert.AreNotEqual(DiagnosticOutcome.Captured, result.Outcome);
+        Assert.IsNotNull(result.Problem);
     }
 
     [TestMethod]

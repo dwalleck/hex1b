@@ -23,7 +23,17 @@ public sealed class DiagnosticHistoryCoverage
     [JsonPropertyName("returnedRows")]
     public int ReturnedRows { get; init; }
 
-    /// <summary>Whether fewer rows were returned than were both requested and available.</summary>
+    /// <summary>
+    /// Returned rows whose retained content was wider than the current screen and was cropped
+    /// to the current width. Cropped blank columns are not counted.
+    /// </summary>
+    [JsonPropertyName("croppedRows")]
+    public int CroppedRows { get; init; }
+
+    /// <summary>
+    /// Whether returned history omits retained content: fewer rows than were both requested and
+    /// available, or rows cropped to the current width.
+    /// </summary>
     [JsonPropertyName("truncated")]
     public bool Truncated { get; init; }
 

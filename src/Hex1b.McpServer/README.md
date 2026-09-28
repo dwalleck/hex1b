@@ -45,7 +45,7 @@ The server communicates via stdio using the MCP protocol.
 - **get_terminal_diagnostic_capabilities** - Describe supported operations, formats, authorizations, and unavailable evidence layers
 - **wait_for_terminal_text** - Wait for specific text to appear on the terminal
 
-Every capture tool returns `capture`, the shared [diagnostic capture contract](https://hex1b.dev/reference/diagnostic-capture) result the CLI also returns: `outcome` (`captured`, `unavailable`, `invalid-request`, `failed`), `problem`, `content`, `geometry`, `history` coverage, `identity` (process, session, build, configuration, acquisition clock), `contentCoverage` (included, excluded, or unavailable, with reasons), `unavailableFields`, and `limitations`. When a tool saves to `savePath`, the content is in the file and omitted from `capture.content`.
+Every capture tool returns `capture`, the shared [diagnostic capture contract](https://hex1b.dev/guide/diagnostic-capture) result the CLI also returns: `outcome` (`captured`, `unavailable`, `invalid-request`, `failed`), `problem`, `content`, `geometry`, `history` coverage, `identity` (process, session, build, configuration, acquisition clock), `contentCoverage` (included, excluded, or unavailable, with reasons), `unavailableFields`, and `limitations`. When a tool saves to `savePath`, the content is in the file and omitted from `capture.content`.
 
 ### Recording
 

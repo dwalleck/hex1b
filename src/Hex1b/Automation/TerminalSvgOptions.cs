@@ -72,7 +72,4 @@ public class TerminalSvgOptions
     /// The color of the pixel grid lines (CSS color string).
     /// </summary>
     public string PixelGridColor { get; set; } = "rgba(64, 64, 64, 0.3)";
-
-    // Hyperlink targets are hidden, non-screen metadata; diagnostics withholds them unless authorized.
-    internal bool IncludeHyperlinkTargets { get; set; } = true;
 }

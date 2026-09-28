@@ -115,11 +115,13 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
     /// <summary>
     /// Gets the socket path for the current process.
     /// </summary>
-    internal static string GetSocketPath()
-    {
-        var pid = Environment.ProcessId;
-        return Path.Combine(GetSocketDirectory(), $"{pid}.diagnostics.socket");
-    }
+    internal static string GetSocketPath() => GetSocketPath(Environment.ProcessId);
+
+    /// <summary>
+    /// Gets the diagnostics socket path of a process.
+    /// </summary>
+    internal static string GetSocketPath(int processId) =>
+        Path.Combine(GetSocketDirectory(), $"{processId}.diagnostics.socket");
 
     // === IHex1bTerminalPresentationFilter ===
 
