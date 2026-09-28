@@ -6,6 +6,7 @@ public sealed partial class Hex1bTerminal
     private TaskCompletionSource? _synchronizedOutputCompletion;
     private ITimer? _synchronizedOutputTimer;
     private long _synchronizedOutputStarted;
+    private long _synchronizedOutputStartedSequence;
 
     internal TerminalWidgetRenderFrame? CaptureTerminalWidgetFrame(int scrollbackOffset)
     {
@@ -35,6 +36,7 @@ public sealed partial class Hex1bTerminal
             return;
 
         _synchronizedOutputStarted = _timeProvider.GetTimestamp();
+        _synchronizedOutputStartedSequence = _modelSequence;
         _synchronizedOutputCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
         _synchronizedOutputTimer ??= _timeProvider.CreateTimer(
             _ => OnSynchronizedOutputTimeout(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);

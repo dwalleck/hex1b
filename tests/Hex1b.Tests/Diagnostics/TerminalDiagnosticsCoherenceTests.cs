@@ -160,6 +160,85 @@ public class TerminalDiagnosticsCoherenceTests
         Assert.AreEqual(expected.History!.ReturnedRows, observed.History!.ReturnedRows);
     }
 
+    [TestMethod]
+    public async Task SynchronizedUpdate_PendingIsDisclosedWithoutWaiting()
+    {
+        await using var terminal = CreateTerminal(40, 6);
+        var diagnostics = new TerminalDiagnostics(terminal, "sync");
+        var before = diagnostics.Capture(new DiagnosticCaptureRequest());
+        Assert.IsFalse(before.SynchronizedUpdate!.Active, "no synchronized update has begun");
+
+        Apply(terminal, "\x1b[?2026hPART");
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        var during = diagnostics.Capture(new DiagnosticCaptureRequest());
+        started.Stop();
+
+        Assert.IsTrue(started.Elapsed < TimeSpan.FromMilliseconds(500),
+            $"capture waited {started.Elapsed.TotalMilliseconds:0} ms for the pending update");
+        Assert.IsTrue(during.SynchronizedUpdate!.Active, "active=false while mode 2026 is pending");
+        Assert.IsNotNull(during.SynchronizedUpdate.StartedAtSequence);
+        Assert.IsTrue(during.SynchronizedUpdate.StartedAtSequence <= Sequence(during));
+        StringAssert.StartsWith(during.Content, "PART", "the partially applied update was not returned");
+
+        Apply(terminal, "\x1b[?2026l");
+        var after = diagnostics.Capture(new DiagnosticCaptureRequest());
+        Assert.IsFalse(after.SynchronizedUpdate!.Active, "active=true after the update ended");
+        Assert.IsNull(after.SynchronizedUpdate.StartedAtSequence);
+    }
+
+    [TestMethod]
+    public async Task SynchronizedUpdate_RepeatedBeginKeepsItsStart()
+    {
+        await using var terminal = CreateTerminal(40, 6);
+        var diagnostics = new TerminalDiagnostics(terminal, "sync");
+        Apply(terminal, "\x1b[?2026hA");
+        var first = diagnostics.Capture(new DiagnosticCaptureRequest()).SynchronizedUpdate!.StartedAtSequence;
+
+        Apply(terminal, "\x1b[?2026hB");
+        var second = diagnostics.Capture(new DiagnosticCaptureRequest());
+
+        Assert.AreEqual(first, second.SynchronizedUpdate!.StartedAtSequence, "a repeated begin moved the update's start");
+        Assert.IsTrue(second.SynchronizedUpdate.StartedAtSequence < Sequence(second));
+    }
+
+    [TestMethod]
+    public async Task SynchronizedUpdate_ReleasedByTimeoutIsInactive()
+    {
+        await using var terminal = CreateTerminal(40, 6);
+        var diagnostics = new TerminalDiagnostics(terminal, "sync");
+        Apply(terminal, "\x1b[?2026hSTUCK");
+        Assert.IsTrue(diagnostics.Capture(new DiagnosticCaptureRequest()).SynchronizedUpdate!.Active);
+
+        await Task.Delay(TimeSpan.FromMilliseconds(1300), TestContext.Current.CancellationToken);
+
+        Assert.IsFalse(diagnostics.Capture(new DiagnosticCaptureRequest()).SynchronizedUpdate!.Active,
+            "the model released the update on its timeout, but the capture still reports it pending");
+    }
+
+    [TestMethod]
+    public async Task Limitations_StateCoherenceScope()
+    {
+        await using var terminal = CreateTerminal(40, 6);
+        var diagnostics = new TerminalDiagnostics(terminal, "limits");
+
+        var result = diagnostics.Capture(new DiagnosticCaptureRequest());
+        var capture = diagnostics.GetCapabilities().Operations.Single(o => o.Operation == "capture");
+
+        foreach (var limitations in new[] { result.Limitations, capture.Limitations })
+        {
+            Assert.IsFalse(limitations.Any(l => l.Contains("not yet a declared guarantee", StringComparison.Ordinal)),
+                "stale coherence limitation present");
+            Assert.IsTrue(limitations.Any(l => l.Contains("One model read covers", StringComparison.Ordinal)),
+                "the coherence scope is not stated");
+            Assert.IsTrue(limitations.Any(l => l.Contains("not atomic with", StringComparison.Ordinal)),
+                "cross-layer atomicity is not disclaimed");
+            Assert.IsTrue(limitations.Any(l => l.Contains("native host", StringComparison.Ordinal)),
+                "the model-only layer is not stated");
+            Assert.IsTrue(limitations.Any(l => l.Contains("Graphics", StringComparison.Ordinal)),
+                "graphics exclusion from the sequence is not stated");
+        }
+    }
+
     // === Helpers ===
 
     private static long Sequence(DiagnosticCaptureResult result)

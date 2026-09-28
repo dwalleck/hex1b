@@ -30,16 +30,17 @@ public sealed class TerminalDiagnostics
     private const string ContentMaySecretsLimitation =
         "Rendered screen and history text can contain secrets. The default policy withholds hidden metadata; it does not make rendered content secret-free.";
     private const string ImmediateLimitation =
-        "Immediate observation of the terminal model: it can include a partially applied synchronized update and is not a completed application frame.";
+        "Immediate observation of the terminal model: a pending synchronized update is reported in synchronizedUpdate and its partially applied content is returned; it is not a completed application frame.";
+    private const string CoherenceScopeLimitation =
+        "One model read covers the returned cells, rendition, geometry, cursor, modes, retained-history rows, model sequence and synchronized-update state; model activity after that read does not change the result.";
     private const string ModelOnlyLimitation =
-        "Terminal-model evidence only: it describes neither the native host's scrollback nor what a native host displayed.";
-    private const string CoherenceLimitation =
-        "Coherence of cells, geometry, cursor, modes, and history across one model observation is not yet a declared guarantee of this operation.";
+        "Terminal-model evidence only: it describes neither the native host's scrollback nor what a native host displayed, and it is not atomic with application, native delivery or host observations; correlate those by identity and acquisition interval.";
+    private const string GraphicsLimitation =
+        "Graphics (KGP and Sixel placements and animation) are rendered as observed but are not part of the model sequence identity; KGP animation can change a rendering without a model-input event.";
     private const string ConcealedLimitation =
         "Concealed (SGR 8) text is withheld from every format; its cells are returned blank.";
     private const string ObservationalLimitation =
         "Capture issues no repaint, terminal query, or control sequence and sends no input.";
-
     private const string AnsiRenditionLimitation =
         "ANSI content represents colors and bold, dim, italic, underline, blink, hidden, strikethrough, and overline; reverse video is rendered by swapping colors, and underline color and style variants are not represented.";
 
@@ -53,7 +54,7 @@ public sealed class TerminalDiagnostics
         "What a native terminal host physically displayed is not observable by Hex1b.";
 
     private static readonly IReadOnlyList<string> CaptureLimitations =
-        [ContentMaySecretsLimitation, ImmediateLimitation, ModelOnlyLimitation, CoherenceLimitation, ConcealedLimitation, ObservationalLimitation];
+        [ContentMaySecretsLimitation, ImmediateLimitation, CoherenceScopeLimitation, ModelOnlyLimitation, GraphicsLimitation, ConcealedLimitation, ObservationalLimitation];
 
     private static readonly IReadOnlyList<string> AnsiCaptureLimitations = [.. CaptureLimitations, AnsiRenditionLimitation];
 
@@ -150,6 +151,11 @@ public sealed class TerminalDiagnostics
                     AlternateScreen = state.InAlternateScreen,
                     CursorColumn = state.CursorX,
                     CursorRow = state.CursorY,
+                },
+                SynchronizedUpdate = new DiagnosticSynchronizedUpdate
+                {
+                    Active = state.SynchronizedUpdatePending,
+                    StartedAtSequence = state.SynchronizedUpdatePending ? state.SynchronizedUpdateStartedSequence : null,
                 },
                 History = history,
                 Identity = identity,

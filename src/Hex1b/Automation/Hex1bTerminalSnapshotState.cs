@@ -40,4 +40,6 @@ internal sealed record Hex1bTerminalSnapshotState(
     IReadOnlyList<TerminalCommandMark> CommandMarks,
     int RetainedHistoryRows,
     long ModelSequence,
-    bool ReflowEnabled);
+    bool ReflowEnabled,
+    bool SynchronizedUpdatePending,
+    long SynchronizedUpdateStartedSequence);

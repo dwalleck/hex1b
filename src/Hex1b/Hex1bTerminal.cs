@@ -2718,7 +2718,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 [.. _commandMarks],
                 _scrollbackBuffer?.Count ?? 0,
                 _modelSequence,
-                _presentation is ITerminalReflowProvider { ReflowEnabled: true });
+                _presentation is ITerminalReflowProvider { ReflowEnabled: true },
+                _synchronizedOutputCompletion is not null,
+                _synchronizedOutputStartedSequence);
         }
     }
 

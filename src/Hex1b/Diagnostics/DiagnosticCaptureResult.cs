@@ -34,6 +34,10 @@ public sealed record DiagnosticCaptureResult
     [JsonPropertyName("geometry")]
     public DiagnosticGeometry? Geometry { get; init; }
 
+    /// <summary>Synchronized-update state at the model read.</summary>
+    [JsonPropertyName("synchronizedUpdate")]
+    public DiagnosticSynchronizedUpdate? SynchronizedUpdate { get; init; }
+
     /// <summary>Retained model-history coverage of the returned content.</summary>
     [JsonPropertyName("history")]
     public DiagnosticHistoryCoverage? History { get; init; }

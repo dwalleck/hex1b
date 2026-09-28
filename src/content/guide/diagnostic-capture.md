@@ -34,6 +34,7 @@ rendition. The CLI's `png` format is rasterized on the client from an `svg` capt
 | `problem` | `{ code, message }` when the outcome is not `captured`. |
 | `format`, `content` | Rendered content. When a client saves the content to a file (MCP `savePath`, CLI `--output`), `content` is omitted and the path is reported separately. |
 | `geometry` | Model columns/rows, alternate-screen state, and cursor position. |
+| `synchronizedUpdate` | `active` when a synchronized update (DEC mode 2026) had begun and not ended at the model read, with `startedAtSequence` naming the batch that began it. |
 | `history` | `requestedRows`, `availableRows`, `returnedRows`, `croppedRows`, `truncated`, `retentionCapacity`, and `reason`. |
 | `identity` | Process ID and start time, terminal-model `sessionId`, `modelSequence`, `sourceLayer` (`terminal-model`), application name/version, loaded `hex1bVersion`, `configuration` (workload, presentation, reflow, history retention), and `acquisition` (clock domain, monotonic start/end timestamps and frequency, wall-clock start/end). |
 | `contentCoverage` | For each content class, whether it is `included`, `excluded`, or `unavailable`, and why. |
@@ -70,6 +71,14 @@ history**. Hidden metadata is withheld and listed as `excluded`, not returned em
 Each authorization is independent. Rendered screen and history text can itself contain secrets.
 The default policy does not make captured content secret-free.
 
+## Coherent model observation
+
+A capture reads the terminal model once, inside the model's own critical section. The returned
+cells and rendition, geometry, cursor, modes, retained-history rows, `modelSequence`, and
+`synchronizedUpdate` all describe that one read; output, resizes, or history eviction after it do
+not change the result. The observation is not atomic with application, native delivery, or host
+observations — correlate those through their identities and acquisition intervals.
+
 ## Model sequence
 
 `identity.modelSequence` counts the model-input events — output application batches and
@@ -105,11 +114,11 @@ model-history support, and authorizations. They also report each evidence layer:
 
 ## Current limitations
 
-- Only immediate capture is supported. A capture can include a partially applied synchronized
-  update and is not a completed application frame. Waiting for named processing milestones is
-  not supported.
-- Coherence of cells, geometry, cursor, modes, and history across one model observation is not
-  yet a declared guarantee.
+- Only immediate capture is supported; waiting for named processing milestones is not. A capture
+  taken during a synchronized update returns the partially applied content, reports it in
+  `synchronizedUpdate`, and is not a completed application frame.
+- Graphics (KGP and Sixel placements and animation) are rendered as observed but are not part of
+  the model sequence; KGP animation can change a rendering without a model-input event.
 - `identity.applicationFrame` is absent: frames are not yet published with identities.
 - `identity.applicationVersion` is reported only for in-process Hex1b applications.
 - Independently acquired observations (for example a capture and a widget tree) are correlated by
