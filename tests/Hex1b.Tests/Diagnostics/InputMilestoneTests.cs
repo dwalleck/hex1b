@@ -93,6 +93,7 @@ public class InputMilestoneTests
         Assert.IsFalse(pending.Milestone!.Met);
         Assert.AreEqual(queued, pending.Milestone.AcceptedInput);
         Assert.IsLessThan(queued, pending.Milestone.ProcessedInput, "the observed watermark reached an unprocessed input");
+        Assert.IsNotNull(pending.Milestone.ModelSequence, "an unmet input-processed result hid the model progress it observed");
 
         harness.Release();
         var processed = await harness.Diagnostics.CaptureAsync(Milestone(DiagnosticMilestone.InputProcessed, queued, 5000));
@@ -780,6 +781,9 @@ public class InputMilestoneTests
         var met = await diagnostics.CaptureAsync(Milestone(DiagnosticMilestone.InputAccepted, 1, 1000));
         Assert.AreEqual(DiagnosticOutcome.Captured, met.Outcome, met.Problem?.Message);
         Assert.AreEqual("text", met.Milestone!.Input!.Kind);
+        var key = await diagnostics.TrackSendAsync(() => terminal.SendInputAsync("\r"u8.ToArray()), "key");
+        var keyRecord = await diagnostics.CaptureAsync(Milestone(DiagnosticMilestone.InputAccepted, key!.LastId, 1000));
+        Assert.AreEqual("key", keyRecord.Milestone!.Input!.Kind, "an acceptance-only record lost its send's kind");
         foreach (var later in new[] { DiagnosticMilestone.InputProcessed, DiagnosticMilestone.FramePublished, DiagnosticMilestone.ModelApplied })
         {
             var result = await diagnostics.CaptureAsync(Milestone(later, 1, 1000));
@@ -893,6 +897,141 @@ public class InputMilestoneTests
         public ValueTask OnInputAsync(IReadOnlyList<Hex1b.Tokens.AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
         public ValueTask OnResizeAsync(int width, int height, TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
         public ValueTask OnSessionEndAsync(TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+    }
+
+    [TestMethod]
+    public async Task SendTurn_DiagnosticAndNativeWritersUnderTheInputLockNeverDeadlock()
+    {
+        var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 3).Build();
+        var diagnostics = new TerminalDiagnostics(terminal, "order");
+        const int Rounds = 300;
+        var ranges = new System.Collections.Concurrent.ConcurrentBag<DiagnosticAcceptedInput>();
+
+        // A diagnostic send takes the send turn, then the terminal's input write lock. A native
+        // SendInputAsync (attach sessions) and the terminal's replies to the application's cursor
+        // position queries take the write lock too.
+        var sends = Task.Run(async () =>
+        {
+            for (var i = 0; i < Rounds; i++)
+                ranges.Add((await diagnostics.TrackSendAsync(() => terminal.SendInputAsync("ab"u8.ToArray()), "text"))!);
+        });
+        Task natives;
+        using (ExecutionContext.SuppressFlow())
+            natives = Task.Run(async () =>
+            {
+                for (var i = 0; i < Rounds; i++)
+                    await terminal.SendInputAsync("cd"u8.ToArray());
+            });
+        var queries = Task.Run(async () =>
+        {
+            for (var i = 0; i < Rounds; i++)
+            {
+                workload.Write("\u001b[6n");
+                await Task.Yield();
+            }
+        });
+        var both = Task.WhenAll(sends, natives, queries);
+
+        Assert.AreSame(both, await Task.WhenAny(both, Task.Delay(TimeSpan.FromSeconds(20), TestContext.Current.CancellationToken)),
+            "a diagnostic send and a native write deadlocked on the send turn and the input write lock");
+        await both;
+        var tracker = terminal.InputMilestones!;
+        Assert.IsGreaterThanOrEqualTo(Rounds * 4, tracker.AcceptedInput);
+        foreach (var range in ranges)
+        {
+            Assert.AreEqual(1, range.LastId - range.FirstId, "a send's range is not exactly its two events");
+            Assert.AreEqual("diagnostic-send", tracker.Record(range.FirstId)?.Source ?? "diagnostic-send");
+        }
+    }
+
+    [TestMethod]
+    public async Task SendTurn_ProtocolRepliesTakeTheTurnBeforeTheInputLock()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 3).Build();
+        var tracker = terminal.InputMilestones!;
+
+        await tracker.WaitForSendTurnAsync(ct);
+        using (var send = tracker.BeginSend())
+        {
+            // The application asks for the cursor position; the terminal's reply is input.
+            workload.Write("\u001b[6n");
+            await Task.Delay(300, ct);
+            var write = terminal.SendInputAsync("a"u8.ToArray(), ct);
+
+            Assert.AreSame(write, await Task.WhenAny(write, Task.Delay(TimeSpan.FromSeconds(5), ct)),
+                "the protocol reply held the input write lock while waiting for the send turn");
+            await write;
+            Assert.AreEqual((1L, 1L), (send.FirstId, send.LastId));
+        }
+
+        for (var i = 0; i < 200 && tracker.AcceptedInput < 2; i++)
+            await Task.Delay(10, ct);
+        Assert.IsGreaterThan(1L, tracker.AcceptedInput, "fixture: the terminal sent no cursor position reply");
+    }
+
+    [TestMethod]
+    public async Task SendTurn_WaitIsCancellable()
+    {
+        var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 3).Build();
+        var diagnostics = new TerminalDiagnostics(terminal, "cancel");
+        var tracker = terminal.InputMilestones!;
+        await tracker.WaitForSendTurnAsync(TestContext.Current.CancellationToken);
+        using var held = tracker.BeginSend();
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+
+        Task<DiagnosticAcceptedInput?> blocked;
+        using (ExecutionContext.SuppressFlow())
+            blocked = Task.Run(() => diagnostics.TrackSendAsync(() => Task.FromResult(true), "key", cts.Token));
+        var ended = await Task.WhenAny(blocked, Task.Delay(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken));
+
+        Assert.AreSame(blocked, ended, "a send waiting for the turn ignored its cancellation");
+        await Assert.ThrowsAsync<OperationCanceledException>(() => blocked);
+    }
+
+    [TestMethod]
+    public async Task SendScope_ATaskForkedInsideASendIsNativeOnceTheSendEnds()
+    {
+        var tracker = new InputMilestoneTracker();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<bool> forked;
+        InputMilestoneTracker.SendScope scope;
+        await tracker.WaitForSendTurnAsync(TestContext.Current.CancellationToken);
+        using (scope = tracker.BeginSend())
+        {
+            tracker.Accept(Key(), _ => true);
+            forked = Task.Run(async () =>
+            {
+                await release.Task;
+                return tracker.Accept(Key(), _ => true);
+            });
+        }
+
+        release.SetResult();
+        Assert.IsTrue(await forked.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+
+        Assert.AreEqual((1L, 1L), (scope.FirstId, scope.LastId), "an ended send kept collecting ids");
+        Assert.AreEqual("native", tracker.Record(2)!.Source);
+    }
+
+    [TestMethod]
+    public async Task OutputMark_NamesOnlyEnqueuedItems()
+    {
+        await using var adapter = new Hex1bAppWorkloadAdapter(maxQueuedOutputItems: 1) { InputMilestones = new InputMilestoneTracker() };
+        adapter.Write("a");
+        using var cts = new CancellationTokenSource();
+
+        var write = Task.Run(async () => await adapter.WriteTokensWithBytesAsync([], "b"u8.ToArray(), cancellationToken: cts.Token));
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+        var markWhileBlocked = adapter.MilestoneOutputSequence;
+        await cts.CancelAsync();
+        await Assert.ThrowsAsync<OperationCanceledException>(() => write);
+
+        Assert.IsFalse(write.IsCompletedSuccessfully, "fixture: the second write was enqueued");
+        Assert.AreEqual(1, markWhileBlocked, "a frame could name an output item still waiting for a channel slot");
     }
 
     private static Hex1bKeyEvent Key() => new(Hex1bKey.X, 'x', Hex1bModifiers.None);

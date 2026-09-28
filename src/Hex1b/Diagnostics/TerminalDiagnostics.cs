@@ -304,19 +304,20 @@ public sealed class TerminalDiagnostics
     /// Runs one diagnostic send and returns the input ids its events were assigned, or
     /// <see langword="null"/> when this target does not track input.
     /// </summary>
-    internal Task<DiagnosticAcceptedInput?> TrackSendAsync(Func<Task> send, string kind) =>
+    internal Task<DiagnosticAcceptedInput?> TrackSendAsync(Func<Task> send, string kind, CancellationToken cancellationToken = default) =>
         TrackSendAsync(async () =>
         {
             await send().ConfigureAwait(false);
             return true;
-        }, kind);
+        }, kind, cancellationToken);
 
     /// <summary>
     /// Runs one diagnostic send of <paramref name="kind"/> input (<c>text</c>, <c>key</c> or
     /// <c>mouse</c>) and returns the input ids its events were assigned, or <see langword="null"/>
     /// when this target does not track input or the send reports it delivered nothing.
     /// </summary>
-    internal async Task<DiagnosticAcceptedInput?> TrackSendAsync(Func<Task<bool>> send, string kind)
+    internal async Task<DiagnosticAcceptedInput?> TrackSendAsync(Func<Task<bool>> send, string kind,
+        CancellationToken cancellationToken = default)
     {
         if (_terminal.InputMilestones is not { } tracker)
         {
@@ -324,7 +325,7 @@ public sealed class TerminalDiagnostics
             return null;
         }
 
-        await tracker.WaitForSendTurnAsync().ConfigureAwait(false);
+        await tracker.WaitForSendTurnAsync(cancellationToken).ConfigureAwait(false);
         using var scope = tracker.BeginSend();
         var delivered = await send().ConfigureAwait(false);
         if (tracker.AcceptanceOnly)

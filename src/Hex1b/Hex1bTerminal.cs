@@ -2959,6 +2959,10 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     private async ValueTask WriteWorkloadInputAsync(ReadOnlyMemory<byte> bytes, CancellationToken ct)
     {
+        var milestones = InputMilestoneTurnToTake();
+        if (milestones is not null)
+            await milestones.WaitForSendTurnAsync(ct).ConfigureAwait(false);
+        using var turn = milestones?.BeginNativeTurn();
         await _workloadInputWriteLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -4488,6 +4492,10 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
         try
         {
+            var milestones = InputMilestoneTurnToTake();
+            if (milestones is not null)
+                await milestones.WaitForSendTurnAsync(_disposeCts.Token).ConfigureAwait(false);
+            using var turn = milestones?.BeginNativeTurn();
             await _workloadInputWriteLock.WaitAsync(_disposeCts.Token).ConfigureAwait(false);
             try
             {
@@ -8202,7 +8210,12 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     private TimeSpan GetElapsed() => _timeProvider.GetUtcNow() - _sessionStart;
 
-    // Reports a fully applied output item to the input milestone tracker.
+    // An input milestone session's send turn is taken before the input write lock by every writer,
+    // diagnostic sends included, so the two locks are always acquired in one order. Null when the
+    // session numbers no application input, or this flow already holds the turn (a diagnostic send).
+    private Diagnostics.InputMilestoneTracker? InputMilestoneTurnToTake() =>
+        InputMilestones is { AcceptanceOnly: false } tracker && !tracker.OwnsTurn ? tracker : null;
+
     // Reports an output item as handled by the pump: applied to the model, or refused or faulted
     // without output reaching it. Every read path reports, so a later frame's mark is reachable.
     private void CompleteMilestoneItem(in WorkloadOutputItem item)

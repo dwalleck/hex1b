@@ -580,6 +580,44 @@ public class CaptureContractCliTests
     }
 
     [TestMethod]
+    public async Task Milestone_KeysReportsDeliveredTextWhenTheKeyFails()
+    {
+        await using var target = await StartFrameAppAsync();
+
+        var (exitCode, stdout, stderr) = await RunCliAsync("keys", Pid, "--text", "a", "--key", "NoSuchKey", "--json");
+
+        Assert.AreEqual(1, exitCode, "fixture: the key send must fail");
+        using var json = JsonDocument.Parse(stdout);
+        Assert.IsGreaterThan(0L, json.RootElement.GetProperty("lastId").GetInt64(), $"the delivered text's ids were not reported: {stdout} {stderr}");
+    }
+
+    [TestMethod]
+    public async Task Milestone_SendToAnExitedPtyChildFailsWithoutAnId()
+    {
+        await WaitForSocketReleaseAsync(TestContext.Current.CancellationToken);
+        await using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithPtyProcess("sh", "-c", "exit 0")
+            .WithHeadless()
+            .WithDimensions(30, 4)
+            .WithDiagnostics(appName: "CliExited", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync(TestContext.Current.CancellationToken);
+        await WaitForSocketAsync(TestContext.Current.CancellationToken);
+        for (var i = 0; i < 200 && (terminal.Workload as Hex1bTerminalChildProcess)?.HasExited != true; i++)
+            await Task.Delay(25, TestContext.Current.CancellationToken);
+        Assert.IsTrue((terminal.Workload as Hex1bTerminalChildProcess)?.HasExited, "fixture: the child did not exit");
+
+        var (textExit, textOut, textErr) = await RunCliAsync("keys", Pid, "--text", "hello", "--json");
+        var (keyExit, keyOut, _) = await RunCliAsync("keys", Pid, "--key", "Enter", "--json");
+
+        Assert.AreEqual(1, textExit, $"a send to an exited child reported success: {textOut}");
+        StringAssert.Contains(textErr, "has exited");
+        Assert.AreEqual(1, keyExit, $"a key to an exited child reported success: {keyOut}");
+        Assert.IsFalse(textOut.Contains("lastId", StringComparison.Ordinal) || keyOut.Contains("lastId", StringComparison.Ordinal),
+            "an undelivered send to an exited child was given an id");
+    }
+
+    [TestMethod]
     public async Task Milestone_InvalidNameIsAnInvalidRequest()
     {
         await using var target = await StartFrameAppAsync();

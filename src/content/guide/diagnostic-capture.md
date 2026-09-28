@@ -160,7 +160,8 @@ channel. This covers diagnostic sends (text, keys, clicks, drags), native keyboa
 input, and resizes, in one sequence per terminal session. Sends through the socket, CLI or MCP
 return the ids their events received as `acceptedInput {firstId, lastId, meaning}`; a text send
 receives one id per character. A send's ids are consecutive: other input waits until the send has
-been queued. A send that delivered nothing returns no ids. Acceptance only means the input was
+been queued. A send that delivered nothing returns no ids, including a send to a PTY child that has
+exited, which fails. Acceptance only means the input was
 queued. The later stages are
 milestones that a capture can wait for:
 
@@ -169,7 +170,7 @@ milestones that a capture can wait for:
 | `input-accepted` | The input was queued for the application; for a PTY, written to the child process. |
 | `input-processed` | The application loop consumed the input: its processed-input watermark reached the id, or the flow runner consumed the input itself. |
 | `frame-published` | A frame whose processed-input watermark covers the input was published. Frames published earlier, such as timer, animation or invalidation frames, are never attributed to the input. |
-| `model-applied` | The terminal's output pump has handled everything the application enqueued up to that frame, including when the frame wrote nothing. Handled means applied to the model, or, for a geometry-gated batch, refused because it was composed for a superseded geometry (the producer recomposes it). Unavailable for inline flow steps, whose output is re-segmented by the flow relay. |
+| `model-applied` | The terminal's output pump has handled everything the application enqueued up to that frame, including when the frame wrote nothing. Handled means applied to the model, or not applied with its producer told why: a geometry-gated batch refused for a superseded geometry (the producer recomposes it), a gated batch the terminal cannot enforce (the producer's delivery fails), or a queued resize that failed. So `model-applied` proves the pump has finished with that output, not that every byte reached the model. Unavailable for inline flow steps, whose output is re-segmented by the flow relay. |
 
 A capture request (`capture` or `application-frame`) may carry `milestone {milestone, inputId,
 timeoutMs}`. The timeout is 1–60,000 ms, with a default of 5,000. Without a milestone, a capture is
@@ -182,7 +183,8 @@ reports the current state. A milestone never waits for a synchronized update to 
 discloses it as usual. The request is validated before any wait. Waiting is asynchronous: the
 synchronous `Capture` and `CaptureApplicationFrame` methods stay immediate and return
 `invalid-request` / `milestone-requires-async` for a milestone request. A socket client that
-disconnects ends its wait.
+disconnects ends its wait. Closing only the write side after sending the request, as `nc -N`
+does, also counts as a disconnect, so keep the connection fully open until the response arrives.
 
 In a flow, an input queued between steps waits for the next step. An input handed to a step that
 ends before processing it fails with `application-stopped`, even after later inputs are processed.

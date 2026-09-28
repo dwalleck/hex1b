@@ -81,9 +81,20 @@ internal sealed class InputMilestoneTracker
     /// this async flow accepts until the scope ends belongs to the send. Synchronous on purpose: an
     /// async method's <see cref="AsyncLocal{T}"/> assignment would not reach its caller.
     /// </summary>
-    internal SendScope BeginSend()
+    internal SendScope BeginSend() => Enter(new SendScope(this, native: false));
+
+    /// <summary>
+    /// Holds the send turn for a native write that takes the terminal's input write lock, on a turn
+    /// taken with <see cref="WaitForSendTurnAsync"/>. Every writer takes the turn before that lock,
+    /// so the two are always acquired in one order; the write's events are numbered as native input.
+    /// </summary>
+    internal SendScope BeginNativeTurn() => Enter(new SendScope(this, native: true));
+
+    /// <summary>True when the current async flow already holds this session's send turn.</summary>
+    internal bool OwnsTurn => OwnSend() is not null;
+
+    private static SendScope Enter(SendScope scope)
     {
-        var scope = new SendScope(this);
         CurrentSend.Value = scope;
         return scope;
     }
@@ -119,7 +130,7 @@ internal sealed class InputMilestoneTracker
             {
                 var id = _accepted + 1;
                 var tracked = new Tracked(id, DateTimeOffset.UtcNow, Stopwatch.GetTimestamp(), KindOf(evt),
-                    send is null ? "native" : "diagnostic-send", evt is Hex1bPasteEvent ? null : evt);
+                    send is { Native: false } ? "diagnostic-send" : "native", evt is Hex1bPasteEvent ? null : evt);
                 var occurrences = _pending.GetOrCreateValue(evt);
                 occurrences.Enqueue(tracked);
                 if (!write(evt))
@@ -130,7 +141,8 @@ internal sealed class InputMilestoneTracker
 
                 _accepted = id;
                 _recent[id % RetainedRecords] = tracked;
-                send?.Include(id);
+                if (send is { Native: false })
+                    send.Include(id);
                 WakeUnsafe();
                 return true;
             }
@@ -435,7 +447,9 @@ internal sealed class InputMilestoneTracker
         waiter.Completion.TrySetResult(status);
     }
 
-    private SendScope? OwnSend() => CurrentSend.Value is { } send && ReferenceEquals(send.Tracker, this) ? send : null;
+    // A task forked inside a send inherits its scope; once the send ends, the scope no longer applies.
+    private SendScope? OwnSend() =>
+        CurrentSend.Value is { Ended: false } send && ReferenceEquals(send.Tracker, this) ? send : null;
 
     private static void RemoveLast(Queue<Tracked> occurrences)
     {
@@ -509,12 +523,19 @@ internal sealed class InputMilestoneTracker
         public TaskCompletionSource<WaitStatus> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
-    /// <summary>The ids one diagnostic send was assigned; disposing it ends the send.</summary>
-    internal sealed class SendScope(InputMilestoneTracker tracker) : IDisposable
+    /// <summary>
+    /// A held send turn: a diagnostic send (collecting the ids it was assigned) or a native write.
+    /// Disposing it ends the turn.
+    /// </summary>
+    internal sealed class SendScope(InputMilestoneTracker tracker, bool native) : IDisposable
     {
         private int _disposed;
 
         internal InputMilestoneTracker Tracker { get; } = tracker;
+
+        internal bool Native { get; } = native;
+
+        internal bool Ended => Volatile.Read(ref _disposed) != 0;
 
         public long? FirstId { get; private set; }
 

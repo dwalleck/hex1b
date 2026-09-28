@@ -93,6 +93,8 @@ internal sealed class KeysCommand : BaseCommand
 
             if (!response.Success)
             {
+                // The text send before it was delivered: report its ids even though the key failed.
+                MilestoneOptions.WriteAccepted(Formatter, accepted, parseResult.GetValue(RootCommand.JsonOption));
                 Formatter.WriteError(response.Error ?? "Failed to send key");
                 return 1;
             }

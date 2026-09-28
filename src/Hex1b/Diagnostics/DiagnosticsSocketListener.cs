@@ -578,10 +578,10 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
             "capture" => await HandleCaptureRequestAsync(request.Capture, cancellationToken),
             "capabilities" => HandleCapabilitiesRequest(),
             TerminalDiagnostics.ApplicationFrameOperation => await HandleApplicationFrameRequestAsync(request.ApplicationFrame, cancellationToken),
-            "input" => await TrackedSendAsync("text", () => HandleInputRequestAsync(request.Data)),
-            "key" => await TrackedSendAsync("key", () => HandleKeyRequestAsync(request.Key, request.Modifiers)),
-            "click" => await TrackedSendAsync("mouse", () => Task.FromResult(HandleClickRequest(request.X, request.Y, request.Button))),
-            "drag" => await TrackedSendAsync("mouse", () => Task.FromResult(HandleDragRequest(request.X, request.Y, request.X2, request.Y2, request.Button))),
+            "input" => await TrackedSendAsync("text", () => HandleInputRequestAsync(request.Data), cancellationToken),
+            "key" => await TrackedSendAsync("key", () => HandleKeyRequestAsync(request.Key, request.Modifiers), cancellationToken),
+            "click" => await TrackedSendAsync("mouse", () => Task.FromResult(HandleClickRequest(request.X, request.Y, request.Button)), cancellationToken),
+            "drag" => await TrackedSendAsync("mouse", () => Task.FromResult(HandleDragRequest(request.X, request.Y, request.X2, request.Y2, request.Button)), cancellationToken),
             "resize" => await HandleResizeRequestAsync(request.X, request.Y),
             "shutdown" => HandleShutdownRequest(),
             "record-start" => await HandleRecordStartRequestAsync(request),
@@ -607,7 +607,8 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
     }
 
     // Runs a send and reports the input ids its events were assigned, when the target tracks input.
-    private async Task<DiagnosticsResponse> TrackedSendAsync(string kind, Func<Task<DiagnosticsResponse>> send)
+    private async Task<DiagnosticsResponse> TrackedSendAsync(string kind, Func<Task<DiagnosticsResponse>> send,
+        CancellationToken cancellationToken)
     {
         if (_diagnostics is null)
             return await send();
@@ -616,7 +617,7 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         {
             response = await send();
             return response.Success;
-        }, kind);
+        }, kind, cancellationToken);
         if (response!.Success)
             response.AcceptedInput = accepted;
         return response;
@@ -668,6 +669,16 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         };
     }
 
+    private const string ChildProcessExitedError = "The child process has exited; the input was not delivered.";
+
+    // A PTY child that has exited silently drops writes, so a send must not report them delivered.
+    private bool ChildProcessExited() => _terminal?.Workload switch
+    {
+        Hex1bTerminalChildProcess child => child.HasExited,
+        StandardProcessWorkloadAdapter process => process.HasExited,
+        _ => false,
+    };
+
     private async Task<DiagnosticsResponse> HandleInputRequestAsync(string? inputData)
     {
         if (_terminal == null)
@@ -679,6 +690,9 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         {
             return new DiagnosticsResponse { Success = false, Error = "No input data provided" };
         }
+
+        if (ChildProcessExited())
+            return new DiagnosticsResponse { Success = false, Error = ChildProcessExitedError };
 
         // Send input to the terminal
         var bytes = Encoding.UTF8.GetBytes(inputData);
@@ -702,6 +716,9 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         {
             return new DiagnosticsResponse { Success = false, Error = "No key name provided" };
         }
+
+        if (ChildProcessExited())
+            return new DiagnosticsResponse { Success = false, Error = ChildProcessExitedError };
 
         // Parse key name to Hex1bKey
         if (!Enum.TryParse<Hex1bKey>(keyName, ignoreCase: true, out var key))

@@ -96,8 +96,12 @@ public sealed class Hex1bAppWorkloadAdapter :
     private readonly SemaphoreSlim _milestoneOutputGate = new(1, 1);
     private long _milestoneOutputSequence;
 
+    // Published only once its item is in the channel: an item still waiting for a slot may be
+    // cancelled and its sequence reused, so a frame's mark never names it.
+    private long _milestoneOutputEnqueued;
+
     /// <summary>The last output sequence enqueued, when input milestones are tracked.</summary>
-    internal long MilestoneOutputSequence => Interlocked.Read(ref _milestoneOutputSequence);
+    internal long MilestoneOutputSequence => Interlocked.Read(ref _milestoneOutputEnqueued);
 
     // Every input-channel write goes through here so a tracked session numbers each event in
     // channel order; an untracked session writes exactly as before.
@@ -534,7 +538,10 @@ public sealed class Hex1bAppWorkloadAdapter :
             var accepted = false;
             try
             {
-                accepted = EnqueueOutputCore(item with { MilestoneSequence = Interlocked.Increment(ref _milestoneOutputSequence) }, requireAcceptance);
+                var sequence = Interlocked.Increment(ref _milestoneOutputSequence);
+                accepted = EnqueueOutputCore(item with { MilestoneSequence = sequence }, requireAcceptance);
+                if (accepted)
+                    Interlocked.Exchange(ref _milestoneOutputEnqueued, sequence);
             }
             finally
             {
@@ -633,8 +640,10 @@ public sealed class Hex1bAppWorkloadAdapter :
             var accepted = false;
             try
             {
-                accepted = await EnqueueOutputCoreAsync(
-                    item with { MilestoneSequence = Interlocked.Increment(ref _milestoneOutputSequence) }, cancellationToken).ConfigureAwait(false);
+                var sequence = Interlocked.Increment(ref _milestoneOutputSequence);
+                accepted = await EnqueueOutputCoreAsync(item with { MilestoneSequence = sequence }, cancellationToken).ConfigureAwait(false);
+                if (accepted)
+                    Interlocked.Exchange(ref _milestoneOutputEnqueued, sequence);
             }
             finally
             {
