@@ -1165,6 +1165,28 @@ public class InputMilestoneTests
     }
 
     [TestMethod]
+    public async Task Accept_AThrowingWriteLeavesNoRegistrationAndReleasesItsHold()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tracker = new InputMilestoneTracker();
+        var evt = Key();
+
+        await tracker.WaitForSendTurnAsync(ct);
+        using (tracker.BeginSend())
+            Assert.ThrowsExactly<InvalidOperationException>(() => tracker.Accept(evt, _ => throw new InvalidOperationException("write failed")));
+        // A native accept waits for the turn: it must not be kept by the send's failed write.
+        var native = Task.Run(() => tracker.Accept(Key(), _ => throw new InvalidOperationException("write failed")));
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => native.WaitAsync(TimeSpan.FromSeconds(2), ct),
+            "a failed write in a send kept the send turn");
+
+        Assert.AreEqual(0, tracker.AcceptedInput, "a failed write consumed an id");
+        Assert.IsNull(tracker.IdOf(evt), "a failed write stayed registered");
+        // The send's hold and the native turn were both given back.
+        Assert.IsTrue(tracker.WaitForSendTurnAsync(ct).Wait(TimeSpan.FromSeconds(2), ct), "a failed write kept the send turn");
+        tracker.BeginSend().Dispose();
+    }
+
+    [TestMethod]
     public async Task SendTurn_WaitIsCancellable()
     {
         var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };

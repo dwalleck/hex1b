@@ -109,16 +109,21 @@ internal sealed class InputMilestoneTracker
     /// </remarks>
     internal IDisposable? PinOwnTurn()
     {
-        if (CurrentSend.Value is not { } send || !ReferenceEquals(send.Tracker, this) || !send.TryPin())
+        if (CurrentSend.Value is not { } send || !ReferenceEquals(send.Tracker, this) || TurnPin.TryCreate(send) is not { } pin)
             return null;
-        var pin = new TurnPin(send);
         CurrentPin.Value = pin;
         return pin;
     }
 
-    internal sealed class TurnPin(SendScope scope) : IDisposable
+    internal sealed class TurnPin : IDisposable
     {
+        private readonly SendScope scope;
         private int _released;
+
+        // Only a pin that took a count on its scope may exist: an active pin lets an ended scope be held.
+        private TurnPin(SendScope scope) => this.scope = scope;
+
+        internal static TurnPin? TryCreate(SendScope scope) => scope.TryPin() ? new TurnPin(scope) : null;
 
         internal bool ActiveFor(SendScope send) => ReferenceEquals(scope, send) && Volatile.Read(ref _released) == 0;
 
@@ -173,7 +178,18 @@ internal sealed class InputMilestoneTracker
                     "native", evt is Hex1bPasteEvent ? null : evt);
                 var occurrences = _pending.GetOrCreateValue(evt);
                 occurrences.Enqueue(tracked);
-                if (!write(evt))
+                bool written;
+                try
+                {
+                    written = write(evt);
+                }
+                catch
+                {
+                    RemoveLast(occurrences);
+                    throw;
+                }
+
+                if (!written)
                 {
                     RemoveLast(occurrences);
                     return false;
