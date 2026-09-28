@@ -329,14 +329,26 @@ public sealed class TerminalDiagnostics
         if (tracker.OwnsTurn)
             throw new InvalidOperationException("A diagnostic send cannot start inside another send on the same terminal.");
         await tracker.WaitForSendTurnAsync(cancellationToken).ConfigureAwait(false);
-        using var scope = tracker.BeginSend();
-        var delivered = await send().ConfigureAwait(false);
+        var scope = tracker.BeginSend();
+        long? written = null;
+        try
+        {
+            var delivered = await send().ConfigureAwait(false);
+            // A PTY write is numbered inside the turn, so ids follow the order of the writes.
+            if (tracker.AcceptanceOnly && delivered)
+                written = tracker.AcceptWrite(kind);
+        }
+        finally
+        {
+            // Ended before its range is read, so no later write can join a range already reported.
+            scope.Dispose();
+        }
+
         if (tracker.AcceptanceOnly)
         {
-            if (!delivered)
-                return null;
-            var id = tracker.AcceptWrite(kind);
-            return new DiagnosticAcceptedInput { FirstId = id, LastId = id, Meaning = WrittenToChild };
+            return written is { } id
+                ? new DiagnosticAcceptedInput { FirstId = id, LastId = id, Meaning = WrittenToChild }
+                : null;
         }
 
         return scope.LastId is { } lastId

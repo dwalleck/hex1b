@@ -27,6 +27,9 @@ internal sealed class InputMilestoneTracker
     // The current diagnostic send, collected across the events it enqueues.
     private static readonly AsyncLocal<SendScope?> CurrentSend = new();
 
+    // The scope this async flow pinned for a write in progress; only that flow keeps an ended send's turn.
+    private static readonly AsyncLocal<SendScope?> PinnedScope = new();
+
     private readonly object _sync = new();
 
     // One send at a time, and no other input between a send's events, so a send's ids are
@@ -98,8 +101,18 @@ internal sealed class InputMilestoneTracker
     /// forked it) for a write under the input write lock, so the turn outlives the write even when
     /// the send ends first. Null when the flow holds no turn and must take one.
     /// </summary>
-    internal IDisposable? PinOwnTurn() =>
-        CurrentSend.Value is { } send && ReferenceEquals(send.Tracker, this) && send.TryPin() ? new TurnPin(send) : null;
+    /// <remarks>
+    /// Synchronous on purpose: it marks the pinning flow in an <see cref="AsyncLocal{T}"/> that the
+    /// write's own callees (its <see cref="Accept"/> calls) must see. Only a scope that has not ended
+    /// can be pinned, so pins cannot chain and hold the turn past its send.
+    /// </remarks>
+    internal IDisposable? PinOwnTurn()
+    {
+        if (CurrentSend.Value is not { } send || !ReferenceEquals(send.Tracker, this) || !send.TryPin())
+            return null;
+        PinnedScope.Value = send;
+        return new TurnPin(send);
+    }
 
     private sealed class TurnPin(SendScope scope) : IDisposable
     {
@@ -107,8 +120,11 @@ internal sealed class InputMilestoneTracker
 
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _released, 1) == 0)
-                scope.Unpin();
+            if (Interlocked.Exchange(ref _released, 1) != 0)
+                return;
+            if (ReferenceEquals(PinnedScope.Value, scope))
+                PinnedScope.Value = null;
+            scope.Unpin();
         }
     }
 
@@ -121,12 +137,10 @@ internal sealed class InputMilestoneTracker
     /// <summary>Numbers one completed write of <paramref name="kind"/> to an acceptance-only workload.</summary>
     internal long AcceptWrite(string kind)
     {
-        var send = OwnSend();
         lock (_sync)
         {
             var id = ++_accepted;
             _recent[id % RetainedRecords] = new Tracked(id, DateTimeOffset.UtcNow, Stopwatch.GetTimestamp(), kind, "diagnostic-send", null);
-            send?.Include(id);
             WakeUnsafe();
             return id;
         }
@@ -149,7 +163,7 @@ internal sealed class InputMilestoneTracker
             {
                 var id = _accepted + 1;
                 var tracked = new Tracked(id, DateTimeOffset.UtcNow, Stopwatch.GetTimestamp(), KindOf(evt),
-                    send is { Native: false } ? "diagnostic-send" : "native", evt is Hex1bPasteEvent ? null : evt);
+                    "native", evt is Hex1bPasteEvent ? null : evt);
                 var occurrences = _pending.GetOrCreateValue(evt);
                 occurrences.Enqueue(tracked);
                 if (!write(evt))
@@ -160,8 +174,9 @@ internal sealed class InputMilestoneTracker
 
                 _accepted = id;
                 _recent[id % RetainedRecords] = tracked;
-                if (send is { Native: false })
-                    send.Include(id);
+                // Only a send still in progress claims the id; a write that outlives its send is native.
+                if (send is { Native: false } && send.TryInclude(id))
+                    tracked.Source = "diagnostic-send";
                 WakeUnsafe();
                 return true;
             }
@@ -468,7 +483,8 @@ internal sealed class InputMilestoneTracker
 
     // A task forked inside a send inherits its scope; once the send ends, the scope no longer applies.
     private SendScope? OwnSend() =>
-        CurrentSend.Value is { Ended: false } send && ReferenceEquals(send.Tracker, this) ? send : null;
+        CurrentSend.Value is { } send && ReferenceEquals(send.Tracker, this)
+            && (!send.Disposed || ReferenceEquals(PinnedScope.Value, send)) ? send : null;
 
     private static void RemoveLast(Queue<Tracked> occurrences)
     {
@@ -507,7 +523,7 @@ internal sealed class InputMilestoneTracker
 
         public string Kind { get; } = kind;
 
-        public string Source { get; } = source;
+        public string Source { get; set; } = source;
 
         // Retained in memory (bounded ring) so a later raw-input capture can describe it; never
         // serialized without that authorization.
@@ -557,20 +573,21 @@ internal sealed class InputMilestoneTracker
         internal bool Native { get; } = native;
 
         /// <summary>
-        /// True once the scope is disposed and no write pinned it: the turn is released, so a task
-        /// forked inside the send is native from then on.
+        /// True once the send has ended. A task forked inside it is native from then on, except the
+        /// flow of a write that pinned the turn while the send was in progress.
         /// </summary>
-        internal bool Ended
+        internal bool Disposed
         {
-            get { lock (_sync) return _disposed && _pins == 0; }
+            get { lock (_sync) return _disposed; }
         }
 
-        // A write that relies on this scope's turn keeps it until the write finishes.
+        // A write that relies on this scope's turn keeps it until the write finishes. Only a send in
+        // progress can be pinned.
         internal bool TryPin()
         {
             lock (_sync)
             {
-                if (_disposed && _pins == 0)
+                if (_disposed)
                     return false;
                 _pins++;
                 return true;
@@ -590,10 +607,16 @@ internal sealed class InputMilestoneTracker
 
         public long? LastId { get; private set; }
 
-        internal void Include(long id)
+        internal bool TryInclude(long id)
         {
-            FirstId ??= id;
-            LastId = id;
+            lock (_sync)
+            {
+                if (_disposed)
+                    return false;
+                FirstId ??= id;
+                LastId = id;
+                return true;
+            }
         }
 
         public void Dispose()

@@ -1018,6 +1018,60 @@ public class InputMilestoneTests
             "a write forked inside a send lost the turn to a native writer and deadlocked");
         await both;
         Assert.AreEqual(2, tracker.AcceptedInput);
+        Assert.IsNull(send.LastId, "a write that outlived its send joined the send's range");
+        Assert.AreEqual(("native", "native"), (tracker.Record(1)!.Source, tracker.Record(2)!.Source),
+            "input written after the send ended was credited to it");
+    }
+
+    [TestMethod]
+    public async Task SendTurn_ForksOfAnEndedSendCannotHoldItsTurn()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 3).Build();
+        var diagnostics = new TerminalDiagnostics(terminal, "chain");
+        var tracker = terminal.InputMilestones!;
+        var writeLock = (SemaphoreSlim)typeof(Hex1bTerminal)
+            .GetField("_workloadInputWriteLock", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(terminal)!;
+        var afterEnd = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var stop = new CancellationTokenSource();
+
+        // The forks' first writes pin the send while it is in progress and are still pinned when
+        // it ends (the write lock is held), then the forks keep writing, overlapping.
+        await writeLock.WaitAsync(ct);
+        await tracker.WaitForSendTurnAsync(ct);
+        Task[] forks;
+        Task<DiagnosticAcceptedInput?> forkSend;
+        var send = tracker.BeginSend();
+        // Long writes keep one fork's pin alive while another re-pins.
+        var chunk = Enumerable.Repeat((byte)'x', 8192).ToArray();
+        forks = Enumerable.Range(0, 4).Select(_ => Task.Run(async () =>
+        {
+            while (!stop.IsCancellationRequested)
+                await terminal.SendInputAsync(chunk, ct);
+        })).ToArray();
+        forkSend = Task.Run(async () =>
+        {
+            await afterEnd.Task;
+            return await diagnostics.TrackSendAsync(() => terminal.SendInputAsync("s"u8.ToArray()), "text");
+        });
+        await Task.Delay(100, ct);
+        send.Dispose();
+        afterEnd.SetResult();
+        Task native;
+        using (ExecutionContext.SuppressFlow())
+            native = Task.Run(() => terminal.SendInputAsync("n"u8.ToArray(), ct));
+        await Task.Delay(100, ct);
+        writeLock.Release();
+
+        var ended = await Task.WhenAny(native, Task.Delay(TimeSpan.FromSeconds(5), ct));
+        await stop.CancelAsync();
+        await Task.WhenAll(forks).WaitAsync(TimeSpan.FromSeconds(10), ct);
+
+        Assert.AreSame(native, ended, "forks of an ended send chained their pins and starved a native writer");
+        var accepted = await forkSend.WaitAsync(TimeSpan.FromSeconds(10), ct);
+        Assert.AreEqual(0, accepted!.LastId - accepted.FirstId, "a fork could not start its own send once its parent had ended");
     }
 
     [TestMethod]
