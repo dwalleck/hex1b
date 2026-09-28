@@ -120,6 +120,14 @@ internal sealed class DiagnosticsSocketClient
     // outcome carries every field the contract promises for it.
     private static DiagnosticCaptureResult Validate(DiagnosticCaptureResult result)
     {
+        // Deserialization leaves omitted collections null despite their initializers.
+        result = result with
+        {
+            ContentCoverage = result.ContentCoverage ?? [],
+            UnavailableFields = result.UnavailableFields ?? [],
+            Limitations = result.Limitations ?? [],
+        };
+
         if (result.ContractVersion != TerminalDiagnostics.ContractVersion)
             return TerminalDiagnostics.Problem(DiagnosticOutcome.Failed, "incompatible-target", VersionMessage(result.ContractVersion));
 
@@ -136,7 +144,27 @@ internal sealed class DiagnosticsSocketClient
                 $"The target reported outcome '{DiagnosticContractNames.Of(result.Outcome)}' without a problem.");
         }
 
-        return result;
+        return result.Outcome == DiagnosticOutcome.Captured ? ExplainOmittedFields(result) : result;
+    }
+
+    // An older target may omit fields this contract version added. Report them as unavailable,
+    // never as a default value, unless the target already explained the absence.
+    private static DiagnosticCaptureResult ExplainOmittedFields(DiagnosticCaptureResult result)
+    {
+        var additions = new List<DiagnosticUnavailableField>();
+        void Explain(bool absent, string field)
+        {
+            if (absent && !result.UnavailableFields.Any(f => f.Field == field))
+                additions.Add(new DiagnosticUnavailableField
+                {
+                    Field = field,
+                    Reason = "The target did not report this field; it may be running an older Hex1b build.",
+                });
+        }
+
+        Explain(result.Identity!.ModelSequence is null, "identity.modelSequence");
+        Explain(result.SynchronizedUpdate is null, "synchronizedUpdate");
+        return additions.Count == 0 ? result : result with { UnavailableFields = [.. result.UnavailableFields, .. additions] };
     }
 
     private static string VersionMessage(int version) =>

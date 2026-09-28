@@ -1,5 +1,6 @@
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using Hex1b.Diagnostics;
 
 namespace Hex1b.Tests.Diagnostics;
@@ -84,6 +85,49 @@ public class DiagnosticsSocketClientTests
         StringAssert.Contains(received, "\"capture\":{\"format\":\"html\",\"historyRows\":7,\"authorizations\":[\"non-screen-metadata\"]}");
         Assert.AreEqual(DiagnosticOutcome.InvalidRequest, result.Outcome, $"the target's own outcome must be preserved: {result.Problem?.Code} {result.Problem?.Message}");
         Assert.AreEqual("c", result.Problem!.Code);
+    }
+
+    [TestMethod]
+    public async Task Capture_TargetWithoutSequenceOrSyncState_ExplainsInsteadOfFabricating()
+    {
+        // A contract-1 target built before model sequences existed: a complete capture with neither field.
+        await using var server = await FakeServer.StartAsync(_ =>
+            """
+            {"success":true,"capture":{"contractVersion":1,"outcome":"captured","format":"text","content":"x",
+            "geometry":{"columns":1,"rows":1},"history":{"requestedRows":0,"returnedRows":0},
+            "identity":{"processId":1,"sessionId":"s","sourceLayer":"terminal-model"}}}
+            """.ReplaceLineEndings(""));
+
+        var result = await new DiagnosticsSocketClient().CaptureAsync(server.Path, new DiagnosticCaptureRequest(),
+            TestContext.Current.CancellationToken);
+
+        Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome);
+        var identity = JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticCaptureResult)
+            .GetProperty("identity");
+        Assert.IsFalse(identity.TryGetProperty("modelSequence", out var fabricated),
+            $"the client reported modelSequence {fabricated} for a target that sent none");
+        foreach (var field in new[] { "identity.modelSequence", "synchronizedUpdate" })
+            Assert.IsTrue(result.UnavailableFields.Any(f => f.Field == field && f.Reason.Length > 0),
+                $"{field} is absent without an explanation");
+    }
+
+    [TestMethod]
+    public async Task Capture_TargetExplainingItsAbsentSequence_IsNotExplainedTwice()
+    {
+        await using var server = await FakeServer.StartAsync(_ =>
+            """
+            {"success":true,"capture":{"contractVersion":1,"outcome":"captured","format":"text","content":"x",
+            "geometry":{"columns":1,"rows":1},"history":{"requestedRows":0,"returnedRows":0},
+            "identity":{"processId":1,"sessionId":"s","sourceLayer":"terminal-model"},
+            "synchronizedUpdate":{"active":false},
+            "unavailableFields":[{"field":"identity.modelSequence","reason":"target reason"}]}}
+            """.ReplaceLineEndings(""));
+
+        var result = await new DiagnosticsSocketClient().CaptureAsync(server.Path, new DiagnosticCaptureRequest(),
+            TestContext.Current.CancellationToken);
+
+        Assert.AreEqual("target reason", result.UnavailableFields.Single(f => f.Field == "identity.modelSequence").Reason);
+        Assert.IsFalse(result.UnavailableFields.Any(f => f.Field == "synchronizedUpdate"), "a reported field was marked unavailable");
     }
 
     [TestMethod]

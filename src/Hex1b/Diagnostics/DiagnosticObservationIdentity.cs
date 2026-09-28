@@ -49,10 +49,11 @@ public sealed class DiagnosticObservationIdentity
     /// Count of model-input events (output application batches and geometry changes) applied in
     /// this terminal session at the observation. Observations with equal values read the same
     /// model state; values are comparable only within one <see cref="SessionId"/>. An event can
-    /// leave the visible state unchanged.
+    /// leave the visible state unchanged. Absent only from targets that do not assign one, in
+    /// which case <see cref="DiagnosticCaptureResult.UnavailableFields"/> explains it.
     /// </summary>
     [JsonPropertyName("modelSequence")]
-    public long ModelSequence { get; init; }
+    public long? ModelSequence { get; init; }
 
     /// <summary>Published application frame identity, when one is associated.</summary>
     [JsonPropertyName("applicationFrame")]

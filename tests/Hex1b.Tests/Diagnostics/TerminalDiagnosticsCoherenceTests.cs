@@ -262,8 +262,8 @@ public class TerminalDiagnosticsCoherenceTests
     private static long Sequence(DiagnosticCaptureResult result)
     {
         Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome, result.Problem?.Message);
-        Assert.IsNotNull(result.Identity, "identity is absent");
-        return result.Identity.ModelSequence;
+        Assert.IsNotNull(result.Identity?.ModelSequence, "modelSequence is absent");
+        return result.Identity!.ModelSequence!.Value;
     }
 
     private static string Fingerprint(DiagnosticCaptureResult result) =>
