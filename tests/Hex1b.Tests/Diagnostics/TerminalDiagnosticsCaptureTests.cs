@@ -329,11 +329,13 @@ public class TerminalDiagnosticsCaptureTests
     [TestMethod]
     public async Task Capture_PendingSynchronizedUpdate_ExplainsEveryAbsentField()
     {
-        await using var source = await StartAsync("\x1b[?2026hPART", waitFor: "PART");
+        // A stopped clock keeps the model's 1 s synchronized-output timeout from releasing the update.
+        await using var source = await StartAsync("\x1b[?2026hPART", waitFor: "PART",
+            timeProvider: new Microsoft.Extensions.Time.Testing.FakeTimeProvider(DateTimeOffset.UtcNow));
 
         var result = new TerminalDiagnostics(source.Terminal, "pending").Capture(new DiagnosticCaptureRequest());
 
-        Assert.IsTrue(result.SynchronizedUpdate!.Active);
+        Assert.IsTrue(result.SynchronizedUpdate!.Active, "fixture: the synchronized update is no longer pending");
         AssertEveryNullFieldIsExplained(result);
     }
 
@@ -524,12 +526,15 @@ public class TerminalDiagnosticsCaptureTests
         return default;
     }
 
-    private static async Task<Source> StartAsync(string output, string waitFor, int? scrollback = null)
+    private static async Task<Source> StartAsync(string output, string waitFor, int? scrollback = null,
+        TimeProvider? timeProvider = null)
     {
         var workload = new RawByteWorkload();
         var builder = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 6);
         if (scrollback is int capacity)
             builder.WithScrollback(capacity);
+        if (timeProvider is not null)
+            builder.WithTimeProvider(timeProvider);
         var source = new Source(builder.Build(), workload);
         await source.WriteAsync(output);
         await source.WaitForAsync(waitFor);

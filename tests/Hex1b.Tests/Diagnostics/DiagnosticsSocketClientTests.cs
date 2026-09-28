@@ -151,6 +151,25 @@ public class DiagnosticsSocketClientTests
     }
 
     [TestMethod]
+    public async Task Capture_NullEntriesWithOmittedFields_DoNotThrow()
+    {
+        // The explanation step reads unavailableFields entries when a field is omitted.
+        await using var server = await FakeServer.StartAsync(_ =>
+            """
+            {"success":true,"capture":{"contractVersion":1,"outcome":"captured","format":"text","content":"x",
+            "geometry":{"columns":1,"rows":1},"history":{"requestedRows":0,"returnedRows":0},
+            "identity":{"processId":1,"sessionId":"s","sourceLayer":"terminal-model"},
+            "unavailableFields":[null]}}
+            """.ReplaceLineEndings(""));
+
+        var result = await new DiagnosticsSocketClient().CaptureAsync(server.Path, new DiagnosticCaptureRequest(),
+            TestContext.Current.CancellationToken);
+
+        Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome);
+        Assert.IsTrue(result.UnavailableFields.Any(f => f.Field == "identity.modelSequence"));
+    }
+
+    [TestMethod]
     public void DescribePartialContent_WithoutStartSequence_DoesNotRenderAnEmptyValue()
     {
         var note = TerminalDiagnostics.DescribePartialContent(new DiagnosticCaptureResult
