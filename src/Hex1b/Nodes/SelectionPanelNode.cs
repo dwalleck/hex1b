@@ -170,6 +170,7 @@ public sealed class SelectionPanelNode : Hex1bNode
                 MouseX = surfaceCtx.MouseX,
                 MouseY = surfaceCtx.MouseY,
                 CellMetrics = surfaceCtx.CellMetrics,
+                RecordsCompositeClips = surfaceCtx.RecordsCompositeClips,
                 SurfacePool = pool,
             };
 

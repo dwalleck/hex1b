@@ -34,7 +34,7 @@ internal static class ApplicationFrameProjector
         var focusedIndex = IndexOfFocused(focusables);
         var walk = new Walk(new Rect(0, 0, columns, rows), timings is null ? null : Stopwatch.GetTimestamp(),
             focusedIndex < 0 ? null : focusables[focusedIndex]);
-        var projectedRoot = root is null ? null : walk.Node(root, walk.Screen);
+        var projectedRoot = root is null ? null : walk.Node(root, walk.Screen, walk.Screen);
         return new DiagnosticApplicationFrame
         {
             ApplicationInstanceId = applicationInstanceId,
@@ -71,17 +71,19 @@ internal static class ApplicationFrameProjector
         // What the renderer drew: RenderChild records the clip each child was composited through
         // (the providers current at that moment, whatever their clip mode, or the parent surface).
         // A composited child draws on a surface of its own bounds, which limits its descendants.
-        // Nodes a parent draws without RenderChild have no record and inherit the parent's limit.
-        public DiagnosticFrameNode Node(Hex1bNode node, Rect limit)
+        // A node without a record (drawn by a parent directly, or by a context that does not record)
+        // falls back to its ancestors' clip rects.
+        public DiagnosticFrameNode Node(Hex1bNode node, Rect limit, Rect fallback)
         {
             if (PopupHost is null && node is ZStackNode host)
                 PopupHost = host;
 
             var bounds = node.Bounds;
             var composite = node.DiagCompositeClip;
-            var clip = composite is { } drawnWithin ? Intersect(limit, drawnWithin) : limit;
+            var clip = composite is { } drawnWithin ? Intersect(limit, drawnWithin) : fallback;
             var visible = Intersect(bounds, clip);
             var childLimit = composite is not null && bounds.Width > 0 && bounds.Height > 0 ? visible : clip;
+            var childFallback = childLimit;
 
             DiagnosticRect? ownClip = null;
             string? clipMode = null;
@@ -89,6 +91,7 @@ internal static class ApplicationFrameProjector
             {
                 ownClip = DiagnosticRect.FromRect(provider.ClipRect);
                 clipMode = provider.ClipMode == ClipMode.Clip ? "clip" : "overflow";
+                childFallback = Intersect(childLimit, provider.ClipRect);
             }
 
             // Editors: metadata on the node; the focused editor's text only on the frame.
@@ -103,7 +106,7 @@ internal static class ApplicationFrameProjector
 
             var children = new List<DiagnosticFrameNode>();
             foreach (var child in node.GetChildren())
-                children.Add(Node(child, childLimit));
+                children.Add(Node(child, childLimit, childFallback));
 
             return new DiagnosticFrameNode
             {
