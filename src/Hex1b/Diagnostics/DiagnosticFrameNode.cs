@@ -55,6 +55,10 @@ public sealed class DiagnosticFrameNode
     [JsonPropertyName("properties")]
     public IReadOnlyDictionary<string, string>? Properties { get; init; }
 
+    /// <summary>The node's last reconcile and render cost, when diagnostic timing is enabled.</summary>
+    [JsonPropertyName("timing")]
+    public DiagnosticNodeTiming? Timing { get; init; }
+
     /// <summary>Child nodes in render order.</summary>
     [JsonPropertyName("children")]
     public IReadOnlyList<DiagnosticFrameNode> Children { get; init; } = [];

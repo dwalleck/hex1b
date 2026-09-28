@@ -1236,7 +1236,8 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, 
         // notify waiters (flow commitment coordinates with the loop here).
         // Publish before advancing the count, so a completed count always has its frame published.
         if (_framePublicationEnabled)
-            PublishApplicationFrame(_frameCount + 1, needsRender, frameWidth, frameHeight);
+            PublishApplicationFrame(_frameCount + 1, needsRender, frameWidth, frameHeight,
+                _diagnosticTimingEnabled ? new ApplicationPassTimings(buildTicks, reconcileTicks, renderTicks) : null);
         Volatile.Write(ref _frameCount, _frameCount + 1);
         FrameRendered?.Invoke();
     }
@@ -1246,7 +1247,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, 
     PublishedApplicationFrame? IApplicationFrameSource.LatestFrame => Volatile.Read(ref _latestFrame);
 
     // Runs on the app loop at the end of a pass; a projection failure never affects rendering.
-    private void PublishApplicationFrame(long frameId, bool wroteOutput, int width, int height)
+    private void PublishApplicationFrame(long frameId, bool wroteOutput, int width, int height, ApplicationPassTimings? timings)
     {
         var start = Stopwatch.GetTimestamp();
         var wallStart = DateTimeOffset.UtcNow;
@@ -1254,7 +1255,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, 
         string? failure = null;
         try
         {
-            frame = ApplicationFrameProjector.Project(_rootNode, frameId, width, height, wroteOutput);
+            frame = ApplicationFrameProjector.Project(_rootNode, _focusRing, frameId, width, height, wroteOutput, timings);
         }
         catch (Exception error)
         {

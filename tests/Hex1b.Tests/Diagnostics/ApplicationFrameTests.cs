@@ -1,5 +1,8 @@
+using System.Diagnostics;
 using System.Text;
 using Hex1b.Diagnostics;
+using Hex1b.Documents;
+using Hex1b.Input;
 using Hex1b.Layout;
 using Hex1b.Nodes;
 using Hex1b.Widgets;
@@ -161,7 +164,397 @@ public class ApplicationFrameTests
         Assert.AreEqual(recovered, result.Frame!.FrameId);
     }
 
+    // Multiline text with a surrogate pair (U+1D11E) on the middle line.
+    private const string MultilineText = "alpha\nbe\U0001D11Eta gamma\nz";
+
+    [TestMethod]
+    public async Task EditorMetadata_TextBoxReportsCaretAndSelectionsBothDirections()
+    {
+        var state = new TextBoxState();
+        await using var harness = await AppHarness.StartAsync(_ => new TextBoxWidget().State(state).Multiline(), columns: 40, rows: 6);
+
+        var anchor = MultilineText.IndexOf("ta", StringComparison.Ordinal);
+        var cursor = 2;
+        await harness.NextPassAsync(() =>
+        {
+            state.Text = MultilineText;
+            state.CursorPosition = cursor;
+            state.SelectionAnchor = anchor; // backward: cursor before anchor, spanning lines
+        });
+        var backward = harness.Capture().Frame!;
+
+        await harness.NextPassAsync(() =>
+        {
+            state.CursorPosition = MultilineText.Length;
+            state.SelectionAnchor = 1; // forward
+        });
+        var forward = harness.Capture().Frame!;
+
+        foreach (var (frame, caret, start, end) in new[]
+        {
+            (backward, cursor, cursor, anchor),
+            (forward, MultilineText.Length, 1, MultilineText.Length),
+        })
+        {
+            var editor = frame.FocusedEditor;
+            Assert.IsNotNull(editor, $"frame {frame.FrameId} reports no focused editor");
+            Assert.AreEqual("text-box", editor.Kind);
+            Assert.AreEqual(MultilineText.Length, editor.Length);
+            Assert.AreEqual(3, editor.LineCount);
+            AssertBoundsOf(frame, nameof(TextBoxNode), editor.Bounds);
+            Assert.HasCount(1, editor.Carets, $"expected 1 caret, got {editor.Carets.Count}");
+            AssertCaret(MultilineText, caret, editor.Carets[0]);
+            Assert.HasCount(1, editor.Selections, $"expected 1 selection, got {editor.Selections.Count}");
+            AssertCaret(MultilineText, start, editor.Selections[0].Start);
+            AssertCaret(MultilineText, end, editor.Selections[0].End);
+        }
+    }
+
+    [TestMethod]
+    public async Task EditorMetadata_EditorReportsEveryCursorAndSelection()
+    {
+        var state = new EditorState(new Hex1bDocument(MultilineText));
+        await using var harness = await AppHarness.StartAsync(_ => new EditorWidget(state), columns: 40, rows: 6);
+
+        var second = MultilineText.IndexOf("gamma", StringComparison.Ordinal);
+        await harness.NextPassAsync(() =>
+        {
+            state.Cursors.Primary.Position = new DocumentOffset(3);
+            state.Cursors.Primary.SelectionAnchor = new DocumentOffset(1);
+            state.Cursors.Add(new DocumentOffset(second + 2), new DocumentOffset(second));
+            state.Cursors.Add(new DocumentOffset(MultilineText.Length), null);
+        });
+        var frame = harness.Capture().Frame!;
+
+        var editor = frame.FocusedEditor;
+        Assert.IsNotNull(editor, "no focused editor");
+        Assert.AreEqual("editor", editor.Kind);
+        Assert.AreEqual(MultilineText.Length, editor.Length);
+        Assert.AreEqual(3, editor.LineCount);
+        AssertBoundsOf(frame, nameof(EditorNode), editor.Bounds);
+
+        var expectedCarets = state.Cursors.Select(c => c.Position.Value).ToArray();
+        Assert.HasCount(3, expectedCarets);
+        Assert.AreEqual(expectedCarets.Length, editor.Carets.Count, $"expected {expectedCarets.Length} carets, got {editor.Carets.Count}");
+        for (var i = 0; i < expectedCarets.Length; i++)
+            AssertCaret(MultilineText, expectedCarets[i], editor.Carets[i]);
+
+        var expectedSelections = state.Cursors.Where(c => c.HasSelection)
+            .Select(c => (c.SelectionStart.Value, c.SelectionEnd.Value)).ToArray();
+        Assert.HasCount(2, expectedSelections);
+        Assert.AreEqual(expectedSelections.Length, editor.Selections.Count, $"expected {expectedSelections.Length} selections, got {editor.Selections.Count}");
+        for (var i = 0; i < expectedSelections.Length; i++)
+        {
+            AssertCaret(MultilineText, expectedSelections[i].Item1, editor.Selections[i].Start);
+            AssertCaret(MultilineText, expectedSelections[i].Item2, editor.Selections[i].End);
+        }
+    }
+
+    [TestMethod]
+    public async Task EditorMetadata_NonEditorFocusReportsNoEditor()
+    {
+        await using var harness = await AppHarness.StartAsync(_ => new ButtonWidget("press"));
+        var result = harness.Capture(DiagnosticAuthorization.EditorText);
+
+        Assert.AreEqual(nameof(ButtonNode), result.Frame!.Focus.FocusedNodeType);
+        Assert.IsNull(result.Frame.FocusedEditor);
+        Assert.IsTrue(result.UnavailableFields.Any(f => f.Field == "frame.focusedEditor"), "absent focused editor is not explained");
+        var coverage = result.ContentCoverage.Single(c => c.Content == DiagnosticContentClass.EditorText);
+        Assert.AreEqual(DiagnosticCoverageState.Unavailable, coverage.State);
+    }
+
+    private const string SentinelA = "SENTINEL-A-7f3e";
+    private const string SentinelB = "SENTINEL-B-91c2";
+
+    [TestMethod]
+    public async Task EditorText_DefaultCaptureWithholdsAllEditorText()
+    {
+        await using var harness = await StartSentinelAppAsync();
+        var result = harness.Capture();
+        var json = Serialize(result);
+
+        Assert.IsFalse(json.Contains(SentinelA, StringComparison.Ordinal), "sentinel A in default capture");
+        Assert.IsFalse(json.Contains(SentinelB, StringComparison.Ordinal), "sentinel B in default capture");
+        Assert.IsNull(result.Frame!.FocusedEditor!.Text);
+        var coverage = result.ContentCoverage.Single(c => c.Content == DiagnosticContentClass.EditorText);
+        Assert.AreEqual(DiagnosticCoverageState.Excluded, coverage.State);
+    }
+
+    [TestMethod]
+    public async Task EditorText_AuthorizedCaptureIncludesOnlyTheFocusedEditor()
+    {
+        await using var harness = await StartSentinelAppAsync();
+        var result = harness.Capture(DiagnosticAuthorization.EditorText);
+        var json = Serialize(result);
+
+        Assert.IsTrue(json.Contains(SentinelA, StringComparison.Ordinal), "focused editor's sentinel A missing from editor-text capture");
+        Assert.IsFalse(json.Contains(SentinelB, StringComparison.Ordinal), "sentinel B present: an unfocused editor's text leaked");
+        Assert.AreEqual(SentinelA, result.Frame!.FocusedEditor!.Text);
+        var coverage = result.ContentCoverage.Single(c => c.Content == DiagnosticContentClass.EditorText);
+        Assert.AreEqual(DiagnosticCoverageState.Included, coverage.State);
+    }
+
+    [TestMethod]
+    public async Task EditorText_OtherAuthorizationsNeverAddEditorText()
+    {
+        await using var harness = await StartSentinelAppAsync();
+        foreach (var authorization in Enum.GetValues<DiagnosticAuthorization>().Where(a => a != DiagnosticAuthorization.EditorText))
+        {
+            var json = Serialize(harness.Capture(authorization));
+            Assert.IsFalse(json.Contains(SentinelA, StringComparison.Ordinal), $"sentinel A in {authorization} capture");
+            Assert.IsFalse(json.Contains(SentinelB, StringComparison.Ordinal), $"sentinel B in {authorization} capture");
+        }
+    }
+
+    [TestMethod]
+    public async Task ReturnedFrameIsImmutable()
+    {
+        var editorState = new EditorState(new Hex1bDocument("first line\nsecond"));
+        var boxState = new TextBoxState();
+        await using var harness = await AppHarness.StartAsync(_ => new VStackWidget(
+        [
+            new EditorWidget(editorState).FixedHeight(3),
+            new TextBoxWidget().State(boxState),
+            new TextBlockWidget($"lines {editorState.Document.LineCount}"),
+        ]), columns: 40, rows: 8);
+        await harness.NextPassAsync(() =>
+        {
+            editorState.Cursors.Primary.Position = new DocumentOffset(2);
+            editorState.Cursors.Add(new DocumentOffset(12), new DocumentOffset(11));
+        });
+
+        var retained = harness.Capture(DiagnosticAuthorization.EditorText);
+        Assert.AreEqual("editor", retained.Frame!.FocusedEditor?.Kind, "fixture: the editor should have focus");
+        var first = Serialize(retained);
+
+        // Later passes change editor text and cursors, focus, and geometry.
+        await harness.NextPassAsync(() =>
+        {
+            editorState.InsertText("typed ");
+            editorState.Cursors.Add(new DocumentOffset(0), null);
+        });
+        await harness.NextPassAsync(() => harness.App.FocusWhere(node => node is TextBoxNode));
+        var resized = harness.App.FrameCount + 1;
+        harness.Resize(30, 6);
+        await harness.WaitForPassAsync(resized);
+        var later = harness.Capture(DiagnosticAuthorization.EditorText);
+        Assert.AreNotEqual(first, Serialize(later), "fixture: later passes should produce a different frame");
+
+        Assert.AreEqual(first, Serialize(retained), "result changed after later frames");
+    }
+
+    [TestMethod]
+    public async Task ConcurrentChanges_FramesStayConsistent()
+    {
+        var box = new TextBoxState();
+        await using var harness = await AppHarness.StartAsync(_ => new VStackWidget(
+        [
+            new BorderWidget(new VStackWidget(
+            [
+                new TextBoxWidget().State(box),
+                new TextBlockWidget($"typed {box.Text.Length} {new string('x', box.Text.Length % 50)}", TextOverflow.Wrap),
+                new ButtonWidget("ok"),
+                new TextBoxWidget("second"),
+            ])).FixedHeight(6),
+            new TextBlockWidget("footer"),
+        ]), columns: 40, rows: 10);
+
+        using var stop = new CancellationTokenSource();
+        var driver = Task.Run(async () =>
+        {
+            var sizes = new[] { (40, 10), (24, 8), (60, 12), (30, 5) };
+            for (var i = 0; !stop.IsCancellationRequested; i++)
+            {
+                var input = new Hex1bTerminalInputSequenceBuilder().Type("ab");
+                if (i % 3 == 0)
+                    input = input.Tab();
+                await input.Build().ApplyAsync(harness.Terminal, stop.Token);
+                if (i % 4 == 0)
+                {
+                    var (w, h) = sizes[i / 4 % sizes.Length];
+                    harness.Resize(w, h);
+                }
+                await Task.Delay(2, stop.Token);
+            }
+        }, stop.Token);
+
+        var frameIds = new HashSet<long>();
+        var sizesSeen = new HashSet<(int, int)>();
+        var focusSeen = new HashSet<string>();
+        try
+        {
+            var elapsed = Stopwatch.StartNew();
+            for (var capture = 0; capture < 200 || (frameIds.Count < 40 && elapsed.Elapsed < TimeSpan.FromSeconds(8)); capture++)
+            {
+                var result = harness.Capture(DiagnosticAuthorization.EditorText);
+                Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome, result.Problem?.Message);
+                var frame = result.Frame!;
+                CheckInvariants(frame);
+                frameIds.Add(frame.FrameId);
+                sizesSeen.Add((frame.Columns, frame.Rows));
+                focusSeen.Add(frame.Focus.FocusedNodeType ?? "none");
+                await Task.Delay(capture % 2 == 0 ? 1 : 0, TestContext.Current.CancellationToken);
+            }
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            try { await driver; } catch (OperationCanceledException) { }
+        }
+
+        Assert.IsGreaterThanOrEqualTo(40, frameIds.Count, $"only {frameIds.Count} distinct frames observed; the driver did not exercise concurrency");
+        Assert.IsGreaterThan(1, sizesSeen.Count, "no resize was observed");
+        Assert.IsGreaterThan(1, focusSeen.Count, "no focus change was observed");
+    }
+
+    [TestMethod]
+    public async Task TimingsAndPopups_TimingsPresentWhenEnabled()
+    {
+        await using var harness = await AppHarness.StartAsync(_ => new VStackWidget(
+            [new TextBlockWidget("a"), new ButtonWidget("b")]));
+        var result = harness.Capture();
+
+        var timings = result.Frame!.Timings;
+        Assert.IsNotNull(timings, "frame timings missing with timing enabled");
+        Assert.IsTrue(timings.BuildMs >= 0 && timings.ReconcileMs >= 0 && timings.RenderMs >= 0);
+        var nodes = new List<(DiagnosticFrameNode Node, Rect Expected)>();
+        Walk(result.Frame.Root!, new Rect(0, 0, result.Frame.Columns, result.Frame.Rows), nodes);
+        foreach (var (node, _) in nodes)
+            Assert.IsNotNull(node.Timing, $"{node.Type} has no node timing");
+        Assert.IsTrue(nodes.Any(n => n.Node.Timing!.LastRenderedMsAgo >= 0), "no node reports a last render");
+        Assert.IsFalse(result.UnavailableFields.Any(f => f.Field == "frame.timings"));
+    }
+
+    [TestMethod]
+    public void TimingsAndPopups_TimingsExplainedWhenDisabled()
+    {
+        var frame = ApplicationFrameProjector.Project(new TextBlockNode(), new FocusRing(), 1, 10, 2, wroteOutput: true, timings: null);
+        var source = new FixedFrameSource(new PublishedApplicationFrame(1, frame, null, 0, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow));
+        var workload = new Hex1bAppWorkloadAdapter { ApplicationFrameSource = source };
+        using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(10, 2).Build();
+
+        var result = new TerminalDiagnostics(terminal, "untimed").CaptureApplicationFrame(new DiagnosticApplicationFrameRequest());
+
+        Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome);
+        Assert.IsNull(result.Frame!.Timings);
+        Assert.IsNull(result.Frame.Root!.Timing);
+        Assert.IsTrue(result.UnavailableFields.Any(f => f.Field == "frame.timings"), "absent timings are not explained");
+    }
+
+    [TestMethod]
+    public async Task TimingsAndPopups_PopupsKeepTheirFields()
+    {
+        await using var harness = await AppHarness.StartAsync(_ => new ZStackWidget(
+            [new VStackWidget([new TextBlockWidget("base"), new ButtonWidget("anchor")])]), columns: 40, rows: 10);
+
+        await harness.NextPassAsync(() =>
+        {
+            var zstack = FindNode<ZStackNode>(harness.App.RootNode)!;
+            var anchor = FindNode<ButtonNode>(harness.App.RootNode)!;
+            zstack.Popups.PushAnchored(anchor, AnchorPosition.Below, new TextBlockWidget("popped"), focusRestoreNode: anchor).AsBarrier();
+        });
+        await harness.NextPassAsync(change: null);
+        var frame = harness.Capture().Frame!;
+
+        Assert.HasCount(1, frame.Popups);
+        var popup = frame.Popups[0];
+        var button = FindFrameNode(frame.Root!, nameof(ButtonNode));
+        Assert.AreEqual(0, popup.Index);
+        Assert.AreEqual(nameof(AnchoredNode), popup.ContentType);
+        Assert.IsNotNull(popup.ContentBounds);
+        Assert.IsTrue(popup.IsBarrier, "barrier flag lost");
+        Assert.IsTrue(popup.IsAnchored, "anchored flag lost");
+        Assert.AreEqual(nameof(ButtonNode), popup.FocusRestoreNodeType);
+        Assert.AreEqual(nameof(ButtonNode), popup.AnchorNodeType);
+        Assert.AreEqual(Describe(button.Bounds), Describe(popup.AnchorBounds!));
+        Assert.IsFalse(popup.AnchorIsStale);
+        Assert.AreEqual(nameof(AnchorPosition.Below), popup.AnchorPosition);
+    }
+
     // === Helpers ===
+
+    private static Task<AppHarness> StartSentinelAppAsync() => AppHarness.StartAsync(_ => new VStackWidget(
+    [
+        new TextBoxWidget(SentinelA),
+        new TextBoxWidget(SentinelB),
+    ]));
+
+    private static string Serialize(DiagnosticApplicationFrameResult result) =>
+        System.Text.Json.JsonSerializer.Serialize(result, DiagnosticsJsonContext.Default.DiagnosticApplicationFrameResult);
+
+    // Independent line/column scan: 0-based, columns count UTF-16 code units, lines split on '\n'.
+    private static (int Line, int Column) Scan(string text, int offset)
+    {
+        int line = 0, column = 0;
+        for (var i = 0; i < offset; i++)
+        {
+            if (text[i] == '\n') { line++; column = 0; }
+            else column++;
+        }
+        return (line, column);
+    }
+
+    private static void AssertCaret(string text, int offset, DiagnosticCaret actual)
+    {
+        var (line, column) = Scan(text, offset);
+        Assert.AreEqual($"{offset}@{line}:{column}", $"{actual.Offset}@{actual.Line}:{actual.Column}", "offset@line:column");
+    }
+
+    private static void AssertBoundsOf(DiagnosticApplicationFrame frame, string type, DiagnosticRect bounds)
+    {
+        var node = FindFrameNode(frame.Root!, type);
+        Assert.AreEqual(Describe(node.Bounds), Describe(bounds), $"{type} editor bounds");
+        Assert.IsGreaterThan(0, bounds.Width * bounds.Height, "editor has no area");
+    }
+
+    private static DiagnosticFrameNode FindFrameNode(DiagnosticFrameNode node, string type) =>
+        node.Type == type ? node : node.Children.Select(child => FindFrameNodeOrNull(child, type)).FirstOrDefault(n => n is not null)
+            ?? throw new AssertFailedException($"no {type} in the frame");
+
+    private static DiagnosticFrameNode? FindFrameNodeOrNull(DiagnosticFrameNode node, string type) =>
+        node.Type == type ? node : node.Children.Select(child => FindFrameNodeOrNull(child, type)).FirstOrDefault(n => n is not null);
+
+    private static T? FindNode<T>(Hex1bNode? node) where T : Hex1bNode =>
+        node is null ? null : node as T ?? node.GetChildren().Select(FindNode<T>).FirstOrDefault(n => n is not null);
+
+    // Invariants recomputed from the result alone, without projector code.
+    private static void CheckInvariants(DiagnosticApplicationFrame frame)
+    {
+        var nodes = new List<(DiagnosticFrameNode Node, Rect Expected)>();
+        Walk(frame.Root!, new Rect(0, 0, frame.Columns, frame.Rows), nodes);
+        foreach (var (node, expected) in nodes)
+        {
+            Assert.AreEqual(Describe(expected), Describe(node.VisibleBounds),
+                $"frame {frame.FrameId}: {node.Type} visible rect outside its bounds or enclosing clips");
+        }
+
+        var treeFocused = nodes.Where(n => n.Node.IsFocused && n.Node.IsFocusable).Select(n => n.Node).ToList();
+        var ring = frame.Focus;
+        Assert.AreEqual(ring.Focusables.Count(f => f.IsFocused), treeFocused.Count, $"frame {frame.FrameId}: focus ring and tree disagree on focus");
+        if (ring.CurrentIndex >= 0)
+        {
+            var entry = ring.Focusables[ring.CurrentIndex];
+            Assert.IsTrue(entry.IsFocused, $"frame {frame.FrameId}: current focus entry is not focused");
+            Assert.AreEqual(ring.FocusedNodeType, entry.Type);
+            Assert.IsTrue(treeFocused.Any(n => n.Type == entry.Type && Describe(n.Bounds) == Describe(entry.Bounds)),
+                $"frame {frame.FrameId}: focused {entry.Type} at {Describe(entry.Bounds)} is not the tree's focused node");
+        }
+
+        if (frame.FocusedEditor is { } editor)
+        {
+            Assert.AreEqual(ring.FocusedNodeType == nameof(TextBoxNode) ? "text-box" : "editor", editor.Kind, $"frame {frame.FrameId}");
+            Assert.AreEqual(editor.Length, editor.Text!.Length, $"frame {frame.FrameId}: editor length differs from its text");
+            Assert.AreEqual(editor.Text.Count(c => c == '\n') + 1, editor.LineCount, $"frame {frame.FrameId}: line count");
+            foreach (var caret in editor.Carets.Concat(editor.Selections.SelectMany(s => new[] { s.Start, s.End })))
+            {
+                Assert.IsTrue(caret.Offset >= 0 && caret.Offset <= editor.Length, $"frame {frame.FrameId}: caret {caret.Offset} outside length {editor.Length}");
+                var (line, column) = Scan(editor.Text, caret.Offset);
+                Assert.AreEqual((line, column), (caret.Line, caret.Column), $"frame {frame.FrameId}: caret {caret.Offset}");
+            }
+            foreach (var selection in editor.Selections)
+                Assert.IsLessThanOrEqualTo(selection.End.Offset, selection.Start.Offset, $"frame {frame.FrameId}: inverted selection");
+        }
+    }
 
     private static void Walk(DiagnosticFrameNode node, Rect clip, List<(DiagnosticFrameNode, Rect)> into)
     {
@@ -185,6 +578,13 @@ public class ApplicationFrameTests
     private static string Describe(Rect r) => $"{r.X},{r.Y},{r.Width},{r.Height}";
 
     private static string Describe(DiagnosticRect r) => $"{r.X},{r.Y},{r.Width},{r.Height}";
+
+    private sealed class FixedFrameSource(PublishedApplicationFrame frame) : IApplicationFrameSource
+    {
+        public bool FramePublicationEnabled => true;
+
+        public PublishedApplicationFrame? LatestFrame => frame;
+    }
 
     internal sealed class StrongBox<T>
     {
@@ -245,6 +645,10 @@ public class ApplicationFrameTests
             await harness.WaitForPassAsync(1);
             return harness;
         }
+
+        // Resizes the way a real presentation does, so the app sees the new size.
+        public void Resize(int columns, int rows) =>
+            ((HeadlessPresentationAdapter)Terminal.PresentationAdapter).TriggerResize(columns, rows);
 
         public DiagnosticApplicationFrameResult Capture(params DiagnosticAuthorization[] authorizations) =>
             Diagnostics.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest { Authorizations = authorizations });

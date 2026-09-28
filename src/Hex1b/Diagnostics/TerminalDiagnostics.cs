@@ -51,6 +51,8 @@ public sealed class TerminalDiagnostics
         "A terminal-model capture is not an application frame; the application-frame operation returns frames, acquired separately.";
     private const string FramePublicationDisabled =
         "The application does not publish frames; frame publication requires diagnostics to be enabled (WithDiagnostics).";
+    private const string NoFocusedEditor = "No editor had focus in this frame.";
+
     private const string FrameIsNotAModelObservation =
         "An application frame is not a terminal-model observation; correlate it with model captures by identities and acquisition intervals.";
     private const string LatestFrameLimitation =
@@ -236,6 +238,35 @@ public sealed class TerminalDiagnostics
         };
         if (frame.Root is null)
             unavailable.Add(new DiagnosticUnavailableField { Field = "frame.root", Reason = "The application had no nodes in this frame." });
+        if (frame.FocusedEditor is null)
+            unavailable.Add(new DiagnosticUnavailableField { Field = "frame.focusedEditor", Reason = NoFocusedEditor });
+        if (frame.Timings is null)
+            unavailable.Add(new DiagnosticUnavailableField
+            {
+                Field = "frame.timings",
+                Reason = "Diagnostic timing was not enabled for this application, so frame and node timings were not recorded.",
+            });
+
+        // The published frame keeps the focused editor's text; only an editor-text capture sees it.
+        var editorTextAuthorized = authorizations.Contains(DiagnosticAuthorization.EditorText);
+        if (!editorTextAuthorized && frame.FocusedEditor is { Text: not null } editor)
+            frame = frame with { FocusedEditor = editor with { Text = null } };
+        var editorTextCoverage = (editorTextAuthorized, frame.FocusedEditor) switch
+        {
+            (false, _) => new DiagnosticContentCoverage
+            {
+                Content = DiagnosticContentClass.EditorText,
+                State = DiagnosticCoverageState.Excluded,
+                Reason = "Requires editor-text authorization.",
+            },
+            (true, null) => new DiagnosticContentCoverage
+            {
+                Content = DiagnosticContentClass.EditorText,
+                State = DiagnosticCoverageState.Unavailable,
+                Reason = NoFocusedEditor,
+            },
+            (true, _) => new DiagnosticContentCoverage { Content = DiagnosticContentClass.EditorText, State = DiagnosticCoverageState.Included },
+        };
 
         var identity = DescribeIdentity(DiagnosticLayer.ApplicationFrame, modelSequence: null, published.FrameId,
             _terminal.PresentationAdapter is Reflow.ITerminalReflowProvider { ReflowEnabled: true },
@@ -257,12 +288,7 @@ public sealed class TerminalDiagnostics
             ContentCoverage =
             [
                 new DiagnosticContentCoverage { Content = DiagnosticContentClass.ApplicationText, State = DiagnosticCoverageState.Included },
-                new DiagnosticContentCoverage
-                {
-                    Content = DiagnosticContentClass.EditorText,
-                    State = DiagnosticCoverageState.Excluded,
-                    Reason = "Requires editor-text authorization.",
-                },
+                editorTextCoverage,
             ],
             UnavailableFields = unavailable,
             Limitations = FrameLimitations,
