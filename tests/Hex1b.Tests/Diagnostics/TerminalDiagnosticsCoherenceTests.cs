@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Hex1b.Diagnostics;
 using Hex1b.Tokens;
+using Microsoft.Extensions.Time.Testing;
 
 namespace Hex1b.Tests.Diagnostics;
 
@@ -59,7 +60,6 @@ public class TerminalDiagnosticsCoherenceTests
     {
         await using var terminal = CreateTerminal(40, 6, retention: 50, reflow: true);
         var diagnostics = new TerminalDiagnostics(terminal, "concurrent");
-        using var writerDone = new CancellationTokenSource();
         var writer = Task.Run(() =>
         {
             for (var k = 0; k < 300; k++)
@@ -204,15 +204,20 @@ public class TerminalDiagnosticsCoherenceTests
     [TestMethod]
     public async Task SynchronizedUpdate_ReleasedByTimeoutIsInactive()
     {
-        await using var terminal = CreateTerminal(40, 6);
+        var clock = new FakeTimeProvider(DateTimeOffset.UtcNow);
+        await using var terminal = CreateTerminal(40, 6, timeProvider: clock);
         var diagnostics = new TerminalDiagnostics(terminal, "sync");
         Apply(terminal, "\x1b[?2026hSTUCK");
-        Assert.IsTrue(diagnostics.Capture(new DiagnosticCaptureRequest()).SynchronizedUpdate!.Active);
+        var pending = diagnostics.Capture(new DiagnosticCaptureRequest());
+        Assert.IsTrue(pending.SynchronizedUpdate!.Active);
 
-        await Task.Delay(TimeSpan.FromMilliseconds(1300), TestContext.Current.CancellationToken);
+        clock.Advance(TimeSpan.FromSeconds(1));
+        var released = diagnostics.Capture(new DiagnosticCaptureRequest());
 
-        Assert.IsFalse(diagnostics.Capture(new DiagnosticCaptureRequest()).SynchronizedUpdate!.Active,
+        Assert.IsFalse(released.SynchronizedUpdate!.Active,
             "the model released the update on its timeout, but the capture still reports it pending");
+        Assert.IsTrue(Sequence(released) > Sequence(pending),
+            $"timeout release changed the synchronized-update state without advancing the sequence ({Sequence(pending)} == {Sequence(released)})");
     }
 
     [TestMethod]
@@ -250,12 +255,14 @@ public class TerminalDiagnosticsCoherenceTests
 
     private static string Fingerprint(DiagnosticCaptureResult result) =>
         $"{result.Geometry!.Columns}x{result.Geometry.Rows}@{result.Geometry.CursorColumn},{result.Geometry.CursorRow}" +
-        $"|h{result.History!.AvailableRows}/{result.History.ReturnedRows}|{result.Content}";
+        $"|h{result.History!.AvailableRows}/{result.History.ReturnedRows}" +
+        $"|s{result.SynchronizedUpdate!.Active}/{result.SynchronizedUpdate.StartedAtSequence}|{result.Content}";
 
     private static void Apply(Hex1bTerminal terminal, string output) =>
         terminal.ApplyTokens(AnsiTokenizer.Tokenize(output));
 
-    private static Hex1bTerminal CreateTerminal(int width, int height, int? retention = null, bool reflow = false)
+    private static Hex1bTerminal CreateTerminal(int width, int height, int? retention = null, bool reflow = false,
+        TimeProvider? timeProvider = null)
     {
         var builder = Hex1bTerminal.CreateBuilder()
             .WithWorkload(new Hex1bAppWorkloadAdapter())
@@ -265,6 +272,8 @@ public class TerminalDiagnosticsCoherenceTests
             builder.WithScrollback(capacity);
         if (reflow)
             builder.WithReflow();
+        if (timeProvider is not null)
+            builder.WithTimeProvider(timeProvider);
         return builder.Build();
     }
 }

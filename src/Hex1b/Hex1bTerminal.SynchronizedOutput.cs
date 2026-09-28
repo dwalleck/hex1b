@@ -59,6 +59,8 @@ public sealed partial class Hex1bTerminal
                 return;
             }
 
+            // Releasing the update changes observed model state without model input.
+            AdvanceModelSequenceUnsafe();
             SetSynchronizedOutputMode(false);
         }
         NotifyPresentationInvalidated();
