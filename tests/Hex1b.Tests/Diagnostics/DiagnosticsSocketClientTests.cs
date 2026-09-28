@@ -315,6 +315,24 @@ public class DiagnosticsSocketClientTests
     }
 
     [TestMethod]
+    public async Task ApplicationFrame_MalformedEntriesAndStrayFrames_NeverThrow()
+    {
+        var withNullCaret = """{"success":true,"applicationFrame":{"contractVersion":1,"outcome":"captured","identity":{},"frame":{"popups":[],"focus":{"focusables":[]},"focusedEditor":{"bounds":{},"carets":[null],"selections":[]}}}}""";
+        var strayFrame = """{"success":false,"applicationFrame":{"contractVersion":1,"outcome":"unavailable","problem":{"code":"x","message":"y"},"frame":{"focus":null}}}""";
+        await using var nullCaret = await FakeServer.StartAsync(_ => withNullCaret);
+        await using var stray = await FakeServer.StartAsync(_ => strayFrame);
+
+        var malformed = await new DiagnosticsSocketClient().CaptureApplicationFrameAsync(nullCaret.Path,
+            new DiagnosticApplicationFrameRequest(), TestContext.Current.CancellationToken);
+        var unavailable = await new DiagnosticsSocketClient().CaptureApplicationFrameAsync(stray.Path,
+            new DiagnosticApplicationFrameRequest(), TestContext.Current.CancellationToken);
+
+        Assert.AreEqual((DiagnosticOutcome.Failed, "protocol-error"), (malformed.Outcome, malformed.Problem?.Code));
+        Assert.AreEqual(DiagnosticOutcome.Unavailable, unavailable.Outcome);
+        Assert.IsNull(unavailable.Frame, "a frame on a non-captured outcome reached the caller");
+    }
+
+    [TestMethod]
     public async Task ApplicationFrame_TargetWithoutTheMethod_IsIncompatible()
     {
         await using var server = await FakeServer.StartAsync(_ => """{"success":false,"error":"Unknown method: application-frame"}""");

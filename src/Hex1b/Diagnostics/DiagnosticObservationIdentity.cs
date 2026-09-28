@@ -58,4 +58,11 @@ public sealed class DiagnosticObservationIdentity
     /// <summary>Published application frame identity, when one is associated.</summary>
     [JsonPropertyName("applicationFrame")]
     public long? ApplicationFrame { get; init; }
+
+    /// <summary>
+    /// The application instance that published <see cref="ApplicationFrame"/>. Frame numbers count
+    /// passes per instance, so the two together identify a frame within a session.
+    /// </summary>
+    [JsonPropertyName("applicationInstanceId")]
+    public string? ApplicationInstanceId { get; init; }
 }

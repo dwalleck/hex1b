@@ -34,7 +34,7 @@ internal static class ApplicationFrameProjector
         var focusedIndex = IndexOfFocused(focusables);
         var walk = new Walk(new Rect(0, 0, columns, rows), timings is null ? null : Stopwatch.GetTimestamp(),
             focusedIndex < 0 ? null : focusables[focusedIndex]);
-        var projectedRoot = root is null ? null : walk.Node(root, clipChain: null);
+        var projectedRoot = root is null ? null : walk.Node(root, walk.Screen, underProvider: false);
         return new DiagnosticApplicationFrame
         {
             ApplicationInstanceId = applicationInstanceId,
@@ -60,29 +60,33 @@ internal static class ApplicationFrameProjector
     // One tree walk: nodes with their effective clip, the popup host, and the focused editor.
     private sealed class Walk(Rect screen, long? now, Hex1bNode? focused)
     {
+        public Rect Screen => screen;
+
         public Hex1bNode? Focused => focused;
 
         public ZStackNode? PopupHost { get; private set; }
 
         public DiagnosticEditorState? FocusedEditor { get; private set; }
 
-        public DiagnosticFrameNode Node(Hex1bNode node, ILayoutProvider? clipChain)
+        // What the renderer draws: under a layout provider every child renders on a surface the
+        // size of its bounds and is composited through the intersection of every enclosing
+        // provider's clip rect, whatever its clip mode (SurfaceRenderContext.RenderChild).
+        public DiagnosticFrameNode Node(Hex1bNode node, Rect clip, bool underProvider)
         {
             if (PopupHost is null && node is ZStackNode host)
                 PopupHost = host;
 
             var bounds = node.Bounds;
-            var clip = EffectiveClip(clipChain, screen);
             var visible = Intersect(bounds, clip);
 
             DiagnosticRect? ownClip = null;
             string? clipMode = null;
-            var childChain = clipChain;
+            var childClip = underProvider ? visible : clip;
             if (node is ILayoutProvider provider)
             {
                 ownClip = DiagnosticRect.FromRect(provider.ClipRect);
                 clipMode = provider.ClipMode == ClipMode.Clip ? "clip" : "overflow";
-                childChain = new SnapshotClip(provider.ClipRect, provider.ClipMode, clipChain);
+                childClip = Intersect(childClip, provider.ClipRect);
             }
 
             // Editors: metadata on the node; the focused editor's text only on the frame.
@@ -95,15 +99,10 @@ internal static class ApplicationFrameProjector
                 editor = described is { Text: not null } ? described with { Text = null } : described;
             }
 
+            var childrenUnderProvider = underProvider || node is ILayoutProvider;
             var children = new List<DiagnosticFrameNode>();
             foreach (var child in node.GetChildren())
-            {
-                // Splitter and drag-bar panes render their children under a pane clip.
-                var paneChain = node is IChildLayoutProvider panes && panes.GetChildLayoutProvider(child) is { } pane
-                    ? new SnapshotClip(pane.ClipRect, pane.ClipMode, childChain)
-                    : childChain;
-                children.Add(Node(child, paneChain));
-            }
+                children.Add(Node(child, childClip, childrenUnderProvider));
 
             return new DiagnosticFrameNode
             {
@@ -125,37 +124,6 @@ internal static class ApplicationFrameProjector
                 Children = children.AsReadOnly(),
             };
         }
-    }
-
-    // The renderer's rule (LayoutProviderHelper): an Overflow provider whose parent is absent or
-    // also Overflow draws unclipped; otherwise drawing is clipped to every enclosing provider.
-    private static Rect EffectiveClip(ILayoutProvider? chain, Rect screen)
-    {
-        if (chain is null)
-            return screen;
-        if (chain.ClipMode == ClipMode.Overflow && chain.ParentLayoutProvider is null or { ClipMode: ClipMode.Overflow })
-            return screen;
-        return Intersect(screen, LayoutProviderHelper.GetEffectiveClipRect(chain));
-    }
-
-    // An immutable copy of one provider in the render-time clip chain; live providers link their
-    // parents only while rendering.
-    private sealed class SnapshotClip(Rect clipRect, ClipMode clipMode, ILayoutProvider? parent) : ILayoutProvider
-    {
-        public ILayoutProvider? ParentLayoutProvider
-        {
-            get => parent;
-            set => throw new NotSupportedException("A projected clip chain is immutable.");
-        }
-
-        public Rect ClipRect => clipRect;
-
-        public ClipMode ClipMode => clipMode;
-
-        public bool ShouldRenderAt(int x, int y) => LayoutProviderHelper.ShouldRenderAt(this, x, y);
-
-        public (int adjustedX, string clippedText) ClipString(int x, int y, string text) =>
-            LayoutProviderHelper.ClipString(this, x, y, text);
     }
 
     private static DiagnosticNodeTiming TimingOf(Hex1bNode node, long now) => new()

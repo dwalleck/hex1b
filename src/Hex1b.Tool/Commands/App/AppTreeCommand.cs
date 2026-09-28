@@ -164,18 +164,23 @@ internal sealed class AppTreeCommand : BaseCommand
 
     private static string Safe(string? text)
     {
-        if (string.IsNullOrEmpty(text) || !text.Any(char.IsControl))
+        if (string.IsNullOrEmpty(text) || !text.Any(IsUnsafe))
             return text ?? "";
         var escaped = new System.Text.StringBuilder(text.Length + 8);
         foreach (var c in text)
         {
-            if (char.IsControl(c))
+            if (IsUnsafe(c))
                 escaped.Append("\\u").Append(((int)c).ToString("x4", System.Globalization.CultureInfo.InvariantCulture));
             else
                 escaped.Append(c);
         }
         return escaped.ToString();
     }
+
+    // Control characters, and format characters such as bidirectional overrides that reorder
+    // what the reader sees.
+    private static bool IsUnsafe(char c) =>
+        char.IsControl(c) || char.GetUnicodeCategory(c) == System.Globalization.UnicodeCategory.Format;
 
     private int WriteFailure(DiagnosticApplicationFrameResult result, bool json)
     {

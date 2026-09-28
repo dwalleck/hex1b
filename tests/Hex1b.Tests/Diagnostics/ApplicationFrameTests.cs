@@ -154,31 +154,40 @@ public class ApplicationFrameTests
     }
 
     [TestMethod]
-    public void Clipping_OverflowRuleMatchesTheRenderer()
+    public void Clipping_FollowsTheCompositorNotTheClipMode()
     {
-        // Hand-arranged content taller than its region, which stacks never produce.
-        static (LayoutNode Outer, TextBlockNode Text) Build(ClipMode outerMode)
-        {
-            var text = new TextBlockNode { Text = "tall" };
-            var inner = new LayoutNode { ClipMode = ClipMode.Overflow, Child = text };
-            var outer = new LayoutNode { ClipMode = outerMode, Child = inner };
-            outer.Arrange(new Rect(0, 0, 10, 4));
-            inner.Arrange(new Rect(0, 0, 10, 2));
-            text.Arrange(new Rect(0, 0, 10, 5));
-            return (outer, text);
-        }
+        // Hand-arranged content larger than its container, which stacks never produce.
+        static TextBlockNode Tall() => new() { Text = "tall" };
 
-        var (clipped, _) = Build(ClipMode.Clip);
-        var (overflowing, _) = Build(ClipMode.Overflow);
-        var underClip = ApplicationFrameProjector.Project(clipped, new FocusRing(), "stub", 1, 10, 10, wroteOutput: true, timings: null);
-        var underOverflow = ApplicationFrameProjector.Project(overflowing, new FocusRing(), "stub", 1, 10, 10, wroteOutput: true, timings: null);
+        var overflowText = Tall();
+        var inner = new LayoutNode { ClipMode = ClipMode.Overflow, Child = overflowText };
+        var outer = new LayoutNode { ClipMode = ClipMode.Overflow, Child = inner };
+        outer.Arrange(new Rect(0, 0, 10, 4));
+        inner.Arrange(new Rect(0, 0, 10, 2));
+        overflowText.Arrange(new Rect(0, 0, 10, 5));
 
-        var inClip = underClip.Root!.Children[0].Children[0];
-        var inOverflow = underOverflow.Root!.Children[0].Children[0];
-        Assert.AreEqual("0,0,10,2", Describe(inClip.VisibleBounds), "an Overflow region under a clipping parent clips to itself");
-        Assert.AreEqual(DiagnosticClipState.PartiallyClipped, inClip.ClipState);
-        Assert.AreEqual("0,0,10,5", Describe(inOverflow.VisibleBounds), "an Overflow region under an Overflow parent draws unclipped");
-        Assert.AreEqual(DiagnosticClipState.Visible, inOverflow.ClipState);
+        var surfaceText = Tall();
+        var container = new PassThroughNode { Child = surfaceText };
+        var region = new LayoutNode { ClipMode = ClipMode.Clip, Child = container };
+        region.Arrange(new Rect(0, 0, 10, 10));
+        container.Arrange(new Rect(0, 0, 10, 3));
+        surfaceText.Arrange(new Rect(0, 0, 10, 5));
+
+        DiagnosticFrameNode Leaf(Hex1bNode root) =>
+            ApplicationFrameProjector.Project(root, new FocusRing(), "stub", 1, 10, 10, wroteOutput: true, timings: null)
+                .Root!.Children[0].Children[0];
+
+        var insetText = Tall();
+        var inset = new InsetOverflowNode { Child = insetText };
+        inset.Arrange(new Rect(0, 0, 10, 10));
+        insetText.Arrange(new Rect(0, 0, 10, 5));
+        var insetLeaf = ApplicationFrameProjector.Project(inset, new FocusRing(), "stub", 1, 10, 10, wroteOutput: true, timings: null)
+            .Root!.Children[0];
+
+        Assert.AreEqual("0,0,10,2", Describe(Leaf(outer).VisibleBounds), "an overflow region still clips what is composited through it");
+        Assert.AreEqual("1,1,9,4", Describe(insetLeaf.VisibleBounds), "an overflow provider's clip rect applies even where it differs from its bounds");
+        Assert.AreEqual("0,0,10,3", Describe(Leaf(region).VisibleBounds), "a node below a clip region draws on a surface of its own bounds");
+        Assert.AreEqual(DiagnosticClipState.PartiallyClipped, Leaf(region).ClipState);
     }
 
     [TestMethod]
@@ -295,6 +304,10 @@ public class ApplicationFrameTests
         var b = second.Capture().Frame!;
 
         Assert.IsFalse(string.IsNullOrEmpty(a.ApplicationInstanceId));
+        Assert.AreEqual(a.ApplicationInstanceId, first.Capture().Identity!.ApplicationInstanceId, "the identity names the instance");
+        var model = first.Diagnostics.Capture(new DiagnosticCaptureRequest());
+        Assert.IsNull(model.Identity!.ApplicationInstanceId);
+        Assert.IsTrue(model.UnavailableFields.Any(f => f.Field == "identity.applicationInstanceId"), "a model capture explains the absent instance");
         Assert.AreEqual(a.ApplicationInstanceId, a2.ApplicationInstanceId);
         Assert.AreNotEqual(a.ApplicationInstanceId, b.ApplicationInstanceId);
     }
@@ -809,26 +822,20 @@ public class ApplicationFrameTests
     }
 
     private static void Walk(DiagnosticFrameNode node, Rect screen, List<(DiagnosticFrameNode, Rect)> into) =>
-        Walk(node, screen, [], into);
+        Walk(node, screen, underRegion: false, into);
 
-    // The renderer's clip rule, reimplemented from the result: a node inside an Overflow region
-    // whose enclosing region is absent or also Overflow draws unclipped; otherwise it is clipped
-    // to every enclosing region. Splitter panes clip their children to the pane.
-    private static void Walk(DiagnosticFrameNode node, Rect screen, ImmutableList<(Rect Rect, bool Overflow)> regions,
-        List<(DiagnosticFrameNode, Rect)> into)
+    // What the renderer can draw, recomputed from the result: every enclosing clip region clips,
+    // whatever its mode, and below the first region every node renders on a surface of its own
+    // bounds, which clips its descendants.
+    private static void Walk(DiagnosticFrameNode node, Rect clip, bool underRegion, List<(DiagnosticFrameNode, Rect)> into)
     {
-        var clip = screen;
-        var unclipped = regions.Count == 0 || (regions[^1].Overflow && (regions.Count == 1 || regions[^2].Overflow));
-        if (!unclipped)
-        {
-            foreach (var (region, _) in regions)
-                clip = Overlap(clip, region);
-        }
-
-        into.Add((node, Overlap(ToRect(node.Bounds), clip)));
-        var inner = node.ClipRect is { } own ? regions.Add((ToRect(own), node.ClipMode == "overflow")) : regions;
+        var visible = Overlap(ToRect(node.Bounds), clip);
+        into.Add((node, visible));
+        var inner = underRegion ? visible : clip;
+        if (node.ClipRect is { } own)
+            inner = Overlap(inner, ToRect(own));
         foreach (var child in node.Children)
-            Walk(child, screen, node.Type == nameof(SplitterNode) ? inner.Add((ToRect(child.Bounds), false)) : inner, into);
+            Walk(child, inner, underRegion || node.ClipRect is not null, into);
     }
 
     private static Rect ToRect(DiagnosticRect r) => new(r.X, r.Y, r.Width, r.Height);
@@ -850,6 +857,44 @@ public class ApplicationFrameTests
         public bool FramePublicationEnabled => true;
 
         public PublishedApplicationFrame? LatestFrame => frame;
+    }
+
+    // An Overflow provider whose clip rect is inset from its bounds.
+    internal sealed class InsetOverflowNode : Hex1bNode, ILayoutProvider
+    {
+        public Hex1bNode? Child { get; set; }
+
+        public ILayoutProvider? ParentLayoutProvider { get; set; }
+
+        public Rect ClipRect => new(Bounds.X + 1, Bounds.Y + 1, Bounds.Width - 1, Bounds.Height - 1);
+
+        public ClipMode ClipMode => ClipMode.Overflow;
+
+        public bool ShouldRenderAt(int x, int y) => LayoutProviderHelper.ShouldRenderAt(this, x, y);
+
+        public (int adjustedX, string clippedText) ClipString(int x, int y, string text) => LayoutProviderHelper.ClipString(this, x, y, text);
+
+        public override IEnumerable<Hex1bNode> GetChildren() => Child is null ? [] : [Child];
+
+        protected override Size MeasureCore(Constraints constraints) => constraints.Constrain(new Size(1, 1));
+
+        public override void Render(Hex1bRenderContext context)
+        {
+        }
+    }
+
+    // A container that is not a layout provider.
+    internal sealed class PassThroughNode : Hex1bNode
+    {
+        public Hex1bNode? Child { get; set; }
+
+        public override IEnumerable<Hex1bNode> GetChildren() => Child is null ? [] : [Child];
+
+        protected override Size MeasureCore(Constraints constraints) => constraints.Constrain(new Size(1, 1));
+
+        public override void Render(Hex1bRenderContext context)
+        {
+        }
     }
 
     internal sealed record AlwaysDirtyWidget : Hex1bWidget

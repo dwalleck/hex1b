@@ -419,7 +419,7 @@ public class CaptureContractCliTests
     public async Task AppTree_DeepTreeAndControlCharacters_CrossTheSocketSafely()
     {
         await WaitForSocketReleaseAsync(TestContext.Current.CancellationToken);
-        Hex1bWidget deep = new ListWidget(["\u001b]0;pwned\u0007item", "second"]);
+        Hex1bWidget deep = new ListWidget(["\u001b]0;pwned\u0007item\u202e", "second"]);
         for (var i = 0; i < 40; i++)
             deep = new VStackWidget([deep]);
         await using var terminal = Hex1bTerminal.CreateBuilder()
@@ -441,6 +441,7 @@ public class CaptureContractCliTests
         StringAssert.Contains(json, "ListNode");
         Assert.AreEqual(0, textExit, textErr);
         Assert.IsFalse(text.Contains('\u001b'), "application text reached the terminal with a raw ESC");
+        Assert.IsFalse(text.Contains('\u202e'), "a bidirectional override reached the terminal unescaped");
         StringAssert.Contains(text, "\\u001b]0;pwned");
     }
 

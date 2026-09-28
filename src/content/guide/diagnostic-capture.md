@@ -129,12 +129,12 @@ render, waits for a frame, or reads live application state, so a retained result
 | `frame.frameId` | The instance's completed-pass count for this frame; also `identity.applicationFrame`. Results with the same `applicationInstanceId` and `frameId` in one `sessionId` are the same frame. |
 | `frame.columns`, `frame.rows` | The pass's screen size. |
 | `frame.wroteOutput` | Whether the pass wrote cell or graphics changes to the terminal. Cursor-only updates and synchronized-update markers do not count. |
-| `frame.root` | Node tree: `type`, `widgetType`, `bounds`, `hitTestBounds`, `contentBounds`, `visibleBounds`, `clipState` (`visible`, `partially-clipped`, `fully-clipped`), the node's own `clipRect`/`clipMode`, focus flags, rendered `text` (text blocks, buttons, menu items, checkboxes, hyperlinks, tabs, tree items, notification cards, window and border titles, FIGlet text), type-specific `properties` (for example a list's or picker's `selectedText`), `editor` metadata for TextBox and Editor nodes (never their text), and `timing`. `visibleBounds` applies the renderer's clip rule: bounds are intersected with the screen and every enclosing clip region, except that an `overflow` region whose enclosing region is absent or also `overflow` draws unclipped. Splitter panes clip their content. |
+| `frame.root` | Node tree: `type`, `widgetType`, `bounds`, `hitTestBounds`, `contentBounds`, `visibleBounds`, `clipState` (`visible`, `partially-clipped`, `fully-clipped`), the node's own `clipRect`/`clipMode`, focus flags, rendered `text` (text blocks, buttons, menu items, checkboxes, hyperlinks, tabs, tree items, notification cards, window and border titles, FIGlet text), type-specific `properties` (for example a list's or picker's `selectedText`), `editor` metadata for TextBox and Editor nodes (never their text), and `timing`. `visibleBounds` is what the renderer can draw: the bounds intersected with the screen, with every enclosing clip region (whatever its `clipMode`), and with the bounds of every ancestor that renders on its own surface (every node below the first clip region). |
 | `frame.popups` | Popup stack, bottom first: content type and bounds, barrier and anchored flags, focus-restore node, and anchor type, bounds, staleness, and position. |
 | `frame.focus` | Focus ring: `currentIndex`, `focusedNodeType`, `lastHitTest`, and each focusable's bounds and hit-test bounds. |
-| `frame.focusedEditor` | For a focused TextBox or Editor: `kind` (`text-box`, `editor`), `bounds`, `length`, `lineCount`, every caret, and every non-empty selection. Positions are `{ offset, line, column }`: UTF-16 offsets and 0-based line and column. `text` is present only with `editor-text` authorization. Editor metadata comes from one snapshot of the editor's text; a cursor the snapshot no longer contains is clamped to it. |
+| `frame.focusedEditor` | For a focused TextBox or Editor: `kind` (`text-box`, `editor`), `bounds`, `length`, `lineCount`, every caret, and every non-empty selection. Positions are `{ offset, line, column }`: UTF-16 offsets and 0-based line and column. `text` is present only with `editor-text` authorization. Editor metadata comes from one read of the editor's text, with the cursors read immediately after; a cursor offset past that text is clamped to it, so under concurrent edits carets can mix positions from just before and after an edit but never exceed the reported length. |
 | `frame.timings` | Build, reconcile, and render milliseconds of the pass. |
-| `identity` | As for `capture`, with `sourceLayer` `application-frame`, `applicationFrame`, and `acquisition` bracketing the projection. `modelSequence` is unavailable: a frame is not a terminal-model observation. |
+| `identity` | As for `capture`, with `sourceLayer` `application-frame`, `applicationFrame` and `applicationInstanceId` (together they identify the frame within the session), and `acquisition` bracketing the projection. `modelSequence` is unavailable: a frame is not a terminal-model observation. |
 | `contentCoverage` | `application-text` is included. `editor-text` is `excluded` without authorization, `included` with it, and `unavailable` when no editor had focus. |
 | `unavailableFields` | Explains an absent `frame.root`, `frame.focusedEditor`, or `frame.timings`. |
 
@@ -174,8 +174,8 @@ model-history support, and authorizations. They also report each evidence layer:
 - KGP animation playback advances on a timer without a model event, so SVG and HTML renderings of
   animated KGP images can differ at the same `modelSequence`. Graphics placements change only
   through output batches and are covered by the sequence.
-- A terminal-model capture's `identity.applicationFrame` is absent: a model capture is not an
-  application frame. Correlate the two through identities and acquisition intervals.
+- A terminal-model capture's `identity.applicationFrame` and `identity.applicationInstanceId` are
+  absent: a model capture is not an application frame. Correlate the two through identities and acquisition intervals.
 - An idle application returns its last published frame; compare its acquisition interval with
   the time of the request.
 - Each inline flow step is its own application instance, so `frameId` restarts at each step while

@@ -277,6 +277,7 @@ public sealed class TerminalDiagnostics
         };
 
         var identity = DescribeIdentity(DiagnosticLayer.ApplicationFrame, modelSequence: null, published.FrameId,
+            frame.ApplicationInstanceId,
             _terminal.PresentationAdapter is Reflow.ITerminalReflowProvider { ReflowEnabled: true },
             new DiagnosticAcquisition
             {
@@ -530,17 +531,15 @@ public sealed class TerminalDiagnostics
     private DiagnosticObservationIdentity DescribeIdentity(
         Hex1bTerminalSnapshotState state, DiagnosticAcquisition acquisition, List<DiagnosticUnavailableField> unavailable)
     {
-        unavailable.Add(new DiagnosticUnavailableField
-        {
-            Field = "identity.applicationFrame",
-            Reason = _terminal.Workload is Hex1bAppWorkloadAdapter ? ModelCaptureIsNotAFrame : NoApplicationLayer,
-        });
+        var notAFrame = _terminal.Workload is Hex1bAppWorkloadAdapter ? ModelCaptureIsNotAFrame : NoApplicationLayer;
+        unavailable.Add(new DiagnosticUnavailableField { Field = "identity.applicationFrame", Reason = notAFrame });
+        unavailable.Add(new DiagnosticUnavailableField { Field = "identity.applicationInstanceId", Reason = notAFrame });
         return DescribeIdentity(DiagnosticLayer.TerminalModel, state.ModelSequence, applicationFrame: null,
-            state.ReflowEnabled, acquisition, unavailable);
+            applicationInstanceId: null, state.ReflowEnabled, acquisition, unavailable);
     }
 
     private DiagnosticObservationIdentity DescribeIdentity(DiagnosticLayer layer, long? modelSequence, long? applicationFrame,
-        bool reflowEnabled, DiagnosticAcquisition acquisition, List<DiagnosticUnavailableField> unavailable)
+        string? applicationInstanceId, bool reflowEnabled, DiagnosticAcquisition acquisition, List<DiagnosticUnavailableField> unavailable)
     {
         var (startedAt, startReason) = ProcessStart.Value;
         if (startedAt is null)
@@ -573,6 +572,7 @@ public sealed class TerminalDiagnostics
             ProcessStartedAt = startedAt,
             ModelSequence = modelSequence,
             ApplicationFrame = applicationFrame,
+            ApplicationInstanceId = applicationInstanceId,
             SessionId = _terminal.DiagnosticSessionId.ToString("N"),
             SourceLayer = layer,
             ApplicationName = _applicationName,

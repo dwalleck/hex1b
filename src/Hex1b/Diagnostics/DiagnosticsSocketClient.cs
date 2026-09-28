@@ -194,27 +194,38 @@ internal sealed class DiagnosticsSocketClient
                 $"The target reported outcome '{DiagnosticContractNames.Of(result.Outcome)}' without a problem.");
         }
 
-        if (result.Frame is { } frame && !IsComplete(frame))
+        // Only a captured result carries a frame; a stray one on another outcome is not surfaced.
+        if (result.Outcome != DiagnosticOutcome.Captured)
+            return result.Frame is null ? result : result with { Frame = null };
+
+        if (!IsComplete(result.Frame!))
         {
             return TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Failed, "protocol-error",
-                "The target reported an application frame with missing lists (popups, focusables, children, carets, or selections).");
+                "The target reported an application frame with missing lists, entries, or positions.");
         }
 
         return result;
     }
 
-    // Deserialization leaves omitted lists null despite their initializers; a frame the contract
-    // promises complete is checked before callers walk it.
+    // Deserialization leaves omitted lists null despite their initializers, and a malformed peer
+    // can send null entries; a frame the contract promises complete is checked before callers walk it.
     private static bool IsComplete(DiagnosticApplicationFrame frame)
     {
+        static bool Caret(DiagnosticCaret? caret) => caret is not null;
+
         static bool EditorComplete(DiagnosticEditorState? editor) =>
-            editor is null || (editor.Carets is not null && editor.Selections is not null && editor.Bounds is not null);
+            editor is null
+            || (editor.Bounds is not null && editor.Carets is not null && editor.Carets.All(Caret)
+                && editor.Selections is not null && editor.Selections.All(s => s is not null && Caret(s.Start) && Caret(s.End)));
 
         static bool NodeComplete(DiagnosticFrameNode? node) =>
-            node is not null && node.Children is not null && node.Bounds is not null && node.VisibleBounds is not null
-            && EditorComplete(node.Editor) && node.Children.All(NodeComplete);
+            node is not null && node.Bounds is not null && node.HitTestBounds is not null && node.ContentBounds is not null
+            && node.VisibleBounds is not null && EditorComplete(node.Editor)
+            && node.Children is not null && node.Children.All(NodeComplete);
 
-        return frame.Popups is not null && frame.Focus.Focusables is not null && EditorComplete(frame.FocusedEditor)
+        return frame.Popups is not null && frame.Popups.All(p => p is not null)
+            && frame.Focus?.Focusables is not null && frame.Focus.Focusables.All(f => f is { Bounds: not null, HitTestBounds: not null })
+            && EditorComplete(frame.FocusedEditor)
             && (frame.Root is null || NodeComplete(frame.Root));
     }
 

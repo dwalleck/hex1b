@@ -584,9 +584,9 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         // Register this app as the application-frame source if the adapter supports it
         if (_adapter is Hex1bAppWorkloadAdapter workloadAdapter)
         {
+            _diagnosticTimingEnabled = workloadAdapter.DiagnosticTimingEnabled;
             workloadAdapter.HostsApplications = true;
             workloadAdapter.ApplicationFrameSource = this;
-            _diagnosticTimingEnabled = workloadAdapter.DiagnosticTimingEnabled;
             // Wire IRepaintableWorkloadAdapter: when an outer multiplexer
             // (e.g. PlaceholderWorkloadAdapter) tells us the surrounding
             // terminal state was reset out from under us, flip _isFirstFrame
