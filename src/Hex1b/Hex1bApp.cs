@@ -133,6 +133,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
     // render loop (see FrameCount). Written only on the render loop thread.
     private long _frameCount;
     private readonly string _applicationInstanceId = Guid.NewGuid().ToString("N");
+    private Diagnostics.InputMilestoneTracker? _inputMilestones;
     private PublishedApplicationFrame? _latestFrame;
     
     // Channel for signaling that a re-render is needed (from Invalidate() calls)
@@ -585,6 +586,8 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         if (_adapter is Hex1bAppWorkloadAdapter workloadAdapter)
         {
             _diagnosticTimingEnabled = workloadAdapter.DiagnosticTimingEnabled;
+            _inputMilestones = workloadAdapter.InputMilestones;
+            _inputMilestones?.ApplicationStarted();
             workloadAdapter.HostsApplications = true;
             workloadAdapter.ApplicationFrameSource = this;
             // Wire IRepaintableWorkloadAdapter: when an outer multiplexer
@@ -792,6 +795,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
                 // A stopped app publishes no frames; later captures must not see its last one.
                 if (ReferenceEquals(wa.ApplicationFrameSource, this))
                     wa.ApplicationFrameSource = null;
+                _inputMilestones?.ApplicationStopped(_applicationInstanceId);
             }
         }
     }
@@ -986,6 +990,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         _metrics.InputCount.Add(1, new KeyValuePair<string, object?>("type", eventType));
         _metrics.InputDuration.Record(
             (Stopwatch.GetTimestamp() - inputStart) * 1000.0 / Stopwatch.Frequency);
+        _inputMilestones?.Processed(inputEvent, _applicationInstanceId);
     }
 
     /// <summary>

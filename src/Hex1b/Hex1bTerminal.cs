@@ -335,6 +335,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         
         _presentation = presentation;
         _workload = workload;
+        if (workload is Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled: true } trackedWorkload)
+            trackedWorkload.InputMilestones = InputMilestones = new Diagnostics.InputMilestoneTracker();
 
         // Expose the terminal's own applied cursor model to its workload adapter as the
         // headless observation source — and only for a genuinely headless terminal. An
@@ -8177,6 +8179,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             _kgpGraphicsState.Reset();
             _sixelGraphicsState.Reset();
             _inAlternateScreen = false;
+            InputMilestones?.Terminate("target-disposed", "The terminal was disposed.");
             return true;
         }
     }

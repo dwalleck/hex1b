@@ -86,6 +86,27 @@ public sealed class Hex1bAppWorkloadAdapter :
     internal bool HostsApplications { get; set; }
 
     /// <summary>
+    /// The session's input milestone tracker, when diagnostics are enabled: every event written to
+    /// the input channel is numbered by it, atomically with the write.
+    /// </summary>
+    internal Diagnostics.InputMilestoneTracker? InputMilestones { get; set; }
+
+    // Every input-channel write goes through here so a tracked session numbers each event in
+    // channel order; an untracked session writes exactly as before.
+    private bool TryWriteInput(Hex1bEvent evt) => InputMilestones is { } tracker
+        ? tracker.Accept(evt, _inputChannel.Writer.TryWrite)
+        : _inputChannel.Writer.TryWrite(evt);
+
+    private ValueTask WriteInputTrackedAsync(Hex1bEvent evt, CancellationToken ct)
+    {
+        if (InputMilestones is null)
+            return _inputChannel.Writer.WriteAsync(evt, ct);
+        if (!TryWriteInput(evt))
+            throw new ChannelClosedException();
+        return ValueTask.CompletedTask;
+    }
+
+    /// <summary>
     /// The terminal's own applied cursor model, attached by <see cref="Hex1bTerminal"/>
     /// during construction when this adapter is the terminal's workload.
     /// </summary>
@@ -811,7 +832,7 @@ public sealed class Hex1bAppWorkloadAdapter :
             var evt = ParseKeyInput(c);
             if (evt != null)
             {
-                await _inputChannel.Writer.WriteAsync(evt, ct);
+                await WriteInputTrackedAsync(evt, ct);
             }
         }
     }
@@ -822,7 +843,7 @@ public sealed class Hex1bAppWorkloadAdapter :
     public ValueTask WriteInputEventAsync(Hex1bEvent evt, CancellationToken ct = default)
     {
         if (_disposed) return ValueTask.CompletedTask;
-        return _inputChannel.Writer.WriteAsync(evt, ct);
+        return WriteInputTrackedAsync(evt, ct);
     }
 
     /// <summary>
@@ -831,7 +852,7 @@ public sealed class Hex1bAppWorkloadAdapter :
     public bool TryWriteInputEvent(Hex1bEvent evt)
     {
         if (_disposed) return false;
-        return _inputChannel.Writer.TryWrite(evt);
+        return TryWriteInput(evt);
     }
 
     /// <summary>
@@ -903,7 +924,7 @@ public sealed class Hex1bAppWorkloadAdapter :
         // (skip the initial dimension setup from terminal constructor)
         if (changed && wasInitialized)
         {
-            _inputChannel.Writer.TryWrite(new Hex1bResizeEvent(width, height));
+            TryWriteInput(new Hex1bResizeEvent(width, height));
         }
         return ValueTask.CompletedTask;
     }
@@ -921,7 +942,7 @@ public sealed class Hex1bAppWorkloadAdapter :
     public void SendKey(ConsoleKey key, char keyChar = '\0', bool shift = false, bool alt = false, bool control = false)
     {
         var evt = KeyMapper.ToHex1bKeyEvent(key, keyChar, shift, alt, control);
-        _inputChannel.Writer.TryWrite(evt);
+        TryWriteInput(evt);
     }
 
     /// <summary>
@@ -930,7 +951,7 @@ public sealed class Hex1bAppWorkloadAdapter :
     public void SendKey(Hex1bKey key, char keyChar = '\0', Hex1bModifiers modifiers = Hex1bModifiers.None)
     {
         var evt = new Hex1bKeyEvent(key, keyChar, modifiers);
-        _inputChannel.Writer.TryWrite(evt);
+        TryWriteInput(evt);
     }
 
     /// <summary>
@@ -939,7 +960,7 @@ public sealed class Hex1bAppWorkloadAdapter :
     public void SendMouse(MouseButton button, MouseAction action, int x, int y, Hex1bModifiers modifiers = Hex1bModifiers.None, int clickCount = 1)
     {
         var evt = new Hex1bMouseEvent(button, action, x, y, modifiers, clickCount);
-        _inputChannel.Writer.TryWrite(evt);
+        TryWriteInput(evt);
     }
 
     /// <summary>
@@ -1157,6 +1178,7 @@ public sealed class Hex1bAppWorkloadAdapter :
         // presentation layer during its disposal to avoid race conditions.
 
         _inputChannel.Writer.TryComplete();
+        InputMilestones?.Terminate("input-closed", "The application input channel was closed.");
         Disconnected?.Invoke();
     }
 

@@ -33,4 +33,8 @@ public sealed class DiagnosticCaptureRequest
     /// </summary>
     [JsonPropertyName("authorizations")]
     public IReadOnlyList<DiagnosticAuthorization>? Authorizations { get; init; }
+
+    /// <summary>An optional milestone to wait for before capturing; absent means immediate.</summary>
+    [JsonPropertyName("milestone")]
+    public DiagnosticMilestoneRequest? Milestone { get; init; }
 }

@@ -38,6 +38,10 @@ public sealed record DiagnosticApplicationFrameResult
     [JsonPropertyName("unavailableFields")]
     public IReadOnlyList<DiagnosticUnavailableField> UnavailableFields { get; init; } = [];
 
+    /// <summary>The milestone the capture waited for and what was observed; absent for immediate captures.</summary>
+    [JsonPropertyName("milestone")]
+    public DiagnosticMilestoneResult? Milestone { get; init; }
+
     /// <summary>Limits on what this observation can support.</summary>
     [JsonPropertyName("limitations")]
     public IReadOnlyList<string> Limitations { get; init; } = [];

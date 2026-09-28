@@ -19,4 +19,7 @@ public enum DiagnosticOutcome
 
     /// <summary>The operation started but failed, or its transport failed.</summary>
     Failed,
+
+    /// <summary>A requested milestone was not met within its timeout; nothing was captured.</summary>
+    TimedOut,
 }

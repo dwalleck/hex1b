@@ -52,6 +52,12 @@ public sealed class TerminalDiagnostics
     private const string FramePublicationDisabled =
         "The application does not publish frames; frame publication requires diagnostics to be enabled (WithDiagnostics).";
     private const string NoFocusedEditor = "No editor had focus in this frame.";
+    private const int DefaultMilestoneTimeoutMs = 5_000;
+    private const string QueuedForApplication =
+        "Queued for the application; input-processed, frame-published and model-applied prove later stages.";
+    private const int MaxMilestoneTimeoutMs = 60_000;
+    private const string InputTrackingUnavailable =
+        "Input milestones require a Hex1b application with diagnostics enabled (WithDiagnostics); this target does not track input.";
     private const string NoActiveApplication =
         "The terminal hosts Hex1b applications, but none is running (for example a flow between steps, or an application that has not started or has exited).";
     private const string FocusedEditorTextOnly =
@@ -111,6 +117,101 @@ public sealed class TerminalDiagnostics
     }
 
     /// <summary>
+    /// Captures the terminal model like <see cref="Capture"/>, first waiting (bounded) for the
+    /// request's milestone when it names one. An unmet milestone returns its outcome with what was
+    /// observed and no content.
+    /// </summary>
+    public async Task<DiagnosticCaptureResult> CaptureAsync(DiagnosticCaptureRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (request.Milestone is not { } milestone)
+            return Capture(request);
+
+        var wait = await WaitForMilestoneAsync(milestone, cancellationToken).ConfigureAwait(false);
+        if (wait.Problem is { } problem)
+            return Problem(problem.Outcome, problem.Code, problem.Message) with { Milestone = wait.Result };
+        return Capture(new DiagnosticCaptureRequest
+        {
+            Format = request.Format,
+            HistoryRows = request.HistoryRows,
+            FontFamily = request.FontFamily,
+            Authorizations = request.Authorizations,
+        }) with { Milestone = wait.Result };
+    }
+
+    /// <summary>
+    /// Returns the latest published application frame like <see cref="CaptureApplicationFrame"/>,
+    /// first waiting (bounded) for the request's milestone when it names one.
+    /// </summary>
+    public async Task<DiagnosticApplicationFrameResult> CaptureApplicationFrameAsync(
+        DiagnosticApplicationFrameRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (request.Milestone is not { } milestone)
+            return CaptureApplicationFrame(request);
+
+        var wait = await WaitForMilestoneAsync(milestone, cancellationToken).ConfigureAwait(false);
+        if (wait.Problem is { } problem)
+            return FrameProblem(problem.Outcome, problem.Code, problem.Message) with { Milestone = wait.Result };
+        return CaptureApplicationFrame(new DiagnosticApplicationFrameRequest { Authorizations = request.Authorizations })
+            with { Milestone = wait.Result };
+    }
+
+    /// <summary>
+    /// Runs one diagnostic send and returns the input ids its events were assigned, or
+    /// <see langword="null"/> when this target does not track input.
+    /// </summary>
+    internal async Task<DiagnosticAcceptedInput?> TrackSendAsync(Func<Task> send)
+    {
+        if (_terminal.InputMilestones is not { } tracker)
+        {
+            await send().ConfigureAwait(false);
+            return null;
+        }
+
+        using var scope = tracker.BeginSend();
+        await send().ConfigureAwait(false);
+        return scope.LastId is { } lastId
+            ? new DiagnosticAcceptedInput { FirstId = scope.FirstId!.Value, LastId = lastId, Meaning = QueuedForApplication }
+            : null;
+    }
+
+    private async Task<(DiagnosticMilestoneResult? Result, (DiagnosticOutcome Outcome, string Code, string Message)? Problem)>
+        WaitForMilestoneAsync(DiagnosticMilestoneRequest request, CancellationToken cancellationToken)
+    {
+        if (!Enum.IsDefined(request.Milestone))
+            return (null, (DiagnosticOutcome.InvalidRequest, "unsupported-milestone", $"Unsupported milestone '{request.Milestone}'."));
+        if (request.InputId is not { } inputId)
+            return (null, (DiagnosticOutcome.InvalidRequest, "missing-input-id", "A milestone request must name an input id."));
+        var timeoutMs = request.TimeoutMs ?? DefaultMilestoneTimeoutMs;
+        if (timeoutMs is < 1 or > MaxMilestoneTimeoutMs)
+            return (null, (DiagnosticOutcome.InvalidRequest, "invalid-milestone-timeout",
+                $"A milestone timeout must be 1 to {MaxMilestoneTimeoutMs} ms."));
+        if (_terminal.IsDisposed)
+            return (null, (DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed."));
+        if (_terminal.InputMilestones is not { } tracker)
+            return (null, (DiagnosticOutcome.Unavailable, "input-tracking-unavailable", InputTrackingUnavailable));
+
+        var status = await tracker.WaitAsync(request.Milestone, inputId, TimeSpan.FromMilliseconds(timeoutMs), cancellationToken)
+            .ConfigureAwait(false);
+        if (status.Outcome == DiagnosticOutcome.InvalidRequest)
+            return (null, (status.Outcome.Value, status.Code!, status.Message!));
+
+        var observed = tracker.Observe();
+        var record = tracker.Record(inputId);
+        var result = new DiagnosticMilestoneResult
+        {
+            Milestone = request.Milestone,
+            InputId = inputId,
+            Met = status.IsMet,
+            AcceptedInput = observed.AcceptedInput,
+            ProcessedInput = observed.ProcessedInput,
+            ProcessedBy = record?.ProcessedBy,
+        };
+        return status.IsMet ? (result, null) : (result, (status.Outcome!.Value, status.Code!, status.Message!));
+    }
+
+    /// <summary>
     /// Immediately captures the terminal model. Never throws for target or request problems;
     /// they are reported through <see cref="DiagnosticCaptureResult.Outcome"/>.
     /// </summary>
@@ -118,6 +219,8 @@ public sealed class TerminalDiagnostics
     public DiagnosticCaptureResult Capture(DiagnosticCaptureRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+        if (request.Milestone is not null)
+            return CaptureAsync(request).GetAwaiter().GetResult();
 
         if (!Enum.IsDefined(request.Format))
             return Problem(DiagnosticOutcome.InvalidRequest, "unsupported-format", $"Unsupported capture format '{request.Format}'.");
@@ -216,6 +319,8 @@ public sealed class TerminalDiagnostics
     public DiagnosticApplicationFrameResult CaptureApplicationFrame(DiagnosticApplicationFrameRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+        if (request.Milestone is not null)
+            return CaptureApplicationFrameAsync(request).GetAwaiter().GetResult();
         var authorizations = request.Authorizations ?? [];
         foreach (var authorization in authorizations)
         {
