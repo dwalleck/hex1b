@@ -1,5 +1,8 @@
+using System.Buffers;
+using System.Text;
 using System.Text.Json;
 using Hex1b.Diagnostics;
+using ModelContextProtocol.Protocol;
 
 namespace Hex1b.McpServer.Tools;
 
@@ -77,6 +80,33 @@ internal static class CaptureToolSupport
         var result = invalid ?? await capture(request!, ct);
         return FrameResult(result, sessionId, processId);
     }
+
+    /// <summary>
+    /// Writes a frame tool result as the tool's text content. Frames nest two JSON levels per
+    /// node level, deeper than the MCP host serializer's default limit of 64, so the result is
+    /// written here with the contract's depth limit.
+    /// </summary>
+    public static CallToolResult ToCallToolResult(ApplicationFrameToolResult result)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { MaxDepth = FrameJsonMaxDepth }))
+        {
+            writer.WriteStartObject();
+            writer.WriteBoolean("success", result.Success);
+            if (result.SessionId is { } sessionId)
+                writer.WriteString("sessionId", sessionId);
+            if (result.ProcessId is { } processId)
+                writer.WriteNumber("processId", processId);
+            writer.WriteString("message", result.Message);
+            writer.WritePropertyName("applicationFrame");
+            result.ApplicationFrame.WriteTo(writer);
+            writer.WriteEndObject();
+        }
+
+        return new CallToolResult { Content = [new TextContentBlock { Text = Encoding.UTF8.GetString(buffer.WrittenSpan) }] };
+    }
+
+    private const int FrameJsonMaxDepth = 1024;
 
     public static ApplicationFrameToolResult FrameResult(DiagnosticApplicationFrameResult result, string? sessionId, int? processId) => new()
     {

@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Hex1b.Diagnostics;
+using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
 namespace Hex1b.McpServer.Tools;
@@ -177,21 +178,19 @@ public class DiagnosticsTools
     /// Returns a Hex1b application's latest published frame for debugging.
     /// </summary>
     [McpServerTool, Description("Gets the latest frame a Hex1b application published: the node tree with bounds, effective visible rects and clip state, popup stack, focus ring, focused-editor carets/selections, and frame timing, with the frame's identity, through the shared application-frame contract. Use this to debug hit testing, focus, clipping, and layout issues. Capturing never drives a render. Use GetHex1bSkill for comprehensive documentation.")]
-    public async Task<ApplicationFrameToolResult> GetHex1bTree(
+    public async Task<CallToolResult> GetHex1bTree(
         [Description("Process ID of the Hex1b application")] int processId,
         [Description(CaptureToolSupport.FrameAuthorizeDescription)] string? authorize = null,
         CancellationToken ct = default)
     {
         var unavailable = CheckTarget(processId, out var socketPath);
-        if (unavailable != null)
-        {
-            return CaptureToolSupport.FrameResult(
+        var result = unavailable != null
+            ? CaptureToolSupport.FrameResult(
                 TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Unavailable, "target-unreachable", unavailable),
-                sessionId: null, processId);
-        }
-
-        return await CaptureToolSupport.CaptureApplicationFrameAsync(
-            (request, token) => Client.CaptureApplicationFrameAsync(socketPath, request, token), authorize, ct, processId: processId);
+                sessionId: null, processId)
+            : await CaptureToolSupport.CaptureApplicationFrameAsync(
+                (request, token) => Client.CaptureApplicationFrameAsync(socketPath, request, token), authorize, ct, processId: processId);
+        return CaptureToolSupport.ToCallToolResult(result);
     }
 
     // Returns why the target cannot be reached, or null when its socket is live.

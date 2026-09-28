@@ -80,6 +80,12 @@ public sealed class Hex1bAppWorkloadAdapter :
     internal Diagnostics.IApplicationFrameSource? ApplicationFrameSource { get; set; }
 
     /// <summary>
+    /// Whether this adapter hosts Hex1b applications (an app or a flow), so a missing frame
+    /// source means no application is running rather than that there is no application layer.
+    /// </summary>
+    internal bool HostsApplications { get; set; }
+
+    /// <summary>
     /// The terminal's own applied cursor model, attached by <see cref="Hex1bTerminal"/>
     /// during construction when this adapter is the terminal's workload.
     /// </summary>

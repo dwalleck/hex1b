@@ -285,6 +285,46 @@ public class DiagnosticsSocketClientTests
             new DiagnosticsSocketClient().CaptureAsync(server.Path, new DiagnosticCaptureRequest(), cts.Token));
     }
 
+    [TestMethod]
+    public async Task ApplicationFrame_CapturedFrameWithMissingNestedLists_IsProtocolError()
+    {
+        var complete = new DiagnosticApplicationFrameResult
+        {
+            Outcome = DiagnosticOutcome.Captured,
+            Identity = new DiagnosticObservationIdentity(),
+            Frame = new DiagnosticApplicationFrame
+            {
+                Root = new DiagnosticFrameNode { Type = "Root", Children = [new DiagnosticFrameNode { Type = "Leaf" }] },
+            },
+        };
+        var json = System.Text.Json.Nodes.JsonNode.Parse(
+            System.Text.Json.JsonSerializer.Serialize(complete, DiagnosticsJsonContext.Default.DiagnosticApplicationFrameResult))!;
+        json["frame"]!["root"]!["children"]![0]!.AsObject().Remove("children");
+        var response = $$"""{"success":true,"applicationFrame":{{json.ToJsonString()}}}""";
+        await using var server = await FakeServer.StartAsync(_ => response);
+        await using var valid = await FakeServer.StartAsync(_ =>
+            $$"""{"success":true,"applicationFrame":{{System.Text.Json.JsonSerializer.Serialize(complete, DiagnosticsJsonContext.Default.DiagnosticApplicationFrameResult)}}}""");
+
+        var result = await new DiagnosticsSocketClient().CaptureApplicationFrameAsync(server.Path,
+            new DiagnosticApplicationFrameRequest(), TestContext.Current.CancellationToken);
+        var accepted = await new DiagnosticsSocketClient().CaptureApplicationFrameAsync(valid.Path,
+            new DiagnosticApplicationFrameRequest(), TestContext.Current.CancellationToken);
+
+        Assert.AreEqual((DiagnosticOutcome.Failed, "protocol-error"), (result.Outcome, result.Problem?.Code));
+        Assert.AreEqual(DiagnosticOutcome.Captured, accepted.Outcome, accepted.Problem?.Message);
+    }
+
+    [TestMethod]
+    public async Task ApplicationFrame_TargetWithoutTheMethod_IsIncompatible()
+    {
+        await using var server = await FakeServer.StartAsync(_ => """{"success":false,"error":"Unknown method: application-frame"}""");
+
+        var result = await new DiagnosticsSocketClient().CaptureApplicationFrameAsync(server.Path,
+            new DiagnosticApplicationFrameRequest(), TestContext.Current.CancellationToken);
+
+        Assert.AreEqual((DiagnosticOutcome.Failed, "incompatible-target"), (result.Outcome, result.Problem?.Code));
+    }
+
     private static string TempSocketPath() =>
         Path.Combine(Path.GetTempPath(), $"hex1b-{Guid.NewGuid():N}.socket");
 

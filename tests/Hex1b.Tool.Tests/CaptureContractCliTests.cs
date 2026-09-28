@@ -415,6 +415,35 @@ public class CaptureContractCliTests
         Assert.IsTrue(frame.TryGetProperty("timings", out _), "a diagnostics-enabled flow step reports timings");
     }
 
+    [TestMethod]
+    public async Task AppTree_DeepTreeAndControlCharacters_CrossTheSocketSafely()
+    {
+        await WaitForSocketReleaseAsync(TestContext.Current.CancellationToken);
+        Hex1bWidget deep = new ListWidget(["\u001b]0;pwned\u0007item", "second"]);
+        for (var i = 0; i < 40; i++)
+            deep = new VStackWidget([deep]);
+        await using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithDimensions(40, 6)
+            .WithHeadless()
+            .WithHex1bApp(_ => new VStackWidget([new TextBlockWidget("DEEPAPP"), deep]))
+            .WithDiagnostics(appName: "CliDeep", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync(TestContext.Current.CancellationToken);
+        await WaitForSocketAsync(TestContext.Current.CancellationToken);
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("DEEPAPP"), TimeSpan.FromSeconds(10), "application rendered")
+            .Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
+
+        var (jsonExit, json, jsonErr) = await RunCliAsync("app", "tree", Pid, "--json");
+        var (textExit, text, textErr) = await RunCliAsync("app", "tree", Pid);
+
+        Assert.AreEqual(0, jsonExit, jsonErr);
+        StringAssert.Contains(json, "ListNode");
+        Assert.AreEqual(0, textExit, textErr);
+        Assert.IsFalse(text.Contains('\u001b'), "application text reached the terminal with a raw ESC");
+        StringAssert.Contains(text, "\\u001b]0;pwned");
+    }
+
     // === Helpers ===
 
     private static string Pid => Environment.ProcessId.ToString();

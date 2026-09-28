@@ -18,9 +18,12 @@ namespace Hex1b.Diagnostics;
 [JsonSerializable(typeof(string))]
 [JsonSerializable(typeof(int))]
 [JsonSerializable(typeof(bool))]
+// Application frames nest two JSON levels per node level; the default depth of 64 would reject
+// trees deeper than about 30 nodes (spec Q10: every node is projected).
 [JsonSourceGenerationOptions(
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
-    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+    MaxDepth = 1024)]
 internal sealed partial class DiagnosticsJsonContext : JsonSerializerContext
 {
 }

@@ -191,6 +191,7 @@ public sealed class Hex1bTerminalBuilder
                 ? new Hex1bAppWorkloadAdapter(presentation)
                 : new Hex1bAppWorkloadAdapter();
             workloadAdapter.DiagnosticTimingEnabled = _diagnosticsEnabled;
+            workloadAdapter.HostsApplications = true;
             var enableMouse = _enableMouse;
 
             var options = new Hex1bAppOptions
@@ -246,6 +247,7 @@ public sealed class Hex1bTerminalBuilder
                 ? new Hex1bAppWorkloadAdapter(presentation)
                 : new Hex1bAppWorkloadAdapter();
             workloadAdapter.DiagnosticTimingEnabled = _diagnosticsEnabled;
+            workloadAdapter.HostsApplications = true;
             var enableMouse = _enableMouse;
 
             var options = new Hex1bAppOptions
@@ -1014,6 +1016,7 @@ public sealed class Hex1bTerminalBuilder
                 : new Hex1bAppWorkloadAdapter();
 
             workloadAdapter.DiagnosticTimingEnabled = _diagnosticsEnabled;
+            workloadAdapter.HostsApplications = true;
 
             var options = new Flow.Hex1bFlowOptions();
             configureOptions?.Invoke(options);

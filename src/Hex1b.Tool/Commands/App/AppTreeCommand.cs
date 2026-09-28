@@ -93,9 +93,9 @@ internal sealed class AppTreeCommand : BaseCommand
             foreach (var popup in frame.Popups)
             {
                 var anchor = popup.IsAnchored
-                    ? $", anchor={popup.AnchorNodeType} {popup.AnchorBounds} {popup.AnchorPosition}{(popup.AnchorIsStale == true ? " (stale)" : "")}"
+                    ? $", anchor={Safe(popup.AnchorNodeType)} {popup.AnchorBounds} {Safe(popup.AnchorPosition)}{(popup.AnchorIsStale == true ? " (stale)" : "")}"
                     : "";
-                Formatter.WriteLine($"  [{popup.Index}] {popup.ContentType} (barrier={popup.IsBarrier}, anchored={popup.IsAnchored}{anchor})");
+                Formatter.WriteLine($"  [{popup.Index}] {Safe(popup.ContentType)} (barrier={popup.IsBarrier}, anchored={popup.IsAnchored}{anchor})");
             }
         }
 
@@ -103,12 +103,12 @@ internal sealed class AppTreeCommand : BaseCommand
         {
             var focus = frame.Focus;
             Formatter.WriteLine("");
-            Formatter.WriteLine($"Focus: {focus.FocusedNodeType ?? "none"} (index {focus.CurrentIndex}/{focus.Focusables.Count})");
+            Formatter.WriteLine($"Focus: {Safe(focus.FocusedNodeType ?? "none")} (index {focus.CurrentIndex}/{focus.Focusables.Count})");
             if (frame.FocusedEditor is { } editor)
             {
                 var carets = string.Join(", ", editor.Carets.Select(c => $"{c.Offset}@{c.Line}:{c.Column}"));
                 var selections = string.Join(", ", editor.Selections.Select(s => $"{s.Start.Offset}-{s.End.Offset}"));
-                Formatter.WriteLine($"Editor: {editor.Kind} {editor.Bounds}, length={editor.Length}, lines={editor.LineCount}, carets=[{carets}], selections=[{selections}]");
+                Formatter.WriteLine($"Editor: {Safe(editor.Kind)} {editor.Bounds}, length={editor.Length}, lines={editor.LineCount}, carets=[{carets}], selections=[{selections}]");
                 if (editor.Text != null)
                     Formatter.WriteLine($"Editor text: {Quote(editor.Text)}");
             }
@@ -123,14 +123,14 @@ internal sealed class AppTreeCommand : BaseCommand
         var focused = node.IsFocused ? " [FOCUSED]" : "";
         var text = node.Text is { } content ? $" {Quote(content)}" : "";
 
-        Formatter.WriteLine($"{indent}{connector}{node.Type}{focused}{text}");
+        Formatter.WriteLine($"{indent}{connector}{Safe(node.Type)}{focused}{text}");
 
         // Detail lines use extra indentation under the connector
         var detailIndent = indent + (isLast ? "   " : "│  ") + "   ";
 
         if (node.Properties is { Count: > 0 })
         {
-            var props = string.Join(", ", node.Properties.Select(p => $"{p.Key}={p.Value}"));
+            var props = string.Join(", ", node.Properties.Select(p => $"{Safe(p.Key)}={Safe(p.Value)}"));
             Formatter.WriteLine($"{detailIndent}Properties: {props}");
         }
 
@@ -158,14 +158,30 @@ internal sealed class AppTreeCommand : BaseCommand
             PrintTree(children[i], childIndent + "   ", i == children.Count - 1, showPerf, remainingDepth - 1);
     }
 
-    // Quoted and escaped, so application text cannot inject terminal control sequences.
+    // Target-supplied strings are escaped before they reach the terminal, so application content
+    // (or a hostile socket peer) cannot inject control sequences.
     private static string Quote(string text) => JsonSerializer.Serialize(text, DiagnosticsJsonContext.Default.String);
+
+    private static string Safe(string? text)
+    {
+        if (string.IsNullOrEmpty(text) || !text.Any(char.IsControl))
+            return text ?? "";
+        var escaped = new System.Text.StringBuilder(text.Length + 8);
+        foreach (var c in text)
+        {
+            if (char.IsControl(c))
+                escaped.Append("\\u").Append(((int)c).ToString("x4", System.Globalization.CultureInfo.InvariantCulture));
+            else
+                escaped.Append(c);
+        }
+        return escaped.ToString();
+    }
 
     private int WriteFailure(DiagnosticApplicationFrameResult result, bool json)
     {
         if (json)
             WriteResult(result);
-        Formatter.WriteError($"{DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}");
+        Formatter.WriteError($"{DiagnosticContractNames.Of(result.Outcome)} ({Safe(result.Problem?.Code)}): {Safe(result.Problem?.Message)}");
         return 1;
     }
 

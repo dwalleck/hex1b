@@ -96,7 +96,8 @@ Sends a mouse click to a terminal.
   - `frame.focus`: focus ring (`currentIndex`, `focusedNodeType`, `focusables`, `lastHitTest`)
   - `frame.focusedEditor`: carets and selections (offset, 0-based line/column), length, line count
   - `identity.applicationFrame`: the frame's identity
-- Local PTY sessions report `no-application-layer`
+- Local PTY sessions report `no-application-layer`; a flow between steps reports `no-active-application`
+- Inline flow-step frames use step-local coordinates (row 0 is the step's first row): translate before clicking
 - Essential for understanding why clicks aren't working or focus is wrong
 
 ### Session Management

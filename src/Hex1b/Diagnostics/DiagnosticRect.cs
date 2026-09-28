@@ -13,19 +13,19 @@ public sealed class DiagnosticRect
 {
     /// <summary>Left column.</summary>
     [JsonPropertyName("x")]
-    public int X { get; set; }
+    public int X { get; init; }
     
     /// <summary>Top row.</summary>
     [JsonPropertyName("y")]
-    public int Y { get; set; }
+    public int Y { get; init; }
     
     /// <summary>Width in columns.</summary>
     [JsonPropertyName("width")]
-    public int Width { get; set; }
+    public int Width { get; init; }
     
     /// <summary>Height in rows.</summary>
     [JsonPropertyName("height")]
-    public int Height { get; set; }
+    public int Height { get; init; }
     
     internal static DiagnosticRect FromRect(Rect rect) => new()
     {

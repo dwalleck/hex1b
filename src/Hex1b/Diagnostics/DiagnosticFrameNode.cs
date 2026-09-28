@@ -11,6 +11,10 @@ public sealed class DiagnosticFrameNode
     [JsonPropertyName("type")]
     public string Type { get; init; } = "";
 
+    /// <summary>Type name of the widget last reconciled into this node, when known.</summary>
+    [JsonPropertyName("widgetType")]
+    public string? WidgetType { get; init; }
+
     /// <summary>Arranged bounds.</summary>
     [JsonPropertyName("bounds")]
     public DiagnosticRect Bounds { get; init; } = new();
@@ -54,6 +58,13 @@ public sealed class DiagnosticFrameNode
     /// <summary>Type-specific values such as a list's selected index.</summary>
     [JsonPropertyName("properties")]
     public IReadOnlyDictionary<string, string>? Properties { get; init; }
+
+    /// <summary>
+    /// Editor metadata for TextBox and Editor nodes: carets, selections, length, line count, and
+    /// bounds. Never carries text; only <see cref="DiagnosticApplicationFrame.FocusedEditor"/> can.
+    /// </summary>
+    [JsonPropertyName("editor")]
+    public DiagnosticEditorState? Editor { get; init; }
 
     /// <summary>The node's last reconcile and render cost, when diagnostic timing is enabled.</summary>
     [JsonPropertyName("timing")]

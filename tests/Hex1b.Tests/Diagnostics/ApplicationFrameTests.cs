@@ -1,4 +1,6 @@
+using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Reflection;
 using System.Text;
 using Hex1b.Diagnostics;
 using Hex1b.Documents;
@@ -56,9 +58,19 @@ public class ApplicationFrameTests
     public async Task NoProjectionWithoutDiagnostics()
     {
         var counter = 0;
+        var projections = ApplicationFrameProjector.ProjectionsForTesting.Value = new System.Runtime.CompilerServices.StrongBox<int>();
         await using var harness = await AppHarness.StartAsync(_ => new TextBlockWidget($"n {counter}"), publish: false);
         for (var i = 0; i < 10; i++)
             await harness.NextPassAsync(() => counter++);
+
+        Assert.AreEqual(0, projections.Value, $"{projections.Value} projections in an app without diagnostics");
+        var enabledProjections = ApplicationFrameProjector.ProjectionsForTesting.Value = new System.Runtime.CompilerServices.StrongBox<int>();
+        await using (var enabled = await AppHarness.StartAsync(_ => new TextBlockWidget($"n {counter}")))
+        {
+            for (var i = 0; i < 10; i++)
+                await enabled.NextPassAsync(() => counter++);
+        }
+        Assert.IsGreaterThanOrEqualTo(10, enabledProjections.Value, "fixture: the counter did not observe the enabled app's projections");
 
         var source = (IApplicationFrameSource)harness.App;
         Assert.IsNull(source.LatestFrame, $"an app without diagnostics projected frame {source.LatestFrame?.FrameId}");
@@ -111,6 +123,231 @@ public class ApplicationFrameTests
         Assert.IsNull(result.Frame, "a workload without an application layer returned a frame");
         Assert.IsFalse(layer.Available);
         Assert.AreEqual(result.Problem.Message, layer.Reason, "capabilities and the operation disagree on why there is no frame");
+    }
+
+    [TestMethod]
+    public async Task Clipping_OverflowRegionsAndSplitterPanesInAnApp()
+    {
+        await using var harness = await AppHarness.StartAsync(_ => new VStackWidget(
+        [
+            // Overflow region (2 rows) inside a clipping border (4 inner rows): clipped to 2 rows.
+            new BorderWidget(new VStackWidget(
+            [
+                new LayoutWidget(new VStackWidget([.. Enumerable.Range(0, 6).Select(i => (Hex1bWidget)new TextBlockWidget($"inner-{i}"))]),
+                    ClipMode.Overflow).FixedHeight(2),
+            ])).FixedHeight(6),
+            new SplitterWidget(
+                new VStackWidget([.. Enumerable.Range(0, 6).Select(i => (Hex1bWidget)new TextBlockWidget($"pane-{i}"))]),
+                new TextBlockWidget("right"), firstSize: 10).FixedHeight(3),
+        ]), columns: 40, rows: 12);
+
+        var frame = harness.Capture().Frame!;
+        var nodes = new List<(DiagnosticFrameNode Node, Rect Expected)>();
+        Walk(frame.Root!, new Rect(0, 0, frame.Columns, frame.Rows), nodes);
+        foreach (var (node, expected) in nodes)
+            Assert.AreEqual(Describe(expected), Describe(node.VisibleBounds), $"{node.Type} {node.Text} at {Describe(node.Bounds)}");
+
+        DiagnosticClipState StateOf(string text) => nodes.Single(n => n.Node.Text == text).Node.ClipState;
+        Assert.AreEqual(DiagnosticClipState.Visible, StateOf("inner-1"));
+        Assert.AreEqual(DiagnosticClipState.FullyClipped, StateOf("inner-2"), "rows past an Overflow region inside a clipping border are not drawn");
+        Assert.AreEqual(DiagnosticClipState.FullyClipped, StateOf("pane-5"), "splitter pane content below the pane is not drawn");
+    }
+
+    [TestMethod]
+    public void Clipping_OverflowRuleMatchesTheRenderer()
+    {
+        // Hand-arranged content taller than its region, which stacks never produce.
+        static (LayoutNode Outer, TextBlockNode Text) Build(ClipMode outerMode)
+        {
+            var text = new TextBlockNode { Text = "tall" };
+            var inner = new LayoutNode { ClipMode = ClipMode.Overflow, Child = text };
+            var outer = new LayoutNode { ClipMode = outerMode, Child = inner };
+            outer.Arrange(new Rect(0, 0, 10, 4));
+            inner.Arrange(new Rect(0, 0, 10, 2));
+            text.Arrange(new Rect(0, 0, 10, 5));
+            return (outer, text);
+        }
+
+        var (clipped, _) = Build(ClipMode.Clip);
+        var (overflowing, _) = Build(ClipMode.Overflow);
+        var underClip = ApplicationFrameProjector.Project(clipped, new FocusRing(), "stub", 1, 10, 10, wroteOutput: true, timings: null);
+        var underOverflow = ApplicationFrameProjector.Project(overflowing, new FocusRing(), "stub", 1, 10, 10, wroteOutput: true, timings: null);
+
+        var inClip = underClip.Root!.Children[0].Children[0];
+        var inOverflow = underOverflow.Root!.Children[0].Children[0];
+        Assert.AreEqual("0,0,10,2", Describe(inClip.VisibleBounds), "an Overflow region under a clipping parent clips to itself");
+        Assert.AreEqual(DiagnosticClipState.PartiallyClipped, inClip.ClipState);
+        Assert.AreEqual("0,0,10,5", Describe(inOverflow.VisibleBounds), "an Overflow region under an Overflow parent draws unclipped");
+        Assert.AreEqual(DiagnosticClipState.Visible, inOverflow.ClipState);
+    }
+
+    [TestMethod]
+    public void EditorMetadata_StaleCursorsAreClampedToTheSnapshot()
+    {
+        var state = new EditorState(new Hex1bDocument("short"));
+        state.Cursors.Primary.Position = new DocumentOffset(3);
+        state.Cursors.Add(new DocumentOffset(4), new DocumentOffset(2));
+        var editor = new EditorNode { State = state };
+        state.Document.Apply(new DeleteOperation(new DocumentRange(new DocumentOffset(2), new DocumentOffset(5))));
+
+        // The cursors still point past the shortened text, as after an edit off the app loop.
+        var frame = ApplicationFrameProjector.Project(editor, new FocusRing(), "stub", 1, 10, 2, wroteOutput: true, timings: null);
+
+        var metadata = frame.Root!.Editor!;
+        Assert.AreEqual(2, metadata.Length);
+        CollectionAssert.AreEqual(new[] { 2, 2 }, metadata.Carets.Select(c => c.Offset).ToArray());
+        Assert.IsEmpty(metadata.Selections, "a selection collapsed by clamping is not reported");
+        Assert.IsNull(metadata.Text, "node-level editor metadata never carries text");
+    }
+
+    [TestMethod]
+    public async Task EditorMetadata_EveryEditorReportsMetadataButOnlyTheFocusedOneText()
+    {
+        var focused = new TextBoxState { Text = SentinelA };
+        var other = new TextBoxState { Text = $"x\n{SentinelB}" };
+        await using var harness = await AppHarness.StartAsync(_ => new VStackWidget(
+            [new TextBoxWidget().State(focused), new TextBoxWidget().State(other).Multiline()]));
+        await harness.NextPassAsync(() =>
+        {
+            other.CursorPosition = other.Text.Length;
+            other.SelectionAnchor = 1;
+        });
+
+        var result = harness.Capture(DiagnosticAuthorization.EditorText);
+        var json = Serialize(result);
+        var editors = new List<(DiagnosticFrameNode Node, Rect Expected)>();
+        Walk(result.Frame!.Root!, new Rect(0, 0, 40, 6), editors);
+        var boxes = editors.Select(e => e.Node).Where(n => n.Type == nameof(TextBoxNode)).ToList();
+
+        Assert.HasCount(2, boxes);
+        Assert.AreEqual(SentinelA, result.Frame.FocusedEditor!.Text);
+        Assert.IsFalse(json.Contains(SentinelB, StringComparison.Ordinal), "sentinel B present: an unfocused editor's text leaked");
+        var unfocused = boxes.Single(b => !b.IsFocused).Editor!;
+        Assert.IsNull(unfocused.Text);
+        Assert.AreEqual(other.Text.Length, unfocused.Length);
+        Assert.AreEqual(2, unfocused.LineCount);
+        AssertCaret(other.Text, other.Text.Length, unfocused.Carets.Single());
+        AssertCaret(other.Text, 1, unfocused.Selections.Single().Start);
+        StringAssert.Contains(result.ContentCoverage.Single(c => c.Content == DiagnosticContentClass.EditorText).Reason, "other editors");
+    }
+
+    [TestMethod]
+    public async Task NodeProjection_ReportsWidgetTypesAndRenderedText()
+    {
+        await using var harness = await AppHarness.StartAsync(_ => new VStackWidget(
+        [
+            new CheckboxWidget().Label("CHECK-LABEL"),
+            new ListWidget(["first item", "second item"]).FixedHeight(2),
+            new BorderWidget(new TextBlockWidget("inside")).Title("BORDER-TITLE"),
+        ]), columns: 40, rows: 10);
+
+        var nodes = new List<(DiagnosticFrameNode Node, Rect Expected)>();
+        Walk(harness.Capture().Frame!.Root!, new Rect(0, 0, 40, 10), nodes);
+        DiagnosticFrameNode Of(string type) => nodes.Select(n => n.Node).First(n => n.Type == type);
+
+        Assert.AreEqual("CHECK-LABEL", Of(nameof(CheckboxNode)).Text);
+        Assert.AreEqual(nameof(CheckboxWidget), Of(nameof(CheckboxNode)).WidgetType);
+        Assert.AreEqual(nameof(VStackWidget), Of(nameof(VStackNode)).WidgetType);
+        Assert.AreEqual("first item", Of(nameof(ListNode)).Properties!["selectedText"]);
+        Assert.AreEqual("BORDER-TITLE", Of(nameof(BorderNode)).Text);
+    }
+
+    [TestMethod]
+    public async Task WroteOutput_ReflectsCellChangesNotDirtyPasses()
+    {
+        var counter = 0;
+        await using var harness = await AppHarness.StartAsync(_ => new VStackWidget(
+            [new TextBlockWidget($"n {counter}"), new AlwaysDirtyWidget()]));
+
+        await harness.NextPassAsync(() => counter++);
+        var changed = harness.Capture().Frame!;
+        await harness.NextPassAsync(change: null);
+        var dirtyOnly = harness.Capture().Frame!;
+
+        Assert.IsTrue(changed.WroteOutput, "a pass that changed cells reports no output");
+        Assert.IsFalse(dirtyOnly.WroteOutput, $"frame {dirtyOnly.FrameId} re-rendered identical cells but reports output");
+    }
+
+    [TestMethod]
+    public async Task StoppedApplication_ReportsNoActiveApplicationNotItsLastFrame()
+    {
+        await using var harness = await AppHarness.StartAsync(_ => new TextBlockWidget("running"));
+        Assert.AreEqual(DiagnosticOutcome.Captured, harness.Capture().Outcome);
+
+        await harness.StopAsync();
+        var stopped = harness.Capture();
+        var layer = harness.Diagnostics.GetCapabilities().Layers.Single(l => l.Layer == DiagnosticLayer.ApplicationFrame);
+
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "no-active-application"), (stopped.Outcome, stopped.Problem?.Code),
+            $"a stopped application's frame {stopped.Frame?.FrameId} was returned");
+        Assert.IsTrue(layer.Available, "the terminal still hosts Hex1b applications");
+        Assert.AreEqual(stopped.Problem!.Message, layer.Reason);
+    }
+
+    [TestMethod]
+    public async Task ApplicationInstanceId_DistinguishesApplicationsSharingFrameIds()
+    {
+        await using var first = await AppHarness.StartAsync(_ => new TextBlockWidget("one"));
+        await using var second = await AppHarness.StartAsync(_ => new TextBlockWidget("two"));
+        var a = first.Capture().Frame!;
+        await first.NextPassAsync(change: null);
+        var a2 = first.Capture().Frame!;
+        var b = second.Capture().Frame!;
+
+        Assert.IsFalse(string.IsNullOrEmpty(a.ApplicationInstanceId));
+        Assert.AreEqual(a.ApplicationInstanceId, a2.ApplicationInstanceId);
+        Assert.AreNotEqual(a.ApplicationInstanceId, b.ApplicationInstanceId);
+    }
+
+    [TestMethod]
+    public void ContractTypes_HaveNoPublicSetters()
+    {
+        var seen = new HashSet<Type>();
+        var mutable = new List<string>();
+        void Visit(Type type)
+        {
+            if (type.Namespace != typeof(DiagnosticApplicationFrame).Namespace || !seen.Add(type))
+                return;
+            foreach (var property in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
+            {
+                if (property.SetMethod is { IsPublic: true } setter
+                    && !setter.ReturnParameter.GetRequiredCustomModifiers().Contains(typeof(System.Runtime.CompilerServices.IsExternalInit)))
+                    mutable.Add($"{type.Name}.{property.Name}");
+                var propertyType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
+                Visit(propertyType);
+                foreach (var argument in propertyType.IsGenericType ? propertyType.GetGenericArguments() : [])
+                    Visit(argument);
+            }
+        }
+
+        Visit(typeof(DiagnosticApplicationFrameResult));
+
+        Assert.IsEmpty(mutable, $"shared frame results can be mutated through: {string.Join(", ", mutable)}");
+    }
+
+    [TestMethod]
+    public void DeepTrees_RoundTripThroughTheContractSerializer()
+    {
+        Hex1bNode root = new TextBlockNode { Text = "leaf" };
+        for (var i = 0; i < 200; i++)
+        {
+            var parent = new VStackNode();
+            parent.Children.Add(root);
+            root = parent;
+        }
+
+        var result = new DiagnosticApplicationFrameResult
+        {
+            Outcome = DiagnosticOutcome.Captured,
+            Frame = ApplicationFrameProjector.Project(root, new FocusRing(), "stub", 1, 10, 2, wroteOutput: true, timings: null),
+        };
+        var json = System.Text.Json.JsonSerializer.Serialize(result, DiagnosticsJsonContext.Default.DiagnosticApplicationFrameResult);
+        var back = System.Text.Json.JsonSerializer.Deserialize(json, DiagnosticsJsonContext.Default.DiagnosticApplicationFrameResult)!;
+
+        var depth = 0;
+        for (var node = back.Frame!.Root; node is { Children.Count: > 0 }; node = node.Children[0])
+            depth++;
+        Assert.AreEqual(200, depth);
     }
 
     [TestMethod]
@@ -443,7 +680,7 @@ public class ApplicationFrameTests
     [TestMethod]
     public void TimingsAndPopups_TimingsExplainedWhenDisabled()
     {
-        var frame = ApplicationFrameProjector.Project(new TextBlockNode(), new FocusRing(), 1, 10, 2, wroteOutput: true, timings: null);
+        var frame = ApplicationFrameProjector.Project(new TextBlockNode(), new FocusRing(), "stub", 1, 10, 2, wroteOutput: true, timings: null);
         var source = new FixedFrameSource(new PublishedApplicationFrame(1, frame, null, 0, 0, DateTimeOffset.UtcNow, DateTimeOffset.UtcNow));
         var workload = new Hex1bAppWorkloadAdapter { ApplicationFrameSource = source };
         using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(10, 2).Build();
@@ -571,16 +808,30 @@ public class ApplicationFrameTests
         }
     }
 
-    private static void Walk(DiagnosticFrameNode node, Rect clip, List<(DiagnosticFrameNode, Rect)> into)
+    private static void Walk(DiagnosticFrameNode node, Rect screen, List<(DiagnosticFrameNode, Rect)> into) =>
+        Walk(node, screen, [], into);
+
+    // The renderer's clip rule, reimplemented from the result: a node inside an Overflow region
+    // whose enclosing region is absent or also Overflow draws unclipped; otherwise it is clipped
+    // to every enclosing region. Splitter panes clip their children to the pane.
+    private static void Walk(DiagnosticFrameNode node, Rect screen, ImmutableList<(Rect Rect, bool Overflow)> regions,
+        List<(DiagnosticFrameNode, Rect)> into)
     {
-        var bounds = new Rect(node.Bounds.X, node.Bounds.Y, node.Bounds.Width, node.Bounds.Height);
-        into.Add((node, Overlap(bounds, clip)));
-        var childClip = node.ClipMode == "clip" && node.ClipRect is { } own
-            ? Overlap(clip, new Rect(own.X, own.Y, own.Width, own.Height))
-            : clip;
+        var clip = screen;
+        var unclipped = regions.Count == 0 || (regions[^1].Overflow && (regions.Count == 1 || regions[^2].Overflow));
+        if (!unclipped)
+        {
+            foreach (var (region, _) in regions)
+                clip = Overlap(clip, region);
+        }
+
+        into.Add((node, Overlap(ToRect(node.Bounds), clip)));
+        var inner = node.ClipRect is { } own ? regions.Add((ToRect(own), node.ClipMode == "overflow")) : regions;
         foreach (var child in node.Children)
-            Walk(child, childClip, into);
+            Walk(child, screen, node.Type == nameof(SplitterNode) ? inner.Add((ToRect(child.Bounds), false)) : inner, into);
     }
+
+    private static Rect ToRect(DiagnosticRect r) => new(r.X, r.Y, r.Width, r.Height);
 
     // Independent rectangle arithmetic for the oracle.
     private static Rect Overlap(Rect a, Rect b)
@@ -599,6 +850,30 @@ public class ApplicationFrameTests
         public bool FramePublicationEnabled => true;
 
         public PublishedApplicationFrame? LatestFrame => frame;
+    }
+
+    internal sealed record AlwaysDirtyWidget : Hex1bWidget
+    {
+        internal override Task<Hex1bNode> ReconcileAsync(Hex1bNode? existingNode, ReconcileContext context)
+        {
+            var node = existingNode as AlwaysDirtyNode ?? new AlwaysDirtyNode();
+            node.MarkDirty();
+            return Task.FromResult<Hex1bNode>(node);
+        }
+
+        internal override Type GetExpectedNodeType() => typeof(AlwaysDirtyNode);
+    }
+
+    // Marked dirty on every reconcile, so every pass renders, but it always draws the same cell.
+    internal sealed class AlwaysDirtyNode : Hex1bNode
+    {
+        protected override Size MeasureCore(Constraints constraints) => constraints.Constrain(new Size(1, 1));
+
+        public override void Render(Hex1bRenderContext context)
+        {
+            context.SetCursorPosition(Bounds.X, Bounds.Y);
+            context.Write("=");
+        }
     }
 
     internal sealed class StrongBox<T>
@@ -664,6 +939,12 @@ public class ApplicationFrameTests
         // Resizes the way a real presentation does, so the app sees the new size.
         public void Resize(int columns, int rows) =>
             ((HeadlessPresentationAdapter)Terminal.PresentationAdapter).TriggerResize(columns, rows);
+
+        public async Task StopAsync()
+        {
+            await _cts.CancelAsync();
+            try { await _run; } catch (OperationCanceledException) { }
+        }
 
         public DiagnosticApplicationFrameResult Capture(params DiagnosticAuthorization[] authorizations) =>
             Diagnostics.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest { Authorizations = authorizations });

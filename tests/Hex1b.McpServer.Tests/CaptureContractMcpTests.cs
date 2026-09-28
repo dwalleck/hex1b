@@ -397,6 +397,42 @@ public class CaptureContractMcpTests : McpServerTestBase
         }
     }
 
+    [TestMethod]
+    public async Task ApplicationFrame_DeepTreeCrossesMcp()
+    {
+        var socketPath = McpDiagnosticsPresentationFilter.GetSocketPath();
+        for (var attempt = 0; attempt < 100 && File.Exists(socketPath); attempt++)
+            await Task.Delay(50);
+        Hex1bWidget deep = new TextBlockWidget("LEAF");
+        for (var i = 0; i < 40; i++)
+            deep = new VStackWidget([deep]);
+        await using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithDimensions(40, 5)
+            .WithHeadless()
+            .WithHex1bApp(_ => deep)
+            .WithDiagnostics(appName: "McpDeep", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync();
+        var probe = new DiagnosticsSocketClient();
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            if (File.Exists(socketPath) && await probe.TryProbeAsync(socketPath) is { Success: true })
+                break;
+            await Task.Delay(50);
+        }
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("LEAF"), TimeSpan.FromSeconds(10), "application rendered")
+            .Build().ApplyAsync(terminal);
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var sessionId = await ConnectAttachedAsync(client);
+
+        var result = await CallAsync(client, "capture_application_frame", new() { ["sessionId"] = sessionId });
+
+        Assert.IsTrue(result.GetProperty("success").GetBoolean(), result.ToString());
+        StringAssert.Contains(result.GetProperty("applicationFrame").GetProperty("frame").GetProperty("root").GetRawText(), "\"LEAF\"");
+    }
+
     // === Helpers ===
 
     private async Task<JsonElement> CallAsync(McpClient client, string tool, Dictionary<string, object?> arguments)
@@ -404,7 +440,8 @@ public class CaptureContractMcpTests : McpServerTestBase
         var result = await client.CallToolAsync(tool, arguments, cancellationToken: TestCancellationToken);
         var text = result.Content.OfType<TextContentBlock>().FirstOrDefault()?.Text;
         Assert.IsNotNull(text, $"{tool} returned no text content");
-        return JsonSerializer.Deserialize<JsonElement>(text);
+        // Application frames nest deeper than the default reader depth of 64.
+        return JsonSerializer.Deserialize<JsonElement>(text, new JsonSerializerOptions { MaxDepth = 1024 });
     }
 
     private async Task<string> StartLocalSessionAsync(McpClient client)

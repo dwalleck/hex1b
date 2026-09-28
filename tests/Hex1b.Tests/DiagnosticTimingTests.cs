@@ -126,5 +126,5 @@ public class DiagnosticTimingTests
     }
 
     private static DiagnosticApplicationFrame Project(Hex1bNode root, ApplicationPassTimings? timings) =>
-        ApplicationFrameProjector.Project(root, new FocusRing(), frameId: 1, columns: 10, rows: 1, wroteOutput: true, timings);
+        ApplicationFrameProjector.Project(root, new FocusRing(), "stub", frameId: 1, columns: 10, rows: 1, wroteOutput: true, timings);
 }

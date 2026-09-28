@@ -52,6 +52,10 @@ public sealed class TerminalDiagnostics
     private const string FramePublicationDisabled =
         "The application does not publish frames; frame publication requires diagnostics to be enabled (WithDiagnostics).";
     private const string NoFocusedEditor = "No editor had focus in this frame.";
+    private const string NoActiveApplication =
+        "The terminal hosts Hex1b applications, but none is running (for example a flow between steps, or an application that has not started or has exited).";
+    private const string FocusedEditorTextOnly =
+        "Only the focused editor's text is included; other editors report metadata only, with their text excluded.";
 
     private const string FrameIsNotAModelObservation =
         "An application frame is not a terminal-model observation; correlate it with model captures by identities and acquisition intervals.";
@@ -60,7 +64,7 @@ public sealed class TerminalDiagnostics
     private const string FrameLayerLimitation =
         "Application-frame evidence only: it describes the application's own layout, focus and editors, is not atomic with terminal-model captures, and says nothing about native presentation.";
     private const string ApplicationTextLimitation =
-        "Rendered application text can contain secrets; editor text is withheld unless editor-text is authorized.";
+        "Rendered application text can contain secrets. Editor text is withheld by default; editor-text includes the focused editor's text only.";
     private const string NoApplicationLayer =
         "The workload is not a Hex1b application, so there are no application frames.";
     private const string NativeDeliveryUnavailable =
@@ -221,10 +225,9 @@ public sealed class TerminalDiagnostics
 
         if (_terminal.IsDisposed)
             return FrameProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
-        if (FrameSource is not { } source)
-            return FrameProblem(DiagnosticOutcome.Unavailable, "no-application-layer", NoApplicationLayer);
-        if (!source.FramePublicationEnabled)
-            return FrameProblem(DiagnosticOutcome.Unavailable, "application-frame-publication-disabled", FramePublicationDisabled);
+        var (source, code, reason) = ReadFrameLayer();
+        if (source is null)
+            return FrameProblem(DiagnosticOutcome.Unavailable, code!, reason!);
         if (source.LatestFrame is not { } published)
             return FrameProblem(DiagnosticOutcome.Unavailable, "no-application-frame-yet",
                 "The application has not completed a render pass since frame publication started.");
@@ -265,7 +268,12 @@ public sealed class TerminalDiagnostics
                 State = DiagnosticCoverageState.Unavailable,
                 Reason = NoFocusedEditor,
             },
-            (true, _) => new DiagnosticContentCoverage { Content = DiagnosticContentClass.EditorText, State = DiagnosticCoverageState.Included },
+            (true, _) => new DiagnosticContentCoverage
+            {
+                Content = DiagnosticContentClass.EditorText,
+                State = DiagnosticCoverageState.Included,
+                Reason = FocusedEditorTextOnly,
+            },
         };
 
         var identity = DescribeIdentity(DiagnosticLayer.ApplicationFrame, modelSequence: null, published.FrameId,
@@ -305,52 +313,72 @@ public sealed class TerminalDiagnostics
         UnavailableFields = [new DiagnosticUnavailableField { Field = "identity", Reason = "No frame was returned." }],
     };
 
-    private IApplicationFrameSource? FrameSource =>
-        _terminal.Workload is Hex1bAppWorkloadAdapter { ApplicationFrameSource: { } source } ? source : null;
+    // Reads the frame source once: a flow swaps it as steps start and finish.
+    private (IApplicationFrameSource? Source, string? Code, string? Reason) ReadFrameLayer()
+    {
+        if (_terminal.Workload is not Hex1bAppWorkloadAdapter adapter)
+            return (null, "no-application-layer", NoApplicationLayer);
+        if (adapter.ApplicationFrameSource is not { } source)
+        {
+            if (!adapter.HostsApplications)
+                return (null, "no-application-layer", NoApplicationLayer);
+            return adapter.DiagnosticTimingEnabled
+                ? (null, "no-active-application", NoActiveApplication)
+                : (null, "application-frame-publication-disabled", FramePublicationDisabled);
+        }
+
+        return source.FramePublicationEnabled
+            ? (source, null, null)
+            : (null, "application-frame-publication-disabled", FramePublicationDisabled);
+    }
 
     /// <summary>
     /// Describes the operations and evidence layers this target supports.
     /// </summary>
-    public DiagnosticCapabilities GetCapabilities() => _terminal.IsDisposed
-        ? CapabilitiesProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.")
-        : new()
+    public DiagnosticCapabilities GetCapabilities()
     {
-        Outcome = DiagnosticOutcome.Captured,
-        Operations =
-        [
-            new DiagnosticOperationCapability
-            {
-                Operation = CaptureOperation,
-                Layer = DiagnosticLayer.TerminalModel,
-                Formats = Enum.GetValues<DiagnosticCaptureFormat>(),
-                Timing = [ImmediateTiming],
-                ModelHistory = true,
-                Authorizations = [DiagnosticAuthorization.NonScreenMetadata],
-                Limitations = AnsiCaptureLimitations,
-            },
-            new DiagnosticOperationCapability
-            {
-                Operation = ApplicationFrameOperation,
-                Layer = DiagnosticLayer.ApplicationFrame,
-                Timing = ["latest-published"],
-                Authorizations = [DiagnosticAuthorization.EditorText],
-                Limitations = FrameLimitations,
-            },
-        ],
-        Layers =
-        [
-            new DiagnosticLayerCapability { Layer = DiagnosticLayer.TerminalModel, Available = true },
-            new DiagnosticLayerCapability
-            {
-                Layer = DiagnosticLayer.ApplicationFrame,
-                Available = FrameSource is { FramePublicationEnabled: true },
-                Reason = FrameSource is null ? NoApplicationLayer
-                    : FrameSource.FramePublicationEnabled ? null : FramePublicationDisabled,
-            },
-            new DiagnosticLayerCapability { Layer = DiagnosticLayer.NativeDelivery, Reason = NativeDeliveryUnavailable },
-            new DiagnosticLayerCapability { Layer = DiagnosticLayer.NativePresentation, Reason = NativePresentationUnavailable },
-        ],
-    };
+        if (_terminal.IsDisposed)
+            return CapabilitiesProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
+
+        var frameLayer = ReadFrameLayer();
+        return new()
+        {
+            Outcome = DiagnosticOutcome.Captured,
+            Operations =
+            [
+                new DiagnosticOperationCapability
+                {
+                    Operation = CaptureOperation,
+                    Layer = DiagnosticLayer.TerminalModel,
+                    Formats = Enum.GetValues<DiagnosticCaptureFormat>(),
+                    Timing = [ImmediateTiming],
+                    ModelHistory = true,
+                    Authorizations = [DiagnosticAuthorization.NonScreenMetadata],
+                    Limitations = AnsiCaptureLimitations,
+                },
+                new DiagnosticOperationCapability
+                {
+                    Operation = ApplicationFrameOperation,
+                    Layer = DiagnosticLayer.ApplicationFrame,
+                    Timing = ["latest-published"],
+                    Authorizations = [DiagnosticAuthorization.EditorText],
+                    Limitations = FrameLimitations,
+                },
+            ],
+            Layers =
+            [
+                new DiagnosticLayerCapability { Layer = DiagnosticLayer.TerminalModel, Available = true },
+                new DiagnosticLayerCapability
+                {
+                    Layer = DiagnosticLayer.ApplicationFrame,
+                    Available = frameLayer.Code is null or "no-active-application",
+                    Reason = frameLayer.Reason,
+                },
+                new DiagnosticLayerCapability { Layer = DiagnosticLayer.NativeDelivery, Reason = NativeDeliveryUnavailable },
+                new DiagnosticLayerCapability { Layer = DiagnosticLayer.NativePresentation, Reason = NativePresentationUnavailable },
+            ],
+        };
+    }
 
     /// <summary>
     /// Human-readable disclosure that a result's content is a partially applied synchronized update,

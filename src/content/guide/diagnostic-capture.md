@@ -125,24 +125,28 @@ render, waits for a frame, or reads live application state, so a retained result
 | Field | Meaning |
 |-------|---------|
 | `contractVersion`, `outcome`, `problem` | As for `capture`. |
-| `frame.frameId` | The application's completed-pass count for this frame; also `identity.applicationFrame`. Two results with the same `frameId` from one application are the same frame. |
-| `frame.columns`, `frame.rows`, `frame.wroteOutput` | The pass's screen size and whether it wrote terminal output. |
-| `frame.root` | Node tree: `type`, `bounds`, `hitTestBounds`, `contentBounds`, `visibleBounds` (the bounds intersected with the screen and every enclosing clip region), `clipState` (`visible`, `partially-clipped`, `fully-clipped`), the node's own `clipRect`/`clipMode`, focus flags, rendered `text` of text nodes, type-specific `properties`, and `timing`. |
+| `frame.applicationInstanceId` | The application instance that published the frame. Each app run, and each inline flow step, is its own instance. |
+| `frame.frameId` | The instance's completed-pass count for this frame; also `identity.applicationFrame`. Results with the same `applicationInstanceId` and `frameId` in one `sessionId` are the same frame. |
+| `frame.columns`, `frame.rows` | The pass's screen size. |
+| `frame.wroteOutput` | Whether the pass wrote cell or graphics changes to the terminal. Cursor-only updates and synchronized-update markers do not count. |
+| `frame.root` | Node tree: `type`, `widgetType`, `bounds`, `hitTestBounds`, `contentBounds`, `visibleBounds`, `clipState` (`visible`, `partially-clipped`, `fully-clipped`), the node's own `clipRect`/`clipMode`, focus flags, rendered `text` (text blocks, buttons, menu items, checkboxes, hyperlinks, tabs, tree items, notification cards, window and border titles, FIGlet text), type-specific `properties` (for example a list's or picker's `selectedText`), `editor` metadata for TextBox and Editor nodes (never their text), and `timing`. `visibleBounds` applies the renderer's clip rule: bounds are intersected with the screen and every enclosing clip region, except that an `overflow` region whose enclosing region is absent or also `overflow` draws unclipped. Splitter panes clip their content. |
 | `frame.popups` | Popup stack, bottom first: content type and bounds, barrier and anchored flags, focus-restore node, and anchor type, bounds, staleness, and position. |
 | `frame.focus` | Focus ring: `currentIndex`, `focusedNodeType`, `lastHitTest`, and each focusable's bounds and hit-test bounds. |
-| `frame.focusedEditor` | For a focused TextBox or Editor: `kind` (`text-box`, `editor`), `bounds`, `length`, `lineCount`, every caret, and every non-empty selection. Positions are `{ offset, line, column }`: UTF-16 offsets and 0-based line and column. `text` is present only with `editor-text` authorization. |
+| `frame.focusedEditor` | For a focused TextBox or Editor: `kind` (`text-box`, `editor`), `bounds`, `length`, `lineCount`, every caret, and every non-empty selection. Positions are `{ offset, line, column }`: UTF-16 offsets and 0-based line and column. `text` is present only with `editor-text` authorization. Editor metadata comes from one snapshot of the editor's text; a cursor the snapshot no longer contains is clamped to it. |
 | `frame.timings` | Build, reconcile, and render milliseconds of the pass. |
 | `identity` | As for `capture`, with `sourceLayer` `application-frame`, `applicationFrame`, and `acquisition` bracketing the projection. `modelSequence` is unavailable: a frame is not a terminal-model observation. |
 | `contentCoverage` | `application-text` is included. `editor-text` is `excluded` without authorization, `included` with it, and `unavailable` when no editor had focus. |
 | `unavailableFields` | Explains an absent `frame.root`, `frame.focusedEditor`, or `frame.timings`. |
 
-Only the focused editor is described. Other editors appear as nodes without their text.
+Every editor reports its metadata on its node. Only the focused editor's text can be returned, and
+only with `editor-text`.
 
 ### Problem codes
 
 | Code | Outcome | Cause |
 |------|---------|-------|
 | `no-application-layer` | `unavailable` | The workload is not a Hex1b application (MCP local sessions, PTYs hosted by `hex1b terminal start`, raw workloads). |
+| `no-active-application` | `unavailable` | The terminal hosts Hex1b applications, but none is running: a flow between steps, or an application that has not started or has exited. Capabilities still report the layer available. |
 | `application-frame-publication-disabled` | `unavailable` | The application was built without `WithDiagnostics()`. |
 | `no-application-frame-yet` | `unavailable` | No render pass has completed since publication started. |
 | `application-frame-projection-failed` | `failed` | Projecting the latest completed pass threw; the message names that frame. Rendering is unaffected, and the next pass publishes again. |
@@ -174,8 +178,14 @@ model-history support, and authorizations. They also report each evidence layer:
   application frame. Correlate the two through identities and acquisition intervals.
 - An idle application returns its last published frame; compare its acquisition interval with
   the time of the request.
-- Each inline flow step is its own application, so `frameId` restarts at each step; between steps
-  the flow has no application layer.
+- Each inline flow step is its own application instance, so `frameId` restarts at each step while
+  `applicationInstanceId` changes; between steps the flow reports `no-active-application`.
+- An inline flow step's frame uses the step's own coordinates: row 0 is the step's first row, not
+  the terminal's, and `rows` is the step's height. Translate before comparing with terminal-model
+  captures or sending mouse input.
+- Diagnostics enable per-node timing as well as frame publication, including in flows. Projection
+  cost (one tree walk and one allocation per node per pass, plus a line scan per editor) is paid
+  only by applications built with `WithDiagnostics()`.
 - `identity.applicationVersion` is reported only for in-process Hex1b applications.
 - Independently acquired observations (for example a capture and a widget tree) are correlated by
   their identities and acquisition intervals, never presented as one atomic moment.

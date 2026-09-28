@@ -194,7 +194,28 @@ internal sealed class DiagnosticsSocketClient
                 $"The target reported outcome '{DiagnosticContractNames.Of(result.Outcome)}' without a problem.");
         }
 
-        return result.Frame is { Popups: null } frame ? result with { Frame = frame with { Popups = [] } } : result;
+        if (result.Frame is { } frame && !IsComplete(frame))
+        {
+            return TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Failed, "protocol-error",
+                "The target reported an application frame with missing lists (popups, focusables, children, carets, or selections).");
+        }
+
+        return result;
+    }
+
+    // Deserialization leaves omitted lists null despite their initializers; a frame the contract
+    // promises complete is checked before callers walk it.
+    private static bool IsComplete(DiagnosticApplicationFrame frame)
+    {
+        static bool EditorComplete(DiagnosticEditorState? editor) =>
+            editor is null || (editor.Carets is not null && editor.Selections is not null && editor.Bounds is not null);
+
+        static bool NodeComplete(DiagnosticFrameNode? node) =>
+            node is not null && node.Children is not null && node.Bounds is not null && node.VisibleBounds is not null
+            && EditorComplete(node.Editor) && node.Children.All(NodeComplete);
+
+        return frame.Popups is not null && frame.Focus.Focusables is not null && EditorComplete(frame.FocusedEditor)
+            && (frame.Root is null || NodeComplete(frame.Root));
     }
 
     // An older target may omit fields this contract version added. Report them as unavailable,

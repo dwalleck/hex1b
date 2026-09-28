@@ -8,7 +8,15 @@ namespace Hex1b.Diagnostics;
 /// </summary>
 public sealed record DiagnosticApplicationFrame
 {
-    /// <summary>The application's completed-pass count after this pass.</summary>
+    /// <summary>
+    /// Identifies the application instance that published this frame. Frame ids count passes
+    /// per instance, so (session, instance, frame id) identifies a frame; each inline flow step
+    /// is its own instance.
+    /// </summary>
+    [JsonPropertyName("applicationInstanceId")]
+    public string ApplicationInstanceId { get; init; } = "";
+
+    /// <summary>The application instance's completed-pass count after this pass.</summary>
     [JsonPropertyName("frameId")]
     public long FrameId { get; init; }
 
@@ -20,7 +28,10 @@ public sealed record DiagnosticApplicationFrame
     [JsonPropertyName("rows")]
     public int Rows { get; init; }
 
-    /// <summary>Whether this pass wrote terminal output; layout- or focus-only passes do not.</summary>
+    /// <summary>
+    /// Whether this pass wrote cell or graphics changes to the terminal. Cursor-only updates and
+    /// synchronized-update markers are not counted.
+    /// </summary>
     [JsonPropertyName("wroteOutput")]
     public bool WroteOutput { get; init; }
 

@@ -132,7 +132,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
     // Completed frame count, polled by flow commitment to coordinate with the
     // render loop (see FrameCount). Written only on the render loop thread.
     private long _frameCount;
-    private bool _framePublicationEnabled;
+    private readonly string _applicationInstanceId = Guid.NewGuid().ToString("N");
     private PublishedApplicationFrame? _latestFrame;
     
     // Channel for signaling that a re-render is needed (from Invalidate() calls)
@@ -584,9 +584,9 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         // Register this app as the application-frame source if the adapter supports it
         if (_adapter is Hex1bAppWorkloadAdapter workloadAdapter)
         {
+            workloadAdapter.HostsApplications = true;
             workloadAdapter.ApplicationFrameSource = this;
             _diagnosticTimingEnabled = workloadAdapter.DiagnosticTimingEnabled;
-            _framePublicationEnabled = workloadAdapter.DiagnosticTimingEnabled;
             // Wire IRepaintableWorkloadAdapter: when an outer multiplexer
             // (e.g. PlaceholderWorkloadAdapter) tells us the surrounding
             // terminal state was reset out from under us, flip _isFirstFrame
@@ -789,6 +789,9 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
             if (_adapter is Hex1bAppWorkloadAdapter wa)
             {
                 wa.SetRepaintRequestHandler(null);
+                // A stopped app publishes no frames; later captures must not see its last one.
+                if (ReferenceEquals(wa.ApplicationFrameSource, this))
+                    wa.ApplicationFrameSource = null;
             }
         }
     }
@@ -1138,6 +1141,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
             || _kgpRetransmitPendingAfterResize
             || (_rootNode?.NeedsRender() ?? false);
         long renderTicks = 0;
+        var wroteOutput = false;
         
         // Step 6.5-9: Only do render output if something actually changed
         //
@@ -1169,7 +1173,6 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
                 }
 
                 // Render using Surface-based path
-                bool wroteOutput;
                 {
                     long renderFrameStart = Stopwatch.GetTimestamp();
                     
@@ -1228,22 +1231,23 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         // Frame completed on the render loop thread: publish the count and
         // notify waiters (flow commitment coordinates with the loop here).
         // Publish before advancing the count, so a completed count always has its frame published.
-        if (_framePublicationEnabled)
-            PublishApplicationFrame(_frameCount + 1, needsRender, frameWidth, frameHeight,
-                _diagnosticTimingEnabled ? new ApplicationPassTimings(buildTicks, reconcileTicks, renderTicks) : null);
+        if (_diagnosticTimingEnabled)
+            PublishApplicationFrame(_frameCount + 1, wroteOutput, frameWidth, frameHeight,
+                new ApplicationPassTimings(buildTicks, reconcileTicks, renderTicks));
         Volatile.Write(ref _frameCount, _frameCount + 1);
         FrameRendered?.Invoke();
     }
 
-    bool IApplicationFrameSource.FramePublicationEnabled => _framePublicationEnabled;
+    // Diagnostics enable both frame publication and the timings frames carry.
+    bool IApplicationFrameSource.FramePublicationEnabled => _diagnosticTimingEnabled;
 
     // For an app whose own adapter is not the terminal's (a flow step); call before RunAsync.
-    internal void EnableFramePublication() => _diagnosticTimingEnabled = _framePublicationEnabled = true;
+    internal void EnableFramePublication() => _diagnosticTimingEnabled = true;
 
     PublishedApplicationFrame? IApplicationFrameSource.LatestFrame => Volatile.Read(ref _latestFrame);
 
     // Runs on the app loop at the end of a pass; a projection failure never affects rendering.
-    private void PublishApplicationFrame(long frameId, bool wroteOutput, int width, int height, ApplicationPassTimings? timings)
+    private void PublishApplicationFrame(long frameId, bool wroteOutput, int width, int height, ApplicationPassTimings timings)
     {
         var start = Stopwatch.GetTimestamp();
         var wallStart = DateTimeOffset.UtcNow;
@@ -1251,7 +1255,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         string? failure = null;
         try
         {
-            frame = ApplicationFrameProjector.Project(_rootNode, _focusRing, frameId, width, height, wroteOutput, timings);
+            frame = ApplicationFrameProjector.Project(_rootNode, _focusRing, _applicationInstanceId, frameId, width, height, wroteOutput, timings);
         }
         catch (Exception error)
         {

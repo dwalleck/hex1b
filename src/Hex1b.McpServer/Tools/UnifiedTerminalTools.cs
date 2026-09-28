@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Hex1b.Diagnostics;
+using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
 namespace Hex1b.McpServer.Tools;
@@ -260,20 +261,18 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
     /// Returns the latest application frame of any target through the shared contract.
     /// </summary>
     [McpServerTool, Description("Returns the latest frame a Hex1b application published at the end of a completed render pass, through the shared diagnostic contract: node tree with bounds, effective visible rects and clip state, focus ring, popups, focused-editor carets/selections, timings, and the frame's identity. Capturing never drives a render. Targets that are not Hex1b applications (for example local PTY sessions) report outcome 'unavailable' with code 'no-application-layer'.")]
-    public async Task<ApplicationFrameToolResult> CaptureApplicationFrame(
+    public async Task<CallToolResult> CaptureApplicationFrame(
         [Description("Session ID of the terminal target")] string sessionId,
         [Description(CaptureToolSupport.FrameAuthorizeDescription)] string? authorize = null,
         CancellationToken ct = default)
     {
         var target = sessionManager.GetTarget(sessionId);
-        if (target == null)
-        {
-            return CaptureToolSupport.FrameResult(
+        var result = target == null
+            ? CaptureToolSupport.FrameResult(
                 TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Unavailable, "session-not-found", $"Session '{sessionId}' not found."),
-                sessionId, processId: null);
-        }
-
-        return await CaptureToolSupport.CaptureApplicationFrameAsync(target.CaptureApplicationFrameAsync, authorize, ct, sessionId);
+                sessionId, processId: null)
+            : await CaptureToolSupport.CaptureApplicationFrameAsync(target.CaptureApplicationFrameAsync, authorize, ct, sessionId);
+        return CaptureToolSupport.ToCallToolResult(result);
     }
 
     /// <summary>
