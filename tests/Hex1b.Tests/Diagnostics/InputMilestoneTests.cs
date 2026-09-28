@@ -269,6 +269,233 @@ public class InputMilestoneTests
         Assert.IsNull(frame.Milestone);
     }
 
+    [TestMethod]
+    public async Task FramePublished_NeverAttributesAnInterveningFrame()
+    {
+        await using var harness = await GatedApp.StartAsync(content: _ => new TextBlockWidget("frames"));
+        await harness.HoldNextBuildAsync();
+        var input = await harness.SendAsync(Hex1bKey.X);
+        var wait = harness.Diagnostics.CaptureApplicationFrameAsync(new DiagnosticApplicationFrameRequest
+        {
+            Milestone = new DiagnosticMilestoneRequest { Milestone = DiagnosticMilestone.FramePublished, InputId = input, TimeoutMs = 5000 },
+        });
+        await harness.WaitForPendingWaitsAsync(1);
+
+        harness.ReleaseBuild();
+        var result = await wait;
+
+        var intervening = harness.Published.Where(f => f.ProcessedInput < input).Select(f => f.FrameId).ToList();
+        Assert.IsNotEmpty(intervening, "fixture: no frame was published between the input's acceptance and its processing");
+        Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome, result.Problem?.Message);
+        var frame = result.Milestone!.Frame!;
+        CollectionAssert.DoesNotContain(intervening, frame.FrameId, $"intervening frame {frame.FrameId} (watermark < {input}) was attributed to the input");
+        Assert.IsGreaterThanOrEqualTo(input, frame.ProcessedInput);
+        Assert.AreEqual(harness.Published.First(f => f.ProcessedInput >= input).FrameId, frame.FrameId, "not the first covering frame");
+    }
+
+    [TestMethod]
+    public async Task ModelApplied_WaitsForThePumpAndReportsTheModelSequence()
+    {
+        var filter = new GatingFilter();
+        var shown = 0;
+        await using var harness = await GatedApp.StartAsync(content: _ => new TextBlockWidget($"shown {shown}"), filter: filter);
+        await harness.WaitForQuietAsync();
+
+        filter.Close();
+        var input = await harness.SendAsync(Hex1bKey.X);
+        shown = 1;
+        harness.App.Invalidate();
+        var gated = await harness.Diagnostics.CaptureAsync(Milestone(DiagnosticMilestone.ModelApplied, input, 400));
+        filter.Open();
+        var applied = await harness.Diagnostics.CaptureAsync(Milestone(DiagnosticMilestone.ModelApplied, input, 5000));
+
+        Assert.AreEqual(DiagnosticOutcome.TimedOut, gated.Outcome, "model-applied met while the output pump was held");
+        Assert.AreEqual(DiagnosticOutcome.Captured, applied.Outcome, applied.Problem?.Message);
+        Assert.IsTrue(applied.Milestone!.Met);
+        Assert.IsNotNull(applied.Milestone.Frame);
+        Assert.IsGreaterThanOrEqualTo(input, applied.Milestone.Frame.ProcessedInput);
+        Assert.IsNotNull(applied.Milestone.ModelSequence);
+        Assert.IsGreaterThanOrEqualTo(applied.Milestone.ModelSequence.Value, applied.Identity!.ModelSequence!.Value,
+            "the capture after the milestone read an older model");
+        StringAssert.Contains(applied.Content, "shown 1", "the model did not contain the covering frame's output");
+    }
+
+    [TestMethod]
+    public async Task ModelApplied_IsMetForAFrameThatWroteNothing()
+    {
+        await using var harness = await GatedApp.StartAsync(content: _ => new TextBlockWidget("static"));
+        await harness.WaitForQuietAsync();
+
+        var input = await harness.SendAsync(Hex1bKey.X);
+        var result = await harness.Diagnostics.CaptureAsync(Milestone(DiagnosticMilestone.ModelApplied, input, 5000));
+
+        Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome, result.Problem?.Message);
+        Assert.IsFalse(result.Milestone!.Frame!.WroteOutput, "fixture: the covering frame wrote output");
+    }
+
+    [TestMethod]
+    public async Task Termination_OutputPumpFailureFailsModelAppliedWaits()
+    {
+        var filter = new GatingFilter();
+        var shown = 0;
+        await using var harness = await GatedApp.StartAsync(content: _ => new TextBlockWidget($"shown {shown}"), filter: filter);
+        await harness.WaitForQuietAsync();
+
+        filter.Close();
+        var input = await harness.SendAsync(Hex1bKey.X);
+        shown = 1;
+        harness.App.Invalidate();
+        var wait = harness.Diagnostics.CaptureAsync(Milestone(DiagnosticMilestone.ModelApplied, input, 30_000));
+        await harness.WaitForPendingWaitsAsync(1);
+
+        var stopwatch = Stopwatch.StartNew();
+        filter.Fail();
+        var result = await wait;
+
+        Assert.AreEqual((DiagnosticOutcome.Failed, "output-pump-failed"), (result.Outcome, result.Problem?.Code));
+        Assert.IsLessThan(TimeSpan.FromSeconds(1), stopwatch.Elapsed);
+        Assert.AreEqual(0, harness.Terminal.InputMilestones!.PendingWaits);
+    }
+
+    [TestMethod]
+    public async Task Termination_CoveringFrameProjectionFailureFailsFrameWaits()
+    {
+        var armed = new ApplicationFrameTests.StrongBox<bool>();
+        await using var harness = await GatedApp.StartAsync(content: _ => new VStackWidget(
+            [new TextBlockWidget("armed"), new ApplicationFrameTests.ArmableProjectionFailureWidget(armed)]));
+        await harness.WaitForQuietAsync();
+
+        armed.Value = true;
+        var input = await harness.SendAsync(Hex1bKey.X);
+        // A model capture: only the milestone, not the capture itself, can report the failed frame.
+        var result = await harness.Diagnostics.CaptureAsync(Milestone(DiagnosticMilestone.FramePublished, input, 5000));
+        armed.Value = false;
+
+        Assert.AreEqual((DiagnosticOutcome.Failed, "application-frame-projection-failed"), (result.Outcome, result.Problem?.Code));
+    }
+
+    [TestMethod]
+    public async Task RawInput_PayloadOnlyWithAuthorization()
+    {
+        const string Sentinel = "ZQX-RAW-SECRET";
+        await using var harness = await GatedApp.StartAsync(content: _ => new TextBlockWidget("raw"));
+        var input = await harness.SendTextAsync(Sentinel);
+
+        string Json(params DiagnosticAuthorization[] authorizations)
+        {
+            var result = harness.Diagnostics.CaptureAsync(new DiagnosticCaptureRequest
+            {
+                Authorizations = authorizations,
+                Milestone = new DiagnosticMilestoneRequest { Milestone = DiagnosticMilestone.InputProcessed, InputId = input, TimeoutMs = 5000 },
+            }).GetAwaiter().GetResult();
+            Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome, result.Problem?.Message);
+            return System.Text.Json.JsonSerializer.Serialize(result, DiagnosticsJsonContext.Default.DiagnosticCaptureResult);
+        }
+
+        var plain = Json();
+        var editor = Json(DiagnosticAuthorization.EditorText);
+        var raw = Json(DiagnosticAuthorization.RawInput);
+
+        Assert.IsFalse(plain.Contains(Sentinel, StringComparison.Ordinal), "sentinel in a default milestone result");
+        Assert.IsFalse(editor.Contains(Sentinel, StringComparison.Ordinal), "sentinel under editor-text");
+        Assert.IsTrue(raw.Contains(Sentinel, StringComparison.Ordinal), "raw-input did not include the payload");
+        StringAssert.Contains(plain, "\"kind\":\"text\"");
+        StringAssert.Contains(plain, "\"source\":\"diagnostic-send\"");
+        StringAssert.Contains(plain, "\"content\":\"raw-input\",\"state\":\"excluded\"");
+        StringAssert.Contains(raw, "\"content\":\"raw-input\",\"state\":\"included\"");
+    }
+
+    [TestMethod]
+    public async Task Milestone_DisclosesAnActiveSynchronizedUpdate()
+    {
+        await using var harness = await GatedApp.StartAsync(content: _ => new TextBlockWidget("sync"));
+        var input = await harness.SendAsync(Hex1bKey.X);
+        var processed = await harness.Diagnostics.CaptureAsync(Milestone(DiagnosticMilestone.InputProcessed, input, 5000));
+        Assert.AreEqual(DiagnosticOutcome.Captured, processed.Outcome, "fixture: input processed");
+        await harness.WaitForQuietAsync();
+
+        harness.Workload.Write("\u001b[?2026h");
+        for (var i = 0; i < 100 && harness.Diagnostics.Capture(new DiagnosticCaptureRequest()).SynchronizedUpdate?.Active != true; i++)
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        var immediate = harness.Diagnostics.Capture(new DiagnosticCaptureRequest());
+        var milestone = await harness.Diagnostics.CaptureAsync(Milestone(DiagnosticMilestone.InputProcessed, input, 5000));
+
+        Assert.IsTrue(immediate.SynchronizedUpdate!.Active, "fixture: no synchronized update active");
+        Assert.AreEqual(DiagnosticOutcome.Captured, milestone.Outcome);
+        Assert.IsTrue(milestone.SynchronizedUpdate!.Active, "a milestone capture hid the active synchronized update");
+        harness.Workload.Write("\u001b[?2026l");
+    }
+
+    [TestMethod]
+    public async Task Flow_InlineStepProcessesForwardedInputAndReportsModelApplicationUnobservable()
+    {
+        await using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithHex1bFlow(async flow =>
+            {
+                var step = flow.Step(_ => new VStackWidget([new TextBlockWidget("FLOW-STEP"), new TextBoxWidget("")]));
+                await step.WaitForCompletionAsync(TestContext.Current.CancellationToken);
+            })
+            .WithHeadless()
+            .WithDimensions(30, 6)
+            .WithDiagnostics(appName: "milestone-flow", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync(TestContext.Current.CancellationToken);
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("FLOW-STEP"), TimeSpan.FromSeconds(10), "flow step rendered")
+            .Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        var diagnostics = new TerminalDiagnostics(terminal, "milestone-flow");
+        Assert.IsTrue(terminal.InputMilestones!.HostsFlow, "a flow session must be marked flow-hosted");
+
+        var accepted = await diagnostics.TrackSendAsync(() =>
+            terminal.SendEventAsync(new Hex1bKeyEvent(Hex1bKey.Q, "q", Hex1bModifiers.None)));
+        DiagnosticCaptureRequest At(DiagnosticMilestone milestone) => Milestone(milestone, accepted!.LastId, 5000);
+        var processed = await diagnostics.CaptureAsync(At(DiagnosticMilestone.InputProcessed));
+        var framed = await diagnostics.CaptureApplicationFrameAsync(new DiagnosticApplicationFrameRequest
+        {
+            Milestone = At(DiagnosticMilestone.FramePublished).Milestone,
+        });
+        var model = await diagnostics.CaptureAsync(At(DiagnosticMilestone.ModelApplied));
+
+        Assert.AreEqual(DiagnosticOutcome.Captured, processed.Outcome, processed.Problem?.Message);
+        Assert.AreEqual(DiagnosticOutcome.Captured, framed.Outcome, framed.Problem?.Message);
+        var stepInstance = framed.Frame!.ApplicationInstanceId;
+        Assert.AreEqual(stepInstance, processed.Milestone!.ProcessedBy, "the step app did not process the forwarded input");
+        Assert.AreEqual(stepInstance, framed.Milestone!.Frame!.ApplicationInstanceId);
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "model-application-unobservable"), (model.Outcome, model.Problem?.Code));
+    }
+
+    // Holds, releases or faults the terminal's output pump from a workload filter, which the pump
+    // awaits after applying each output batch.
+    private sealed class GatingFilter : IHex1bTerminalWorkloadFilter
+    {
+        private volatile TaskCompletionSource? _gate;
+        private volatile bool _fail;
+
+        public void Close() => _gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void Open() => _gate?.TrySetResult();
+
+        public void Fail()
+        {
+            _fail = true;
+            Open();
+        }
+
+        public async ValueTask OnOutputAsync(IReadOnlyList<Hex1b.Tokens.AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default)
+        {
+            if (_gate is { } gate)
+                await gate.Task.ConfigureAwait(false);
+            if (_fail)
+                throw new InvalidOperationException("injected output pump failure");
+        }
+
+        public ValueTask OnSessionStartAsync(int width, int height, DateTimeOffset timestamp, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask OnInputAsync(IReadOnlyList<Hex1b.Tokens.AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask OnFrameCompleteAsync(TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask OnResizeAsync(int width, int height, TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask OnSessionEndAsync(TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+    }
+
     private static DiagnosticCaptureRequest Milestone(DiagnosticMilestone milestone, long inputId, int timeoutMs) => new()
     {
         Milestone = new DiagnosticMilestoneRequest { Milestone = milestone, InputId = inputId, TimeoutMs = timeoutMs },
@@ -298,16 +525,36 @@ public class InputMilestoneTests
         public string ApplicationInstanceId =>
             Diagnostics.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest()).Frame!.ApplicationInstanceId;
 
-        public static async Task<GatedApp> StartAsync(bool diagnostics = true)
+        public static async Task<GatedApp> StartAsync(bool diagnostics = true,
+            Func<GatedApp, Hex1bWidget>? content = null, IHex1bTerminalWorkloadFilter? filter = null)
         {
             var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = diagnostics };
-            var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(30, 4).Build();
+            var builder = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(30, 4);
+            if (filter is not null)
+                builder.AddWorkloadFilter(filter);
+            var terminal = builder.Build();
             var harness = new GatedApp(workload, terminal);
-            harness.App = new Hex1bApp(_ => new ButtonWidget("gate").OnClick(async _ =>
+            harness.App = new Hex1bApp(async _ =>
             {
-                harness._entered.TrySetResult();
-                await harness._gate.Task;
-            }), new Hex1bAppOptions { WorkloadAdapter = workload });
+                // A held build keeps the loop inside a render pass, so input accepted meanwhile
+                // is processed only after that pass publishes its frame.
+                if (harness._holdBuild is { } hold)
+                {
+                    harness._buildHeld.TrySetResult();
+                    await hold.Task;
+                }
+
+                return content?.Invoke(harness) ?? new ButtonWidget("gate").OnClick(async _ =>
+                {
+                    harness._entered.TrySetResult();
+                    await harness._gate.Task;
+                });
+            }, new Hex1bAppOptions { WorkloadAdapter = workload });
+            harness.App.FrameRendered += () =>
+            {
+                if (harness.Diagnostics.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest()).Frame is { } frame)
+                    harness.Published.Enqueue((frame.FrameId, frame.ProcessedInput ?? 0));
+            };
             harness._run = harness.App.RunAsync(harness._cts.Token);
             for (var i = 0; i < 500 && harness.App.FrameCount < 1; i++)
                 await Task.Delay(10, TestContext.Current.CancellationToken);
@@ -331,6 +578,44 @@ public class InputMilestoneTests
         }
 
         public void Release() => _gate.TrySetResult();
+
+        public async Task WaitForQuietAsync()
+        {
+            var last = -1L;
+            while (App.FrameCount != last)
+            {
+                last = App.FrameCount;
+                await Task.Delay(150, TestContext.Current.CancellationToken);
+            }
+        }
+
+        // Frames as published, with their processed-input watermark (recorded on the app loop).
+        public System.Collections.Concurrent.ConcurrentQueue<(long FrameId, long ProcessedInput)> Published { get; } = new();
+
+        private TaskCompletionSource? _holdBuild;
+        private TaskCompletionSource _buildHeld = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task HoldNextBuildAsync()
+        {
+            _buildHeld = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _holdBuild = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            App.Invalidate();
+            await _buildHeld.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        }
+
+        public void ReleaseBuild()
+        {
+            var hold = _holdBuild;
+            _holdBuild = null;
+            hold?.TrySetResult();
+        }
+
+        public async Task<long> SendTextAsync(string text)
+        {
+            var accepted = await Diagnostics.TrackSendAsync(() =>
+                Terminal.SendEventAsync(new Hex1bKeyEvent(Hex1bKey.X, text, Hex1bModifiers.None)));
+            return accepted!.LastId;
+        }
 
         public async Task StopAsync()
         {

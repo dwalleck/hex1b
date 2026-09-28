@@ -91,6 +91,15 @@ public sealed class Hex1bAppWorkloadAdapter :
     /// </summary>
     internal Diagnostics.InputMilestoneTracker? InputMilestones { get; set; }
 
+    private readonly object _milestoneOutputSync = new();
+    private long _milestoneOutputSequence;
+
+    /// <summary>The last output sequence enqueued, when input milestones are tracked.</summary>
+    internal long MilestoneOutputSequence
+    {
+        get { lock (_milestoneOutputSync) return _milestoneOutputSequence; }
+    }
+
     // Every input-channel write goes through here so a tracked session numbers each event in
     // channel order; an untracked session writes exactly as before.
     private bool TryWriteInput(Hex1bEvent evt) => InputMilestones is { } tracker
@@ -520,6 +529,19 @@ public sealed class Hex1bAppWorkloadAdapter :
     /// </param>
     private void EnqueueOutput(WorkloadOutputItem item, bool requireAcceptance = false)
     {
+        if (InputMilestones is not null)
+        {
+            // Sequence numbers must follow channel order, so assignment and write are one step.
+            lock (_milestoneOutputSync)
+                EnqueueOutputCore(item with { MilestoneSequence = ++_milestoneOutputSequence }, requireAcceptance);
+            return;
+        }
+
+        EnqueueOutputCore(item, requireAcceptance);
+    }
+
+    private void EnqueueOutputCore(WorkloadOutputItem item, bool requireAcceptance)
+    {
         if (_disposed)
         {
             ReturnPooledResources(item);
@@ -590,6 +612,14 @@ public sealed class Hex1bAppWorkloadAdapter :
     /// </summary>
     private async ValueTask EnqueueOutputAsync(WorkloadOutputItem item, CancellationToken cancellationToken)
     {
+        if (InputMilestones is not null)
+        {
+            // The ordered path blocks rather than awaits: sequence and write stay one step.
+            lock (_milestoneOutputSync)
+                EnqueueOutputCore(item with { MilestoneSequence = ++_milestoneOutputSequence }, requireAcceptance: false);
+            return;
+        }
+
         if (_outputChannel.Writer.TryWrite(item))
         {
             Interlocked.Increment(ref _outputQueueDepth);

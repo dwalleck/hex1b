@@ -5,6 +5,12 @@ public sealed partial class Hex1bTerminal
     // Correlates observations of this model across diagnostic requests and clients.
     internal Guid DiagnosticSessionId { get; } = Guid.NewGuid();
 
+    /// <summary>The model sequence now, read under the model lock.</summary>
+    internal long CurrentModelSequence
+    {
+        get { lock (_bufferLock) return _modelSequence; }
+    }
+
     /// <summary>The session's input milestone tracker; present only when diagnostics are enabled.</summary>
     internal Diagnostics.InputMilestoneTracker? InputMilestones { get; }
 

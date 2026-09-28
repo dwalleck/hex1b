@@ -75,6 +75,12 @@ public readonly record struct WorkloadOutputItem(
     internal TaskCompletionSource<bool>? ProcessingBarrier { get; init; }
 
     /// <summary>
+    /// Position of this item in its adapter's output order when input milestones are tracked
+    /// (0 otherwise); the terminal reports each applied item so model-applied can be proven.
+    /// </summary>
+    internal long MilestoneSequence { get; init; }
+
+    /// <summary>
     /// In-process model resize, ordered after preceding output application and
     /// before subsequent observation barriers. Only the owning terminal enqueues it.
     /// </summary>

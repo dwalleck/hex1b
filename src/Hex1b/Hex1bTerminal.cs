@@ -1600,6 +1600,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         await ApplyResizeWithWorkloadAsync(resize.Width, resize.Height, queued: true, ct)
                             .ConfigureAwait(false);
                         readItem.ProcessingBarrier?.TrySetResult(true);
+                        CompleteMilestoneItem(readItem);
                     }
                     catch (OperationCanceledException) when (ct.IsCancellationRequested)
                     {
@@ -1649,6 +1650,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     if (_workload is StandardProcessWorkloadAdapter)
                         break;
                     
+                    CompleteMilestoneItem(readItem);
+
                     // Small delay to prevent busy-waiting in headless mode
                     await Task.Delay(10, ct);
                     continue;
@@ -1697,6 +1700,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
                 var outputStateLock = _workload is IHmp1TerminalOutputSource ? Hmp1OutputStateLock : _hmp1OutputStateLock;
                 var outputStateLockTaken = false;
+                var milestoneItemFaulted = false;
                 try
                 {
                 if (outputStateLock is not null)
@@ -1964,6 +1968,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
                 catch (Exception error)
                 {
+                    milestoneItemFaulted = true;
                     if (acceptedDelivery is { } faulted)
                     {
                         acceptedDelivery = null;
@@ -1974,6 +1979,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 }
                 finally
                 {
+                    if (!milestoneItemFaulted)
+                        CompleteMilestoneItem(readItem);
                     Hmp1ReplayActivityState = null;
                     Hmp1ReplayScrollbackState = null;
                     Hmp1ReplayCommandMarkState = null;
@@ -2004,6 +2011,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         {
             (_workload as IHmp1TerminalOutputSource)?.Hmp1Workload?.CompleteInitialReplay(ex);
             ReportPumpFault("workload output pump", ex);
+            InputMilestones?.OutputPumpFailed(ex.Message);
         }
         finally
         {
@@ -8187,6 +8195,13 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     // === Filter Notification Helpers ===
 
     private TimeSpan GetElapsed() => _timeProvider.GetUtcNow() - _sessionStart;
+
+    // Reports a fully applied output item to the input milestone tracker.
+    private void CompleteMilestoneItem(in WorkloadOutputItem item)
+    {
+        if (item.MilestoneSequence > 0)
+            InputMilestones?.OutputApplied(item.MilestoneSequence);
+    }
 
     private async ValueTask NotifyWorkloadFiltersSessionStartAsync(CancellationToken ct = default)
     {

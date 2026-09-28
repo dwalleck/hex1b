@@ -795,8 +795,9 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
                 // A stopped app publishes no frames; later captures must not see its last one.
                 if (ReferenceEquals(wa.ApplicationFrameSource, this))
                     wa.ApplicationFrameSource = null;
-                _inputMilestones?.ApplicationStopped(_applicationInstanceId);
             }
+
+            _inputMilestones?.ApplicationStopped(_applicationInstanceId);
         }
     }
 
@@ -1247,7 +1248,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
     bool IApplicationFrameSource.FramePublicationEnabled => _diagnosticTimingEnabled;
 
     // For an app whose own adapter is not the terminal's (a flow step); call before RunAsync.
-    internal void EnableFramePublication() => _diagnosticTimingEnabled = true;
+    internal void EnableFramePublication(Diagnostics.InputMilestoneTracker? inputMilestones) => (_diagnosticTimingEnabled, _inputMilestones) = (true, inputMilestones);
 
     PublishedApplicationFrame? IApplicationFrameSource.LatestFrame => Volatile.Read(ref _latestFrame);
 
@@ -1258,9 +1259,10 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         var wallStart = DateTimeOffset.UtcNow;
         DiagnosticApplicationFrame? frame = null;
         string? failure = null;
+        var processedInput = _inputMilestones?.ProcessedInput;
         try
         {
-            frame = ApplicationFrameProjector.Project(_rootNode, _focusRing, _applicationInstanceId, frameId, width, height, wroteOutput, timings);
+            frame = ApplicationFrameProjector.Project(_rootNode, _focusRing, _applicationInstanceId, frameId, width, height, wroteOutput, timings, processedInput);
         }
         catch (Exception error)
         {
@@ -1269,6 +1271,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
 
         Volatile.Write(ref _latestFrame, new PublishedApplicationFrame(
             frameId, frame, failure, start, Stopwatch.GetTimestamp(), wallStart, DateTimeOffset.UtcNow));
+        _inputMilestones?.FramePublished(_applicationInstanceId, frameId, processedInput ?? 0, wroteOutput, frame is null, (_adapter as Hex1bAppWorkloadAdapter)?.MilestoneOutputSequence);
     }
     
     /// <summary>

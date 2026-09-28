@@ -127,16 +127,25 @@ public sealed class TerminalDiagnostics
         if (request.Milestone is not { } milestone)
             return Capture(request);
 
-        var wait = await WaitForMilestoneAsync(milestone, cancellationToken).ConfigureAwait(false);
+        var rawInput = request.Authorizations?.Contains(DiagnosticAuthorization.RawInput) == true;
+        var wait = await WaitForMilestoneAsync(milestone, rawInput, cancellationToken).ConfigureAwait(false);
         if (wait.Problem is { } problem)
             return Problem(problem.Outcome, problem.Code, problem.Message) with { Milestone = wait.Result };
-        return Capture(new DiagnosticCaptureRequest
+        var captured = Capture(new DiagnosticCaptureRequest
         {
             Format = request.Format,
             HistoryRows = request.HistoryRows,
             FontFamily = request.FontFamily,
             Authorizations = request.Authorizations,
-        }) with { Milestone = wait.Result };
+        });
+        return captured.Outcome != DiagnosticOutcome.Captured
+            ? captured with { Milestone = wait.Result }
+            : captured with
+            {
+                Milestone = wait.Result,
+                ContentCoverage = WithRawInputCoverage(captured.ContentCoverage, wait.Result!, rawInput),
+                UnavailableFields = [.. captured.UnavailableFields, .. wait.Unavailable],
+            };
     }
 
     /// <summary>
@@ -150,11 +159,103 @@ public sealed class TerminalDiagnostics
         if (request.Milestone is not { } milestone)
             return CaptureApplicationFrame(request);
 
-        var wait = await WaitForMilestoneAsync(milestone, cancellationToken).ConfigureAwait(false);
+        var rawInput = request.Authorizations?.Contains(DiagnosticAuthorization.RawInput) == true;
+        var wait = await WaitForMilestoneAsync(milestone, rawInput, cancellationToken).ConfigureAwait(false);
         if (wait.Problem is { } problem)
             return FrameProblem(problem.Outcome, problem.Code, problem.Message) with { Milestone = wait.Result };
-        return CaptureApplicationFrame(new DiagnosticApplicationFrameRequest { Authorizations = request.Authorizations })
-            with { Milestone = wait.Result };
+        var captured = CaptureApplicationFrame(new DiagnosticApplicationFrameRequest { Authorizations = request.Authorizations });
+        return captured.Outcome != DiagnosticOutcome.Captured
+            ? captured with { Milestone = wait.Result }
+            : captured with
+            {
+                Milestone = wait.Result,
+                ContentCoverage = WithRawInputCoverage(captured.ContentCoverage, wait.Result!, rawInput),
+                UnavailableFields = [.. captured.UnavailableFields, .. wait.Unavailable],
+            };
+    }
+
+    // A milestone capture reports the awaited input's payload only under raw-input.
+    private static IReadOnlyList<DiagnosticContentCoverage> WithRawInputCoverage(
+        IReadOnlyList<DiagnosticContentCoverage> coverage, DiagnosticMilestoneResult milestone, bool rawInput)
+    {
+        var entry = !rawInput
+            ? new DiagnosticContentCoverage
+            {
+                Content = DiagnosticContentClass.RawInput,
+                State = DiagnosticCoverageState.Excluded,
+                Reason = "Requires raw-input authorization; milestone results report input metadata only.",
+            }
+            : milestone.Input?.Payload is not null
+                ? new DiagnosticContentCoverage { Content = DiagnosticContentClass.RawInput, State = DiagnosticCoverageState.Included }
+                : new DiagnosticContentCoverage
+                {
+                    Content = DiagnosticContentClass.RawInput,
+                    State = DiagnosticCoverageState.Unavailable,
+                    Reason = "The awaited input's payload is not retained (evicted, streamed paste content, or an event without a payload).",
+                };
+        return [.. coverage.Where(c => c.Content != DiagnosticContentClass.RawInput), entry];
+    }
+
+    private async Task<(DiagnosticMilestoneResult? Result, (DiagnosticOutcome Outcome, string Code, string Message)? Problem,
+        IReadOnlyList<DiagnosticUnavailableField> Unavailable)>
+        WaitForMilestoneAsync(DiagnosticMilestoneRequest request, bool rawInput, CancellationToken cancellationToken)
+    {
+        if (!Enum.IsDefined(request.Milestone))
+            return (null, (DiagnosticOutcome.InvalidRequest, "unsupported-milestone", $"Unsupported milestone '{request.Milestone}'."), []);
+        if (request.InputId is not { } inputId)
+            return (null, (DiagnosticOutcome.InvalidRequest, "missing-input-id", "A milestone request must name an input id."), []);
+        var timeoutMs = request.TimeoutMs ?? DefaultMilestoneTimeoutMs;
+        if (timeoutMs is < 1 or > MaxMilestoneTimeoutMs)
+            return (null, (DiagnosticOutcome.InvalidRequest, "invalid-milestone-timeout",
+                $"A milestone timeout must be 1 to {MaxMilestoneTimeoutMs} ms."), []);
+        if (_terminal.IsDisposed)
+            return (null, (DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed."), []);
+        if (_terminal.InputMilestones is not { } tracker)
+            return (null, (DiagnosticOutcome.Unavailable, "input-tracking-unavailable", InputTrackingUnavailable), []);
+
+        var status = await tracker.WaitAsync(request.Milestone, inputId, TimeSpan.FromMilliseconds(timeoutMs), cancellationToken)
+            .ConfigureAwait(false);
+        if (status.Outcome == DiagnosticOutcome.InvalidRequest)
+            return (null, (status.Outcome.Value, status.Code!, status.Message!), []);
+
+        var observed = tracker.Observe();
+        var record = tracker.Record(inputId);
+        var unavailable = new List<DiagnosticUnavailableField>();
+        if (record is null)
+            unavailable.Add(new DiagnosticUnavailableField
+            {
+                Field = "milestone.input",
+                Reason = $"Only the last {InputMilestoneTracker.RetainedRecords} inputs' records are retained.",
+            });
+        var result = new DiagnosticMilestoneResult
+        {
+            Milestone = request.Milestone,
+            InputId = inputId,
+            Met = status.IsMet,
+            AcceptedInput = observed.AcceptedInput,
+            ProcessedInput = observed.ProcessedInput,
+            ProcessedBy = record?.ProcessedBy,
+            Frame = status.Frame is { } frame
+                ? new DiagnosticMilestoneFrame
+                {
+                    ApplicationInstanceId = frame.ApplicationInstanceId,
+                    FrameId = frame.FrameId,
+                    ProcessedInput = frame.ProcessedInput,
+                    WroteOutput = frame.WroteOutput,
+                }
+                : null,
+            ModelSequence = request.Milestone == DiagnosticMilestone.ModelApplied && status.IsMet ? _terminal.CurrentModelSequence : null,
+            Input = record is null ? null : new DiagnosticInputRecord
+            {
+                Id = record.Id,
+                Kind = record.Kind,
+                Source = record.Source,
+                AcceptedAt = record.AcceptedAt,
+                ProcessedAt = record.ProcessedAt,
+                Payload = rawInput ? record.Payload : null,
+            },
+        };
+        return status.IsMet ? (result, null, unavailable) : (result, (status.Outcome!.Value, status.Code!, status.Message!), unavailable);
     }
 
     /// <summary>

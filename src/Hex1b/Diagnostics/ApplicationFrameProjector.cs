@@ -25,7 +25,7 @@ internal static class ApplicationFrameProjector
 
     // Timings are null when diagnostic timing is off, which also leaves node timings out.
     internal static DiagnosticApplicationFrame Project(Hex1bNode? root, FocusRing focusRing, string applicationInstanceId,
-        long frameId, int columns, int rows, bool wroteOutput, ApplicationPassTimings? timings)
+        long frameId, int columns, int rows, bool wroteOutput, ApplicationPassTimings? timings, long? processedInput = null)
     {
         if (ProjectionsForTesting.Value is { } counter)
             Interlocked.Increment(ref counter.Value);
@@ -39,6 +39,7 @@ internal static class ApplicationFrameProjector
         {
             ApplicationInstanceId = applicationInstanceId,
             FrameId = frameId,
+            ProcessedInput = processedInput,
             Columns = columns,
             Rows = rows,
             WroteOutput = wroteOutput,

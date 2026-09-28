@@ -35,6 +35,9 @@ internal sealed class InputMilestoneTracker
     private string? _processedBy;
     private (string Code, string Message)? _terminated;
     private string? _stoppedApplication;
+    private PublishedFrame? _latestFrame;
+    private long _appliedOutput;
+    private string? _outputFailure;
 
     internal InputMilestoneTracker()
     {
@@ -50,12 +53,18 @@ internal sealed class InputMilestoneTracker
     internal bool Accept(Hex1bEvent evt, Func<Hex1bEvent, bool> write)
     {
         var send = CurrentSend.Value;
+        var (kind, payload) = Describe(evt);
         lock (_sync)
         {
             if (!write(evt))
                 return false;
             var id = ++_accepted;
-            var tracked = new Tracked(id, DateTimeOffset.UtcNow);
+            var tracked = new Tracked(id, DateTimeOffset.UtcNow)
+            {
+                Kind = kind,
+                Source = send is null ? "native" : "diagnostic-send",
+                Payload = payload,
+            };
             _tracked.AddOrUpdate(evt, tracked);
             _recent[id % RetainedRecords] = tracked;
             send?.Include(id);
@@ -75,8 +84,13 @@ internal sealed class InputMilestoneTracker
         return scope;
     }
 
-    /// <summary>Records that <paramref name="applicationInstanceId"/>'s loop consumed <paramref name="evt"/>.</summary>
-    internal void Processed(Hex1bEvent evt, string applicationInstanceId)
+    /// <summary>
+    /// Records that <paramref name="applicationInstanceId"/>'s loop consumed <paramref name="evt"/>.
+    /// Only application loops advance the watermark, since they consume in channel order; a flow
+    /// runner consuming an event itself (a resize) marks just that input processed, so it cannot
+    /// carry the watermark past an input a step has not processed yet.
+    /// </summary>
+    internal void Processed(Hex1bEvent evt, string applicationInstanceId, bool advancesWatermark = true)
     {
         if (!_tracked.TryGetValue(evt, out var tracked))
             return;
@@ -84,6 +98,12 @@ internal sealed class InputMilestoneTracker
         {
             tracked.ProcessedBy = applicationInstanceId;
             tracked.ProcessedAt = DateTimeOffset.UtcNow;
+            if (!advancesWatermark)
+            {
+                WakeUnsafe();
+                return;
+            }
+
             if (tracked.Id <= _processed)
                 return;
             _processed = tracked.Id;
@@ -114,11 +134,80 @@ internal sealed class InputMilestoneTracker
     /// </summary>
     internal void ApplicationStopped(string applicationInstanceId)
     {
-        if (HostsFlow)
-            return;
         lock (_sync)
         {
-            _stoppedApplication = applicationInstanceId;
+            if (HostsFlow)
+            {
+                // Inputs a flow pump handed to this step and it never processed are lost; inputs
+                // still queued at the terminal wait for the next step.
+                foreach (var tracked in _recent)
+                {
+                    if (tracked is { Forwarded: true, ProcessedBy: null, Lost: null })
+                        tracked.Lost = applicationInstanceId;
+                }
+            }
+            else
+            {
+                _stoppedApplication = applicationInstanceId;
+            }
+
+            WakeUnsafe();
+        }
+    }
+
+    /// <summary>A flow pump handed <paramref name="evt"/> from the terminal's channel to a step.</summary>
+    internal void Forwarded(Hex1bEvent evt)
+    {
+        if (_tracked.TryGetValue(evt, out var tracked))
+            tracked.Forwarded = true;
+    }
+
+    /// <summary>The highest input id processed so far (the frame watermark source).</summary>
+    internal long ProcessedInput
+    {
+        get { lock (_sync) return _processed; }
+    }
+
+    /// <summary>
+    /// Records a completed pass's publication. <paramref name="outputMark"/> is the last output
+    /// sequence the application had enqueued, or <see langword="null"/> when its output reaches
+    /// the model through a relay the tracker cannot follow (an inline flow step).
+    /// </summary>
+    internal void FramePublished(string applicationInstanceId, long frameId, long processedInput, bool wroteOutput,
+        bool projectionFailed, long? outputMark)
+    {
+        lock (_sync)
+        {
+            var frame = new PublishedFrame(applicationInstanceId, frameId, processedInput, wroteOutput, projectionFailed, outputMark);
+            foreach (var waiter in _waiters)
+            {
+                if (waiter.CoveringFrame is null && waiter.InputId <= processedInput)
+                    waiter.CoveringFrame = frame;
+            }
+
+            _latestFrame = frame;
+            WakeUnsafe();
+        }
+    }
+
+    /// <summary>The terminal applied every output item up to <paramref name="sequence"/>.</summary>
+    internal void OutputApplied(long sequence)
+    {
+        lock (_sync)
+        {
+            if (sequence <= _appliedOutput)
+                return;
+            _appliedOutput = sequence;
+            WakeUnsafe();
+        }
+    }
+
+    /// <summary>The terminal's output pump failed: output can no longer reach the model.</summary>
+    internal void OutputPumpFailed(string message)
+    {
+        lock (_sync)
+        {
+            _outputFailure ??= message;
             WakeUnsafe();
         }
     }
@@ -198,20 +287,38 @@ internal sealed class InputMilestoneTracker
     }
 
     // Must hold _sync. Returns the final status when the milestone is decided, else null.
-    private WaitStatus? Evaluate(DiagnosticMilestone milestone, long inputId)
+    private WaitStatus? Evaluate(DiagnosticMilestone milestone, long inputId, PublishedFrame? coveringFrame = null)
     {
+        // A frame covering a pending input is the one recorded at its publication; for an input
+        // already covered when the wait starts, the latest frame (progress beyond the request).
+        var frame = coveringFrame ?? (_latestFrame is { } latest && latest.ProcessedInput >= inputId ? latest : null);
         switch (milestone)
         {
             case DiagnosticMilestone.InputAccepted:
                 return WaitStatus.Met;
             case DiagnosticMilestone.InputProcessed:
-                if (_processed >= inputId)
+                if (_processed >= inputId || _recent[inputId % RetainedRecords] is { ProcessedBy: not null } record && record.Id == inputId)
                     return WaitStatus.Met;
                 break;
-            default:
-                return WaitStatus.Unavailable("milestone-not-supported",
-                    $"Milestone {DiagnosticContractNames.Of(milestone)} is not supported by this target.");
+            case DiagnosticMilestone.FramePublished when frame is not null:
+                return frame.ProjectionFailed
+                    ? WaitStatus.Failed("application-frame-projection-failed", $"Projecting application frame {frame.FrameId}, the first to cover input {inputId}, failed.")
+                    : WaitStatus.MetAt(frame);
+            case DiagnosticMilestone.ModelApplied when frame is not null:
+                if (frame.ProjectionFailed)
+                    return WaitStatus.Failed("application-frame-projection-failed", $"Projecting application frame {frame.FrameId}, the first to cover input {inputId}, failed.");
+                if (frame.OutputMark is not { } mark)
+                    return WaitStatus.Unavailable("model-application-unobservable",
+                        "This application's output reaches the model through a flow relay that re-segments it, so frame output cannot be linked to model application.") with { Frame = frame };
+                if (_appliedOutput >= mark)
+                    return WaitStatus.MetAt(frame);
+                if (_outputFailure is { } failure)
+                    return WaitStatus.Failed("output-pump-failed", $"The terminal output pump failed: {failure}") with { Frame = frame };
+                break;
         }
+
+        if (_recent[inputId % RetainedRecords] is { Lost: { } lostBy } lost && lost.Id == inputId)
+            return WaitStatus.Failed("application-stopped", $"Application instance {lostBy} stopped before processing input {inputId}.");
 
         if (_stoppedApplication is { } stopped)
             return WaitStatus.Failed("application-stopped",
@@ -224,7 +331,7 @@ internal sealed class InputMilestoneTracker
     {
         foreach (var waiter in _waiters.ToArray())
         {
-            if (Evaluate(waiter.Milestone, waiter.InputId) is { } status)
+            if (Evaluate(waiter.Milestone, waiter.InputId, waiter.CoveringFrame) is { } status)
                 Complete(waiter, status);
         }
     }
@@ -241,16 +348,44 @@ internal sealed class InputMilestoneTracker
 
         public DateTimeOffset AcceptedAt { get; } = acceptedAt;
 
+        public string Kind { get; init; } = "other";
+
+        public string Source { get; init; } = "native";
+
+        // Retained in memory (bounded ring) so a later raw-input capture can report it; never
+        // serialized without that authorization.
+        public string? Payload { get; init; }
+
         public string? ProcessedBy { get; set; }
 
         public DateTimeOffset? ProcessedAt { get; set; }
+
+        public bool Forwarded { get; set; }
+
+        public string? Lost { get; set; }
     }
+
+    internal sealed record PublishedFrame(string ApplicationInstanceId, long FrameId, long ProcessedInput, bool WroteOutput,
+        bool ProjectionFailed, long? OutputMark);
+
+    private static (string Kind, string? Payload) Describe(Hex1bEvent evt) => evt switch
+    {
+        Hex1bKeyEvent key => (key.Text is { Length: > 0 } && key.Modifiers == Hex1bModifiers.None ? "text" : "key",
+            $"{key.Key}{(key.Modifiers == Hex1bModifiers.None ? "" : "+" + key.Modifiers)}{(key.Text is { Length: > 0 } t ? $" \"{t}\"" : "")}"),
+        // Paste content streams to the application after acceptance; only the kind is known here.
+        Hex1bPasteEvent => ("paste", null),
+        Hex1bMouseEvent mouse => ("mouse", $"{mouse.Button} {mouse.Action} at {mouse.X},{mouse.Y}"),
+        Hex1bResizeEvent resize => ("resize", $"{resize.Width}x{resize.Height}"),
+        _ => ("other", null),
+    };
 
     private sealed class Waiter(DiagnosticMilestone milestone, long inputId)
     {
         public DiagnosticMilestone Milestone { get; } = milestone;
 
         public long InputId { get; } = inputId;
+
+        public PublishedFrame? CoveringFrame { get; set; }
 
         public TaskCompletionSource<WaitStatus> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
@@ -283,6 +418,11 @@ internal sealed class InputMilestoneTracker
     internal sealed record WaitStatus(DiagnosticOutcome? Outcome, string? Code, string? Message)
     {
         public static readonly WaitStatus Met = new(null, null, null);
+
+        /// <summary>The first frame covering the input, for frame and model milestones.</summary>
+        public PublishedFrame? Frame { get; init; }
+
+        public static WaitStatus MetAt(PublishedFrame frame) => Met with { Frame = frame };
 
         public bool IsMet => Outcome is null;
 

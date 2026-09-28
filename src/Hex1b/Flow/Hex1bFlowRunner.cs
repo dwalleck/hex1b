@@ -19,6 +19,9 @@ internal sealed class Hex1bFlowRunner
     private readonly Hex1bFlowOptions _options;
     private readonly IHex1bAppTerminalWorkloadAdapter _parentAdapter;
 
+    // The session's input milestone tracker, created by the terminal once it exists.
+    private Diagnostics.InputMilestoneTracker? MilestoneTracker => (_parentAdapter as Hex1bAppWorkloadAdapter)?.InputMilestones;
+
     /// <summary>
     /// Current cursor row in the terminal buffer (0-based, relative to terminal top).
     /// Tracks where the next yield widget or step should be rendered. After a
@@ -1024,6 +1027,10 @@ internal sealed class Hex1bFlowRunner
     /// </summary>
     public async Task RunAsync(CancellationToken ct)
     {
+        // Steps read the terminal's input one after another: input queued between steps waits for
+        // the next one instead of failing when a step stops.
+        if (MilestoneTracker is { } milestones)
+            milestones.HostsFlow = true;
         _cancellationToken = ct;
 
         // Query the current cursor position using the host terminal's
@@ -1817,7 +1824,7 @@ internal sealed class Hex1bFlowRunner
                 {
                     diagnosticHost = parentWorkloadAdapter;
                     if (parentWorkloadAdapter.DiagnosticTimingEnabled)
-                        app.EnableFramePublication();
+                        app.EnableFramePublication(parentWorkloadAdapter.InputMilestones);
                     previousFrameSource = parentWorkloadAdapter.ApplicationFrameSource;
                     parentWorkloadAdapter.ApplicationFrameSource = app;
                 }
@@ -2610,8 +2617,10 @@ internal sealed class Hex1bFlowRunner
                         {
                             // Let the runner handle repositioning before forwarding
                             onResize(resize.Width, resize.Height);
+                            MilestoneTracker?.Processed(evt, "flow-runner", advancesWatermark: false);
                             continue; // ResizeAsync already called in onResize
                         }
+                        MilestoneTracker?.Forwarded(evt);
                         await stepAdapter.WriteInputEventAsync(evt, ct);
                     }
                 }

@@ -20,6 +20,13 @@ public sealed record DiagnosticApplicationFrame
     [JsonPropertyName("frameId")]
     public long FrameId { get; init; }
 
+    /// <summary>
+    /// The highest input id the application had processed when this pass was published; absent
+    /// when the session does not track input. A frame covers exactly the inputs up to this id.
+    /// </summary>
+    [JsonPropertyName("processedInput")]
+    public long? ProcessedInput { get; init; }
+
     /// <summary>Frame width in columns.</summary>
     [JsonPropertyName("columns")]
     public int Columns { get; init; }
