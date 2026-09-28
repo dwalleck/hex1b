@@ -186,7 +186,10 @@ public sealed class SelectionPanelNode : Hex1bNode
 
             // Render directly — DO NOT go through tempContext.RenderChild,
             // which would re-allocate a Child.Bounds-sized surface and
-            // defeat the point of this whole refactor.
+            // defeat the point of this whole refactor. Diagnostics still
+            // record the clip the child is drawn through this pass.
+            if (surfaceCtx.RecordsCompositeClips)
+                Child.DiagCompositeClip = LayoutProviderHelper.GetEffectiveClipRect(tempContext.CurrentLayoutProvider);
             Child.Render(tempContext);
 
             ApplyCursorOverlayToViewport(tempSurface, visibleTerm);

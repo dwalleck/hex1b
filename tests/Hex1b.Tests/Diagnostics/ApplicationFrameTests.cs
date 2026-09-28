@@ -265,6 +265,29 @@ public class ApplicationFrameTests
         y < 0 || y >= screen.Length ? "" : screen[y].PadRight(x + width).Substring(x, width);
 
     [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Clipping_SelectionPanelMovedInCopyModeMatchesTheRenderedScreen(bool caching)
+    {
+        var moved = false;
+        await using var harness = await AppHarness.StartAsync(ctx => new VStackWidget(
+        [
+            new TextBlockWidget("TOPLINE").FixedHeight(moved ? 3 : 1),
+            ctx.SelectionPanel(new VStackWidget([new TextBlockWidget("MHEAD"), .. Lines("MOV", 3)])).FixedHeight(4),
+            new TextBlockWidget("TAILLINE"),
+        ]), columns: 30, rows: 12, configure: options => options.EnableRenderCaching = caching);
+
+        await harness.NextPassAsync(() => FindNode<SelectionPanelNode>(harness.App.RootNode)!.EnterCopyMode());
+        await harness.NextPassAsync(() => moved = true);
+        await harness.WaitForQuietAsync();
+
+        var texts = AssertFrameMatchesScreen(harness, caching);
+
+        Assert.AreEqual(DiagnosticClipState.Visible, texts.Single(n => n.Text == "MOV02").ClipState,
+            "fixture: the moved copy-mode panel draws its last row");
+    }
+
+    [TestMethod]
     public void Clipping_NodesWithoutARecordFallBackToTheirAncestorsClipRects()
     {
         // Never rendered, so no node carries a composite clip.
