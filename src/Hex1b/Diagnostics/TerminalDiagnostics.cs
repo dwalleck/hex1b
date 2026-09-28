@@ -44,8 +44,21 @@ public sealed class TerminalDiagnostics
     private const string AnsiRenditionLimitation =
         "ANSI content represents colors and bold, dim, italic, underline, blink, hidden, strikethrough, and overline; reverse video is rendered by swapping colors, and underline color and style variants are not represented.";
 
-    private const string AppFrameNotPublished =
-        "Application frames are not yet published with identities through the diagnostics contract.";
+    /// <summary>Name of the application-frame operation.</summary>
+    public const string ApplicationFrameOperation = "application-frame";
+
+    private const string ModelCaptureIsNotAFrame =
+        "A terminal-model capture is not an application frame; the application-frame operation returns frames, acquired separately.";
+    private const string FramePublicationDisabled =
+        "The application does not publish frames; frame publication requires diagnostics to be enabled (WithDiagnostics).";
+    private const string FrameIsNotAModelObservation =
+        "An application frame is not a terminal-model observation; correlate it with model captures by identities and acquisition intervals.";
+    private const string LatestFrameLimitation =
+        "The latest frame published by the application loop at the end of a completed pass; an idle application returns an older frame, so compare its projection time with the capture time.";
+    private const string FrameLayerLimitation =
+        "Application-frame evidence only: it describes the application's own layout, focus and editors, is not atomic with terminal-model captures, and says nothing about native presentation.";
+    private const string ApplicationTextLimitation =
+        "Rendered application text can contain secrets; editor text is withheld unless editor-text is authorized.";
     private const string NoApplicationLayer =
         "The workload is not a Hex1b application, so there are no application frames.";
     private const string NativeDeliveryUnavailable =
@@ -57,6 +70,9 @@ public sealed class TerminalDiagnostics
         [ContentMaySecretsLimitation, ImmediateLimitation, CoherenceScopeLimitation, ModelOnlyLimitation, GraphicsLimitation, ConcealedLimitation, ObservationalLimitation];
 
     private static readonly IReadOnlyList<string> AnsiCaptureLimitations = [.. CaptureLimitations, AnsiRenditionLimitation];
+
+    private static readonly IReadOnlyList<string> FrameLimitations =
+        [LatestFrameLimitation, FrameLayerLimitation, ApplicationTextLimitation, ObservationalLimitation];
 
     private static readonly string Hex1bVersion = ReadInformationalVersion(typeof(Hex1bTerminal).Assembly)
         ?? typeof(Hex1bTerminal).Assembly.GetName().Version?.ToString() ?? "unknown";
@@ -186,6 +202,87 @@ public sealed class TerminalDiagnostics
     }
 
     /// <summary>
+    /// Returns the latest application frame published by the target's Hex1b application loop.
+    /// Never waits for, requests, or forces a frame. Target and request problems are reported
+    /// through <see cref="DiagnosticApplicationFrameResult.Outcome"/>.
+    /// </summary>
+    /// <param name="request">Authorizations for the capture.</param>
+    public DiagnosticApplicationFrameResult CaptureApplicationFrame(DiagnosticApplicationFrameRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var authorizations = request.Authorizations ?? [];
+        foreach (var authorization in authorizations)
+        {
+            if (!Enum.IsDefined(authorization))
+                return FrameProblem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", $"Unsupported authorization '{authorization}'.");
+        }
+
+        if (_terminal.IsDisposed)
+            return FrameProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
+        if (FrameSource is not { } source)
+            return FrameProblem(DiagnosticOutcome.Unavailable, "no-application-layer", NoApplicationLayer);
+        if (!source.FramePublicationEnabled)
+            return FrameProblem(DiagnosticOutcome.Unavailable, "application-frame-publication-disabled", FramePublicationDisabled);
+        if (source.LatestFrame is not { } published)
+            return FrameProblem(DiagnosticOutcome.Unavailable, "no-application-frame-yet",
+                "The application has not completed a render pass since frame publication started.");
+        if (published.Frame is not { } frame)
+            return FrameProblem(DiagnosticOutcome.Failed, "application-frame-projection-failed",
+                $"Projecting application frame {published.FrameId} failed: {published.Failure}");
+
+        var unavailable = new List<DiagnosticUnavailableField>
+        {
+            new() { Field = "identity.modelSequence", Reason = FrameIsNotAModelObservation },
+        };
+        if (frame.Root is null)
+            unavailable.Add(new DiagnosticUnavailableField { Field = "frame.root", Reason = "The application had no nodes in this frame." });
+
+        var identity = DescribeIdentity(DiagnosticLayer.ApplicationFrame, modelSequence: null, published.FrameId,
+            _terminal.PresentationAdapter is Reflow.ITerminalReflowProvider { ReflowEnabled: true },
+            new DiagnosticAcquisition
+            {
+                ClockDomain = "process-monotonic",
+                Frequency = Stopwatch.Frequency,
+                StartTimestamp = published.ProjectionStartTimestamp,
+                EndTimestamp = published.ProjectionEndTimestamp,
+                WallClockStart = published.ProjectionStart,
+                WallClockEnd = published.ProjectionEnd,
+            }, unavailable);
+
+        return new DiagnosticApplicationFrameResult
+        {
+            Outcome = DiagnosticOutcome.Captured,
+            Frame = frame,
+            Identity = identity,
+            ContentCoverage =
+            [
+                new DiagnosticContentCoverage { Content = DiagnosticContentClass.ApplicationText, State = DiagnosticCoverageState.Included },
+                new DiagnosticContentCoverage
+                {
+                    Content = DiagnosticContentClass.EditorText,
+                    State = DiagnosticCoverageState.Excluded,
+                    Reason = "Requires editor-text authorization.",
+                },
+            ],
+            UnavailableFields = unavailable,
+            Limitations = FrameLimitations,
+        };
+    }
+
+    /// <summary>
+    /// Creates an application-frame result for an operation that produced no frame.
+    /// </summary>
+    internal static DiagnosticApplicationFrameResult FrameProblem(DiagnosticOutcome outcome, string code, string message) => new()
+    {
+        Outcome = outcome,
+        Problem = new DiagnosticProblem { Code = code, Message = message },
+        UnavailableFields = [new DiagnosticUnavailableField { Field = "identity", Reason = "No frame was returned." }],
+    };
+
+    private IApplicationFrameSource? FrameSource =>
+        _terminal.Workload is Hex1bAppWorkloadAdapter { ApplicationFrameSource: { } source } ? source : null;
+
+    /// <summary>
     /// Describes the operations and evidence layers this target supports.
     /// </summary>
     public DiagnosticCapabilities GetCapabilities() => _terminal.IsDisposed
@@ -205,6 +302,14 @@ public sealed class TerminalDiagnostics
                 Authorizations = [DiagnosticAuthorization.NonScreenMetadata],
                 Limitations = AnsiCaptureLimitations,
             },
+            new DiagnosticOperationCapability
+            {
+                Operation = ApplicationFrameOperation,
+                Layer = DiagnosticLayer.ApplicationFrame,
+                Timing = ["latest-published"],
+                Authorizations = [DiagnosticAuthorization.EditorText],
+                Limitations = FrameLimitations,
+            },
         ],
         Layers =
         [
@@ -212,7 +317,9 @@ public sealed class TerminalDiagnostics
             new DiagnosticLayerCapability
             {
                 Layer = DiagnosticLayer.ApplicationFrame,
-                Reason = _terminal.Workload is Hex1bAppWorkloadAdapter ? AppFrameNotPublished : NoApplicationLayer,
+                Available = FrameSource is { FramePublicationEnabled: true },
+                Reason = FrameSource is null ? NoApplicationLayer
+                    : FrameSource.FramePublicationEnabled ? null : FramePublicationDisabled,
             },
             new DiagnosticLayerCapability { Layer = DiagnosticLayer.NativeDelivery, Reason = NativeDeliveryUnavailable },
             new DiagnosticLayerCapability { Layer = DiagnosticLayer.NativePresentation, Reason = NativePresentationUnavailable },
@@ -369,6 +476,18 @@ public sealed class TerminalDiagnostics
     private DiagnosticObservationIdentity DescribeIdentity(
         Hex1bTerminalSnapshotState state, DiagnosticAcquisition acquisition, List<DiagnosticUnavailableField> unavailable)
     {
+        unavailable.Add(new DiagnosticUnavailableField
+        {
+            Field = "identity.applicationFrame",
+            Reason = _terminal.Workload is Hex1bAppWorkloadAdapter ? ModelCaptureIsNotAFrame : NoApplicationLayer,
+        });
+        return DescribeIdentity(DiagnosticLayer.TerminalModel, state.ModelSequence, applicationFrame: null,
+            state.ReflowEnabled, acquisition, unavailable);
+    }
+
+    private DiagnosticObservationIdentity DescribeIdentity(DiagnosticLayer layer, long? modelSequence, long? applicationFrame,
+        bool reflowEnabled, DiagnosticAcquisition acquisition, List<DiagnosticUnavailableField> unavailable)
+    {
         var (startedAt, startReason) = ProcessStart.Value;
         if (startedAt is null)
             unavailable.Add(new DiagnosticUnavailableField { Field = "identity.processStartedAt", Reason = startReason! });
@@ -394,19 +513,14 @@ public sealed class TerminalDiagnostics
             });
         }
 
-        unavailable.Add(new DiagnosticUnavailableField
-        {
-            Field = "identity.applicationFrame",
-            Reason = workload is Hex1bAppWorkloadAdapter ? AppFrameNotPublished : NoApplicationLayer,
-        });
-
         return new DiagnosticObservationIdentity
         {
             ProcessId = Environment.ProcessId,
             ProcessStartedAt = startedAt,
-            ModelSequence = state.ModelSequence,
+            ModelSequence = modelSequence,
+            ApplicationFrame = applicationFrame,
             SessionId = _terminal.DiagnosticSessionId.ToString("N"),
-            SourceLayer = DiagnosticLayer.TerminalModel,
+            SourceLayer = layer,
             ApplicationName = _applicationName,
             ApplicationVersion = applicationVersion,
             Hex1bVersion = Hex1bVersion,
@@ -422,7 +536,7 @@ public sealed class TerminalDiagnostics
                 Presentation = _terminal.PresentationAdapter is HeadlessPresentationAdapter
                     ? "headless"
                     : _terminal.PresentationAdapter.GetType().Name,
-                ReflowEnabled = state.ReflowEnabled,
+                ReflowEnabled = reflowEnabled,
                 HistoryRetentionCapacity = _terminal.HistoryRetentionCapacity,
             },
             Acquisition = acquisition,

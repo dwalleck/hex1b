@@ -7,23 +7,27 @@ using Hex1b.Nodes;
 namespace Hex1b.Diagnostics;
 
 /// <summary>
-/// A diagnostic representation of a rectangle.
+/// A rectangle in terminal cells: columns from the left, rows from the top.
 /// </summary>
-internal sealed class DiagnosticRect
+public sealed class DiagnosticRect
 {
+    /// <summary>Left column.</summary>
     [JsonPropertyName("x")]
     public int X { get; set; }
     
+    /// <summary>Top row.</summary>
     [JsonPropertyName("y")]
     public int Y { get; set; }
     
+    /// <summary>Width in columns.</summary>
     [JsonPropertyName("width")]
     public int Width { get; set; }
     
+    /// <summary>Height in rows.</summary>
     [JsonPropertyName("height")]
     public int Height { get; set; }
     
-    public static DiagnosticRect FromRect(Rect rect) => new()
+    internal static DiagnosticRect FromRect(Rect rect) => new()
     {
         X = rect.X,
         Y = rect.Y,
@@ -31,5 +35,6 @@ internal sealed class DiagnosticRect
         Height = rect.Height
     };
     
+    /// <inheritdoc />
     public override string ToString() => $"x={X} y={Y} w={Width} h={Height} ({X},{Y} → {X + Width},{Y + Height})";
 }

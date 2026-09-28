@@ -39,7 +39,7 @@ namespace Hex1b;
 /// State management is handled via closures - simply capture your state variables
 /// in the widget builder callback.
 /// </remarks>
-public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
+public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, IApplicationFrameSource
 {
     // Not readonly: a live inline step can replace its root layout without
     // stopping the app (see SwapRootComponent). Read once per frame; the
@@ -132,6 +132,8 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
     // Completed frame count, polled by flow commitment to coordinate with the
     // render loop (see FrameCount). Written only on the render loop thread.
     private long _frameCount;
+    private bool _framePublicationEnabled;
+    private PublishedApplicationFrame? _latestFrame;
     
     // Channel for signaling that a re-render is needed (from Invalidate() calls)
     private readonly Channel<bool> _invalidateChannel = Channel.CreateBounded<bool>(
@@ -586,7 +588,9 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
         if (_adapter is Hex1bAppWorkloadAdapter workloadAdapter)
         {
             workloadAdapter.DiagnosticTreeProvider = this;
+            workloadAdapter.ApplicationFrameSource = this;
             _diagnosticTimingEnabled = workloadAdapter.DiagnosticTimingEnabled;
+            _framePublicationEnabled = workloadAdapter.DiagnosticTimingEnabled;
             // Wire IRepaintableWorkloadAdapter: when an outer multiplexer
             // (e.g. PlaceholderWorkloadAdapter) tells us the surrounding
             // terminal state was reset out from under us, flip _isFirstFrame
@@ -1230,8 +1234,35 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider
 
         // Frame completed on the render loop thread: publish the count and
         // notify waiters (flow commitment coordinates with the loop here).
+        // Publish before advancing the count, so a completed count always has its frame published.
+        if (_framePublicationEnabled)
+            PublishApplicationFrame(_frameCount + 1, needsRender, frameWidth, frameHeight);
         Volatile.Write(ref _frameCount, _frameCount + 1);
         FrameRendered?.Invoke();
+    }
+
+    bool IApplicationFrameSource.FramePublicationEnabled => _framePublicationEnabled;
+
+    PublishedApplicationFrame? IApplicationFrameSource.LatestFrame => Volatile.Read(ref _latestFrame);
+
+    // Runs on the app loop at the end of a pass; a projection failure never affects rendering.
+    private void PublishApplicationFrame(long frameId, bool wroteOutput, int width, int height)
+    {
+        var start = Stopwatch.GetTimestamp();
+        var wallStart = DateTimeOffset.UtcNow;
+        DiagnosticApplicationFrame? frame = null;
+        string? failure = null;
+        try
+        {
+            frame = ApplicationFrameProjector.Project(_rootNode, frameId, width, height, wroteOutput);
+        }
+        catch (Exception error)
+        {
+            failure = $"{error.GetType().FullName}: {error.Message}";
+        }
+
+        Volatile.Write(ref _latestFrame, new PublishedApplicationFrame(
+            frameId, frame, failure, start, Stopwatch.GetTimestamp(), wallStart, DateTimeOffset.UtcNow));
     }
     
     /// <summary>

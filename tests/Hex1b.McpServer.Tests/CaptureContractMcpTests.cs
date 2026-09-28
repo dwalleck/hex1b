@@ -117,7 +117,7 @@ public class CaptureContractMcpTests : McpServerTestBase
         Assert.AreEqual("hex1b-application", identity.GetProperty("configuration").GetProperty("workload").GetString());
         Assert.AreEqual(3, capture.GetProperty("history").GetProperty("requestedRows").GetInt32());
         Assert.AreEqual(50, capture.GetProperty("history").GetProperty("retentionCapacity").GetInt32());
-        AssertUnavailable(capture, "identity.applicationFrame", "not yet published");
+        AssertUnavailable(capture, "identity.applicationFrame", "is not an application frame");
         Assert.AreEqual(direct.Identity!.ModelSequence, identity.GetProperty("modelSequence").GetInt64(),
             "MCP and the in-process engine disagree on the model state of a static terminal");
         CollectionAssert.AreEqual(
@@ -304,7 +304,9 @@ public class CaptureContractMcpTests : McpServerTestBase
                 .GetProperty("capabilities");
 
             Assert.AreEqual("captured", attachedCaps.GetProperty("outcome").GetString());
-            StringAssert.Contains(FrameLayerReason(attachedCaps), "not yet published");
+            Assert.IsTrue(attachedCaps.GetProperty("layers").EnumerateArray()
+                .Single(l => l.GetProperty("layer").GetString() == "application-frame").GetProperty("available").GetBoolean(),
+                "a diagnostics-enabled app publishes application frames");
             StringAssert.Contains(FrameLayerReason(localCaps), "not a Hex1b application");
             Assert.AreEqual(
                 attachedCaps.GetProperty("operations").ToString(),

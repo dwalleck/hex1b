@@ -14,6 +14,9 @@ public enum DiagnosticContentClass
     /// <summary>Rendered rows retained in the terminal model's history (not native scrollback).</summary>
     RenderedHistory,
 
+    /// <summary>Text that application nodes render (labels, text blocks, selected items).</summary>
+    ApplicationText,
+
     /// <summary>Text written with the concealed attribute (SGR 8); stored in cells but not rendered.</summary>
     ConcealedText,
 

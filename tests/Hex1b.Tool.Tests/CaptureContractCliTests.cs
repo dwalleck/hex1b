@@ -52,7 +52,7 @@ public class CaptureContractCliTests
         Assert.AreEqual(4, history.GetProperty("requestedRows").GetInt32());
         Assert.AreEqual(50, history.GetProperty("retentionCapacity").GetInt32());
 
-        AssertUnavailable(root, "identity.applicationFrame", "not yet published");
+        AssertUnavailable(root, "identity.applicationFrame", "is not an application frame");
         Assert.IsTrue(identity.GetProperty("modelSequence").GetInt64() > 0, "modelSequence missing from the CLI result");
         AssertCoverage(root, "hyperlink-targets", "excluded");
         AssertCoverage(root, "window-title", "excluded");
@@ -275,7 +275,7 @@ public class CaptureContractCliTests
             capture.GetProperty("timing").EnumerateArray().Select(f => f.GetString()).ToArray());
         var frame = json.RootElement.GetProperty("layers").EnumerateArray()
             .Single(l => l.GetProperty("layer").GetString() == "application-frame");
-        Assert.IsFalse(frame.GetProperty("available").GetBoolean());
+        Assert.IsTrue(frame.GetProperty("available").GetBoolean(), "a diagnostics-enabled app publishes application frames");
     }
 
     [TestMethod]

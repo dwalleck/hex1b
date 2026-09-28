@@ -80,6 +80,8 @@ public sealed class Hex1bAppWorkloadAdapter :
     /// </summary>
     internal Diagnostics.IDiagnosticTreeProvider? DiagnosticTreeProvider { get; set; }
 
+    internal Diagnostics.IApplicationFrameSource? ApplicationFrameSource { get; set; }
+
     /// <summary>
     /// The terminal's own applied cursor model, attached by <see cref="Hex1bTerminal"/>
     /// during construction when this adapter is the terminal's workload.

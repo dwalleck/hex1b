@@ -20,6 +20,8 @@ namespace Hex1b.Diagnostics;
 [JsonSerializable(typeof(DiagnosticCaptureRequest))]
 [JsonSerializable(typeof(DiagnosticCaptureResult))]
 [JsonSerializable(typeof(DiagnosticCapabilities))]
+[JsonSerializable(typeof(DiagnosticApplicationFrameRequest))]
+[JsonSerializable(typeof(DiagnosticApplicationFrameResult))]
 [JsonSerializable(typeof(string))]
 [JsonSerializable(typeof(int))]
 [JsonSerializable(typeof(bool))]
