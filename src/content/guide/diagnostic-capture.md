@@ -34,12 +34,12 @@ rendition. The CLI's `png` format is rasterized on the client from an `svg` capt
 | `problem` | `{ code, message }` when the outcome is not `captured`. |
 | `format`, `content` | Rendered content. When a client saves the content to a file (MCP `savePath`, CLI `--output`), `content` is omitted and the path is reported separately. |
 | `geometry` | Model columns/rows, alternate-screen state, and cursor position. |
-| `synchronizedUpdate` | `active` when a synchronized update (DEC mode 2026) had begun and not ended at the model read, with `startedAtSequence` naming the batch that began it. |
+| `synchronizedUpdate` | `active` when a synchronized update (DEC mode 2026) had begun and not ended at the model read. `startedAtSequence` names the batch that began it and is present exactly while `active` is true — a conditional field, not an unavailable one. Clients also print a partial-content warning (MCP message, CLI stderr) while it is active. |
 | `history` | `requestedRows`, `availableRows`, `returnedRows`, `croppedRows`, `truncated`, `retentionCapacity`, and `reason`. |
 | `identity` | Process ID and start time, terminal-model `sessionId`, `modelSequence`, `sourceLayer` (`terminal-model`), application name/version, loaded `hex1bVersion`, `configuration` (workload, presentation, reflow, history retention), and `acquisition` (clock domain, monotonic start/end timestamps and frequency, wall-clock start/end). |
 | `contentCoverage` | For each content class, whether it is `included`, `excluded`, or `unavailable`, and why. |
 | `nonScreenMetadata` | Window title and icon name, only with `non-screen-metadata` authorization. |
-| `unavailableFields` | Each absent field and the reason. Absent values are never reported as zero or empty. |
+| `unavailableFields` | Each field absent because it could not be observed, and the reason. Absent values are never reported as zero or empty. Conditional fields (such as `synchronizedUpdate.startedAtSequence`) are absent when they do not apply and are documented here instead. |
 | `limitations` | What this observation cannot support. |
 
 ### Problem codes
@@ -81,8 +81,9 @@ observations — correlate those through their identities and acquisition interv
 
 ## Model sequence
 
-`identity.modelSequence` counts the model-input events — output application batches and
-geometry changes — that the terminal model has applied in this session. It is read in the same
+`identity.modelSequence` counts the model events — output application batches, geometry
+changes, and the release of a synchronized update by its timeout — that the terminal model has
+applied in this session. It is read in the same
 critical section as the captured cells, so two captures reporting the same value observed the
 same model state, and a larger value means later events were applied. An event can leave the
 visible state unchanged. Values are comparable only within one `sessionId`.
@@ -117,8 +118,9 @@ model-history support, and authorizations. They also report each evidence layer:
 - Only immediate capture is supported; waiting for named processing milestones is not. A capture
   taken during a synchronized update returns the partially applied content, reports it in
   `synchronizedUpdate`, and is not a completed application frame.
-- Graphics (KGP and Sixel placements and animation) are rendered as observed but are not part of
-  the model sequence; KGP animation can change a rendering without a model-input event.
+- KGP animation playback advances on a timer without a model event, so SVG and HTML renderings of
+  animated KGP images can differ at the same `modelSequence`. Graphics placements change only
+  through output batches and are covered by the sequence.
 - `identity.applicationFrame` is absent: frames are not yet published with identities.
 - `identity.applicationVersion` is reported only for in-process Hex1b applications.
 - Independently acquired observations (for example a capture and a widget tree) are correlated by

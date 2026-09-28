@@ -470,6 +470,11 @@ public class TerminalDiagnosticsCaptureTests
             }
         }
 
+        // startedAtSequence is conditional, not unavailable: present exactly while an update is pending.
+        var sync = json.GetProperty("synchronizedUpdate");
+        Assert.AreEqual(sync.GetProperty("active").GetBoolean(), sync.TryGetProperty("startedAtSequence", out _),
+            "startedAtSequence must be present exactly when a synchronized update is active");
+
         // Fields omitted entirely by the serializer must also be accounted for.
         var identityNames = typeof(DiagnosticObservationIdentity).GetProperties()
             .Select(p => p.GetCustomAttribute<System.Text.Json.Serialization.JsonPropertyNameAttribute>()!.Name);

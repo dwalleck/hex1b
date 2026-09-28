@@ -4,7 +4,9 @@ namespace Hex1b.Tests.Diagnostics;
 
 /// <summary>
 /// Advancing the model sequence must not add work that allocates on the unarmed output path.
-/// The limits are the per-batch allocations measured at 2728298d, before the sequence existed.
+/// The limits are the per-batch allocations measured at 2728298d, before the sequence existed,
+/// so any change that adds allocation to unarmed output application fails here, not only the
+/// sequence. Investigate the added allocation before raising a limit.
 /// </summary>
 [TestClass]
 public class ModelSequenceAllocationTests
@@ -29,9 +31,9 @@ public class ModelSequenceAllocationTests
         var textBytes = Measure(() => terminal.ApplyTokens(text));
 
         Assert.IsTrue(emptyBytes <= EmptyBatchBaselineBytes,
-            $"empty-batch allocation {emptyBytes} > {EmptyBatchBaselineBytes} baseline per 1000 batches");
+            $"empty-batch allocation {emptyBytes} > {EmptyBatchBaselineBytes} per 1000 batches (2728298d baseline); something now allocates on unarmed output application");
         Assert.IsTrue(textBytes <= OneCharacterBatchBaselineBytes,
-            $"one-character-batch allocation {textBytes} > {OneCharacterBatchBaselineBytes} baseline per 1000 batches");
+            $"one-character-batch allocation {textBytes} > {OneCharacterBatchBaselineBytes} per 1000 batches (2728298d baseline); something now allocates on unarmed output application");
     }
 
     private static long Measure(Action apply)

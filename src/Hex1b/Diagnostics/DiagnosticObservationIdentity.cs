@@ -46,8 +46,8 @@ public sealed class DiagnosticObservationIdentity
     public DiagnosticAcquisition Acquisition { get; init; } = new();
 
     /// <summary>
-    /// Count of model-input events (output application batches and geometry changes) applied in
-    /// this terminal session at the observation. Observations with equal values read the same
+    /// Count of model events (output application batches, geometry changes, and synchronized-update
+    /// timeout releases) applied in this terminal session at the observation. Observations with equal values read the same
     /// model state; values are comparable only within one <see cref="SessionId"/>. An event can
     /// leave the visible state unchanged. Absent only from targets that do not assign one, in
     /// which case <see cref="DiagnosticCaptureResult.UnavailableFields"/> explains it.

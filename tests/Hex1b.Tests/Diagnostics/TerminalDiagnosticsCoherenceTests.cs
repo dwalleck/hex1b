@@ -239,8 +239,10 @@ public class TerminalDiagnosticsCoherenceTests
                 "cross-layer atomicity is not disclaimed");
             Assert.IsTrue(limitations.Any(l => l.Contains("native host", StringComparison.Ordinal)),
                 "the model-only layer is not stated");
-            Assert.IsTrue(limitations.Any(l => l.Contains("Graphics", StringComparison.Ordinal)),
-                "graphics exclusion from the sequence is not stated");
+            Assert.IsTrue(limitations.Any(l => l.Contains("KGP animation", StringComparison.Ordinal)),
+                "the KGP animation gap in the sequence is not stated");
+            Assert.IsFalse(limitations.Any(l => l.Contains("placements and animation) are rendered as observed but are not part", StringComparison.Ordinal)),
+                "graphics placements are claimed to be outside the sequence although output batches advance it");
         }
     }
 

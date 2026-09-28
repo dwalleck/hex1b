@@ -36,7 +36,7 @@ public sealed class TerminalDiagnostics
     private const string ModelOnlyLimitation =
         "Terminal-model evidence only: it describes neither the native host's scrollback nor what a native host displayed, and it is not atomic with application, native delivery or host observations; correlate those by identity and acquisition interval.";
     private const string GraphicsLimitation =
-        "Graphics (KGP and Sixel placements and animation) are rendered as observed but are not part of the model sequence identity; KGP animation can change a rendering without a model-input event.";
+        "KGP animation playback advances on a timer without a model event, so SVG and HTML renderings of animated KGP images can differ at the same model sequence; graphics placements change only through output batches and are covered by it.";
     private const string ConcealedLimitation =
         "Concealed (SGR 8) text is withheld from every format; its cells are returned blank.";
     private const string ObservationalLimitation =
