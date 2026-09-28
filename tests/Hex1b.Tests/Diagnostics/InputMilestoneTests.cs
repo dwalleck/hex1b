@@ -1171,6 +1171,8 @@ public class InputMilestoneTests
         var tracker = new InputMilestoneTracker();
         var evt = Key();
 
+        // The same event is still pending from an earlier accept: only the failed occurrence goes.
+        Assert.IsTrue(tracker.Accept(evt, _ => true));
         await tracker.WaitForSendTurnAsync(ct);
         using (tracker.BeginSend())
             Assert.ThrowsExactly<InvalidOperationException>(() => tracker.Accept(evt, _ => throw new InvalidOperationException("write failed")));
@@ -1179,7 +1181,9 @@ public class InputMilestoneTests
         await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => native.WaitAsync(TimeSpan.FromSeconds(2), ct),
             "a failed write in a send kept the send turn");
 
-        Assert.AreEqual(0, tracker.AcceptedInput, "a failed write consumed an id");
+        Assert.AreEqual(1, tracker.AcceptedInput, "a failed write consumed an id");
+        Assert.AreEqual(1L, tracker.IdOf(evt), "a failed write removed another occurrence's registration, or kept its own");
+        tracker.Processed(evt, "app");
         Assert.IsNull(tracker.IdOf(evt), "a failed write stayed registered");
         // The send's hold and the native turn were both given back.
         Assert.IsTrue(tracker.WaitForSendTurnAsync(ct).Wait(TimeSpan.FromSeconds(2), ct), "a failed write kept the send turn");

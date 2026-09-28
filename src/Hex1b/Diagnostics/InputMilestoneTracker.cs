@@ -185,13 +185,13 @@ internal sealed class InputMilestoneTracker
                 }
                 catch
                 {
-                    RemoveLast(occurrences);
+                    Unregister(occurrences, tracked);
                     throw;
                 }
 
                 if (!written)
                 {
-                    RemoveLast(occurrences);
+                    Unregister(occurrences, tracked);
                     return false;
                 }
 
@@ -511,12 +511,14 @@ internal sealed class InputMilestoneTracker
         CurrentSend.Value is { } send && ReferenceEquals(send.Tracker, this)
             && (!send.Disposed || CurrentPin.Value?.ActiveFor(send) == true) ? send : null;
 
-    private static void RemoveLast(Queue<Tracked> occurrences)
+    // Removes this accept's own occurrence, not merely the newest: a re-entrant write may have
+    // registered another occurrence of the same event since.
+    private static void Unregister(Queue<Tracked> occurrences, Tracked tracked)
     {
-        var kept = occurrences.ToArray()[..^1];
+        var kept = occurrences.Where(t => !ReferenceEquals(t, tracked)).ToArray();
         occurrences.Clear();
-        foreach (var tracked in kept)
-            occurrences.Enqueue(tracked);
+        foreach (var other in kept)
+            occurrences.Enqueue(other);
     }
 
     private static string KindOf(Hex1bEvent evt) => evt switch
