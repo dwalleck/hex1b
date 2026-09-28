@@ -4,6 +4,7 @@ using Hex1b.Diagnostics;
 using Hex1b.Theming;
 using Hex1b.Tokens;
 using Hex1b.Widgets;
+using Microsoft.Extensions.Time.Testing;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 
@@ -128,12 +129,13 @@ public class CaptureContractMcpTests : McpServerTestBase
     [TestMethod]
     public async Task CaptureTerminalScreen_ReportsModelSequenceAndSyncDisclosure()
     {
-        await using var terminal = await StartAttachedAppAsync();
+        // A raw-workload terminal on a stopped clock: no app frame or timer can end the update.
+        await using var terminal = await StartRawAttachedAsync(new FakeTimeProvider(DateTimeOffset.UtcNow));
         await StartServerAsync();
         await using var client = await CreateClientAsync();
         var attached = await ConnectAttachedAsync(client);
         var local = await StartLocalSessionAsync(client);
-        var engine = new TerminalDiagnostics(terminal, "McpAttached");
+        var engine = new TerminalDiagnostics(terminal, "McpRaw");
         try
         {
             var staticCapture = (await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = attached })).GetProperty("capture");
@@ -365,6 +367,32 @@ public class CaptureContractMcpTests : McpServerTestBase
         await new Hex1bTerminalInputSequenceBuilder()
             .WaitUntil(s => s.ContainsText("STYLED"), TimeSpan.FromSeconds(10), "application rendered")
             .Build().ApplyAsync(terminal);
+        return terminal;
+    }
+
+    private static async Task<Hex1bTerminal> StartRawAttachedAsync(TimeProvider clock)
+    {
+        var socketPath = McpDiagnosticsPresentationFilter.GetSocketPath();
+        for (var attempt = 0; attempt < 100 && File.Exists(socketPath); attempt++)
+            await Task.Delay(50);
+
+        var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(new Hex1bAppWorkloadAdapter())
+            .WithHeadless()
+            .WithDimensions(40, 5)
+            .WithTimeProvider(clock)
+            .WithDiagnostics(appName: "McpRaw", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync();
+        var client = new DiagnosticsSocketClient();
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            if (File.Exists(socketPath) && await client.TryProbeAsync(socketPath) is { Success: true })
+                break;
+            await Task.Delay(50);
+        }
+
+        terminal.ApplyTokens(AnsiTokenizer.Tokenize("STATIC"));
         return terminal;
     }
 

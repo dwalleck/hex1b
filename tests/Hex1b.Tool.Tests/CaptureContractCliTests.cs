@@ -6,6 +6,7 @@ using Hex1b.Tokens;
 using Hex1b.Tool.Hosting;
 using Hex1b.Widgets;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Time.Testing;
 
 namespace Hex1b.Tool.Tests;
 
@@ -117,8 +118,9 @@ public class CaptureContractCliTests
     [TestMethod]
     public async Task Screenshot_ReportsModelSequenceAndSyncDisclosure()
     {
-        await using var target = await StartAttachedAppAsync();
-        var engine = new TerminalDiagnostics(target, "CliAttached");
+        // A raw-workload terminal on a stopped clock: no app frame or timer can end the update.
+        await using var target = await StartRawAttachedAsync(new FakeTimeProvider(DateTimeOffset.UtcNow));
+        var engine = new TerminalDiagnostics(target, "CliRaw");
 
         var (staticExit, staticOut, staticErr) = await RunCliAsync("capture", "screenshot", Pid, "--json");
         var engineStatic = engine.Capture(new DiagnosticCaptureRequest());
@@ -326,6 +328,22 @@ public class CaptureContractCliTests
         await new Hex1bTerminalInputSequenceBuilder()
             .WaitUntil(s => s.ContainsText("STYLED"), TimeSpan.FromSeconds(10), "application rendered")
             .Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        return terminal;
+    }
+
+    private static async Task<Hex1bTerminal> StartRawAttachedAsync(TimeProvider clock)
+    {
+        await WaitForSocketReleaseAsync(TestContext.Current.CancellationToken);
+        var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(new Hex1bAppWorkloadAdapter())
+            .WithHeadless()
+            .WithDimensions(40, 5)
+            .WithTimeProvider(clock)
+            .WithDiagnostics(appName: "CliRaw", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync(TestContext.Current.CancellationToken);
+        await WaitForSocketAsync(TestContext.Current.CancellationToken);
+        terminal.ApplyTokens(AnsiTokenizer.Tokenize("STATIC"));
         return terminal;
     }
 
