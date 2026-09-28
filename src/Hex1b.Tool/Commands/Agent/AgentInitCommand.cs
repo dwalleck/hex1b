@@ -327,13 +327,13 @@ internal sealed class AgentInitCommand : BaseCommand
         ## How to Inspect a Hex1b TUI App's Widget Tree
 
         If the terminal is running a Hex1b application with `.WithDiagnostics()` enabled, you can
-        inspect its internal widget/node tree.
+        inspect the latest frame it published: node tree, clipping, focus, popups, and focused editor.
 
         ```bash
         # Show the full widget tree with geometry
         dotnet hex1b app tree <id>
 
-        # Include focus state
+        # Include focus state and focused-editor carets/selections
         dotnet hex1b app tree <id> --focus
 
         # Include popup stack
@@ -342,7 +342,7 @@ internal sealed class AgentInitCommand : BaseCommand
         # Limit tree depth
         dotnet hex1b app tree <id> --depth 3
 
-        # Get as JSON for programmatic inspection
+        # Get the application-frame contract as JSON for programmatic inspection
         dotnet hex1b app tree <id> --json
         ```
 

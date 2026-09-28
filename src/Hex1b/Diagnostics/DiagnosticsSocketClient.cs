@@ -94,6 +94,28 @@ internal sealed class DiagnosticsSocketClient
     }
 
     /// <summary>
+    /// Returns an attached application's latest published frame. Transport, protocol, and
+    /// contract failures become diagnostic outcomes; only caller cancellation throws.
+    /// </summary>
+    public async Task<DiagnosticApplicationFrameResult> CaptureApplicationFrameAsync(
+        string socketPath, DiagnosticApplicationFrameRequest request, CancellationToken cancellationToken = default)
+    {
+        var (response, problem) = await ExchangeAsync(socketPath,
+            new DiagnosticsRequest { Method = TerminalDiagnostics.ApplicationFrameOperation, ApplicationFrame = request },
+            cancellationToken).ConfigureAwait(false);
+        if (problem is not null)
+            return TerminalDiagnostics.FrameProblem(problem.Value.Outcome, problem.Value.Code, problem.Value.Message);
+
+        if (response!.ApplicationFrame is not { } result)
+        {
+            var (outcome, code, message) = Unexpected(response);
+            return TerminalDiagnostics.FrameProblem(outcome, code, message);
+        }
+
+        return Validate(result);
+    }
+
+    /// <summary>
     /// Describes an attached target's capabilities. Transport, protocol, and contract failures
     /// become diagnostic outcomes; only caller cancellation throws.
     /// </summary>
@@ -146,6 +168,33 @@ internal sealed class DiagnosticsSocketClient
         }
 
         return result.Outcome == DiagnosticOutcome.Captured ? ExplainOmittedFields(result) : result;
+    }
+
+    private static DiagnosticApplicationFrameResult Validate(DiagnosticApplicationFrameResult result)
+    {
+        result = result with
+        {
+            ContentCoverage = (result.ContentCoverage ?? []).Where(entry => entry is not null).ToArray(),
+            UnavailableFields = (result.UnavailableFields ?? []).Where(entry => entry is not null).ToArray(),
+            Limitations = (result.Limitations ?? []).Where(entry => entry is not null).ToArray(),
+        };
+
+        if (result.ContractVersion != TerminalDiagnostics.ContractVersion)
+            return TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Failed, "incompatible-target", VersionMessage(result.ContractVersion));
+
+        if (result.Outcome == DiagnosticOutcome.Captured && (result.Frame?.Focus is null || result.Identity is null))
+        {
+            return TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Failed, "protocol-error",
+                "The target reported an application frame without its frame, focus, or identity.");
+        }
+
+        if (result.Outcome != DiagnosticOutcome.Captured && result.Problem is null)
+        {
+            return TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Failed, "protocol-error",
+                $"The target reported outcome '{DiagnosticContractNames.Of(result.Outcome)}' without a problem.");
+        }
+
+        return result.Frame is { Popups: null } frame ? result with { Frame = frame with { Popups = [] } } : result;
     }
 
     // An older target may omit fields this contract version added. Report them as unavailable,

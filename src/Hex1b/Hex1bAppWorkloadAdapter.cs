@@ -75,11 +75,8 @@ public sealed class Hex1bAppWorkloadAdapter :
     private readonly HashSet<GeometryGatedDelivery> _pendingDeliveries = new();
 
     /// <summary>
-    /// Optional diagnostic tree provider for MCP diagnostics.
-    /// Set by Hex1bApp when it starts running.
+    /// The application that publishes frames for diagnostics. Set by Hex1bApp when it starts running.
     /// </summary>
-    internal Diagnostics.IDiagnosticTreeProvider? DiagnosticTreeProvider { get; set; }
-
     internal Diagnostics.IApplicationFrameSource? ApplicationFrameSource { get; set; }
 
     /// <summary>

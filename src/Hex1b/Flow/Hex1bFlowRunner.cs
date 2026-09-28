@@ -1805,19 +1805,21 @@ internal sealed class Hex1bFlowRunner
                 step.AttachCommitCoordinator(commitCoordinator);
                 System.Threading.Volatile.Write(ref commitCoordinatorBox.Value, commitCoordinator);
 
-                // Publish the live app as the diagnostic tree provider on the
-                // terminal-facing adapter while the step runs, so the active
-                // prompt's real widget tree can be inspected. An inline step's
-                // own adapter is not a Hex1bAppWorkloadAdapter, so the app's
-                // own registration cannot reach the host; this is the existing
-                // seam, not an additional renderer.
+                // Publish the step app's frames through the terminal-facing
+                // adapter while the step runs, so the active prompt's frames
+                // can be inspected. An inline step's own adapter is not a
+                // Hex1bAppWorkloadAdapter, so the app's own registration cannot
+                // reach the host; this is the existing seam, not an additional
+                // renderer.
                 Hex1bAppWorkloadAdapter? diagnosticHost = null;
-                Diagnostics.IDiagnosticTreeProvider? previousDiagnosticProvider = null;
+                Diagnostics.IApplicationFrameSource? previousFrameSource = null;
                 if (_parentAdapter is Hex1bAppWorkloadAdapter parentWorkloadAdapter)
                 {
                     diagnosticHost = parentWorkloadAdapter;
-                    previousDiagnosticProvider = parentWorkloadAdapter.DiagnosticTreeProvider;
-                    parentWorkloadAdapter.DiagnosticTreeProvider = app;
+                    if (parentWorkloadAdapter.DiagnosticTimingEnabled)
+                        app.EnableFramePublication();
+                    previousFrameSource = parentWorkloadAdapter.ApplicationFrameSource;
+                    parentWorkloadAdapter.ApplicationFrameSource = app;
                 }
 
                 try
@@ -1826,12 +1828,12 @@ internal sealed class Hex1bFlowRunner
                 }
                 finally
                 {
-                    // Restore only if the app is still the registered provider,
+                    // Restore only if the app is still the registered source,
                     // so a later owner is never clobbered.
                     if (diagnosticHost is not null
-                        && ReferenceEquals(diagnosticHost.DiagnosticTreeProvider, app))
+                        && ReferenceEquals(diagnosticHost.ApplicationFrameSource, app))
                     {
-                        diagnosticHost.DiagnosticTreeProvider = previousDiagnosticProvider;
+                        diagnosticHost.ApplicationFrameSource = previousFrameSource;
                     }
                 }
             }

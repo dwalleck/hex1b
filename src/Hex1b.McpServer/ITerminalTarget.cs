@@ -87,6 +87,12 @@ public interface ITerminalTarget : IAsyncDisposable
     Task<DiagnosticCaptureResult> CaptureAsync(DiagnosticCaptureRequest request, CancellationToken ct = default);
 
     /// <summary>
+    /// Returns the target application's latest published frame through the shared
+    /// application-frame contract; targets without an application layer report it unavailable.
+    /// </summary>
+    Task<DiagnosticApplicationFrameResult> CaptureApplicationFrameAsync(DiagnosticApplicationFrameRequest request, CancellationToken ct = default);
+
+    /// <summary>
     /// Describes the target's diagnostic capabilities and their limits.
     /// </summary>
     Task<DiagnosticCapabilities> GetDiagnosticCapabilitiesAsync(CancellationToken ct = default);

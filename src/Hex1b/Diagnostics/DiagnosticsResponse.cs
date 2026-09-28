@@ -57,30 +57,6 @@ internal sealed class DiagnosticsResponse
     public string? Data { get; set; }
     
     /// <summary>
-    /// For "tree" method: the widget/node tree.
-    /// </summary>
-    [JsonPropertyName("tree")]
-    public DiagnosticNode? Tree { get; set; }
-    
-    /// <summary>
-    /// For "tree" method: the popup stack.
-    /// </summary>
-    [JsonPropertyName("popups")]
-    public IReadOnlyList<DiagnosticPopupEntry>? Popups { get; set; }
-    
-    /// <summary>
-    /// For "tree" method: focus ring information.
-    /// </summary>
-    [JsonPropertyName("focusInfo")]
-    public DiagnosticFocusInfo? FocusInfo { get; set; }
-    
-    /// <summary>
-    /// For "tree" method: frame-level performance metrics.
-    /// </summary>
-    [JsonPropertyName("frameInfo")]
-    public DiagnosticFrameInfo? FrameInfo { get; set; }
-    
-    /// <summary>
     /// For "attach" method: whether this client is the resize leader.
     /// </summary>
     [JsonPropertyName("leader")]
@@ -109,4 +85,10 @@ internal sealed class DiagnosticsResponse
     /// </summary>
     [JsonPropertyName("capabilities")]
     public DiagnosticCapabilities? Capabilities { get; set; }
+
+    /// <summary>
+    /// For "application-frame" method: the latest published application frame, including failures.
+    /// </summary>
+    [JsonPropertyName("applicationFrame")]
+    public DiagnosticApplicationFrameResult? ApplicationFrame { get; set; }
 }

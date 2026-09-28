@@ -85,4 +85,10 @@ internal sealed class DiagnosticsRequest
     /// </summary>
     [JsonPropertyName("capture")]
     public DiagnosticCaptureRequest? Capture { get; set; }
+
+    /// <summary>
+    /// For "application-frame" method, the application-frame request; absent means no authorizations.
+    /// </summary>
+    [JsonPropertyName("applicationFrame")]
+    public DiagnosticApplicationFrameRequest? ApplicationFrame { get; set; }
 }

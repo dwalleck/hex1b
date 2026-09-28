@@ -1,6 +1,8 @@
 using System.Text.Json;
 using Hex1b.Automation;
 using Hex1b.Diagnostics;
+using Hex1b.Flow;
+using Hex1b.Nodes;
 using Hex1b.Theming;
 using Hex1b.Tokens;
 using Hex1b.Tool.Hosting;
@@ -290,6 +292,129 @@ public class CaptureContractCliTests
         Assert.AreEqual(1, absent);
     }
 
+    private const string FrameSentinel = "SENTINEL-CLI-5d1a";
+
+    [TestMethod]
+    public async Task AppTree_Json_EqualsTheEnginesApplicationFrame()
+    {
+        await using var target = await StartFrameAppAsync();
+
+        var (cli, engine) = await CaptureStableAsync(target, "app", "tree", Pid, "--json");
+
+        Assert.AreEqual("captured", cli.GetProperty("outcome").GetString());
+        var identity = cli.GetProperty("identity");
+        Assert.AreEqual("application-frame", identity.GetProperty("sourceLayer").GetString());
+        Assert.AreEqual(engine.Frame!.FrameId, identity.GetProperty("applicationFrame").GetInt64());
+        var frame = cli.GetProperty("frame");
+        Assert.AreEqual(1, frame.GetProperty("popups").GetArrayLength(), "fixture: the popup is missing");
+        Assert.AreEqual("text-box", frame.GetProperty("focusedEditor").GetProperty("kind").GetString(), "fixture: the TextBox should have focus");
+        Assert.IsTrue(JsonElement.DeepEquals(ToJson(engine), cli),
+            $"CLI result differs from the engine's.\nengine: {ToJson(engine)}\ncli:    {cli}");
+    }
+
+    [TestMethod]
+    public async Task AppTree_EditorText_IncludedOnlyWhenAuthorized()
+    {
+        await using var target = await StartFrameAppAsync();
+
+        var (_, plainJson, _) = await RunCliAsync("app", "tree", Pid, "--json");
+        var (_, plainText, _) = await RunCliAsync("app", "tree", Pid, "--focus", "--popups");
+        var (authorizedExit, authorizedJson, authorizedErr) = await RunCliAsync("app", "tree", Pid, "--json", "--authorize", "editor-text");
+        var (_, authorizedText, _) = await RunCliAsync("app", "tree", Pid, "--focus", "--authorize", "editor-text");
+
+        Assert.IsFalse(plainJson.Contains(FrameSentinel, StringComparison.Ordinal), "sentinel in default CLI JSON");
+        Assert.IsFalse(plainText.Contains(FrameSentinel, StringComparison.Ordinal), "sentinel in default CLI text");
+        Assert.AreEqual(0, authorizedExit, authorizedErr);
+        using var json = JsonDocument.Parse(authorizedJson);
+        Assert.AreEqual(FrameSentinel, json.RootElement.GetProperty("frame").GetProperty("focusedEditor").GetProperty("text").GetString());
+        AssertCoverage(json.RootElement, "editor-text", "included");
+        StringAssert.Contains(authorizedText, FrameSentinel);
+    }
+
+    [TestMethod]
+    public async Task AppTree_Text_ShowsFrameTreeFocusAndPopups()
+    {
+        await using var target = await StartFrameAppAsync();
+
+        var (exitCode, stdout, stderr) = await RunCliAsync("app", "tree", Pid, "--focus", "--popups");
+
+        Assert.AreEqual(0, exitCode, stderr);
+        StringAssert.StartsWith(stdout, "Frame ");
+        StringAssert.Contains(stdout, "TextBoxNode [FOCUSED]");
+        StringAssert.Contains(stdout, "\"FRAMEAPP\"");
+        StringAssert.Contains(stdout, "Popups:");
+        StringAssert.Contains(stdout, "anchor=ButtonNode");
+        StringAssert.Contains(stdout, "Focus: TextBoxNode");
+        StringAssert.Contains(stdout, "Editor: text-box");
+    }
+
+    [TestMethod]
+    public async Task AppTree_LocalHostedPty_ReportsNoApplicationLayer()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var config = new TerminalHostConfig { Width = 40, Height = 6 };
+        if (OperatingSystem.IsWindows())
+        {
+            config.Command = "powershell";
+            config.Arguments = ["-NoProfile", "-Command", "Write-Host HOSTED; Start-Sleep 60"];
+        }
+        else
+        {
+            config.Command = "/bin/sh";
+            config.Arguments = ["-c", "echo HOSTED; exec sleep 60"];
+        }
+
+        await WaitForSocketReleaseAsync(cts.Token);
+        var host = TerminalHost.RunAsync(config, cts.Token);
+        try
+        {
+            await WaitForSocketAsync(cts.Token);
+
+            var (exitCode, stdout, stderr) = await RunCliAsync("app", "tree", Pid, "--json");
+
+            Assert.AreEqual(1, exitCode, stdout);
+            using var json = JsonDocument.Parse(stdout);
+            Assert.AreEqual("unavailable", json.RootElement.GetProperty("outcome").GetString());
+            Assert.AreEqual("no-application-layer", json.RootElement.GetProperty("problem").GetProperty("code").GetString());
+            StringAssert.Contains(stderr, "no-application-layer");
+        }
+        finally
+        {
+            await cts.CancelAsync();
+            try { await host; } catch (OperationCanceledException) { }
+        }
+    }
+
+    [TestMethod]
+    public async Task AppTree_FlowStep_ReturnsTheActiveStepsFrame()
+    {
+        await WaitForSocketReleaseAsync(TestContext.Current.CancellationToken);
+        await using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithHex1bFlow(async flow =>
+            {
+                var step = flow.Step(_ => new VStackWidget([new TextBlockWidget("FLOWSTEP"), new TextBoxWidget("step input")]));
+                await step.WaitForCompletionAsync(TestContext.Current.CancellationToken);
+            })
+            .WithHeadless()
+            .WithDimensions(40, 8)
+            .WithDiagnostics(appName: "CliFlow", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync(TestContext.Current.CancellationToken);
+        await WaitForSocketAsync(TestContext.Current.CancellationToken);
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("FLOWSTEP"), TimeSpan.FromSeconds(10), "flow step rendered")
+            .Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
+
+        var (exitCode, stdout, stderr) = await RunCliAsync("app", "tree", Pid, "--json");
+
+        Assert.AreEqual(0, exitCode, $"{stderr}\n{stdout}");
+        using var json = JsonDocument.Parse(stdout);
+        var frame = json.RootElement.GetProperty("frame");
+        StringAssert.Contains(frame.GetProperty("root").ToString(), "\"FLOWSTEP\"", "the active step's tree is missing");
+        Assert.AreEqual("text-box", frame.GetProperty("focusedEditor").GetProperty("kind").GetString());
+        Assert.IsTrue(frame.TryGetProperty("timings", out _), "a diagnostics-enabled flow step reports timings");
+    }
+
     // === Helpers ===
 
     private static string Pid => Environment.ProcessId.ToString();
@@ -335,6 +460,78 @@ public class CaptureContractCliTests
             .Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
         return terminal;
     }
+
+    // A static app whose anchored popup holds the focused TextBox with the sentinel (an open popup
+    // owns focus). The popup is pushed from the app's own build, on the app loop, once the anchor
+    // node exists.
+    private static async Task<Hex1bTerminal> StartFrameAppAsync()
+    {
+        await WaitForSocketReleaseAsync(TestContext.Current.CancellationToken);
+        Hex1bApp? app = null;
+        var pushed = false;
+        var terminal = Hex1bTerminal.CreateBuilder()
+            .WithDimensions(40, 8)
+            .WithHeadless()
+            .WithHex1bApp(_ => { }, built =>
+            {
+                app = built;
+                return _ =>
+                {
+                    if (!pushed && FindNode<ZStackNode>(built.RootNode) is { } host && FindNode<ButtonNode>(built.RootNode) is { } anchor)
+                    {
+                        host.Popups.PushAnchored(anchor, AnchorPosition.Below,
+                            new VStackWidget([new TextBlockWidget("POPPED"), new TextBoxWidget(FrameSentinel)]), focusRestoreNode: anchor);
+                        built.RequestFocus(node => node is TextBoxNode);
+                        pushed = true;
+                    }
+
+                    return new ZStackWidget([new VStackWidget(
+                    [
+                        new TextBlockWidget("FRAMEAPP"),
+                        new ButtonWidget("anchor"),
+                    ])]);
+                };
+            })
+            .WithDiagnostics(appName: "CliFrames", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync(TestContext.Current.CancellationToken);
+        await WaitForSocketAsync(TestContext.Current.CancellationToken);
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("FRAMEAPP"), TimeSpan.FromSeconds(10), "application rendered")
+            .Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        app!.Invalidate();
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("POPPED"), TimeSpan.FromSeconds(10), "popup rendered")
+            .Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        return terminal;
+    }
+
+    // Engine and CLI observe the same published frame only while the app is idle; retry until an
+    // engine capture before and after the CLI call agree.
+    private static async Task<(JsonElement Cli, DiagnosticApplicationFrameResult Engine)> CaptureStableAsync(
+        Hex1bTerminal target, params string[] args)
+    {
+        var engine = new TerminalDiagnostics(target, "CliFrames");
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            var before = engine.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest());
+            var (exitCode, stdout, stderr) = await RunCliAsync(args);
+            var after = engine.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest());
+            Assert.AreEqual(0, exitCode, stderr);
+            if (before.Frame?.FrameId == after.Frame?.FrameId)
+                return (JsonDocument.Parse(stdout).RootElement.Clone(), before);
+            await Task.Delay(100, TestContext.Current.CancellationToken);
+        }
+
+        Assert.Fail("the application never stayed idle across a CLI capture");
+        return default;
+    }
+
+    private static JsonElement ToJson(DiagnosticApplicationFrameResult result) =>
+        JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticApplicationFrameResult);
+
+    private static T? FindNode<T>(Hex1bNode? node) where T : Hex1bNode =>
+        node is null ? null : node as T ?? node.GetChildren().Select(FindNode<T>).FirstOrDefault(n => n is not null);
 
     private static async Task<Hex1bTerminal> StartRawAttachedAsync(TimeProvider clock)
     {

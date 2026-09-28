@@ -65,7 +65,7 @@ history**. Hidden metadata is withheld and listed as `excluded`, not returned em
 | `rendered-history` | included when requested; `excluded` when not requested; `unavailable` when the model retains no history or the alternate screen is active | same |
 | `hyperlink-targets` | excluded | included in `ansi` (OSC 8) and `html`; unavailable in `text` and `svg` |
 | `window-title` | excluded | included as `nonScreenMetadata` |
-| `editor-text` | excluded | unavailable: capture does not collect application editor text |
+| `editor-text` | excluded | unavailable: capture does not collect application editor text (see [Application frames](#application-frames)) |
 | `raw-input` | excluded | unavailable: capture does not collect keyboard input |
 
 Each authorization is independent. Rendered screen and history text can itself contain secrets.
@@ -100,6 +100,55 @@ History rows are returned at the current screen width. A row that retained non-b
 wider than the screen (for example output written before a resize without reflow) is cropped;
 `croppedRows` counts those rows, `truncated` becomes `true`, and `reason` says so.
 
+## Application frames
+
+The `application-frame` operation returns the latest frame a Hex1b application **published** at
+the end of a completed render pass. It is a separate operation from `capture`, with its own
+result, and is served by `hex1b app tree`, the MCP tools `capture_application_frame` (by session)
+and `GetHex1bTree` (by process ID), and the socket method `application-frame`. Every client
+returns the engine's result unchanged.
+
+Frames are published only by applications built with `WithDiagnostics()` (including inline flow
+steps, which publish through the flow's terminal); applications without it never project frames.
+The projection runs on the application loop, after rendering and before the completed-pass count
+advances, and holds copies only. A capture reads the latest published frame and never drives a
+render, waits for a frame, or reads live application state, so a retained result never changes.
+
+### Request
+
+| Field | Wire name | Values | Default |
+|-------|-----------|--------|---------|
+| Authorizations | `authorizations` | `editor-text` (other values are accepted and add nothing) | none |
+
+### Result
+
+| Field | Meaning |
+|-------|---------|
+| `contractVersion`, `outcome`, `problem` | As for `capture`. |
+| `frame.frameId` | The application's completed-pass count for this frame; also `identity.applicationFrame`. Two results with the same `frameId` from one application are the same frame. |
+| `frame.columns`, `frame.rows`, `frame.wroteOutput` | The pass's screen size and whether it wrote terminal output. |
+| `frame.root` | Node tree: `type`, `bounds`, `hitTestBounds`, `contentBounds`, `visibleBounds` (the bounds intersected with the screen and every enclosing clip region), `clipState` (`visible`, `partially-clipped`, `fully-clipped`), the node's own `clipRect`/`clipMode`, focus flags, rendered `text` of text nodes, type-specific `properties`, and `timing`. |
+| `frame.popups` | Popup stack, bottom first: content type and bounds, barrier and anchored flags, focus-restore node, and anchor type, bounds, staleness, and position. |
+| `frame.focus` | Focus ring: `currentIndex`, `focusedNodeType`, `lastHitTest`, and each focusable's bounds and hit-test bounds. |
+| `frame.focusedEditor` | For a focused TextBox or Editor: `kind` (`text-box`, `editor`), `bounds`, `length`, `lineCount`, every caret, and every non-empty selection. Positions are `{ offset, line, column }`: UTF-16 offsets and 0-based line and column. `text` is present only with `editor-text` authorization. |
+| `frame.timings` | Build, reconcile, and render milliseconds of the pass. |
+| `identity` | As for `capture`, with `sourceLayer` `application-frame`, `applicationFrame`, and `acquisition` bracketing the projection. `modelSequence` is unavailable: a frame is not a terminal-model observation. |
+| `contentCoverage` | `application-text` is included. `editor-text` is `excluded` without authorization, `included` with it, and `unavailable` when no editor had focus. |
+| `unavailableFields` | Explains an absent `frame.root`, `frame.focusedEditor`, or `frame.timings`. |
+
+Only the focused editor is described. Other editors appear as nodes without their text.
+
+### Problem codes
+
+| Code | Outcome | Cause |
+|------|---------|-------|
+| `no-application-layer` | `unavailable` | The workload is not a Hex1b application (MCP local sessions, PTYs hosted by `hex1b terminal start`, raw workloads). |
+| `application-frame-publication-disabled` | `unavailable` | The application was built without `WithDiagnostics()`. |
+| `no-application-frame-yet` | `unavailable` | No render pass has completed since publication started. |
+| `application-frame-projection-failed` | `failed` | Projecting the latest completed pass threw; the message names that frame. Rendering is unaffected, and the next pass publishes again. |
+
+Transport, target, and request codes are the same as for `capture`.
+
 ## Capabilities
 
 `hex1b capture capabilities <id>` and the MCP tool `get_terminal_diagnostic_capabilities`
@@ -109,7 +158,7 @@ model-history support, and authorizations. They also report each evidence layer:
 | Layer | Available | Notes |
 |-------|-----------|-------|
 | `terminal-model` | yes | Cells, cursor, modes, and retained model history. |
-| `application-frame` | no | Application frames are not yet published with identities. Generic PTY targets have no application layer. |
+| `application-frame` | Hex1b applications with `WithDiagnostics()` | Operation `application-frame`, timing `latest-published`, authorization `editor-text`. Otherwise unavailable with the reason the operation reports. |
 | `native-delivery` | no | Native delivery outcomes are not observed. |
 | `native-presentation` | no | What a host terminal physically displayed is not observable by Hex1b. |
 
@@ -121,7 +170,12 @@ model-history support, and authorizations. They also report each evidence layer:
 - KGP animation playback advances on a timer without a model event, so SVG and HTML renderings of
   animated KGP images can differ at the same `modelSequence`. Graphics placements change only
   through output batches and are covered by the sequence.
-- `identity.applicationFrame` is absent: frames are not yet published with identities.
+- A terminal-model capture's `identity.applicationFrame` is absent: a model capture is not an
+  application frame. Correlate the two through identities and acquisition intervals.
+- An idle application returns its last published frame; compare its acquisition interval with
+  the time of the request.
+- Each inline flow step is its own application, so `frameId` restarts at each step; between steps
+  the flow has no application layer.
 - `identity.applicationVersion` is reported only for in-process Hex1b applications.
 - Independently acquired observations (for example a capture and a widget tree) are correlated by
   their identities and acquisition intervals, never presented as one atomic moment.

@@ -1013,6 +1013,8 @@ public sealed class Hex1bTerminalBuilder
                 ? new Hex1bAppWorkloadAdapter(presentation)
                 : new Hex1bAppWorkloadAdapter();
 
+            workloadAdapter.DiagnosticTimingEnabled = _diagnosticsEnabled;
+
             var options = new Flow.Hex1bFlowOptions();
             configureOptions?.Invoke(options);
 

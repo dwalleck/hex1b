@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Hex1b.Automation;
 using Hex1b.Diagnostics;
+using Hex1b.Nodes;
 using Hex1b.Theming;
 using Hex1b.Tokens;
 using Hex1b.Widgets;
@@ -322,6 +323,80 @@ public class CaptureContractMcpTests : McpServerTestBase
             .Single(l => l.GetProperty("layer").GetString() == "application-frame").GetProperty("reason").GetString()!;
     }
 
+    private const string FrameSentinel = "SENTINEL-MCP-3b8e";
+
+    [TestMethod]
+    public async Task ApplicationFrame_AttachedApp_EqualsTheEnginesResultThroughBothTools()
+    {
+        await using var terminal = await StartFrameAppAsync();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var sessionId = await ConnectAttachedAsync(client);
+        var engine = new TerminalDiagnostics(terminal, "McpFrames");
+
+        foreach (var (tool, arguments) in new (string, Dictionary<string, object?>)[]
+        {
+            ("capture_application_frame", new() { ["sessionId"] = sessionId }),
+            ("get_hex1b_tree", new() { ["processId"] = Environment.ProcessId }),
+        })
+        {
+            var (result, direct) = await CaptureStableAsync(engine, () => CallAsync(client, tool, arguments));
+
+            Assert.IsTrue(result.GetProperty("success").GetBoolean(), result.ToString());
+            var frame = result.GetProperty("applicationFrame");
+            Assert.AreEqual("application-frame", frame.GetProperty("identity").GetProperty("sourceLayer").GetString(), tool);
+            Assert.AreEqual(1, frame.GetProperty("frame").GetProperty("popups").GetArrayLength(), "fixture: the popup is missing");
+            Assert.AreEqual("text-box", frame.GetProperty("frame").GetProperty("focusedEditor").GetProperty("kind").GetString(),
+                $"{tool}: focused editor missing");
+            Assert.IsTrue(JsonElement.DeepEquals(ToJson(direct), frame),
+                $"{tool} result differs from the engine's.\nengine: {ToJson(direct)}\nmcp:    {frame}");
+        }
+    }
+
+    [TestMethod]
+    public async Task ApplicationFrame_EditorTextOnlyWhenAuthorized()
+    {
+        await using var terminal = await StartFrameAppAsync();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var sessionId = await ConnectAttachedAsync(client);
+
+        var plain = await CallAsync(client, "capture_application_frame", new() { ["sessionId"] = sessionId });
+        var plainTree = await CallAsync(client, "get_hex1b_tree", new() { ["processId"] = Environment.ProcessId });
+        var authorized = await CallAsync(client, "capture_application_frame", new() { ["sessionId"] = sessionId, ["authorize"] = "editor-text" });
+        var invalid = await CallAsync(client, "capture_application_frame", new() { ["sessionId"] = sessionId, ["authorize"] = "everything" });
+
+        Assert.IsFalse(plain.ToString().Contains(FrameSentinel, StringComparison.Ordinal), "sentinel in default MCP frame");
+        Assert.IsFalse(plainTree.ToString().Contains(FrameSentinel, StringComparison.Ordinal), "sentinel in default GetHex1bTree");
+        var frame = authorized.GetProperty("applicationFrame");
+        Assert.AreEqual(FrameSentinel, frame.GetProperty("frame").GetProperty("focusedEditor").GetProperty("text").GetString());
+        AssertCoverage(frame, "editor-text", "included");
+        Assert.AreEqual("invalid-request", invalid.GetProperty("applicationFrame").GetProperty("outcome").GetString());
+    }
+
+    [TestMethod]
+    public async Task ApplicationFrame_LocalSession_ReportsNoApplicationLayer()
+    {
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var local = await StartLocalSessionAsync(client);
+        try
+        {
+            var result = await CallAsync(client, "capture_application_frame", new() { ["sessionId"] = local });
+            var missing = await CallAsync(client, "capture_application_frame", new() { ["sessionId"] = "no-such-session" });
+
+            Assert.IsFalse(result.GetProperty("success").GetBoolean());
+            var frame = result.GetProperty("applicationFrame");
+            Assert.AreEqual("unavailable", frame.GetProperty("outcome").GetString());
+            Assert.AreEqual("no-application-layer", frame.GetProperty("problem").GetProperty("code").GetString());
+            Assert.AreEqual("session-not-found", missing.GetProperty("applicationFrame").GetProperty("problem").GetProperty("code").GetString());
+        }
+        finally
+        {
+            await CallAsync(client, "remove_session", new() { ["sessionId"] = local });
+        }
+    }
+
     // === Helpers ===
 
     private async Task<JsonElement> CallAsync(McpClient client, string tool, Dictionary<string, object?> arguments)
@@ -381,6 +456,83 @@ public class CaptureContractMcpTests : McpServerTestBase
             .Build().ApplyAsync(terminal);
         return terminal;
     }
+
+    // A static app whose anchored popup holds the focused TextBox with the sentinel (an open popup
+    // owns focus). The popup is pushed from the app's own build, on the app loop, once the anchor
+    // node exists.
+    private static async Task<Hex1bTerminal> StartFrameAppAsync()
+    {
+        var socketPath = McpDiagnosticsPresentationFilter.GetSocketPath();
+        for (var attempt = 0; attempt < 100 && File.Exists(socketPath); attempt++)
+            await Task.Delay(50);
+
+        Hex1bApp? app = null;
+        var pushed = false;
+        var terminal = Hex1bTerminal.CreateBuilder()
+            .WithDimensions(40, 8)
+            .WithHeadless()
+            .WithHex1bApp(_ => { }, built =>
+            {
+                app = built;
+                return _ =>
+                {
+                    if (!pushed && FindNode<ZStackNode>(built.RootNode) is { } host && FindNode<ButtonNode>(built.RootNode) is { } anchor)
+                    {
+                        host.Popups.PushAnchored(anchor, AnchorPosition.Below,
+                            new VStackWidget([new TextBlockWidget("POPPED"), new TextBoxWidget(FrameSentinel)]), focusRestoreNode: anchor);
+                        built.RequestFocus(node => node is TextBoxNode);
+                        pushed = true;
+                    }
+
+                    return new ZStackWidget([new VStackWidget([new TextBlockWidget("FRAMEAPP"), new ButtonWidget("anchor")])]);
+                };
+            })
+            .WithDiagnostics(appName: "McpFrames", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync();
+
+        var client = new DiagnosticsSocketClient();
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            if (File.Exists(socketPath) && await client.TryProbeAsync(socketPath) is { Success: true })
+                break;
+            await Task.Delay(50);
+        }
+
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("FRAMEAPP"), TimeSpan.FromSeconds(10), "application rendered")
+            .Build().ApplyAsync(terminal);
+        app!.Invalidate();
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("POPPED"), TimeSpan.FromSeconds(10), "popup rendered")
+            .Build().ApplyAsync(terminal);
+        return terminal;
+    }
+
+    // Engine and MCP observe the same published frame only while the app is idle; retry until an
+    // engine capture before and after the tool call agree.
+    private static async Task<(JsonElement Result, DiagnosticApplicationFrameResult Engine)> CaptureStableAsync(
+        TerminalDiagnostics engine, Func<Task<JsonElement>> call)
+    {
+        for (var attempt = 0; attempt < 10; attempt++)
+        {
+            var before = engine.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest());
+            var result = await call();
+            var after = engine.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest());
+            if (before.Frame?.FrameId == after.Frame?.FrameId)
+                return (result, before);
+            await Task.Delay(100);
+        }
+
+        Assert.Fail("the application never stayed idle across an MCP call");
+        return default;
+    }
+
+    private static JsonElement ToJson(DiagnosticApplicationFrameResult result) =>
+        JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticApplicationFrameResult);
+
+    private static T? FindNode<T>(Hex1bNode? node) where T : Hex1bNode =>
+        node is null ? null : node as T ?? node.GetChildren().Select(FindNode<T>).FirstOrDefault(n => n is not null);
 
     private static async Task<Hex1bTerminal> StartRawAttachedAsync(TimeProvider clock)
     {

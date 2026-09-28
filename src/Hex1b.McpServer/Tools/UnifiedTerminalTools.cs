@@ -257,6 +257,26 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
     }
 
     /// <summary>
+    /// Returns the latest application frame of any target through the shared contract.
+    /// </summary>
+    [McpServerTool, Description("Returns the latest frame a Hex1b application published at the end of a completed render pass, through the shared diagnostic contract: node tree with bounds, effective visible rects and clip state, focus ring, popups, focused-editor carets/selections, timings, and the frame's identity. Capturing never drives a render. Targets that are not Hex1b applications (for example local PTY sessions) report outcome 'unavailable' with code 'no-application-layer'.")]
+    public async Task<ApplicationFrameToolResult> CaptureApplicationFrame(
+        [Description("Session ID of the terminal target")] string sessionId,
+        [Description(CaptureToolSupport.FrameAuthorizeDescription)] string? authorize = null,
+        CancellationToken ct = default)
+    {
+        var target = sessionManager.GetTarget(sessionId);
+        if (target == null)
+        {
+            return CaptureToolSupport.FrameResult(
+                TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Unavailable, "session-not-found", $"Session '{sessionId}' not found."),
+                sessionId, processId: null);
+        }
+
+        return await CaptureToolSupport.CaptureApplicationFrameAsync(target.CaptureApplicationFrameAsync, authorize, ct, sessionId);
+    }
+
+    /// <summary>
     /// Describes the diagnostic capabilities of any target.
     /// </summary>
     [McpServerTool, Description("Describes what diagnostic observations a terminal target supports: operations, formats, timing, authorizations, evidence layers (terminal model, application frame, native delivery, native presentation) with reasons for unavailable layers, and exact limitations.")]

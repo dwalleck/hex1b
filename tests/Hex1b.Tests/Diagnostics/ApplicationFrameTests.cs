@@ -99,6 +99,21 @@ public class ApplicationFrameTests
     }
 
     [TestMethod]
+    public async Task NoApplicationLayer_CapabilitiesMarkTheLayerUnavailable()
+    {
+        await using var raw = Hex1bTerminal.CreateBuilder().WithWorkload(new Hex1bAppWorkloadAdapter()).WithHeadless().WithDimensions(20, 3).Build();
+        var diagnostics = new TerminalDiagnostics(raw, "raw");
+
+        var result = diagnostics.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest { Authorizations = [DiagnosticAuthorization.EditorText] });
+        var layer = diagnostics.GetCapabilities().Layers.Single(l => l.Layer == DiagnosticLayer.ApplicationFrame);
+
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "no-application-layer"), (result.Outcome, result.Problem!.Code));
+        Assert.IsNull(result.Frame, "a workload without an application layer returned a frame");
+        Assert.IsFalse(layer.Available);
+        Assert.AreEqual(result.Problem.Message, layer.Reason, "capabilities and the operation disagree on why there is no frame");
+    }
+
+    [TestMethod]
     public async Task Clipping_VisibleBoundsFollowEnclosingClipRegions()
     {
         await using var harness = await AppHarness.StartAsync(_ => new VStackWidget(

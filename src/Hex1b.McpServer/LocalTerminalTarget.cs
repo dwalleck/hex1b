@@ -72,6 +72,10 @@ public sealed class LocalTerminalTarget : ITerminalTarget
         => Task.FromResult(_session.Diagnostics.Capture(request));
 
     /// <inheritdoc />
+    public Task<DiagnosticApplicationFrameResult> CaptureApplicationFrameAsync(DiagnosticApplicationFrameRequest request, CancellationToken ct = default)
+        => Task.FromResult(_session.Diagnostics.CaptureApplicationFrame(request));
+
+    /// <inheritdoc />
     public Task<DiagnosticCapabilities> GetDiagnosticCapabilitiesAsync(CancellationToken ct = default)
         => Task.FromResult(_session.Diagnostics.GetCapabilities());
 

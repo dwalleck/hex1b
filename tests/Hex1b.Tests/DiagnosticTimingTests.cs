@@ -1,18 +1,21 @@
 using System.Diagnostics;
 using Hex1b.Diagnostics;
+using Hex1b.Input;
 using Hex1b.Layout;
 using Hex1b.Nodes;
 
 namespace Hex1b.Tests;
 
 /// <summary>
-/// Tests for diagnostic timing and tree output improvements.
+/// Tests for diagnostic timing in published application frames and its text form.
 /// </summary>
 [TestClass]
 public class DiagnosticTimingTests
 {
+    private static readonly ApplicationPassTimings NoPassCost = new(0, 0, 0);
+
     [TestMethod]
-    public void DiagnosticTiming_FromNode_ConvertsTicksToMilliseconds()
+    public void NodeTiming_ConvertsTicksToMilliseconds()
     {
         var node = new TextBlockNode { Text = "test" };
         // Simulate 1ms of reconcile time (using Stopwatch frequency)
@@ -20,8 +23,7 @@ public class DiagnosticTimingTests
         node.DiagRenderTicks = Stopwatch.Frequency / 2000; // 0.5ms
         node.DiagLastRenderedTimestamp = Stopwatch.GetTimestamp() - Stopwatch.Frequency / 100; // 10ms ago
 
-        var now = Stopwatch.GetTimestamp();
-        var timing = DiagnosticTiming.FromNode(node, now);
+        var timing = Project(node, NoPassCost).Root!.Timing!;
 
         TestSeq.InRange(timing.ReconcileMs, 0.9, 1.1);
         TestSeq.InRange(timing.RenderMs, 0.4, 0.6);
@@ -29,22 +31,46 @@ public class DiagnosticTimingTests
     }
 
     [TestMethod]
-    public void DiagnosticTiming_FromNode_ZeroTicks_ReturnsZeros()
+    public void NodeTiming_ZeroTicks_ReturnsZerosAndNeverRendered()
     {
-        var node = new TextBlockNode { Text = "test" };
-        var now = Stopwatch.GetTimestamp();
+        var node = new ButtonNode { Label = "Click" };
 
-        var timing = DiagnosticTiming.FromNode(node, now);
+        var timing = Project(node, NoPassCost).Root!.Timing;
 
+        Assert.IsNotNull(timing, "timing-enabled frames report node timing even when a node cost nothing");
         Assert.AreEqual(0, timing.ReconcileMs);
         Assert.AreEqual(0, timing.RenderMs);
         Assert.AreEqual(-1, timing.LastRenderedMsAgo);
     }
 
     [TestMethod]
-    public void DiagnosticTiming_ToString_FormatsCorrectly()
+    public void NodeTiming_AbsentWhenTimingDisabled()
     {
-        var timing = new DiagnosticTiming
+        var node = new ButtonNode { Label = "Click" };
+        node.DiagReconcileTicks = Stopwatch.Frequency / 1000;
+
+        var frame = Project(node, timings: null);
+
+        Assert.IsNull(frame.Timings);
+        Assert.IsNull(frame.Root!.Timing);
+    }
+
+    [TestMethod]
+    public void FrameTimings_ConvertPassTicksToMilliseconds()
+    {
+        var frequency = Stopwatch.Frequency;
+        var frame = Project(new TextBlockNode { Text = "x" },
+            new ApplicationPassTimings(frequency * 3 / 2000, frequency * 3 / 10000, frequency / 500));
+
+        TestSeq.InRange(frame.Timings!.BuildMs, 1.49, 1.51);
+        TestSeq.InRange(frame.Timings.ReconcileMs, 0.29, 0.31);
+        TestSeq.InRange(frame.Timings.RenderMs, 1.99, 2.01);
+    }
+
+    [TestMethod]
+    public void NodeTiming_ToString_FormatsCorrectly()
+    {
+        var timing = new DiagnosticNodeTiming
         {
             ReconcileMs = 0.15,
             RenderMs = 0.30,
@@ -59,9 +85,9 @@ public class DiagnosticTimingTests
     }
 
     [TestMethod]
-    public void DiagnosticTiming_ToString_OmitsZeroValues()
+    public void NodeTiming_ToString_OmitsZeroValues()
     {
-        var timing = new DiagnosticTiming
+        var timing = new DiagnosticNodeTiming
         {
             ReconcileMs = 0,
             RenderMs = 0.5,
@@ -73,32 +99,6 @@ public class DiagnosticTimingTests
         Assert.DoesNotContain("reconcile", result);
         Assert.Contains("render=0.50ms", result);
         Assert.DoesNotContain("last=", result);
-    }
-
-    [TestMethod]
-    public void DiagnosticNode_FromNode_IncludesTimingWhenSet()
-    {
-        var node = new ButtonNode { Label = "Click" };
-        node.DiagReconcileTicks = Stopwatch.Frequency / 1000; // 1ms
-        node.DiagRenderTicks = Stopwatch.Frequency / 2000; // 0.5ms
-        node.DiagLastRenderedTimestamp = Stopwatch.GetTimestamp();
-
-        var diagNode = DiagnosticNode.FromNode(node);
-
-        Assert.IsNotNull(diagNode.Timing);
-        Assert.IsTrue(diagNode.Timing.ReconcileMs > 0);
-        Assert.IsTrue(diagNode.Timing.RenderMs > 0);
-    }
-
-    [TestMethod]
-    public void DiagnosticNode_FromNode_NoTimingWhenZero()
-    {
-        var node = new ButtonNode { Label = "Click" };
-        // No timing fields set — all are default 0
-
-        var diagNode = DiagnosticNode.FromNode(node);
-
-        Assert.IsNull(diagNode.Timing);
     }
 
     [TestMethod]
@@ -116,23 +116,6 @@ public class DiagnosticTimingTests
     }
 
     [TestMethod]
-    public void DiagnosticFrameInfo_ReportsTimingEnabled()
-    {
-        var frameInfo = new DiagnosticFrameInfo
-        {
-            BuildMs = 1.5,
-            ReconcileMs = 0.3,
-            RenderMs = 2.0,
-            TimingEnabled = true
-        };
-
-        Assert.IsTrue(frameInfo.TimingEnabled);
-        Assert.AreEqual(1.5, frameInfo.BuildMs);
-        Assert.AreEqual(0.3, frameInfo.ReconcileMs);
-        Assert.AreEqual(2.0, frameInfo.RenderMs);
-    }
-
-    [TestMethod]
     public void Hex1bNode_TimingFields_DefaultToZero()
     {
         var node = new TextBlockNode { Text = "test" };
@@ -141,4 +124,7 @@ public class DiagnosticTimingTests
         Assert.AreEqual(0, node.DiagRenderTicks);
         Assert.AreEqual(0, node.DiagLastRenderedTimestamp);
     }
+
+    private static DiagnosticApplicationFrame Project(Hex1bNode root, ApplicationPassTimings? timings) =>
+        ApplicationFrameProjector.Project(root, new FocusRing(), frameId: 1, columns: 10, rows: 1, wroteOutput: true, timings);
 }

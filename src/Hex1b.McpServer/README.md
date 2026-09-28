@@ -47,6 +47,13 @@ The server communicates via stdio using the MCP protocol.
 
 Every capture tool returns `capture`, the shared [diagnostic capture contract](https://hex1b.dev/guide/diagnostic-capture) result the CLI also returns: `outcome` (`captured`, `unavailable`, `invalid-request`, `failed`), `problem`, `content`, `geometry`, `history` coverage, `identity` (process, session, build, configuration, acquisition clock), `contentCoverage` (included, excluded, or unavailable, with reasons), `unavailableFields`, and `limitations`. When a tool saves to `savePath`, the content is in the file and omitted from `capture.content`.
 
+### Application frames
+
+- **capture_application_frame** - Return the latest frame a Hex1b application published (node tree with visible bounds and clip state, focus ring, popups, focused-editor carets and selections, timings), with optional `authorize` `editor-text` for the focused editor's text. Local PTY sessions report `no-application-layer`.
+- **get_hex1b_tree** - The same result for a Hex1b application by process ID.
+
+Both return `applicationFrame`, the shared [application-frame result](https://hex1b.dev/guide/diagnostic-capture#application-frames) that `hex1b app tree --json` also returns. Capturing never drives a render.
+
 ### Recording
 
 - **start_asciinema_recording** - Start recording a terminal session to an asciinema file. Captures the current terminal state as the initial frame, then records all subsequent output. Supports `idle_time_limit` parameter (default 2s) to compress long pauses during playback.

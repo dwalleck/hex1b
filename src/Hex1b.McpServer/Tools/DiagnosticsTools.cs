@@ -174,57 +174,25 @@ public class DiagnosticsTools
     }
 
     /// <summary>
-    /// Gets the widget/node tree from a Hex1b application for debugging.
+    /// Returns a Hex1b application's latest published frame for debugging.
     /// </summary>
-    [McpServerTool, Description("Gets the widget/node tree, popup stack, focus ring, and frame timing information from a Hex1b application. Use this to debug hit testing, focus, and layout issues. Essential for understanding why clicks aren't working or focus is wrong. Use GetHex1bSkill for comprehensive documentation.")]
-    public async Task<GetHex1bTreeResult> GetHex1bTree(
+    [McpServerTool, Description("Gets the latest frame a Hex1b application published: the node tree with bounds, effective visible rects and clip state, popup stack, focus ring, focused-editor carets/selections, and frame timing, with the frame's identity, through the shared application-frame contract. Use this to debug hit testing, focus, clipping, and layout issues. Capturing never drives a render. Use GetHex1bSkill for comprehensive documentation.")]
+    public async Task<ApplicationFrameToolResult> GetHex1bTree(
         [Description("Process ID of the Hex1b application")] int processId,
+        [Description(CaptureToolSupport.FrameAuthorizeDescription)] string? authorize = null,
         CancellationToken ct = default)
     {
         var unavailable = CheckTarget(processId, out var socketPath);
         if (unavailable != null)
-            return new GetHex1bTreeResult { Success = false, ProcessId = processId, Message = unavailable };
-
-        try
         {
-            var response = await Client.SendAsync(socketPath, new DiagnosticsRequest { Method = "tree" }, ct,
-                DiagnosticsSocketClient.DefaultObservationTimeout);
-            if (!response.Success)
-            {
-                return new GetHex1bTreeResult
-                {
-                    Success = false,
-                    ProcessId = processId,
-                    Message = response.Error ?? "Unknown error from diagnostics socket."
-                };
-            }
+            return CaptureToolSupport.FrameResult(
+                TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Unavailable, "target-unreachable", unavailable),
+                sessionId: null, processId);
+        }
 
-            return new GetHex1bTreeResult
-            {
-                Success = true,
-                ProcessId = processId,
-                Message = $"Retrieved tree from {response.Width}x{response.Height} terminal",
-                Width = response.Width ?? 0,
-                Height = response.Height ?? 0,
-                Tree = ToElement(response.Tree),
-                Popups = ToElement(response.Popups),
-                FocusInfo = ToElement(response.FocusInfo),
-                FrameInfo = ToElement(response.FrameInfo)
-            };
-        }
-        catch (Exception ex)
-        {
-            return new GetHex1bTreeResult
-            {
-                Success = false,
-                ProcessId = processId,
-                Message = $"Failed to get tree: {ex.Message}"
-            };
-        }
+        return await CaptureToolSupport.CaptureApplicationFrameAsync(
+            (request, token) => Client.CaptureApplicationFrameAsync(socketPath, request, token), authorize, ct, processId: processId);
     }
-
-    private static JsonElement? ToElement<T>(T? value) where T : class =>
-        value is null ? null : JsonSerializer.SerializeToElement(value, DiagnosticsJsonOptions.Default.GetTypeInfo(typeof(T)));
 
     // Returns why the target cannot be reached, or null when its socket is live.
     private static string? CheckTarget(int processId, out string socketPath)
@@ -309,38 +277,4 @@ public class SendInputToHex1bTerminalResult
 
     [JsonPropertyName("charactersSent")]
     public int CharactersSent { get; init; }
-}
-
-public class GetHex1bTreeResult
-{
-    [JsonPropertyName("success")]
-    public required bool Success { get; init; }
-
-    [JsonPropertyName("processId")]
-    public required int ProcessId { get; init; }
-
-    [JsonPropertyName("message")]
-    public required string Message { get; init; }
-
-    [JsonPropertyName("width")]
-    public int Width { get; init; }
-
-    [JsonPropertyName("height")]
-    public int Height { get; init; }
-    
-    [JsonPropertyName("tree")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public JsonElement? Tree { get; init; }
-    
-    [JsonPropertyName("popups")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public JsonElement? Popups { get; init; }
-    
-    [JsonPropertyName("focusInfo")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public JsonElement? FocusInfo { get; init; }
-
-    [JsonPropertyName("frameInfo")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public JsonElement? FrameInfo { get; init; }
 }

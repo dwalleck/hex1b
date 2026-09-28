@@ -40,14 +40,8 @@ internal static class DiagnosticContractNames
             return (null, TerminalDiagnostics.Problem(DiagnosticOutcome.InvalidRequest, "unsupported-format",
                 $"Unsupported capture format '{format}'. Supported: {string.Join(", ", All<DiagnosticCaptureFormat>())}."));
 
-        var parsedAuthorizations = new List<DiagnosticAuthorization>();
-        foreach (var name in authorizations ?? [])
-        {
-            if (!TryParse<DiagnosticAuthorization>(name, out var authorization))
-                return (null, TerminalDiagnostics.Problem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization",
-                    $"Unsupported authorization '{name}'. Supported: {string.Join(", ", All<DiagnosticAuthorization>())}."));
-            parsedAuthorizations.Add(authorization);
-        }
+        if (!TryParseAuthorizations(authorizations, out var parsedAuthorizations, out var unsupported))
+            return (null, TerminalDiagnostics.Problem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", unsupported));
 
         return (new DiagnosticCaptureRequest
         {
@@ -56,5 +50,36 @@ internal static class DiagnosticContractNames
             FontFamily = fontFamily,
             Authorizations = parsedAuthorizations,
         }, null);
+    }
+
+    /// <summary>
+    /// Builds an application-frame request from client text, or an invalid-request result
+    /// describing the first unrecognized authorization.
+    /// </summary>
+    public static (DiagnosticApplicationFrameRequest? Request, DiagnosticApplicationFrameResult? Invalid) ParseApplicationFrameRequest(
+        IEnumerable<string>? authorizations)
+    {
+        if (!TryParseAuthorizations(authorizations, out var parsed, out var unsupported))
+            return (null, TerminalDiagnostics.FrameProblem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", unsupported));
+
+        return (new DiagnosticApplicationFrameRequest { Authorizations = parsed }, null);
+    }
+
+    private static bool TryParseAuthorizations(IEnumerable<string>? names, out List<DiagnosticAuthorization> parsed, out string unsupported)
+    {
+        parsed = [];
+        unsupported = "";
+        foreach (var name in names ?? [])
+        {
+            if (!TryParse<DiagnosticAuthorization>(name, out var authorization))
+            {
+                unsupported = $"Unsupported authorization '{name}'. Supported: {string.Join(", ", All<DiagnosticAuthorization>())}.";
+                return false;
+            }
+
+            parsed.Add(authorization);
+        }
+
+        return true;
     }
 }

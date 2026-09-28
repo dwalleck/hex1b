@@ -98,7 +98,7 @@ hex1b keys <id> --key Tab --ctrl
 
 | Command | Description |
 |---------|-------------|
-| `app tree` | Show the widget/node tree of a running application |
+| `app tree` | Show the latest published frame (node tree, focus, popups, focused editor) of a running application |
 
 ### `assert` — Validate terminal content
 

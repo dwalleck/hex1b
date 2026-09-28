@@ -409,11 +409,14 @@ hex1b mouse drag <id> <x1> <y1> <x2> <y2> [options]
 
 ## `app`
 
-TUI application diagnostics for inspecting the widget/node tree.
+TUI application diagnostics for inspecting published application frames.
 
 ### `app tree`
 
-Inspect the widget/node tree of a TUI application.
+Inspect the latest frame a TUI application published: node tree with geometry and clipping,
+focus ring, popups, focused editor, and timing. The application must use `WithDiagnostics()`.
+`--json` prints the shared [application-frame result](../guide/diagnostic-capture.md#application-frames);
+targets that are not Hex1b applications report `no-application-layer` and exit with code 1.
 
 ```bash
 hex1b app tree <id> [options]
@@ -425,9 +428,11 @@ hex1b app tree <id> [options]
 
 | Option | Type | Description |
 |--------|------|-------------|
-| `--focus` | flag | Include focus ring info |
-| `--popups` | flag | Include popup stack |
-| `--depth` | int | Limit tree depth |
+| `--focus` | flag | Include focus ring and focused-editor metadata (text output) |
+| `--popups` | flag | Include popup stack (text output) |
+| `--depth` | int | Limit printed tree depth (text output) |
+| `--no-perf` | flag | Hide timing (text output) |
+| `--authorize` | string[] | `editor-text` includes the focused editor's text (repeatable or comma-separated) |
 
 **Examples:**
 
@@ -438,8 +443,8 @@ hex1b app tree abc123
 # With focus info, limited depth
 hex1b app tree abc123 --focus --depth 3
 
-# As JSON
-hex1b app tree abc123 --json
+# As the contract JSON, including the focused editor's text
+hex1b app tree abc123 --json --authorize editor-text
 ```
 
 ---

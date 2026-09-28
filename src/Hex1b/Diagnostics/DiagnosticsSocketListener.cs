@@ -538,11 +538,11 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
             "info" => HandleInfoRequest(),
             "capture" => HandleCaptureRequest(request.Capture),
             "capabilities" => HandleCapabilitiesRequest(),
+            TerminalDiagnostics.ApplicationFrameOperation => HandleApplicationFrameRequest(request.ApplicationFrame),
             "input" => await HandleInputRequestAsync(request.Data),
             "key" => await HandleKeyRequestAsync(request.Key, request.Modifiers),
             "click" => HandleClickRequest(request.X, request.Y, request.Button),
             "drag" => HandleDragRequest(request.X, request.Y, request.X2, request.Y2, request.Button),
-            "tree" => HandleTreeRequest(),
             "resize" => await HandleResizeRequestAsync(request.X, request.Y),
             "shutdown" => HandleShutdownRequest(),
             "record-start" => await HandleRecordStartRequestAsync(request),
@@ -581,6 +581,19 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
             Success = result.Outcome == DiagnosticOutcome.Captured,
             Error = result.Problem?.Message,
             Capture = result
+        };
+    }
+
+    private DiagnosticsResponse HandleApplicationFrameRequest(DiagnosticApplicationFrameRequest? request)
+    {
+        var result = _diagnostics?.CaptureApplicationFrame(request ?? new DiagnosticApplicationFrameRequest())
+            ?? TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Unavailable, "target-not-initialized",
+                "The terminal is not initialized.");
+        return new DiagnosticsResponse
+        {
+            Success = result.Outcome == DiagnosticOutcome.Captured,
+            Error = result.Problem?.Message,
+            ApplicationFrame = result
         };
     }
 
@@ -841,31 +854,6 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         }
 
         return new DiagnosticsResponse { Success = false, Error = "Terminal workload does not support direct mouse injection" };
-    }
-
-    private DiagnosticsResponse HandleTreeRequest()
-    {
-        if (_terminal == null)
-        {
-            return new DiagnosticsResponse { Success = false, Error = "Terminal not initialized" };
-        }
-
-        // Get the diagnostic tree provider from the workload adapter
-        if (_terminal.Workload is Hex1bAppWorkloadAdapter workload && workload.DiagnosticTreeProvider is { } provider)
-        {
-            return new DiagnosticsResponse
-            {
-                Success = true,
-                Width = _terminal.Width,
-                Height = _terminal.Height,
-                Tree = provider.GetDiagnosticTree(),
-                Popups = provider.GetDiagnosticPopups(),
-                FocusInfo = provider.GetDiagnosticFocusInfo(),
-                FrameInfo = provider.GetDiagnosticFrameInfo()
-            };
-        }
-
-        return new DiagnosticsResponse { Success = false, Error = "No diagnostic tree provider available" };
     }
 
     private async Task<DiagnosticsResponse> HandleResizeRequestAsync(int? width, int? height)

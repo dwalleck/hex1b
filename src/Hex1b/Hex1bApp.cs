@@ -39,7 +39,7 @@ namespace Hex1b;
 /// State management is handled via closures - simply capture your state variables
 /// in the widget builder callback.
 /// </remarks>
-public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, IApplicationFrameSource
+public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
 {
     // Not readonly: a live inline step can replace its root layout without
     // stopping the app (see SwapRootComponent). Read once per frame; the
@@ -242,9 +242,6 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, 
     
     // Diagnostic timing (opt-in, zero-alloc when disabled)
     private bool _diagnosticTimingEnabled;
-    private long _diagBuildTicks;
-    private long _diagReconcileTicks;
-    private long _diagRenderTicks;
     
     // Metrics instrumentation
     private readonly Diagnostics.Hex1bMetrics _metrics;
@@ -584,10 +581,9 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, 
     /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
-        // Register this app as the diagnostic tree provider if the adapter supports it
+        // Register this app as the application-frame source if the adapter supports it
         if (_adapter is Hex1bAppWorkloadAdapter workloadAdapter)
         {
-            workloadAdapter.DiagnosticTreeProvider = this;
             workloadAdapter.ApplicationFrameSource = this;
             _diagnosticTimingEnabled = workloadAdapter.DiagnosticTimingEnabled;
             _framePublicationEnabled = workloadAdapter.DiagnosticTimingEnabled;
@@ -1059,7 +1055,6 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, 
         }
         
         var buildTicks = Stopwatch.GetTimestamp() - buildStart;
-        if (_diagnosticTimingEnabled) _diagBuildTicks = buildTicks;
 
         // Step 2: Wrap in rescue widget if enabled (catches Reconcile/Measure/Arrange/Render and Build failures)
         if (_rescueEnabled)
@@ -1105,7 +1100,6 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, 
             }
             
             reconcileTicks = Stopwatch.GetTimestamp() - reconcileFrameStart;
-            if (_diagnosticTimingEnabled) _diagReconcileTicks = reconcileTicks;
         }
 
         // Step 4: Layout - measure and arrange the node tree
@@ -1182,7 +1176,6 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, 
                     wroteOutput = await RenderFrameWithSurfaceAsync(frameWidth, frameHeight, frameCapabilities, cancellationToken).ConfigureAwait(false);
                     
                     renderTicks = Stopwatch.GetTimestamp() - renderFrameStart;
-                    if (_diagnosticTimingEnabled) _diagRenderTicks = renderTicks;
                 }
                 
                 // Clear dirty flags on all nodes (they've been rendered)
@@ -1243,6 +1236,9 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, 
     }
 
     bool IApplicationFrameSource.FramePublicationEnabled => _framePublicationEnabled;
+
+    // For an app whose own adapter is not the terminal's (a flow step); call before RunAsync.
+    internal void EnableFramePublication() => _diagnosticTimingEnabled = _framePublicationEnabled = true;
 
     PublishedApplicationFrame? IApplicationFrameSource.LatestFrame => Volatile.Read(ref _latestFrame);
 
@@ -2597,123 +2593,5 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IDiagnosticTreeProvider, 
         
         // Dispose the adapter asynchronously
         await _adapter.DisposeAsync();
-    }
-    
-    // ========================================
-    // IDiagnosticTreeProvider implementation
-    // ========================================
-    
-    DiagnosticNode? IDiagnosticTreeProvider.GetDiagnosticTree()
-    {
-        return _rootNode != null ? DiagnosticNode.FromNode(_rootNode) : null;
-    }
-    
-    IReadOnlyList<DiagnosticPopupEntry> IDiagnosticTreeProvider.GetDiagnosticPopups()
-    {
-        var popups = new List<DiagnosticPopupEntry>();
-        
-        // Find ZStackNode (the popup host) in the tree
-        var zstack = FindNode<ZStackNode>(_rootNode);
-        if (zstack == null) return popups;
-        
-        var entries = zstack.Popups.Entries;
-        for (int i = 0; i < entries.Count; i++)
-        {
-            var entry = entries[i];
-            var diagEntry = new DiagnosticPopupEntry
-            {
-                Index = i,
-                ContentType = entry.ContentNode?.GetType().Name ?? "null",
-                HasBackdrop = true, // All popups have backdrops
-                FocusRestoreNodeType = entry.FocusRestoreNode?.GetType().Name,
-                IsAnchored = entry.AnchorNode != null,
-                IsBarrier = entry.IsBarrier
-            };
-            
-            if (entry.ContentNode != null)
-            {
-                diagEntry.ContentBounds = DiagnosticRect.FromRect(entry.ContentNode.ContentBounds);
-            }
-            
-            // Check if it's an anchored popup
-            if (entry.ContentNode is AnchoredNode anchoredNode)
-            {
-                diagEntry.AnchorInfo = new DiagnosticAnchorInfo
-                {
-                    AnchorNodeType = anchoredNode.AnchorNode?.GetType().Name,
-                    AnchorBounds = anchoredNode.AnchorNode != null 
-                        ? DiagnosticRect.FromRect(anchoredNode.AnchorNode.Bounds) 
-                        : null,
-                    IsStale = anchoredNode.IsAnchorStale,
-                    Position = anchoredNode.Position.ToString()
-                };
-            }
-            
-            popups.Add(diagEntry);
-        }
-        
-        return popups;
-    }
-    
-    DiagnosticFocusInfo IDiagnosticTreeProvider.GetDiagnosticFocusInfo()
-    {
-        var focusables = _focusRing.Focusables;
-        var currentIndex = -1;
-        var focusedType = (string?)null;
-        
-        for (int i = 0; i < focusables.Count; i++)
-        {
-            if (focusables[i].IsFocused)
-            {
-                currentIndex = i;
-                focusedType = focusables[i].GetType().Name;
-                break;
-            }
-        }
-        
-        return new DiagnosticFocusInfo
-        {
-            FocusableCount = focusables.Count,
-            CurrentFocusIndex = currentIndex,
-            FocusedNodeType = focusedType,
-            LastHitTestDebug = _focusRing.LastHitTestDebug,
-            Focusables = focusables.Select((node, i) => new DiagnosticFocusableEntry
-            {
-                Index = i,
-                Type = node.GetType().Name,
-                Bounds = DiagnosticRect.FromRect(node.Bounds),
-                HitTestBounds = DiagnosticRect.FromRect(node.HitTestBounds),
-                IsFocused = node.IsFocused
-            }).ToList()
-        };
-    }
-    
-    DiagnosticFrameInfo IDiagnosticTreeProvider.GetDiagnosticFrameInfo()
-    {
-        var freq = (double)Stopwatch.Frequency;
-        return new DiagnosticFrameInfo
-        {
-            BuildMs = _diagBuildTicks * 1000.0 / freq,
-            ReconcileMs = _diagReconcileTicks * 1000.0 / freq,
-            RenderMs = _diagRenderTicks * 1000.0 / freq,
-            TimingEnabled = _diagnosticTimingEnabled
-        };
-    }
-    
-    /// <summary>
-    /// Finds the first node of type T in the tree.
-    /// </summary>
-    private static T? FindNode<T>(Hex1bNode? root) where T : Hex1bNode
-    {
-        if (root == null) return null;
-        if (root is T found) return found;
-        
-        foreach (var child in root.GetChildren())
-        {
-            var result = FindNode<T>(child);
-            if (result != null) return result;
-        }
-        
-        return null;
     }
 }

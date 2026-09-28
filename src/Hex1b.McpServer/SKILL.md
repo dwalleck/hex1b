@@ -85,14 +85,18 @@ Sends a mouse click to a terminal.
 
 ### Diagnostic Tools
 
-#### `GetHex1bTree`
-**IMPORTANT**: Use this tool to debug layout, hit testing, and focus issues.
+#### `GetHex1bTree` / `capture_application_frame`
+**IMPORTANT**: Use these tools to debug layout, clipping, hit testing, and focus issues.
 - Parameters:
-  - `processId`: Process ID of the Hex1b application
-- Returns:
-  - `tree`: Full widget/node hierarchy with bounds, hit test bounds, and properties
-  - `popups`: Popup stack entries with anchor info and stale status
-  - `focusInfo`: All focusable nodes with positions and last hit test debug info
+  - `processId` (`GetHex1bTree`) or `sessionId` (`capture_application_frame`)
+  - `authorize`: optional `editor-text` to include the focused editor's text
+- Return `applicationFrame`, the latest frame the app published at the end of a render pass:
+  - `frame.root`: node hierarchy with `bounds`, `hitTestBounds`, `visibleBounds`, `clipState`, and properties
+  - `frame.popups`: popup stack with anchor type, bounds, staleness (`anchorIsStale`), and position
+  - `frame.focus`: focus ring (`currentIndex`, `focusedNodeType`, `focusables`, `lastHitTest`)
+  - `frame.focusedEditor`: carets and selections (offset, 0-based line/column), length, line count
+  - `identity.applicationFrame`: the frame's identity
+- Local PTY sessions report `no-application-layer`
 - Essential for understanding why clicks aren't working or focus is wrong
 
 ### Session Management
@@ -170,7 +174,7 @@ When tests fail unexpectedly:
 1. Enable `WithDiagnostics()` in the test
 2. Add a breakpoint or delay
 3. Use `GetHex1bTree` MCP tool to inspect:
-   - Node bounds and hit test bounds
+   - Node bounds, hit test bounds, and visible (clipped) bounds
    - Focus ring state
    - Popup stack
 
@@ -206,18 +210,18 @@ When tests fail unexpectedly:
 ## Common Issues and Solutions
 
 ### Click not working / wrong element responding
-1. Use `GetHex1bTree` to inspect `focusInfo.focusables`
+1. Use `GetHex1bTree` to inspect `frame.focus.focusables`
 2. Look for nodes with mismatched `bounds` vs `hitTestBounds`
 3. Check for nodes with `bounds: (0,0,0,0)` but non-zero `hitTestBounds`
 
 ### Popup appearing at wrong position
-1. Check `popups` array in tree output
-2. Look for `anchorInfo.isStale: true` indicating stale anchor reference
+1. Check the `frame.popups` array
+2. Look for `anchorIsStale: true` indicating stale anchor reference
 3. Stale anchors happen when the anchor node is replaced during reconciliation
 
 ### Focus not on expected element
-1. Check `focusInfo.currentFocusIndex` and `focusedNodeType`
-2. Verify the element is in `focusables` array
+1. Check `frame.focus.currentIndex` and `focusedNodeType`
+2. Verify the element is in the `frame.focus.focusables` array
 3. Check `isFocusable: true` on the node
 
 ## Getting This Skill

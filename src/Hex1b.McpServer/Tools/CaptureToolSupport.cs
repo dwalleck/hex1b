@@ -13,6 +13,9 @@ internal static class CaptureToolSupport
     public const string AuthorizeDescription =
         "Optional comma-separated opt-ins beyond the rendered screen: non-screen-metadata (titles, hyperlink targets), editor-text, raw-input. Default content can still contain secrets.";
 
+    public const string FrameAuthorizeDescription =
+        "Optional comma-separated opt-ins: editor-text includes the focused editor's full text. Without it, editors report caret, selection, length, and line metadata only.";
+
     public const string HistoryRowsDescription =
         "Rows of retained terminal-model history to include above the screen (default 0). This is model history, not native scrollback; see capture.history for requested/available/returned rows.";
 
@@ -54,6 +57,37 @@ internal static class CaptureToolSupport
     /// </summary>
     public static JsonElement ToJson(DiagnosticCaptureResult result) =>
         JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticCaptureResult);
+
+    public static JsonElement ToJson(DiagnosticApplicationFrameResult result) =>
+        JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticApplicationFrameResult);
+
+    /// <summary>
+    /// Parses the authorize argument, captures the latest application frame, and wraps the
+    /// contract result for MCP.
+    /// </summary>
+    public static async Task<ApplicationFrameToolResult> CaptureApplicationFrameAsync(
+        Func<DiagnosticApplicationFrameRequest, CancellationToken, Task<DiagnosticApplicationFrameResult>> capture,
+        string? authorize,
+        CancellationToken ct,
+        string? sessionId = null,
+        int? processId = null)
+    {
+        var authorizations = authorize?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var (request, invalid) = DiagnosticContractNames.ParseApplicationFrameRequest(authorizations);
+        var result = invalid ?? await capture(request!, ct);
+        return FrameResult(result, sessionId, processId);
+    }
+
+    public static ApplicationFrameToolResult FrameResult(DiagnosticApplicationFrameResult result, string? sessionId, int? processId) => new()
+    {
+        Success = result.Outcome == DiagnosticOutcome.Captured,
+        SessionId = sessionId,
+        ProcessId = processId,
+        Message = result.Frame is { } frame
+            ? $"Captured application frame {frame.FrameId} ({frame.Columns}x{frame.Rows})."
+            : $"Application frame {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}",
+        ApplicationFrame = ToJson(result),
+    };
 
     public static JsonElement ToJson(DiagnosticCapabilities capabilities) =>
         JsonSerializer.SerializeToElement(capabilities, DiagnosticsJsonContext.Default.DiagnosticCapabilities);

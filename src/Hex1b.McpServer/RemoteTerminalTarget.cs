@@ -140,6 +140,10 @@ public sealed class RemoteTerminalTarget : ITerminalTarget
         => _client.CaptureAsync(_socketPath, request, ct);
 
     /// <inheritdoc />
+    public Task<DiagnosticApplicationFrameResult> CaptureApplicationFrameAsync(DiagnosticApplicationFrameRequest request, CancellationToken ct = default)
+        => _client.CaptureApplicationFrameAsync(_socketPath, request, ct);
+
+    /// <inheritdoc />
     public Task<DiagnosticCapabilities> GetDiagnosticCapabilitiesAsync(CancellationToken ct = default)
         => _client.GetCapabilitiesAsync(_socketPath, ct);
 

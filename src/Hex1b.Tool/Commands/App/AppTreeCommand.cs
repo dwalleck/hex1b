@@ -7,7 +7,8 @@ using Microsoft.Extensions.Logging;
 namespace Hex1b.Tool.Commands.App;
 
 /// <summary>
-/// Inspects the widget/node tree of a TUI application.
+/// Inspects a TUI application's latest published frame (node tree, focus, popups, focused
+/// editor) through the shared application-frame contract.
 /// </summary>
 internal sealed class AppTreeCommand : BaseCommand
 {
@@ -15,17 +16,21 @@ internal sealed class AppTreeCommand : BaseCommand
     private readonly DiagnosticsSocketClient _client;
 
     private static readonly Argument<string> s_idArgument = new("id") { Description = "Terminal ID (or prefix)" };
-    private static readonly Option<bool> s_focusOption = new("--focus") { Description = "Include focus ring info" };
-    private static readonly Option<bool> s_popupsOption = new("--popups") { Description = "Include popup stack" };
-    private static readonly Option<int?> s_depthOption = new("--depth") { Description = "Limit tree depth" };
-    private static readonly Option<bool> s_noPerfOption = new("--no-perf") { Description = "Hide performance timing" };
+    private static readonly Option<bool> s_focusOption = new("--focus") { Description = "Include the focus ring and focused editor" };
+    private static readonly Option<bool> s_popupsOption = new("--popups") { Description = "Include the popup stack" };
+    private static readonly Option<int?> s_depthOption = new("--depth") { Description = "Limit printed tree depth (text output only)" };
+    private static readonly Option<bool> s_noPerfOption = new("--no-perf") { Description = "Hide performance timing (text output only)" };
+    private static readonly Option<string[]> s_authorizeOption = new("--authorize")
+    {
+        Description = "Opt in to content beyond the frame's defaults: editor-text includes the focused editor's text (repeatable or comma-separated)"
+    };
 
     public AppTreeCommand(
         TerminalIdResolver resolver,
         DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<AppTreeCommand> logger)
-        : base("tree", "Inspect the widget/node tree of a TUI application", formatter, logger)
+        : base("tree", "Inspect the latest published frame of a TUI application", formatter, logger)
     {
         _resolver = resolver;
         _client = client;
@@ -35,6 +40,7 @@ internal sealed class AppTreeCommand : BaseCommand
         Options.Add(s_popupsOption);
         Options.Add(s_depthOption);
         Options.Add(s_noPerfOption);
+        Options.Add(s_authorizeOption);
     }
 
     protected override async Task<int> ExecuteAsync(ParseResult parseResult, CancellationToken cancellationToken)
@@ -42,7 +48,15 @@ internal sealed class AppTreeCommand : BaseCommand
         var id = parseResult.GetValue(s_idArgument)!;
         var showFocus = parseResult.GetValue(s_focusOption);
         var showPopups = parseResult.GetValue(s_popupsOption);
+        var depth = parseResult.GetValue(s_depthOption);
         var hidePerf = parseResult.GetValue(s_noPerfOption);
+        var authorizations = parseResult.GetValue(s_authorizeOption)?
+            .SelectMany(value => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        var json = parseResult.GetValue(RootCommand.JsonOption);
+
+        var (request, invalid) = DiagnosticContractNames.ParseApplicationFrameRequest(authorizations);
+        if (invalid != null)
+            return WriteFailure(invalid, json);
 
         var resolved = _resolver.Resolve(id);
         if (!resolved.Success)
@@ -51,98 +65,110 @@ internal sealed class AppTreeCommand : BaseCommand
             return 1;
         }
 
-        var response = await _client.SendAsync(resolved.SocketPath!, new DiagnosticsRequest { Method = "tree" }, cancellationToken);
-        if (!response.Success)
+        var result = await _client.CaptureApplicationFrameAsync(resolved.SocketPath!, request!, cancellationToken);
+        if (result.Outcome != DiagnosticOutcome.Captured)
+            return WriteFailure(result, json);
+
+        // JSON is the whole contract result; the display options only shape text output.
+        if (json)
         {
-            Formatter.WriteError(response.Error ?? "Failed to get tree");
-            return 1;
+            WriteResult(result);
+            return 0;
         }
 
-        var showPerf = !hidePerf && response.FrameInfo is { TimingEnabled: true };
+        var frame = result.Frame!;
+        var showPerf = !hidePerf && frame.Timings is not null;
+        Formatter.WriteLine($"Frame {frame.FrameId}: {frame.Columns}x{frame.Rows}, {(frame.WroteOutput ? "wrote output" : "no output")}");
+        if (showPerf)
+            Formatter.WriteLine($"Timing: build={frame.Timings!.BuildMs:F2}ms reconcile={frame.Timings.ReconcileMs:F2}ms render={frame.Timings.RenderMs:F2}ms");
+        Formatter.WriteLine("");
 
-        if (parseResult.GetValue(RootCommand.JsonOption))
+        if (frame.Root != null)
+            PrintTree(frame.Root, "", true, showPerf, depth ?? int.MaxValue);
+
+        if (showPopups && frame.Popups.Count > 0)
         {
-            Formatter.WriteJson(new
+            Formatter.WriteLine("");
+            Formatter.WriteLine("Popups:");
+            foreach (var popup in frame.Popups)
             {
-                tree = response.Tree,
-                popups = showPopups ? response.Popups : null,
-                focusInfo = showFocus ? response.FocusInfo : null,
-                frameInfo = showPerf ? response.FrameInfo : null
-            });
+                var anchor = popup.IsAnchored
+                    ? $", anchor={popup.AnchorNodeType} {popup.AnchorBounds} {popup.AnchorPosition}{(popup.AnchorIsStale == true ? " (stale)" : "")}"
+                    : "";
+                Formatter.WriteLine($"  [{popup.Index}] {popup.ContentType} (barrier={popup.IsBarrier}, anchored={popup.IsAnchored}{anchor})");
+            }
         }
-        else
+
+        if (showFocus)
         {
-            if (showPerf && response.FrameInfo != null)
+            var focus = frame.Focus;
+            Formatter.WriteLine("");
+            Formatter.WriteLine($"Focus: {focus.FocusedNodeType ?? "none"} (index {focus.CurrentIndex}/{focus.Focusables.Count})");
+            if (frame.FocusedEditor is { } editor)
             {
-                Formatter.WriteLine($"Frame: build={response.FrameInfo.BuildMs:F2}ms reconcile={response.FrameInfo.ReconcileMs:F2}ms render={response.FrameInfo.RenderMs:F2}ms");
-                Formatter.WriteLine("");
-            }
-
-            if (response.Tree != null)
-            {
-                PrintTree(response.Tree, "", true, showPerf);
-            }
-
-            if (showPopups && response.Popups is { Count: > 0 })
-            {
-                Formatter.WriteLine("");
-                Formatter.WriteLine("Popups:");
-                foreach (var popup in response.Popups)
-                {
-                    Formatter.WriteLine($"  [{popup.Index}] {popup.ContentType} (barrier={popup.IsBarrier}, anchored={popup.IsAnchored})");
-                }
-            }
-
-            if (showFocus && response.FocusInfo != null)
-            {
-                Formatter.WriteLine("");
-                Formatter.WriteLine($"Focus: {response.FocusInfo.FocusedNodeType ?? "none"} (index {response.FocusInfo.CurrentFocusIndex}/{response.FocusInfo.FocusableCount})");
+                var carets = string.Join(", ", editor.Carets.Select(c => $"{c.Offset}@{c.Line}:{c.Column}"));
+                var selections = string.Join(", ", editor.Selections.Select(s => $"{s.Start.Offset}-{s.End.Offset}"));
+                Formatter.WriteLine($"Editor: {editor.Kind} {editor.Bounds}, length={editor.Length}, lines={editor.LineCount}, carets=[{carets}], selections=[{selections}]");
+                if (editor.Text != null)
+                    Formatter.WriteLine($"Editor text: {Quote(editor.Text)}");
             }
         }
 
         return 0;
     }
 
-    private void PrintTree(DiagnosticNode node, string indent, bool isLast, bool showPerf)
+    private void PrintTree(DiagnosticFrameNode node, string indent, bool isLast, bool showPerf, int remainingDepth)
     {
         var connector = isLast ? "└─ " : "├─ ";
         var focused = node.IsFocused ? " [FOCUSED]" : "";
+        var text = node.Text is { } content ? $" {Quote(content)}" : "";
 
-        // Node header
-        Formatter.WriteLine($"{indent}{connector}{node.Type}{focused}");
+        Formatter.WriteLine($"{indent}{connector}{node.Type}{focused}{text}");
 
         // Detail lines use extra indentation under the connector
         var detailIndent = indent + (isLast ? "   " : "│  ") + "   ";
 
-        // Properties
         if (node.Properties is { Count: > 0 })
         {
             var props = string.Join(", ", node.Properties.Select(p => $"{p.Key}={p.Value}"));
             Formatter.WriteLine($"{detailIndent}Properties: {props}");
         }
 
-        // Geometry
-        Formatter.WriteLine($"{detailIndent}Geometry:   {node.Bounds}");
+        var clipping = node.ClipState == DiagnosticClipState.Visible
+            ? ""
+            : $" ({DiagnosticContractNames.Of(node.ClipState)}, visible {node.VisibleBounds})";
+        Formatter.WriteLine($"{detailIndent}Geometry:   {node.Bounds}{clipping}");
 
-        // Performance timing
-        if (showPerf && node.Timing != null)
+        if (showPerf && node.Timing?.ToString() is { Length: > 0 } timing)
+            Formatter.WriteLine($"{detailIndent}Performance: {timing}");
+
+        var children = node.Children ?? [];
+        if (children.Count == 0)
+            return;
+
+        if (remainingDepth <= 1)
         {
-            var timingStr = node.Timing.ToString();
-            if (timingStr.Length > 0)
-            {
-                Formatter.WriteLine($"{detailIndent}Performance: {timingStr}");
-            }
+            Formatter.WriteLine($"{detailIndent}Children:   {children.Count} not shown (--depth)");
+            return;
         }
 
-        // Children
-        if (node.Children is { Count: > 0 })
-        {
-            var childIndent = indent + (isLast ? "   " : "│  ");
-            Formatter.WriteLine($"{detailIndent}Children:");
-            for (var i = 0; i < node.Children.Count; i++)
-            {
-                PrintTree(node.Children[i], childIndent + "   ", i == node.Children.Count - 1, showPerf);
-            }
-        }
+        var childIndent = indent + (isLast ? "   " : "│  ");
+        Formatter.WriteLine($"{detailIndent}Children:");
+        for (var i = 0; i < children.Count; i++)
+            PrintTree(children[i], childIndent + "   ", i == children.Count - 1, showPerf, remainingDepth - 1);
     }
+
+    // Quoted and escaped, so application text cannot inject terminal control sequences.
+    private static string Quote(string text) => JsonSerializer.Serialize(text, DiagnosticsJsonContext.Default.String);
+
+    private int WriteFailure(DiagnosticApplicationFrameResult result, bool json)
+    {
+        if (json)
+            WriteResult(result);
+        Formatter.WriteError($"{DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}");
+        return 1;
+    }
+
+    private static void WriteResult(DiagnosticApplicationFrameResult result) =>
+        Console.WriteLine(JsonSerializer.Serialize(result, DiagnosticsJsonOptions.Indented.GetTypeInfo(typeof(DiagnosticApplicationFrameResult))));
 }
