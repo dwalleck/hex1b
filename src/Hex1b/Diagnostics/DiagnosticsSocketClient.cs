@@ -90,6 +90,9 @@ internal sealed class DiagnosticsSocketClient
             return TerminalDiagnostics.Problem(outcome, code, message);
         }
 
+        if (request.Milestone is not null && result.Outcome == DiagnosticOutcome.Captured && result.Milestone is null)
+            return TerminalDiagnostics.Problem(DiagnosticOutcome.Failed, "incompatible-target", MilestoneIgnored);
+
         return Validate(result);
     }
 
@@ -111,6 +114,9 @@ internal sealed class DiagnosticsSocketClient
             var (outcome, code, message) = Unexpected(response);
             return TerminalDiagnostics.FrameProblem(outcome, code, message);
         }
+
+        if (request.Milestone is not null && result.Outcome == DiagnosticOutcome.Captured && result.Milestone is null)
+            return TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Failed, "incompatible-target", MilestoneIgnored);
 
         return Validate(result);
     }
@@ -281,9 +287,16 @@ internal sealed class DiagnosticsSocketClient
             ?? new DiagnosticsResponse { Success = false, Error = "Failed to deserialize response" };
     }
 
+    // A target predating milestones ignores the request's milestone and captures at once; that
+    // capture proves nothing about the awaited input, so it is not reported as captured.
+    private const string MilestoneIgnored =
+        "The target returned a capture without the requested milestone result; it does not support input milestones.";
+
     // A milestone capture may legitimately wait its whole timeout before the target answers.
     private static TimeSpan MilestoneWait(DiagnosticMilestoneRequest? milestone) =>
-        milestone is null ? TimeSpan.Zero : TimeSpan.FromMilliseconds(Math.Max(0, milestone.TimeoutMs ?? 5_000));
+        milestone is null
+            ? TimeSpan.Zero
+            : TimeSpan.FromMilliseconds(Math.Max(0, milestone.TimeoutMs ?? TerminalDiagnostics.DefaultMilestoneTimeoutMs));
 
     private async Task<(DiagnosticsResponse? Response, (DiagnosticOutcome Outcome, string Code, string Message)? Problem)> ExchangeAsync(
         string socketPath, DiagnosticsRequest request, CancellationToken cancellationToken, TimeSpan extraWait = default)

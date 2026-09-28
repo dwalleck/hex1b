@@ -91,14 +91,13 @@ public sealed class Hex1bAppWorkloadAdapter :
     /// </summary>
     internal Diagnostics.InputMilestoneTracker? InputMilestones { get; set; }
 
-    private readonly object _milestoneOutputSync = new();
+    // Sequence numbers must follow channel order, so assignment and write are one step under this
+    // gate. A semaphore rather than a lock, so the async path can await a full channel inside it.
+    private readonly SemaphoreSlim _milestoneOutputGate = new(1, 1);
     private long _milestoneOutputSequence;
 
     /// <summary>The last output sequence enqueued, when input milestones are tracked.</summary>
-    internal long MilestoneOutputSequence
-    {
-        get { lock (_milestoneOutputSync) return _milestoneOutputSequence; }
-    }
+    internal long MilestoneOutputSequence => Interlocked.Read(ref _milestoneOutputSequence);
 
     // Every input-channel write goes through here so a tracked session numbers each event in
     // channel order; an untracked session writes exactly as before.
@@ -531,16 +530,29 @@ public sealed class Hex1bAppWorkloadAdapter :
     {
         if (InputMilestones is not null)
         {
-            // Sequence numbers must follow channel order, so assignment and write are one step.
-            lock (_milestoneOutputSync)
-                EnqueueOutputCore(item with { MilestoneSequence = ++_milestoneOutputSequence }, requireAcceptance);
+            _milestoneOutputGate.Wait();
+            var accepted = false;
+            try
+            {
+                accepted = EnqueueOutputCore(item with { MilestoneSequence = Interlocked.Increment(ref _milestoneOutputSequence) }, requireAcceptance);
+            }
+            finally
+            {
+                // A rejected item's sequence never reaches the pump; give it back so a frame's
+                // output mark always names an item that was enqueued.
+                if (!accepted)
+                    Interlocked.Decrement(ref _milestoneOutputSequence);
+                _milestoneOutputGate.Release();
+            }
+
             return;
         }
 
         EnqueueOutputCore(item, requireAcceptance);
     }
 
-    private void EnqueueOutputCore(WorkloadOutputItem item, bool requireAcceptance)
+    // Returns whether the item was enqueued.
+    private bool EnqueueOutputCore(WorkloadOutputItem item, bool requireAcceptance)
     {
         if (_disposed)
         {
@@ -549,7 +561,7 @@ public sealed class Hex1bAppWorkloadAdapter :
             {
                 throw new ObjectDisposedException(nameof(Hex1bAppWorkloadAdapter));
             }
-            return;
+            return false;
         }
 
         // Fast path: unbounded channel always accepts; bounded channel
@@ -557,7 +569,7 @@ public sealed class Hex1bAppWorkloadAdapter :
         if (_outputChannel.Writer.TryWrite(item))
         {
             Interlocked.Increment(ref _outputQueueDepth);
-            return;
+            return true;
         }
 
         // Slow path: bounded channel is full. Block the producer until a
@@ -574,6 +586,7 @@ public sealed class Hex1bAppWorkloadAdapter :
             if (!writeTask.IsCompletedSuccessfully)
                 writeTask.AsTask().GetAwaiter().GetResult();
             Interlocked.Increment(ref _outputQueueDepth);
+            return true;
         }
         catch (ChannelClosedException)
         {
@@ -584,6 +597,7 @@ public sealed class Hex1bAppWorkloadAdapter :
             {
                 throw;
             }
+            return false;
         }
         catch (InvalidOperationException)
         {
@@ -593,6 +607,7 @@ public sealed class Hex1bAppWorkloadAdapter :
             {
                 throw;
             }
+            return false;
         }
     }
 
@@ -614,22 +629,40 @@ public sealed class Hex1bAppWorkloadAdapter :
     {
         if (InputMilestones is not null)
         {
-            // The ordered path blocks rather than awaits: sequence and write stay one step.
-            lock (_milestoneOutputSync)
-                EnqueueOutputCore(item with { MilestoneSequence = ++_milestoneOutputSequence }, requireAcceptance: false);
+            await _milestoneOutputGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var accepted = false;
+            try
+            {
+                accepted = await EnqueueOutputCoreAsync(
+                    item with { MilestoneSequence = Interlocked.Increment(ref _milestoneOutputSequence) }, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                if (!accepted)
+                    Interlocked.Decrement(ref _milestoneOutputSequence);
+                _milestoneOutputGate.Release();
+            }
+
             return;
         }
 
+        await EnqueueOutputCoreAsync(item, cancellationToken).ConfigureAwait(false);
+    }
+
+    // Returns whether the item was enqueued.
+    private async ValueTask<bool> EnqueueOutputCoreAsync(WorkloadOutputItem item, CancellationToken cancellationToken)
+    {
         if (_outputChannel.Writer.TryWrite(item))
         {
             Interlocked.Increment(ref _outputQueueDepth);
-            return;
+            return true;
         }
 
         try
         {
             await _outputChannel.Writer.WriteAsync(item, cancellationToken).ConfigureAwait(false);
             Interlocked.Increment(ref _outputQueueDepth);
+            return true;
         }
         catch (ChannelClosedException)
         {
@@ -644,6 +677,8 @@ public sealed class Hex1bAppWorkloadAdapter :
             ReturnPooledResources(item);
             throw;
         }
+
+        return false;
     }
 
     /// <summary>

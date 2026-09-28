@@ -376,6 +376,31 @@ public class DiagnosticsSocketClientTests
     }
 
     [TestMethod]
+    public async Task Milestone_TargetIgnoringTheMilestone_IsIncompatibleNotCaptured()
+    {
+        // A target built before milestones: it drops the unknown field and captures at once.
+        await using var server = await FakeServer.StartAsync(line => line.Contains("\"method\":\"application-frame\"", StringComparison.Ordinal)
+            ? """{"success":true,"applicationFrame":{"contractVersion":1,"outcome":"captured","identity":{},"frame":{"popups":[],"focus":{"focusables":[]}}}}"""
+            : """
+              {"success":true,"capture":{"contractVersion":1,"outcome":"captured","format":"text","content":"x",
+              "geometry":{"columns":1,"rows":1},"history":{"requestedRows":0,"returnedRows":0},
+              "identity":{"processId":1,"sessionId":"s","sourceLayer":"terminal-model"}}}
+              """.ReplaceLineEndings(""));
+        var milestone = new DiagnosticMilestoneRequest { Milestone = DiagnosticMilestone.InputProcessed, InputId = 1 };
+        var client = new DiagnosticsSocketClient();
+
+        var capture = await client.CaptureAsync(server.Path, new DiagnosticCaptureRequest { Milestone = milestone }, TestContext.Current.CancellationToken);
+        var frame = await client.CaptureApplicationFrameAsync(server.Path, new DiagnosticApplicationFrameRequest { Milestone = milestone },
+            TestContext.Current.CancellationToken);
+        var plain = await client.CaptureAsync(server.Path, new DiagnosticCaptureRequest(), TestContext.Current.CancellationToken);
+
+        Assert.AreEqual((DiagnosticOutcome.Failed, "incompatible-target"), (capture.Outcome, capture.Problem?.Code),
+            "a capture that ignored the milestone was reported as captured");
+        Assert.AreEqual((DiagnosticOutcome.Failed, "incompatible-target"), (frame.Outcome, frame.Problem?.Code));
+        Assert.AreEqual(DiagnosticOutcome.Captured, plain.Outcome, "fixture: the target captures without a milestone");
+    }
+
+    [TestMethod]
     public async Task ApplicationFrame_TargetWithoutTheMethod_IsIncompatible()
     {
         await using var server = await FakeServer.StartAsync(_ => """{"success":false,"error":"Unknown method: application-frame"}""");

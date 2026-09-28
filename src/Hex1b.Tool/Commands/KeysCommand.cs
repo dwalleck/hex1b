@@ -60,6 +60,8 @@ internal sealed class KeysCommand : BaseCommand
             return 1;
         }
 
+        // One send prints its accepted range; --text with --key makes two sends, printed together.
+        var accepted = new List<DiagnosticAcceptedInput?>();
         if (text != null)
         {
             var response = await _client.SendAsync(resolved.SocketPath!,
@@ -71,7 +73,7 @@ internal sealed class KeysCommand : BaseCommand
                 return 1;
             }
 
-            MilestoneOptions.WriteAccepted(Formatter, response.AcceptedInput, parseResult.GetValue(RootCommand.JsonOption));
+            accepted.Add(response.AcceptedInput);
         }
 
         if (key != null)
@@ -95,9 +97,10 @@ internal sealed class KeysCommand : BaseCommand
                 return 1;
             }
 
-            MilestoneOptions.WriteAccepted(Formatter, response.AcceptedInput, parseResult.GetValue(RootCommand.JsonOption));
+            accepted.Add(response.AcceptedInput);
         }
 
+        MilestoneOptions.WriteAccepted(Formatter, accepted, parseResult.GetValue(RootCommand.JsonOption));
         return 0;
     }
 }

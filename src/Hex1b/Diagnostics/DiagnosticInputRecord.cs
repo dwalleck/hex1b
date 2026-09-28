@@ -24,9 +24,20 @@ public sealed record DiagnosticInputRecord
     [JsonPropertyName("acceptedAt")]
     public DateTimeOffset AcceptedAt { get; init; }
 
+    /// <summary>
+    /// When the input was accepted, as a <c>process-monotonic</c> timestamp in the clock domain of
+    /// capture acquisitions (<see cref="DiagnosticAcquisition"/>), so it orders against them exactly.
+    /// </summary>
+    [JsonPropertyName("acceptedTimestamp")]
+    public long AcceptedTimestamp { get; init; }
+
     /// <summary>When the application loop processed it (UTC), once processed.</summary>
     [JsonPropertyName("processedAt")]
     public DateTimeOffset? ProcessedAt { get; init; }
+
+    /// <summary>When the application loop processed it, as a <c>process-monotonic</c> timestamp, once processed.</summary>
+    [JsonPropertyName("processedTimestamp")]
+    public long? ProcessedTimestamp { get; init; }
 
     /// <summary>The payload (key and modifiers, text, mouse button and position); only with raw-input authorization.</summary>
     [JsonPropertyName("payload")]

@@ -1851,6 +1851,8 @@ internal sealed class Hex1bFlowRunner
 
                 try { await outputPumpTask; } catch (OperationCanceledException) { }
                 try { await inputPumpTask; } catch (OperationCanceledException) { }
+                // The pump may have handed the ended step input after its application stopped.
+                MilestoneTracker?.StepEnded("the ended flow step");
                 Task[] pendingResizeTasks;
                 lock (resizeTaskSync)
                 {

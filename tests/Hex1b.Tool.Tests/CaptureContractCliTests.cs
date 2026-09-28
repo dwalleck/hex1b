@@ -494,6 +494,92 @@ public class CaptureContractCliTests
     }
 
     [TestMethod]
+    public async Task Milestone_KeysWithTextAndKey_PrintsOneJsonDocument()
+    {
+        await using var target = await StartFrameAppAsync();
+
+        var (exitCode, stdout, stderr) = await RunCliAsync("keys", Pid, "--text", "a", "--key", "Q", "--json");
+
+        Assert.AreEqual(0, exitCode, stderr);
+        using var json = JsonDocument.Parse(stdout);
+        Assert.AreEqual(JsonValueKind.Array, json.RootElement.ValueKind, $"two sends did not print one JSON array: {stdout}");
+        var sends = json.RootElement.EnumerateArray().ToArray();
+        Assert.HasCount(2, sends);
+        Assert.IsGreaterThan(sends[0].GetProperty("lastId").GetInt64(), sends[1].GetProperty("firstId").GetInt64());
+    }
+
+    [TestMethod]
+    public async Task Milestone_AbandonedSocketWaitReleasesItsPendingSlot()
+    {
+        await WaitForSocketReleaseAsync(TestContext.Current.CancellationToken);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithDimensions(30, 4)
+            .WithHeadless()
+            .WithHex1bApp(_ => new ButtonWidget("GATE").OnClick(async _ =>
+            {
+                entered.TrySetResult();
+                await gate.Task;
+            }))
+            .WithDiagnostics(appName: "CliAbandon", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync(TestContext.Current.CancellationToken);
+        try
+        {
+            await WaitForSocketAsync(TestContext.Current.CancellationToken);
+            await new Hex1bTerminalInputSequenceBuilder()
+                .WaitUntil(s => s.ContainsText("GATE"), TimeSpan.FromSeconds(10), "application rendered")
+                .Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
+            var engine = new TerminalDiagnostics(terminal, "CliAbandon");
+            await engine.TrackSendAsync(() => terminal.SendEventAsync(new Hex1b.Input.Hex1bKeyEvent(Hex1b.Input.Hex1bKey.Enter, '\r', Hex1b.Input.Hex1bModifiers.None)), "key");
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            var queued = (await engine.TrackSendAsync(() => terminal.SendEventAsync(
+                new Hex1b.Input.Hex1bKeyEvent(Hex1b.Input.Hex1bKey.X, 'x', Hex1b.Input.Hex1bModifiers.None)), "key"))!.LastId;
+            var tracker = terminal.InputMilestones!;
+
+            using (var socket = new System.Net.Sockets.Socket(System.Net.Sockets.AddressFamily.Unix, System.Net.Sockets.SocketType.Stream,
+                       System.Net.Sockets.ProtocolType.Unspecified))
+            {
+                await socket.ConnectAsync(new System.Net.Sockets.UnixDomainSocketEndPoint(McpDiagnosticsPresentationFilter.GetSocketPath()),
+                    TestContext.Current.CancellationToken);
+                var request = JsonSerializer.Serialize(new DiagnosticsRequest
+                {
+                    Method = TerminalDiagnostics.CaptureOperation,
+                    Capture = new DiagnosticCaptureRequest
+                    {
+                        Milestone = new DiagnosticMilestoneRequest { Milestone = DiagnosticMilestone.InputProcessed, InputId = queued, TimeoutMs = 60_000 },
+                    },
+                }, DiagnosticsJsonContext.Default.DiagnosticsRequest);
+                await socket.SendAsync(System.Text.Encoding.UTF8.GetBytes(request + "\n"), TestContext.Current.CancellationToken);
+                for (var i = 0; i < 300 && tracker.PendingWaits < 1; i++)
+                    await Task.Delay(10, TestContext.Current.CancellationToken);
+                Assert.AreEqual(1, tracker.PendingWaits, "fixture: the socket wait never became pending");
+            }
+
+            for (var i = 0; i < 300 && tracker.PendingWaits > 0; i++)
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+            Assert.AreEqual(0, tracker.PendingWaits, "a disconnected client's wait kept its pending slot");
+
+            // The timeout bound through the CLI: timed out after the requested 300 ms, not the default 5 s.
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var (exitCode, stdout, _) = await RunCliAsync("capture", "screenshot", Pid, "--json",
+                "--milestone", "input-processed", "--input-id", queued.ToString(), "--milestone-timeout", "300");
+            var elapsed = stopwatch.Elapsed;
+            Assert.AreEqual(1, exitCode);
+            using var timedOut = JsonDocument.Parse(stdout);
+            Assert.AreEqual("timed-out", timedOut.RootElement.GetProperty("outcome").GetString());
+            Assert.IsFalse(timedOut.RootElement.GetProperty("milestone").GetProperty("met").GetBoolean());
+            Assert.IsTrue(elapsed >= TimeSpan.FromMilliseconds(280) && elapsed < TimeSpan.FromSeconds(4),
+                $"the CLI milestone wait took {elapsed.TotalMilliseconds:0} ms for a 300 ms timeout");
+        }
+        finally
+        {
+            gate.TrySetResult();
+        }
+    }
+
+    [TestMethod]
     public async Task Milestone_InvalidNameIsAnInvalidRequest()
     {
         await using var target = await StartFrameAppAsync();

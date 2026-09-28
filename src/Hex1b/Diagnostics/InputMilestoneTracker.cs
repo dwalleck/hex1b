@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Hex1b.Input;
 
@@ -23,11 +24,17 @@ internal sealed class InputMilestoneTracker
     /// </summary>
     internal static readonly AsyncLocal<StrongBox<int>?> ConstructionsForTesting = new();
 
-    // The id of the current diagnostic send, collected across the events it enqueues.
+    // The current diagnostic send, collected across the events it enqueues.
     private static readonly AsyncLocal<SendScope?> CurrentSend = new();
 
     private readonly object _sync = new();
-    private readonly ConditionalWeakTable<Hex1bEvent, Tracked> _tracked = new();
+
+    // One send at a time, and no other input between a send's events, so a send's ids are
+    // consecutive. Held across the send; other writers pass through it for each event.
+    private readonly SemaphoreSlim _sendGate = new(1, 1);
+
+    // Occurrences of an event object not yet processed, oldest first (an instance may be sent twice).
+    private readonly ConditionalWeakTable<Hex1bEvent, Queue<Tracked>> _pending = new();
     private readonly List<Waiter> _waiters = [];
     private readonly Tracked?[] _recent = new Tracked?[RetainedRecords];
     private long _accepted;
@@ -35,6 +42,7 @@ internal sealed class InputMilestoneTracker
     private string? _processedBy;
     private (string Code, string Message)? _terminated;
     private string? _stoppedApplication;
+    private bool _hostsFlow;
     private PublishedFrame? _latestFrame;
     private long _appliedOutput;
     private string? _outputFailure;
@@ -52,14 +60,42 @@ internal sealed class InputMilestoneTracker
     /// </summary>
     internal bool AcceptanceOnly { get; }
 
-    /// <summary>Numbers one completed write to an acceptance-only workload.</summary>
-    internal long AcceptWrite()
+    /// <summary>
+    /// Set by a flow: its channel is read by one step after another, so an input still queued when
+    /// a step stops waits for the next step rather than failing.
+    /// </summary>
+    internal bool HostsFlow
     {
-        var send = CurrentSend.Value;
+        get { lock (_sync) return _hostsFlow; }
+        set { lock (_sync) _hostsFlow = value; }
+    }
+
+    /// <summary>
+    /// Waits until no other send is in progress and takes the turn; <see cref="BeginSend"/> must
+    /// follow at once, in the caller's own async flow.
+    /// </summary>
+    internal Task WaitForSendTurnAsync(CancellationToken cancellationToken = default) => _sendGate.WaitAsync(cancellationToken);
+
+    /// <summary>
+    /// Starts a diagnostic send on a turn taken with <see cref="WaitForSendTurnAsync"/>: every event
+    /// this async flow accepts until the scope ends belongs to the send. Synchronous on purpose: an
+    /// async method's <see cref="AsyncLocal{T}"/> assignment would not reach its caller.
+    /// </summary>
+    internal SendScope BeginSend()
+    {
+        var scope = new SendScope(this);
+        CurrentSend.Value = scope;
+        return scope;
+    }
+
+    /// <summary>Numbers one completed write of <paramref name="kind"/> to an acceptance-only workload.</summary>
+    internal long AcceptWrite(string kind)
+    {
+        var send = OwnSend();
         lock (_sync)
         {
             var id = ++_accepted;
-            _recent[id % RetainedRecords] = new Tracked(id, DateTimeOffset.UtcNow) { Kind = "text", Source = "diagnostic-send" };
+            _recent[id % RetainedRecords] = new Tracked(id, DateTimeOffset.UtcNow, Stopwatch.GetTimestamp(), kind, "diagnostic-send", null);
             send?.Include(id);
             WakeUnsafe();
             return id;
@@ -68,41 +104,42 @@ internal sealed class InputMilestoneTracker
 
     /// <summary>
     /// Numbers <paramref name="evt"/> and writes it with <paramref name="write"/> under one lock,
-    /// so ids follow the channel's order exactly. Returns the write's result; an event the write
-    /// rejects consumes no id.
+    /// so ids follow the channel's order exactly. The event is registered before the write, so a
+    /// reader cannot process it unregistered. Returns the write's result; a rejected event
+    /// consumes no id.
     /// </summary>
     internal bool Accept(Hex1bEvent evt, Func<Hex1bEvent, bool> write)
     {
-        var send = CurrentSend.Value;
-        var (kind, payload) = Describe(evt);
-        lock (_sync)
+        var send = OwnSend();
+        if (send is null)
+            _sendGate.Wait();
+        try
         {
-            if (!write(evt))
-                return false;
-            var id = ++_accepted;
-            var tracked = new Tracked(id, DateTimeOffset.UtcNow)
+            lock (_sync)
             {
-                Kind = kind,
-                Source = send is null ? "native" : "diagnostic-send",
-                Payload = payload,
-            };
-            _tracked.AddOrUpdate(evt, tracked);
-            _recent[id % RetainedRecords] = tracked;
-            send?.Include(id);
-            WakeUnsafe();
-            return true;
-        }
-    }
+                var id = _accepted + 1;
+                var tracked = new Tracked(id, DateTimeOffset.UtcNow, Stopwatch.GetTimestamp(), KindOf(evt),
+                    send is null ? "native" : "diagnostic-send", evt is Hex1bPasteEvent ? null : evt);
+                var occurrences = _pending.GetOrCreateValue(evt);
+                occurrences.Enqueue(tracked);
+                if (!write(evt))
+                {
+                    RemoveLast(occurrences);
+                    return false;
+                }
 
-    /// <summary>
-    /// Starts a diagnostic send: every event accepted in this async flow until the scope ends is
-    /// attributed to it.
-    /// </summary>
-    internal SendScope BeginSend()
-    {
-        var scope = new SendScope(this);
-        CurrentSend.Value = scope;
-        return scope;
+                _accepted = id;
+                _recent[id % RetainedRecords] = tracked;
+                send?.Include(id);
+                WakeUnsafe();
+                return true;
+            }
+        }
+        finally
+        {
+            if (send is null)
+                _sendGate.Release();
+        }
     }
 
     /// <summary>
@@ -113,22 +150,48 @@ internal sealed class InputMilestoneTracker
     /// </summary>
     internal void Processed(Hex1bEvent evt, string applicationInstanceId, bool advancesWatermark = true)
     {
-        if (!_tracked.TryGetValue(evt, out var tracked))
-            return;
         lock (_sync)
         {
+            if (!_pending.TryGetValue(evt, out var occurrences) || !occurrences.TryDequeue(out var tracked))
+                return;
             tracked.ProcessedBy = applicationInstanceId;
             tracked.ProcessedAt = DateTimeOffset.UtcNow;
-            if (!advancesWatermark)
+            tracked.ProcessedTimestamp = Stopwatch.GetTimestamp();
+            if (advancesWatermark && tracked.Id > _processed)
             {
-                WakeUnsafe();
-                return;
+                _processed = tracked.Id;
+                _processedBy = applicationInstanceId;
             }
 
-            if (tracked.Id <= _processed)
-                return;
-            _processed = tracked.Id;
-            _processedBy = applicationInstanceId;
+            WakeUnsafe();
+        }
+    }
+
+    /// <summary>A flow pump handed <paramref name="evt"/> from the terminal's channel to a step.</summary>
+    internal void Forwarded(Hex1bEvent evt)
+    {
+        lock (_sync)
+        {
+            if (_pending.TryGetValue(evt, out var occurrences) && occurrences.FirstOrDefault(t => !t.Forwarded) is { } tracked)
+                tracked.Forwarded = true;
+        }
+    }
+
+    /// <summary>
+    /// Marks inputs a flow handed to a step that ended without processing them as lost. Called when
+    /// the step's application stops and again once its input pump has stopped, so an input the pump
+    /// forwarded after the application stopped is lost too.
+    /// </summary>
+    internal void StepEnded(string stepDescription)
+    {
+        lock (_sync)
+        {
+            foreach (var tracked in _recent)
+            {
+                if (tracked is { Forwarded: true, ProcessedBy: null, Lost: null })
+                    tracked.Lost = stepDescription;
+            }
+
             WakeUnsafe();
         }
     }
@@ -144,43 +207,29 @@ internal sealed class InputMilestoneTracker
     }
 
     /// <summary>
-    /// Set by a flow: its channel is read by one step after another, so an input still queued when
-    /// a step stops waits for the next step rather than failing.
-    /// </summary>
-    internal bool HostsFlow { get; set; }
-
-    /// <summary>
-    /// Fails the waits for unprocessed inputs when the application reading the channel stops and
-    /// no later application will read it.
+    /// An application that read the channel stopped. In a flow the next step reads on, so only the
+    /// inputs handed to this step are lost; otherwise unprocessed inputs can no longer be processed.
     /// </summary>
     internal void ApplicationStopped(string applicationInstanceId)
     {
+        if (HostsFlow)
+        {
+            StepEnded(applicationInstanceId);
+            return;
+        }
+
         lock (_sync)
         {
-            if (HostsFlow)
-            {
-                // Inputs a flow pump handed to this step and it never processed are lost; inputs
-                // still queued at the terminal wait for the next step.
-                foreach (var tracked in _recent)
-                {
-                    if (tracked is { Forwarded: true, ProcessedBy: null, Lost: null })
-                        tracked.Lost = applicationInstanceId;
-                }
-            }
-            else
-            {
-                _stoppedApplication = applicationInstanceId;
-            }
-
+            _stoppedApplication = applicationInstanceId;
             WakeUnsafe();
         }
     }
 
-    /// <summary>A flow pump handed <paramref name="evt"/> from the terminal's channel to a step.</summary>
-    internal void Forwarded(Hex1bEvent evt)
+    /// <summary>An application started reading the channel; inputs can be processed again.</summary>
+    internal void ApplicationStarted()
     {
-        if (_tracked.TryGetValue(evt, out var tracked))
-            tracked.Forwarded = true;
+        lock (_sync)
+            _stoppedApplication = null;
     }
 
     /// <summary>The highest input id processed so far (the frame watermark source).</summary>
@@ -211,7 +260,7 @@ internal sealed class InputMilestoneTracker
         }
     }
 
-    /// <summary>The terminal applied every output item up to <paramref name="sequence"/>.</summary>
+    /// <summary>The terminal's output pump finished every output item up to <paramref name="sequence"/>.</summary>
     internal void OutputApplied(long sequence)
     {
         lock (_sync)
@@ -233,15 +282,12 @@ internal sealed class InputMilestoneTracker
         }
     }
 
-    /// <summary>An application started reading the channel; inputs can be processed again.</summary>
-    internal void ApplicationStarted()
+    /// <summary>The id of the oldest unprocessed occurrence of <paramref name="evt"/>, when tracked.</summary>
+    internal long? IdOf(Hex1bEvent evt)
     {
         lock (_sync)
-            _stoppedApplication = null;
+            return _pending.TryGetValue(evt, out var occurrences) && occurrences.TryPeek(out var tracked) ? tracked.Id : null;
     }
-
-    /// <summary>The id <paramref name="evt"/> was assigned, when it was tracked.</summary>
-    internal long? IdOf(Hex1bEvent evt) => _tracked.TryGetValue(evt, out var tracked) ? tracked.Id : null;
 
     /// <summary>The highest input id issued so far.</summary>
     internal long AcceptedInput
@@ -251,7 +297,7 @@ internal sealed class InputMilestoneTracker
 
     /// <summary>
     /// Waits until <paramref name="milestone"/> is met for <paramref name="inputId"/>, the
-    /// timeout elapses, or the awaited event becomes impossible.
+    /// timeout elapses, the awaited event becomes impossible, or the caller cancels (which throws).
     /// </summary>
     internal async Task<WaitStatus> WaitAsync(DiagnosticMilestone milestone, long inputId, TimeSpan timeout,
         CancellationToken cancellationToken)
@@ -278,7 +324,11 @@ internal sealed class InputMilestoneTracker
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return WaitStatus.TimedOut($"Milestone {DiagnosticContractNames.Of(milestone)} for input {inputId} was not met within {timeout.TotalMilliseconds:0} ms.");
+            lock (_sync)
+            {
+                return WaitStatus.TimedOut($"Milestone {DiagnosticContractNames.Of(milestone)} for input {inputId} was not met within {timeout.TotalMilliseconds:0} ms.")
+                    with { Frame = waiter.CoveringFrame ?? CoveringLatest(inputId) };
+            }
         }
         finally
         {
@@ -294,11 +344,16 @@ internal sealed class InputMilestoneTracker
             return new Observation(_accepted, _processed, _processedBy);
     }
 
-    /// <summary>The retained record for <paramref name="inputId"/>, or <see langword="null"/> once evicted.</summary>
-    internal Tracked? Record(long inputId)
+    /// <summary>A copy of the retained record for <paramref name="inputId"/>, or <see langword="null"/> once evicted.</summary>
+    internal RecordSnapshot? Record(long inputId)
     {
         lock (_sync)
-            return _recent[inputId % RetainedRecords] is { } tracked && tracked.Id == inputId ? tracked : null;
+        {
+            return _recent[inputId % RetainedRecords] is { } tracked && tracked.Id == inputId
+                ? new RecordSnapshot(tracked.Id, tracked.Kind, tracked.Source, tracked.AcceptedAt, tracked.AcceptedTimestamp,
+                    tracked.ProcessedAt, tracked.ProcessedTimestamp, tracked.ProcessedBy, tracked.Event is { } evt ? PayloadOf(evt) : null)
+                : null;
+        }
     }
 
     /// <summary>Test view: the number of pending waits.</summary>
@@ -307,23 +362,34 @@ internal sealed class InputMilestoneTracker
         get { lock (_sync) return _waiters.Count; }
     }
 
+    // Must hold _sync.
+    private PublishedFrame? CoveringLatest(long inputId) =>
+        _latestFrame is { } latest && latest.ProcessedInput >= inputId ? latest : null;
+
     // Must hold _sync. Returns the final status when the milestone is decided, else null.
     private WaitStatus? Evaluate(DiagnosticMilestone milestone, long inputId, PublishedFrame? coveringFrame = null)
     {
-        // A frame covering a pending input is the one recorded at its publication; for an input
-        // already covered when the wait starts, the latest frame (progress beyond the request).
-        var frame = coveringFrame ?? (_latestFrame is { } latest && latest.ProcessedInput >= inputId ? latest : null);
         if (AcceptanceOnly && milestone != DiagnosticMilestone.InputAccepted)
             return WaitStatus.Unavailable("input-consumption-unobservable",
                 "Input is written to a child process whose consumption is not observable; only acceptance is reported.");
+        if (milestone == DiagnosticMilestone.InputAccepted)
+            return WaitStatus.Met;
+
+        var record = _recent[inputId % RetainedRecords] is { } retained && retained.Id == inputId ? retained : null;
+
+        // A lost input was never processed, whatever later inputs did to the watermark.
+        if (record is { Lost: { } lostBy, ProcessedBy: null })
+            return WaitStatus.Failed("application-stopped", $"Input {inputId} was handed to a flow step ({lostBy}) that ended before processing it.");
+
+        var processed = record is { ProcessedBy: not null } || _processed >= inputId;
+
+        // A frame covering a pending input is the one recorded at its publication; for an input
+        // already covered when the wait starts, the latest frame (progress beyond the request).
+        var frame = coveringFrame ?? CoveringLatest(inputId);
         switch (milestone)
         {
-            case DiagnosticMilestone.InputAccepted:
+            case DiagnosticMilestone.InputProcessed when processed:
                 return WaitStatus.Met;
-            case DiagnosticMilestone.InputProcessed:
-                if (_processed >= inputId || _recent[inputId % RetainedRecords] is { ProcessedBy: not null } record && record.Id == inputId)
-                    return WaitStatus.Met;
-                break;
             case DiagnosticMilestone.FramePublished when frame is not null:
                 return frame.ProjectionFailed
                     ? WaitStatus.Failed("application-frame-projection-failed", $"Projecting application frame {frame.FrameId}, the first to cover input {inputId}, failed.")
@@ -338,21 +404,24 @@ internal sealed class InputMilestoneTracker
                     return WaitStatus.MetAt(frame);
                 if (_outputFailure is { } failure)
                     return WaitStatus.Failed("output-pump-failed", $"The terminal output pump failed: {failure}") with { Frame = frame };
-                break;
+
+                // The frame's output is still in the pump: an application stopping cannot stop it.
+                return _terminated is { } ended ? WaitStatus.Failed(ended.Code, ended.Message) with { Frame = frame } : null;
         }
 
-        if (_recent[inputId % RetainedRecords] is { Lost: { } lostBy } lost && lost.Id == inputId)
-            return WaitStatus.Failed("application-stopped", $"Application instance {lostBy} stopped before processing input {inputId}.");
-
+        // Undecided when the reader stopped: no further processing or frames will come.
         if (_stoppedApplication is { } stopped)
-            return WaitStatus.Failed("application-stopped",
-                $"Application instance {stopped} stopped before processing input {inputId}.");
+            return WaitStatus.Failed("application-stopped", processed
+                ? $"Application instance {stopped} stopped before publishing a frame covering input {inputId}."
+                : $"Application instance {stopped} stopped before processing input {inputId}.");
         return _terminated is { } terminated ? WaitStatus.Failed(terminated.Code, terminated.Message) : null;
     }
 
     // Must hold _sync.
     private void WakeUnsafe()
     {
+        if (_waiters.Count == 0)
+            return;
         foreach (var waiter in _waiters.ToArray())
         {
             if (Evaluate(waiter.Milestone, waiter.InputId, waiter.CoveringFrame) is { } status)
@@ -366,42 +435,68 @@ internal sealed class InputMilestoneTracker
         waiter.Completion.TrySetResult(status);
     }
 
-    internal sealed class Tracked(long id, DateTimeOffset acceptedAt)
+    private SendScope? OwnSend() => CurrentSend.Value is { } send && ReferenceEquals(send.Tracker, this) ? send : null;
+
+    private static void RemoveLast(Queue<Tracked> occurrences)
+    {
+        var kept = occurrences.ToArray()[..^1];
+        occurrences.Clear();
+        foreach (var tracked in kept)
+            occurrences.Enqueue(tracked);
+    }
+
+    private static string KindOf(Hex1bEvent evt) => evt switch
+    {
+        Hex1bKeyEvent key => key.Text is { Length: > 0 } && key.Modifiers == Hex1bModifiers.None ? "text" : "key",
+        Hex1bPasteEvent => "paste",
+        Hex1bMouseEvent => "mouse",
+        Hex1bResizeEvent => "resize",
+        _ => "other",
+    };
+
+    // Described only when a raw-input capture asks. Paste content streams to the application after
+    // acceptance, so paste events are not retained.
+    private static string? PayloadOf(Hex1bEvent evt) => evt switch
+    {
+        Hex1bKeyEvent key => $"{key.Key}{(key.Modifiers == Hex1bModifiers.None ? "" : "+" + key.Modifiers)}{(key.Text is { Length: > 0 } t ? $" \"{t}\"" : "")}",
+        Hex1bMouseEvent mouse => $"{mouse.Button} {mouse.Action} at {mouse.X},{mouse.Y}",
+        Hex1bResizeEvent resize => $"{resize.Width}x{resize.Height}",
+        _ => null,
+    };
+
+    private sealed class Tracked(long id, DateTimeOffset acceptedAt, long acceptedTimestamp, string kind, string source, Hex1bEvent? evt)
     {
         public long Id { get; } = id;
 
         public DateTimeOffset AcceptedAt { get; } = acceptedAt;
 
-        public string Kind { get; init; } = "other";
+        public long AcceptedTimestamp { get; } = acceptedTimestamp;
 
-        public string Source { get; init; } = "native";
+        public string Kind { get; } = kind;
 
-        // Retained in memory (bounded ring) so a later raw-input capture can report it; never
+        public string Source { get; } = source;
+
+        // Retained in memory (bounded ring) so a later raw-input capture can describe it; never
         // serialized without that authorization.
-        public string? Payload { get; init; }
+        public Hex1bEvent? Event { get; } = evt;
 
         public string? ProcessedBy { get; set; }
 
         public DateTimeOffset? ProcessedAt { get; set; }
+
+        public long? ProcessedTimestamp { get; set; }
 
         public bool Forwarded { get; set; }
 
         public string? Lost { get; set; }
     }
 
+    /// <summary>An immutable copy of one input's record.</summary>
+    internal sealed record RecordSnapshot(long Id, string Kind, string Source, DateTimeOffset AcceptedAt, long AcceptedTimestamp,
+        DateTimeOffset? ProcessedAt, long? ProcessedTimestamp, string? ProcessedBy, string? Payload);
+
     internal sealed record PublishedFrame(string ApplicationInstanceId, long FrameId, long ProcessedInput, bool WroteOutput,
         bool ProjectionFailed, long? OutputMark);
-
-    private static (string Kind, string? Payload) Describe(Hex1bEvent evt) => evt switch
-    {
-        Hex1bKeyEvent key => (key.Text is { Length: > 0 } && key.Modifiers == Hex1bModifiers.None ? "text" : "key",
-            $"{key.Key}{(key.Modifiers == Hex1bModifiers.None ? "" : "+" + key.Modifiers)}{(key.Text is { Length: > 0 } t ? $" \"{t}\"" : "")}"),
-        // Paste content streams to the application after acceptance; only the kind is known here.
-        Hex1bPasteEvent => ("paste", null),
-        Hex1bMouseEvent mouse => ("mouse", $"{mouse.Button} {mouse.Action} at {mouse.X},{mouse.Y}"),
-        Hex1bResizeEvent resize => ("resize", $"{resize.Width}x{resize.Height}"),
-        _ => ("other", null),
-    };
 
     private sealed class Waiter(DiagnosticMilestone milestone, long inputId)
     {
@@ -414,10 +509,12 @@ internal sealed class InputMilestoneTracker
         public TaskCompletionSource<WaitStatus> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
-    /// <summary>The ids one diagnostic send was assigned.</summary>
+    /// <summary>The ids one diagnostic send was assigned; disposing it ends the send.</summary>
     internal sealed class SendScope(InputMilestoneTracker tracker) : IDisposable
     {
-        private readonly InputMilestoneTracker _tracker = tracker;
+        private int _disposed;
+
+        internal InputMilestoneTracker Tracker { get; } = tracker;
 
         public long? FirstId { get; private set; }
 
@@ -431,8 +528,11 @@ internal sealed class InputMilestoneTracker
 
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
             if (ReferenceEquals(CurrentSend.Value, this))
                 CurrentSend.Value = null;
+            Tracker._sendGate.Release();
         }
     }
 

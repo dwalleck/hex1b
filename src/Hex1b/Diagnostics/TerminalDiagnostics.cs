@@ -52,12 +52,16 @@ public sealed class TerminalDiagnostics
     private const string FramePublicationDisabled =
         "The application does not publish frames; frame publication requires diagnostics to be enabled (WithDiagnostics).";
     private const string NoFocusedEditor = "No editor had focus in this frame.";
-    private const int DefaultMilestoneTimeoutMs = 5_000;
+    /// <summary>The milestone wait bound applied when a request names none.</summary>
+    internal const int DefaultMilestoneTimeoutMs = 5_000;
     private const string WrittenToChild =
         "Written to the child process; its consumption is not observable, so later milestones are unavailable.";
     private const string QueuedForApplication =
         "Queued for the application; input-processed, frame-published and model-applied prove later stages.";
-    private const int MaxMilestoneTimeoutMs = 60_000;
+    /// <summary>The longest milestone wait a request may name.</summary>
+    internal const int MaxMilestoneTimeoutMs = 60_000;
+    private const string MilestoneRequiresAsync =
+        "A milestone wait is asynchronous; use CaptureAsync or CaptureApplicationFrameAsync.";
     private const string InputTrackingUnavailable =
         "Input milestones require a Hex1b application with diagnostics enabled (WithDiagnostics); this target does not track input.";
     private const string NoActiveApplication =
@@ -129,6 +133,8 @@ public sealed class TerminalDiagnostics
         ArgumentNullException.ThrowIfNull(request);
         if (request.Milestone is not { } milestone)
             return Capture(request);
+        if (ValidateCapture(request) is { } invalid)
+            return invalid;
 
         var rawInput = request.Authorizations?.Contains(DiagnosticAuthorization.RawInput) == true;
         var wait = await WaitForMilestoneAsync(milestone, rawInput, cancellationToken).ConfigureAwait(false);
@@ -161,6 +167,8 @@ public sealed class TerminalDiagnostics
         ArgumentNullException.ThrowIfNull(request);
         if (request.Milestone is not { } milestone)
             return CaptureApplicationFrame(request);
+        if (ValidateAuthorizations(request.Authorizations) is { } invalid)
+            return invalid;
 
         var rawInput = request.Authorizations?.Contains(DiagnosticAuthorization.RawInput) == true;
         var wait = await WaitForMilestoneAsync(milestone, rawInput, cancellationToken).ConfigureAwait(false);
@@ -175,6 +183,33 @@ public sealed class TerminalDiagnostics
                 ContentCoverage = WithRawInputCoverage(captured.ContentCoverage, wait.Result!, rawInput),
                 UnavailableFields = [.. captured.UnavailableFields, .. wait.Unavailable],
             };
+    }
+
+    // Checked before any milestone wait, so a malformed request fails at once rather than after it.
+    private static DiagnosticCaptureResult? ValidateCapture(DiagnosticCaptureRequest request)
+    {
+        if (!Enum.IsDefined(request.Format))
+            return Problem(DiagnosticOutcome.InvalidRequest, "unsupported-format", $"Unsupported capture format '{request.Format}'.");
+        if (request.HistoryRows < 0)
+            return Problem(DiagnosticOutcome.InvalidRequest, "invalid-history-rows", "historyRows must be zero or greater.");
+        foreach (var authorization in request.Authorizations ?? [])
+        {
+            if (!Enum.IsDefined(authorization))
+                return Problem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", $"Unsupported authorization '{authorization}'.");
+        }
+
+        return null;
+    }
+
+    private static DiagnosticApplicationFrameResult? ValidateAuthorizations(IReadOnlyList<DiagnosticAuthorization>? authorizations)
+    {
+        foreach (var authorization in authorizations ?? [])
+        {
+            if (!Enum.IsDefined(authorization))
+                return FrameProblem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", $"Unsupported authorization '{authorization}'.");
+        }
+
+        return null;
     }
 
     // A milestone capture reports the awaited input's payload only under raw-input.
@@ -247,14 +282,18 @@ public sealed class TerminalDiagnostics
                     WroteOutput = frame.WroteOutput,
                 }
                 : null,
-            ModelSequence = request.Milestone == DiagnosticMilestone.ModelApplied && status.IsMet ? _terminal.CurrentModelSequence : null,
+            // What the model had reached: the proof for model-applied, and the observed progress
+            // when any milestone was not met.
+            ModelSequence = !status.IsMet || request.Milestone == DiagnosticMilestone.ModelApplied ? _terminal.CurrentModelSequence : null,
             Input = record is null ? null : new DiagnosticInputRecord
             {
                 Id = record.Id,
                 Kind = record.Kind,
                 Source = record.Source,
                 AcceptedAt = record.AcceptedAt,
+                AcceptedTimestamp = record.AcceptedTimestamp,
                 ProcessedAt = record.ProcessedAt,
+                ProcessedTimestamp = record.ProcessedTimestamp,
                 Payload = rawInput ? record.Payload : null,
             },
         };
@@ -265,7 +304,19 @@ public sealed class TerminalDiagnostics
     /// Runs one diagnostic send and returns the input ids its events were assigned, or
     /// <see langword="null"/> when this target does not track input.
     /// </summary>
-    internal async Task<DiagnosticAcceptedInput?> TrackSendAsync(Func<Task> send)
+    internal Task<DiagnosticAcceptedInput?> TrackSendAsync(Func<Task> send, string kind) =>
+        TrackSendAsync(async () =>
+        {
+            await send().ConfigureAwait(false);
+            return true;
+        }, kind);
+
+    /// <summary>
+    /// Runs one diagnostic send of <paramref name="kind"/> input (<c>text</c>, <c>key</c> or
+    /// <c>mouse</c>) and returns the input ids its events were assigned, or <see langword="null"/>
+    /// when this target does not track input or the send reports it delivered nothing.
+    /// </summary>
+    internal async Task<DiagnosticAcceptedInput?> TrackSendAsync(Func<Task<bool>> send, string kind)
     {
         if (_terminal.InputMilestones is not { } tracker)
         {
@@ -273,52 +324,20 @@ public sealed class TerminalDiagnostics
             return null;
         }
 
+        await tracker.WaitForSendTurnAsync().ConfigureAwait(false);
         using var scope = tracker.BeginSend();
-        await send().ConfigureAwait(false);
+        var delivered = await send().ConfigureAwait(false);
         if (tracker.AcceptanceOnly)
         {
-            var id = tracker.AcceptWrite();
+            if (!delivered)
+                return null;
+            var id = tracker.AcceptWrite(kind);
             return new DiagnosticAcceptedInput { FirstId = id, LastId = id, Meaning = WrittenToChild };
         }
 
         return scope.LastId is { } lastId
             ? new DiagnosticAcceptedInput { FirstId = scope.FirstId!.Value, LastId = lastId, Meaning = QueuedForApplication }
             : null;
-    }
-
-    private async Task<(DiagnosticMilestoneResult? Result, (DiagnosticOutcome Outcome, string Code, string Message)? Problem)>
-        WaitForMilestoneAsync(DiagnosticMilestoneRequest request, CancellationToken cancellationToken)
-    {
-        if (!Enum.IsDefined(request.Milestone))
-            return (null, (DiagnosticOutcome.InvalidRequest, "unsupported-milestone", $"Unsupported milestone '{request.Milestone}'."));
-        if (request.InputId is not { } inputId)
-            return (null, (DiagnosticOutcome.InvalidRequest, "missing-input-id", "A milestone request must name an input id."));
-        var timeoutMs = request.TimeoutMs ?? DefaultMilestoneTimeoutMs;
-        if (timeoutMs is < 1 or > MaxMilestoneTimeoutMs)
-            return (null, (DiagnosticOutcome.InvalidRequest, "invalid-milestone-timeout",
-                $"A milestone timeout must be 1 to {MaxMilestoneTimeoutMs} ms."));
-        if (_terminal.IsDisposed)
-            return (null, (DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed."));
-        if (_terminal.InputMilestones is not { } tracker)
-            return (null, (DiagnosticOutcome.Unavailable, "input-tracking-unavailable", InputTrackingUnavailable));
-
-        var status = await tracker.WaitAsync(request.Milestone, inputId, TimeSpan.FromMilliseconds(timeoutMs), cancellationToken)
-            .ConfigureAwait(false);
-        if (status.Outcome == DiagnosticOutcome.InvalidRequest)
-            return (null, (status.Outcome.Value, status.Code!, status.Message!));
-
-        var observed = tracker.Observe();
-        var record = tracker.Record(inputId);
-        var result = new DiagnosticMilestoneResult
-        {
-            Milestone = request.Milestone,
-            InputId = inputId,
-            Met = status.IsMet,
-            AcceptedInput = observed.AcceptedInput,
-            ProcessedInput = observed.ProcessedInput,
-            ProcessedBy = record?.ProcessedBy,
-        };
-        return status.IsMet ? (result, null) : (result, (status.Outcome!.Value, status.Code!, status.Message!));
     }
 
     /// <summary>
@@ -330,19 +349,11 @@ public sealed class TerminalDiagnostics
     {
         ArgumentNullException.ThrowIfNull(request);
         if (request.Milestone is not null)
-            return CaptureAsync(request).GetAwaiter().GetResult();
+            return Problem(DiagnosticOutcome.InvalidRequest, "milestone-requires-async", MilestoneRequiresAsync);
+        if (ValidateCapture(request) is { } invalid)
+            return invalid;
 
-        if (!Enum.IsDefined(request.Format))
-            return Problem(DiagnosticOutcome.InvalidRequest, "unsupported-format", $"Unsupported capture format '{request.Format}'.");
-        if (request.HistoryRows < 0)
-            return Problem(DiagnosticOutcome.InvalidRequest, "invalid-history-rows", "historyRows must be zero or greater.");
         var authorizations = request.Authorizations ?? [];
-        foreach (var authorization in authorizations)
-        {
-            if (!Enum.IsDefined(authorization))
-                return Problem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", $"Unsupported authorization '{authorization}'.");
-        }
-
         var nonScreen = authorizations.Contains(DiagnosticAuthorization.NonScreenMetadata);
         try
         {
@@ -430,13 +441,10 @@ public sealed class TerminalDiagnostics
     {
         ArgumentNullException.ThrowIfNull(request);
         if (request.Milestone is not null)
-            return CaptureApplicationFrameAsync(request).GetAwaiter().GetResult();
+            return FrameProblem(DiagnosticOutcome.InvalidRequest, "milestone-requires-async", MilestoneRequiresAsync);
+        if (ValidateAuthorizations(request.Authorizations) is { } invalid)
+            return invalid;
         var authorizations = request.Authorizations ?? [];
-        foreach (var authorization in authorizations)
-        {
-            if (!Enum.IsDefined(authorization))
-                return FrameProblem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", $"Unsupported authorization '{authorization}'.");
-        }
 
         if (_terminal.IsDisposed)
             return FrameProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");

@@ -159,7 +159,9 @@ A diagnostics-enabled Hex1b application numbers every input as it enters the app
 channel. This covers diagnostic sends (text, keys, clicks, drags), native keyboard, mouse and paste
 input, and resizes, in one sequence per terminal session. Sends through the socket, CLI or MCP
 return the ids their events received as `acceptedInput {firstId, lastId, meaning}`; a text send
-receives one id per character. Acceptance only means the input was queued. The later stages are
+receives one id per character. A send's ids are consecutive: other input waits until the send has
+been queued. A send that delivered nothing returns no ids. Acceptance only means the input was
+queued. The later stages are
 milestones that a capture can wait for:
 
 | Milestone | Met when |
@@ -167,31 +169,41 @@ milestones that a capture can wait for:
 | `input-accepted` | The input was queued for the application; for a PTY, written to the child process. |
 | `input-processed` | The application loop consumed the input: its processed-input watermark reached the id, or the flow runner consumed the input itself. |
 | `frame-published` | A frame whose processed-input watermark covers the input was published. Frames published earlier, such as timer, animation or invalidation frames, are never attributed to the input. |
-| `model-applied` | Everything the application enqueued up to that frame was applied to the terminal model, including when the frame wrote nothing. Unavailable for inline flow steps, whose output is re-segmented by the flow relay. |
+| `model-applied` | The terminal's output pump has handled everything the application enqueued up to that frame, including when the frame wrote nothing. Handled means applied to the model, or, for a geometry-gated batch, refused because it was composed for a superseded geometry (the producer recomposes it). Unavailable for inline flow steps, whose output is re-segmented by the flow relay. |
 
 A capture request (`capture` or `application-frame`) may carry `milestone {milestone, inputId,
 timeoutMs}`. The timeout is 1–60,000 ms, with a default of 5,000. Without a milestone, a capture is
 immediate and unchanged. With one, the capture waits and then returns a `milestone` block: the
 requested stage and id, whether it was met, the accepted and processed watermarks, the processing
 application instance, the first covering frame (`applicationInstanceId`, `frameId`, its watermark,
-`wroteOutput`), the model sequence for `model-applied`, and the input's record. The observed values
-can exceed the request: a past id is met at once and reports the current state. A milestone never
-waits for a synchronized update to end; the capture discloses it as usual.
+`wroteOutput`), the model sequence (for `model-applied`, and whenever the milestone was not met), and
+the input's record. The observed values can exceed the request: a past id is met at once and
+reports the current state. A milestone never waits for a synchronized update to end; the capture
+discloses it as usual. The request is validated before any wait. Waiting is asynchronous: the
+synchronous `Capture` and `CaptureApplicationFrame` methods stay immediate and return
+`invalid-request` / `milestone-requires-async` for a milestone request. A socket client that
+disconnects ends its wait.
+
+In a flow, an input queued between steps waits for the next step. An input handed to a step that
+ends before processing it fails with `application-stopped`, even after later inputs are processed.
 
 Outcomes:
 
 | Outcome / code | When |
 |----------------|------|
-| `timed-out` / `milestone-timed-out` | Not met within the timeout. No content; the milestone block reports what was observed at the deadline. |
+| `timed-out` / `milestone-timed-out` | Not met within the timeout. No content; the milestone block reports the watermarks, the first covering frame and the model sequence observed at the deadline. |
 | `failed` / `application-stopped`, `target-disposed`, `input-closed`, `output-pump-failed`, `application-frame-projection-failed` | The awaited event can no longer happen. The wait ends at once. |
 | `unavailable` / `input-tracking-unavailable` | The application does not track input (built without `WithDiagnostics()`). |
 | `unavailable` / `input-consumption-unobservable` | A PTY target: only acceptance is observable. |
 | `unavailable` / `model-application-unobservable` | An inline flow step's `model-applied`. |
 | `unavailable` / `too-many-pending-waits` | 64 waits are already pending in the session. |
 | `invalid-request` / `unknown-input-id`, `missing-input-id`, `invalid-milestone-timeout`, `unsupported-milestone` | The request cannot be served. |
+| `invalid-request` / `milestone-requires-async` | A milestone passed to a synchronous in-process capture method. |
+| `failed` / `incompatible-target` | Reported by the client: the target returned a capture without the milestone result, so it predates input milestones. |
 
-The input record (`id`, `kind`, `source`, `acceptedAt`, `processedAt`) is included by default for
-the last 1,024 inputs. Its `payload` (key and modifiers, typed text, mouse button and position)
+The input record (`id`, `kind`, `source`, `acceptedAt`, `processedAt`, and the process-monotonic
+`acceptedTimestamp` and `processedTimestamp` in the clock domain of `identity.acquisition`) is
+included by default for the last 1,024 inputs. Its `payload` (key and modifiers, typed text, mouse button and position)
 appears only with the `raw-input` authorization; paste content streams to the application and is
 not retained. Capabilities list each milestone, its guarantee, and whether this target supports it.
 Milestones are observations of this process's application and terminal model; none of them is a

@@ -328,7 +328,7 @@ hex1b capture recording playback --file demo.cast --player
 
 Send keystrokes to a terminal.
 
-On success, a diagnostics-enabled target reports the ids its events received: `Accepted inputs 3-5: …`, or `{firstId, lastId, meaning}` with `--json`. `mouse click` and `mouse drag` do the same. Pass the last id to `--input-id` on a capture.
+On success, a diagnostics-enabled target reports the ids its events received: `Accepted inputs 3-5: …`, or `{firstId, lastId, meaning}` with `--json`. With both `--text` and `--key`, `--json` prints one array with the text send's range, then the key's. `mouse click` and `mouse drag` do the same. Pass the last id to `--input-id` on a capture.
 
 ```bash
 hex1b keys <id> [options]

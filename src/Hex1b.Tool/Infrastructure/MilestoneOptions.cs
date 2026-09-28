@@ -57,4 +57,22 @@ internal sealed class MilestoneOptions
                 ? $"Accepted input {accepted.LastId}: {accepted.Meaning}"
                 : $"Accepted inputs {accepted.FirstId}-{accepted.LastId}: {accepted.Meaning}");
     }
+
+    /// <summary>
+    /// Prints the accepted ranges of a command's sends: one send as one JSON object, several as
+    /// one JSON array, so <c>--json</c> output is always a single document.
+    /// </summary>
+    public static void WriteAccepted(OutputFormatter formatter, IReadOnlyList<DiagnosticAcceptedInput?> sends, bool json)
+    {
+        if (sends.Count == 1 || !json)
+        {
+            foreach (var accepted in sends)
+                WriteAccepted(formatter, accepted, json);
+            return;
+        }
+
+        var tracked = sends.OfType<DiagnosticAcceptedInput>().ToArray();
+        if (tracked.Length > 0)
+            Console.WriteLine(JsonSerializer.Serialize(tracked, DiagnosticsJsonContext.Default.DiagnosticAcceptedInputArray));
+    }
 }

@@ -276,7 +276,23 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
                 return;
             }
 
-            var response = await HandleRequestAsync(request);
+            // A milestone wait ends early when its client goes away, rather than holding a
+            // pending-wait slot for its whole timeout.
+            using var abandoned = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var watch = (request.Capture?.Milestone ?? request.ApplicationFrame?.Milestone) is not null
+                ? WatchForDisconnectAsync(reader, abandoned)
+                : Task.CompletedTask;
+            DiagnosticsResponse response;
+            try
+            {
+                response = await HandleRequestAsync(request, abandoned.Token);
+            }
+            finally
+            {
+                await abandoned.CancelAsync();
+                await watch;
+            }
+
             var responseJson = JsonSerializer.Serialize(response, DiagnosticsJsonContext.Default.DiagnosticsResponse);
             await writer.WriteLineAsync(responseJson);
         }
@@ -531,18 +547,41 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         }
     }
 
-    private async Task<DiagnosticsResponse> HandleRequestAsync(DiagnosticsRequest request)
+    // A request connection sends one line; end of stream after it means the client disconnected.
+    private static async Task WatchForDisconnectAsync(StreamReader reader, CancellationTokenSource abandoned)
+    {
+        try
+        {
+            while (await reader.ReadLineAsync(abandoned.Token) is not null)
+            {
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (IOException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
+        await abandoned.CancelAsync();
+    }
+
+    private async Task<DiagnosticsResponse> HandleRequestAsync(DiagnosticsRequest request, CancellationToken cancellationToken)
     {
         return request.Method?.ToLowerInvariant() switch
         {
             "info" => HandleInfoRequest(),
-            "capture" => await HandleCaptureRequestAsync(request.Capture),
+            "capture" => await HandleCaptureRequestAsync(request.Capture, cancellationToken),
             "capabilities" => HandleCapabilitiesRequest(),
-            TerminalDiagnostics.ApplicationFrameOperation => await HandleApplicationFrameRequestAsync(request.ApplicationFrame),
-            "input" => await TrackedSendAsync(() => HandleInputRequestAsync(request.Data)),
-            "key" => await TrackedSendAsync(() => HandleKeyRequestAsync(request.Key, request.Modifiers)),
-            "click" => await TrackedSendAsync(() => Task.FromResult(HandleClickRequest(request.X, request.Y, request.Button))),
-            "drag" => await TrackedSendAsync(() => Task.FromResult(HandleDragRequest(request.X, request.Y, request.X2, request.Y2, request.Button))),
+            TerminalDiagnostics.ApplicationFrameOperation => await HandleApplicationFrameRequestAsync(request.ApplicationFrame, cancellationToken),
+            "input" => await TrackedSendAsync("text", () => HandleInputRequestAsync(request.Data)),
+            "key" => await TrackedSendAsync("key", () => HandleKeyRequestAsync(request.Key, request.Modifiers)),
+            "click" => await TrackedSendAsync("mouse", () => Task.FromResult(HandleClickRequest(request.X, request.Y, request.Button))),
+            "drag" => await TrackedSendAsync("mouse", () => Task.FromResult(HandleDragRequest(request.X, request.Y, request.X2, request.Y2, request.Button))),
             "resize" => await HandleResizeRequestAsync(request.X, request.Y),
             "shutdown" => HandleShutdownRequest(),
             "record-start" => await HandleRecordStartRequestAsync(request),
@@ -568,24 +607,28 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
     }
 
     // Runs a send and reports the input ids its events were assigned, when the target tracks input.
-    private async Task<DiagnosticsResponse> TrackedSendAsync(Func<Task<DiagnosticsResponse>> send)
+    private async Task<DiagnosticsResponse> TrackedSendAsync(string kind, Func<Task<DiagnosticsResponse>> send)
     {
         if (_diagnostics is null)
             return await send();
         DiagnosticsResponse? response = null;
-        var accepted = await _diagnostics.TrackSendAsync(async () => response = await send());
+        var accepted = await _diagnostics.TrackSendAsync(async () =>
+        {
+            response = await send();
+            return response.Success;
+        }, kind);
         if (response!.Success)
             response.AcceptedInput = accepted;
         return response;
     }
 
-    private async Task<DiagnosticsResponse> HandleCaptureRequestAsync(DiagnosticCaptureRequest? request)
+    private async Task<DiagnosticsResponse> HandleCaptureRequestAsync(DiagnosticCaptureRequest? request, CancellationToken cancellationToken)
     {
         var result = request is null
             ? TerminalDiagnostics.Problem(DiagnosticOutcome.InvalidRequest, "missing-capture-request",
                 "The capture method requires a capture request.")
             : _diagnostics is { } diagnostics
-                ? await diagnostics.CaptureAsync(request)
+                ? await diagnostics.CaptureAsync(request, cancellationToken)
                 : TerminalDiagnostics.Problem(DiagnosticOutcome.Unavailable, "target-not-initialized",
                     "The terminal is not initialized.");
 
@@ -597,10 +640,11 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         };
     }
 
-    private async Task<DiagnosticsResponse> HandleApplicationFrameRequestAsync(DiagnosticApplicationFrameRequest? request)
+    private async Task<DiagnosticsResponse> HandleApplicationFrameRequestAsync(DiagnosticApplicationFrameRequest? request,
+        CancellationToken cancellationToken)
     {
         var result = _diagnostics is { } diagnostics
-            ? await diagnostics.CaptureApplicationFrameAsync(request ?? new DiagnosticApplicationFrameRequest())
+            ? await diagnostics.CaptureApplicationFrameAsync(request ?? new DiagnosticApplicationFrameRequest(), cancellationToken)
             : TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Unavailable, "target-not-initialized",
                 "The terminal is not initialized.");
         return new DiagnosticsResponse

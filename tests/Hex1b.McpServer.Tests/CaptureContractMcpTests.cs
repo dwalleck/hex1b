@@ -483,6 +483,14 @@ public class CaptureContractMcpTests : McpServerTestBase
         });
 
         Assert.IsTrue(processed.GetProperty("capture").GetProperty("milestone").GetProperty("met").GetBoolean(), processed.ToString());
+        var engine = await new TerminalDiagnostics(terminal, "McpFrames").CaptureAsync(new DiagnosticCaptureRequest
+        {
+            Milestone = new DiagnosticMilestoneRequest { Milestone = DiagnosticMilestone.InputProcessed, InputId = inputId },
+        });
+        var engineMilestone = JsonSerializer.SerializeToElement(engine.Milestone!, DiagnosticsJsonContext.Default.Options);
+        var mcpMilestone = processed.GetProperty("capture").GetProperty("milestone");
+        Assert.IsTrue(JsonElement.DeepEquals(WithoutWallClock(engineMilestone), WithoutWallClock(mcpMilestone)),
+            $"MCP milestone differs from the engine's.\nengine: {engineMilestone}\nmcp:    {mcpMilestone}");
         StringAssert.Contains(processed.GetProperty("message").GetString(), $"Milestone input-processed for input {inputId}: met");
         Assert.IsFalse(processed.GetProperty("capture").GetProperty("milestone").GetProperty("input").TryGetProperty("payload", out _),
             "raw key payload in a default MCP milestone result");
@@ -527,6 +535,18 @@ public class CaptureContractMcpTests : McpServerTestBase
     }
 
     // === Helpers ===
+
+    // Wall-clock record times differ in serialized precision; compare everything else exactly.
+    private static JsonElement WithoutWallClock(JsonElement milestone)
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(milestone.GetRawText())!;
+        if (node["input"] is System.Text.Json.Nodes.JsonObject input)
+        {
+            input.Remove("acceptedAt");
+            input.Remove("processedAt");
+        }
+        return JsonDocument.Parse(node.ToJsonString()).RootElement.Clone();
+    }
 
     private async Task<JsonElement> CallAsync(McpClient client, string tool, Dictionary<string, object?> arguments)
     {

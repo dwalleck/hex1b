@@ -252,7 +252,7 @@ public sealed class TerminalSession : IAsyncDisposable
             return null;
 
         var bytes = Encoding.UTF8.GetBytes(text);
-        return await Diagnostics.TrackSendAsync(async () => await _process.WriteInputAsync(bytes, ct));
+        return await Diagnostics.TrackSendAsync(async () => await _process.WriteInputAsync(bytes, ct), "text");
     }
 
     /// <summary>
@@ -269,7 +269,7 @@ public sealed class TerminalSession : IAsyncDisposable
         var bytes = TranslateKey(key, modifiers);
         if (bytes.Length == 0)
             return null;
-        return await Diagnostics.TrackSendAsync(async () => await _process.WriteInputAsync(bytes, ct));
+        return await Diagnostics.TrackSendAsync(async () => await _process.WriteInputAsync(bytes, ct), "key");
     }
 
 

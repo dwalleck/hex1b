@@ -1610,6 +1610,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     catch (Exception error)
                     {
                         readItem.ProcessingBarrier?.TrySetException(error);
+                        // The pump has finished with the item; a later item must not wait on it.
+                        CompleteMilestoneItem(readItem);
                     }
                     finally
                     {
@@ -1672,6 +1674,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                             pooledItemTokens,
                             pooledItemTokensReturn,
                             ct).ConfigureAwait(false);
+                        // Handled whether presentation applied or refused it: a refused batch
+                        // was composed for a superseded geometry and is recomposed.
+                        CompleteMilestoneItem(readItem);
                         continue;
                     }
 
@@ -1689,6 +1694,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                             System.Buffers.ArrayPool<byte>.Shared.Return(pooledItemBuffer);
                         if (pooledItemTokens is not null && pooledItemTokensReturn is not null)
                             pooledItemTokensReturn(pooledItemTokens);
+                        CompleteMilestoneItem(readItem);
                         continue;
                     }
 
@@ -8197,6 +8203,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     private TimeSpan GetElapsed() => _timeProvider.GetUtcNow() - _sessionStart;
 
     // Reports a fully applied output item to the input milestone tracker.
+    // Reports an output item as handled by the pump: applied to the model, or refused or faulted
+    // without output reaching it. Every read path reports, so a later frame's mark is reachable.
     private void CompleteMilestoneItem(in WorkloadOutputItem item)
     {
         if (item.MilestoneSequence > 0)
