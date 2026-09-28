@@ -108,9 +108,6 @@ public sealed class TerminalDiagnostics
                 return Problem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", $"Unsupported authorization '{authorization}'.");
         }
 
-        if (_terminal.IsDisposed)
-            return Problem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
-
         var nonScreen = authorizations.Contains(DiagnosticAuthorization.NonScreenMetadata);
         try
         {
@@ -120,6 +117,14 @@ public sealed class TerminalDiagnostics
             var state = _terminal.CaptureSnapshotState(request.HistoryRows, ScrollbackWidth.CurrentTerminal);
             var endTimestamp = Stopwatch.GetTimestamp();
             var wallClockEnd = DateTimeOffset.UtcNow;
+            if (state.Disposed)
+            {
+                // Disposal is observed inside the read, so a capture racing disposal can never
+                // report the reset model. Release the references the read took.
+                new Hex1bTerminalSnapshot(_terminal, state, ScrollbackWidth.CurrentTerminal, TerminalCell.Empty).Dispose();
+                return Problem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
+            }
+
             AfterModelReadForTesting?.Invoke();
 
             var croppedRows = CountCroppedRows(state);

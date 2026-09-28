@@ -244,6 +244,19 @@ public class TerminalDiagnosticsCoherenceTests
         }
     }
 
+    [TestMethod]
+    public async Task ModelRead_ObservesDisposalInsideTheRead()
+    {
+        var terminal = CreateTerminal(40, 6, retention: 10);
+        Apply(terminal, "live");
+        Assert.IsFalse(terminal.CaptureSnapshotState(0, Hex1b.Automation.ScrollbackWidth.CurrentTerminal).Disposed);
+
+        await terminal.DisposeAsync();
+
+        Assert.IsTrue(terminal.CaptureSnapshotState(0, Hex1b.Automation.ScrollbackWidth.CurrentTerminal).Disposed,
+            "the model read did not observe disposal, so a capture racing disposal could report the reset model as captured");
+    }
+
     // === Helpers ===
 
     private static long Sequence(DiagnosticCaptureResult result)

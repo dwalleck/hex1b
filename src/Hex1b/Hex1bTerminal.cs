@@ -2720,7 +2720,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 _modelSequence,
                 _presentation is ITerminalReflowProvider { ReflowEnabled: true },
                 _synchronizedOutputCompletion is not null,
-                _synchronizedOutputStartedSequence);
+                _synchronizedOutputStartedSequence,
+                _disposed);
         }
     }
 

@@ -42,4 +42,5 @@ internal sealed record Hex1bTerminalSnapshotState(
     long ModelSequence,
     bool ReflowEnabled,
     bool SynchronizedUpdatePending,
-    long SynchronizedUpdateStartedSequence);
+    long SynchronizedUpdateStartedSequence,
+    bool Disposed);
