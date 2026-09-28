@@ -38,4 +38,6 @@ internal sealed record Hex1bTerminalSnapshotState(
     TerminalShellIntegration ShellIntegration,
     TerminalWorkingDirectory WorkingDirectory,
     IReadOnlyList<TerminalCommandMark> CommandMarks,
-    int RetainedHistoryRows);
+    int RetainedHistoryRows,
+    long ModelSequence,
+    bool ReflowEnabled);

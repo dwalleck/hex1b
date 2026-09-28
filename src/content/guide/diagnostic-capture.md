@@ -35,7 +35,7 @@ rendition. The CLI's `png` format is rasterized on the client from an `svg` capt
 | `format`, `content` | Rendered content. When a client saves the content to a file (MCP `savePath`, CLI `--output`), `content` is omitted and the path is reported separately. |
 | `geometry` | Model columns/rows, alternate-screen state, and cursor position. |
 | `history` | `requestedRows`, `availableRows`, `returnedRows`, `croppedRows`, `truncated`, `retentionCapacity`, and `reason`. |
-| `identity` | Process ID and start time, terminal-model `sessionId`, `sourceLayer` (`terminal-model`), application name/version, loaded `hex1bVersion`, `configuration` (workload, presentation, reflow, history retention), and `acquisition` (clock domain, monotonic start/end timestamps and frequency, wall-clock start/end). |
+| `identity` | Process ID and start time, terminal-model `sessionId`, `modelSequence`, `sourceLayer` (`terminal-model`), application name/version, loaded `hex1bVersion`, `configuration` (workload, presentation, reflow, history retention), and `acquisition` (clock domain, monotonic start/end timestamps and frequency, wall-clock start/end). |
 | `contentCoverage` | For each content class, whether it is `included`, `excluded`, or `unavailable`, and why. |
 | `nonScreenMetadata` | Window title and icon name, only with `non-screen-metadata` authorization. |
 | `unavailableFields` | Each absent field and the reason. Absent values are never reported as zero or empty. |
@@ -70,6 +70,14 @@ history**. Hidden metadata is withheld and listed as `excluded`, not returned em
 Each authorization is independent. Rendered screen and history text can itself contain secrets.
 The default policy does not make captured content secret-free.
 
+## Model sequence
+
+`identity.modelSequence` counts the model-input events — output application batches and
+geometry changes — that the terminal model has applied in this session. It is read in the same
+critical section as the captured cells, so two captures reporting the same value observed the
+same model state, and a larger value means later events were applied. An event can leave the
+visible state unchanged. Values are comparable only within one `sessionId`.
+
 ## Model history
 
 `historyRows` asks for rows that Hex1b's terminal model retained after they scrolled off the
@@ -102,9 +110,7 @@ model-history support, and authorizations. They also report each evidence layer:
   not supported.
 - Coherence of cells, geometry, cursor, modes, and history across one model observation is not
   yet a declared guarantee.
-- `identity.modelSequence` is absent: the model assigns sequence identities only while a capture
-  scope is armed. `identity.applicationFrame` is absent: frames are not yet published with
-  identities.
+- `identity.applicationFrame` is absent: frames are not yet published with identities.
 - `identity.applicationVersion` is reported only for in-process Hex1b applications.
 - Independently acquired observations (for example a capture and a widget tree) are correlated by
   their identities and acquisition intervals, never presented as one atomic moment.

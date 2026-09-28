@@ -45,9 +45,14 @@ public sealed class DiagnosticObservationIdentity
     [JsonPropertyName("acquisition")]
     public DiagnosticAcquisition Acquisition { get; init; } = new();
 
-    /// <summary>Terminal-model event sequence at the observation, when the model assigns one.</summary>
+    /// <summary>
+    /// Count of model-input events (output application batches and geometry changes) applied in
+    /// this terminal session at the observation. Observations with equal values read the same
+    /// model state; values are comparable only within one <see cref="SessionId"/>. An event can
+    /// leave the visible state unchanged.
+    /// </summary>
     [JsonPropertyName("modelSequence")]
-    public long? ModelSequence { get; init; }
+    public long ModelSequence { get; init; }
 
     /// <summary>Published application frame identity, when one is associated.</summary>
     [JsonPropertyName("applicationFrame")]

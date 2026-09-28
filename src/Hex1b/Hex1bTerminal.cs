@@ -2716,7 +2716,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 _activityState.ShellIntegration,
                 _activityState.WorkingDirectory,
                 [.. _commandMarks],
-                _scrollbackBuffer?.Count ?? 0);
+                _scrollbackBuffer?.Count ?? 0,
+                _modelSequence,
+                _presentation is ITerminalReflowProvider { ReflowEnabled: true });
         }
     }
 
@@ -3032,6 +3034,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         bool deferNotification;
         lock (_bufferLock)
         {
+            AdvanceModelSequenceUnsafe();
             // Check if the presentation adapter supports reflow and has it enabled
             if (_presentation is ITerminalReflowProvider { ReflowEnabled: true } reflowProvider)
             {

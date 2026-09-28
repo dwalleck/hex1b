@@ -204,6 +204,7 @@ public sealed partial class Hex1bTerminal
             if (terminal._captureApplicationDepth != 0 && terminal._captures is not null)
                 terminal.FailCapturesUnsafe(new InvalidOperationException("Output application reentered during capture."));
             terminal._captureApplicationDepth++;
+            terminal.AdvanceModelSequenceUnsafe();
         }
 
         public void Dispose() => _terminal._captureApplicationDepth--;

@@ -117,7 +117,8 @@ public class CaptureContractMcpTests : McpServerTestBase
         Assert.AreEqual(3, capture.GetProperty("history").GetProperty("requestedRows").GetInt32());
         Assert.AreEqual(50, capture.GetProperty("history").GetProperty("retentionCapacity").GetInt32());
         AssertUnavailable(capture, "identity.applicationFrame", "not yet published");
-        AssertUnavailable(capture, "identity.modelSequence", "capture scope");
+        Assert.AreEqual(direct.Identity!.ModelSequence, identity.GetProperty("modelSequence").GetInt64(),
+            "MCP and the in-process engine disagree on the model state of a static terminal");
         CollectionAssert.AreEqual(
             direct.ContentCoverage.Select(c => $"{DiagnosticContractNames.Of(c.Content)}:{DiagnosticContractNames.Of(c.State)}").ToArray(),
             capture.GetProperty("contentCoverage").EnumerateArray()

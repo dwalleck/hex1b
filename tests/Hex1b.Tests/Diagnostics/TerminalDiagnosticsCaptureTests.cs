@@ -318,8 +318,9 @@ public class TerminalDiagnosticsCaptureTests
         Assert.IsTrue(acquisition.WallClockStart <= acquisition.WallClockEnd);
         Assert.IsTrue(b.Identity.Acquisition.StartTimestamp >= acquisition.EndTimestamp, "acquisitions went backwards");
 
-        Assert.IsNull(identity.ModelSequence);
-        AssertUnavailableField(a, "identity.modelSequence");
+        Assert.IsTrue(identity.ModelSequence > 0, "modelSequence must name the observed model state");
+        Assert.AreEqual(identity.ModelSequence, b.Identity.ModelSequence, "no event occurred between the two captures");
+        Assert.IsFalse(a.UnavailableFields.Any(f => f.Field == "identity.modelSequence"));
         Assert.IsNull(identity.ApplicationFrame);
         AssertUnavailableField(a, "identity.applicationFrame");
         AssertEveryNullFieldIsExplained(a);

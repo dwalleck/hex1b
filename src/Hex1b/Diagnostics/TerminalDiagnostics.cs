@@ -43,8 +43,6 @@ public sealed class TerminalDiagnostics
     private const string AnsiRenditionLimitation =
         "ANSI content represents colors and bold, dim, italic, underline, blink, hidden, strikethrough, and overline; reverse video is rendered by swapping colors, and underline color and style variants are not represented.";
 
-    private const string SequenceUnavailable =
-        "The terminal model assigns event sequence identities only while a capture scope is armed; immediate capture does not arm one.";
     private const string AppFrameNotPublished =
         "Application frames are not yet published with identities through the diagnostics contract.";
     private const string NoApplicationLayer =
@@ -69,6 +67,12 @@ public sealed class TerminalDiagnostics
 
     private readonly Hex1bTerminal _terminal;
     private readonly string _applicationName;
+
+    /// <summary>
+    /// Runs after the model read and before anything else, so tests can mutate the live model at
+    /// that boundary and prove the result describes the read. Production code never sets it.
+    /// </summary>
+    internal Action? AfterModelReadForTesting { get; init; }
 
     /// <summary>
     /// Creates the diagnostics engine for a terminal.
@@ -115,6 +119,7 @@ public sealed class TerminalDiagnostics
             var state = _terminal.CaptureSnapshotState(request.HistoryRows, ScrollbackWidth.CurrentTerminal);
             var endTimestamp = Stopwatch.GetTimestamp();
             var wallClockEnd = DateTimeOffset.UtcNow;
+            AfterModelReadForTesting?.Invoke();
 
             var croppedRows = CountCroppedRows(state);
             using var snapshot = new Hex1bTerminalSnapshot(_terminal, ApplyContentPolicy(state, nonScreen),
@@ -123,7 +128,7 @@ public sealed class TerminalDiagnostics
 
             var unavailable = new List<DiagnosticUnavailableField>();
             var history = DescribeHistory(request.HistoryRows, state, snapshot.ScrollbackLineCount, croppedRows, unavailable);
-            var identity = DescribeIdentity(new DiagnosticAcquisition
+            var identity = DescribeIdentity(state, new DiagnosticAcquisition
             {
                 ClockDomain = "process-monotonic",
                 Frequency = Stopwatch.Frequency,
@@ -341,7 +346,7 @@ public sealed class TerminalDiagnostics
     }
 
     private DiagnosticObservationIdentity DescribeIdentity(
-        DiagnosticAcquisition acquisition, List<DiagnosticUnavailableField> unavailable)
+        Hex1bTerminalSnapshotState state, DiagnosticAcquisition acquisition, List<DiagnosticUnavailableField> unavailable)
     {
         var (startedAt, startReason) = ProcessStart.Value;
         if (startedAt is null)
@@ -368,7 +373,6 @@ public sealed class TerminalDiagnostics
             });
         }
 
-        unavailable.Add(new DiagnosticUnavailableField { Field = "identity.modelSequence", Reason = SequenceUnavailable });
         unavailable.Add(new DiagnosticUnavailableField
         {
             Field = "identity.applicationFrame",
@@ -379,6 +383,7 @@ public sealed class TerminalDiagnostics
         {
             ProcessId = Environment.ProcessId,
             ProcessStartedAt = startedAt,
+            ModelSequence = state.ModelSequence,
             SessionId = _terminal.DiagnosticSessionId.ToString("N"),
             SourceLayer = DiagnosticLayer.TerminalModel,
             ApplicationName = _applicationName,
@@ -396,7 +401,7 @@ public sealed class TerminalDiagnostics
                 Presentation = _terminal.PresentationAdapter is HeadlessPresentationAdapter
                     ? "headless"
                     : _terminal.PresentationAdapter.GetType().Name,
-                ReflowEnabled = _terminal.ReflowEnabled,
+                ReflowEnabled = state.ReflowEnabled,
                 HistoryRetentionCapacity = _terminal.HistoryRetentionCapacity,
             },
             Acquisition = acquisition,

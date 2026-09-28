@@ -7,7 +7,7 @@ namespace Hex1b.Diagnostics;
 /// </summary>
 public sealed class DiagnosticUnavailableField
 {
-    /// <summary>JSON path of the absent field, for example <c>identity.modelSequence</c>.</summary>
+    /// <summary>JSON path of the absent field, for example <c>history.availableRows</c>.</summary>
     [JsonPropertyName("field")]
     public string Field { get; init; } = "";
 

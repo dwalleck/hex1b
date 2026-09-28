@@ -52,7 +52,7 @@ public class CaptureContractCliTests
         Assert.AreEqual(50, history.GetProperty("retentionCapacity").GetInt32());
 
         AssertUnavailable(root, "identity.applicationFrame", "not yet published");
-        AssertUnavailable(root, "identity.modelSequence", "capture scope");
+        Assert.IsTrue(identity.GetProperty("modelSequence").GetInt64() > 0, "modelSequence missing from the CLI result");
         AssertCoverage(root, "hyperlink-targets", "excluded");
         AssertCoverage(root, "window-title", "excluded");
         AssertCoverage(root, "editor-text", "excluded");
