@@ -39,10 +39,31 @@ internal sealed class InputMilestoneTracker
     private long _appliedOutput;
     private string? _outputFailure;
 
-    internal InputMilestoneTracker()
+    internal InputMilestoneTracker(bool acceptanceOnly = false)
     {
+        AcceptanceOnly = acceptanceOnly;
         if (ConstructionsForTesting.Value is { } counter)
             Interlocked.Increment(ref counter.Value);
+    }
+
+    /// <summary>
+    /// True for a workload whose consumption is not observable (a PTY child): sends receive
+    /// acceptance ids, and every later stage is unavailable.
+    /// </summary>
+    internal bool AcceptanceOnly { get; }
+
+    /// <summary>Numbers one completed write to an acceptance-only workload.</summary>
+    internal long AcceptWrite()
+    {
+        var send = CurrentSend.Value;
+        lock (_sync)
+        {
+            var id = ++_accepted;
+            _recent[id % RetainedRecords] = new Tracked(id, DateTimeOffset.UtcNow) { Kind = "text", Source = "diagnostic-send" };
+            send?.Include(id);
+            WakeUnsafe();
+            return id;
+        }
     }
 
     /// <summary>
@@ -292,6 +313,9 @@ internal sealed class InputMilestoneTracker
         // A frame covering a pending input is the one recorded at its publication; for an input
         // already covered when the wait starts, the latest frame (progress beyond the request).
         var frame = coveringFrame ?? (_latestFrame is { } latest && latest.ProcessedInput >= inputId ? latest : null);
+        if (AcceptanceOnly && milestone != DiagnosticMilestone.InputAccepted)
+            return WaitStatus.Unavailable("input-consumption-unobservable",
+                "Input is written to a child process whose consumption is not observable; only acceptance is reported.");
         switch (milestone)
         {
             case DiagnosticMilestone.InputAccepted:

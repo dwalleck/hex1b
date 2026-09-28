@@ -53,6 +53,8 @@ public sealed class TerminalDiagnostics
         "The application does not publish frames; frame publication requires diagnostics to be enabled (WithDiagnostics).";
     private const string NoFocusedEditor = "No editor had focus in this frame.";
     private const int DefaultMilestoneTimeoutMs = 5_000;
+    private const string WrittenToChild =
+        "Written to the child process; its consumption is not observable, so later milestones are unavailable.";
     private const string QueuedForApplication =
         "Queued for the application; input-processed, frame-published and model-applied prove later stages.";
     private const int MaxMilestoneTimeoutMs = 60_000;
@@ -114,6 +116,7 @@ public sealed class TerminalDiagnostics
         _applicationName = applicationName
             ?? Assembly.GetEntryAssembly()?.GetName().Name
             ?? "Hex1bApp";
+        _terminal.EnsureAcceptanceTracker();
     }
 
     /// <summary>
@@ -272,6 +275,12 @@ public sealed class TerminalDiagnostics
 
         using var scope = tracker.BeginSend();
         await send().ConfigureAwait(false);
+        if (tracker.AcceptanceOnly)
+        {
+            var id = tracker.AcceptWrite();
+            return new DiagnosticAcceptedInput { FirstId = id, LastId = id, Meaning = WrittenToChild };
+        }
+
         return scope.LastId is { } lastId
             ? new DiagnosticAcceptedInput { FirstId = scope.FirstId!.Value, LastId = lastId, Meaning = QueuedForApplication }
             : null;
@@ -520,6 +529,30 @@ public sealed class TerminalDiagnostics
         UnavailableFields = [new DiagnosticUnavailableField { Field = "identity", Reason = "No frame was returned." }],
     };
 
+    private static IReadOnlyList<DiagnosticMilestoneCapability> DescribeMilestones(InputMilestoneTracker? tracker) =>
+        MilestoneGuarantees.Select(entry => new DiagnosticMilestoneCapability
+        {
+            Milestone = entry.Key,
+            Guarantee = entry.Value,
+            Available = tracker is not null && (!tracker.AcceptanceOnly || entry.Key == DiagnosticMilestone.InputAccepted),
+            Reason = tracker is null ? InputTrackingUnavailable
+                : tracker.AcceptanceOnly && entry.Key != DiagnosticMilestone.InputAccepted
+                    ? "Input is written to a child process whose consumption is not observable."
+                    : null,
+        }).ToArray();
+
+    private static readonly IReadOnlyDictionary<DiagnosticMilestone, string> MilestoneGuarantees = new Dictionary<DiagnosticMilestone, string>
+    {
+        [DiagnosticMilestone.InputAccepted] =
+            "The input was queued for the application (for a PTY: written to the child process). It does not prove processing.",
+        [DiagnosticMilestone.InputProcessed] =
+            "The application loop consumed the input (its processed-input watermark reached the id, or the flow runner consumed it).",
+        [DiagnosticMilestone.FramePublished] =
+            "A frame whose processed-input watermark covers the input was published; frames published before the input was processed are never attributed to it.",
+        [DiagnosticMilestone.ModelApplied] =
+            "Everything the application enqueued up to that frame was applied to the terminal model. Not a native delivery or presentation acknowledgment; unavailable for inline flow steps.",
+    };
+
     // Reads the frame source once: a flow swaps it as steps start and finish.
     private (IApplicationFrameSource? Source, string? Code, string? Reason) ReadFrameLayer()
     {
@@ -548,6 +581,7 @@ public sealed class TerminalDiagnostics
             return CapabilitiesProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
 
         var frameLayer = ReadFrameLayer();
+        var milestones = DescribeMilestones(_terminal.InputMilestones);
         return new()
         {
             Outcome = DiagnosticOutcome.Captured,
@@ -560,16 +594,18 @@ public sealed class TerminalDiagnostics
                     Formats = Enum.GetValues<DiagnosticCaptureFormat>(),
                     Timing = [ImmediateTiming],
                     ModelHistory = true,
-                    Authorizations = [DiagnosticAuthorization.NonScreenMetadata],
+                    Authorizations = [DiagnosticAuthorization.NonScreenMetadata, DiagnosticAuthorization.RawInput],
                     Limitations = AnsiCaptureLimitations,
+                    Milestones = milestones,
                 },
                 new DiagnosticOperationCapability
                 {
                     Operation = ApplicationFrameOperation,
                     Layer = DiagnosticLayer.ApplicationFrame,
                     Timing = ["latest-published"],
-                    Authorizations = [DiagnosticAuthorization.EditorText],
+                    Authorizations = [DiagnosticAuthorization.EditorText, DiagnosticAuthorization.RawInput],
                     Limitations = FrameLimitations,
+                    Milestones = milestones,
                 },
             ],
             Layers =

@@ -82,4 +82,19 @@ internal static class DiagnosticContractNames
 
         return true;
     }
+
+    /// <summary>
+    /// Builds a milestone request from client text: <see langword="null"/> when no milestone is
+    /// named; otherwise the request, or the reason the text is not a milestone.
+    /// </summary>
+    public static (DiagnosticMilestoneRequest? Milestone, string? Invalid) ParseMilestone(string? name, long? inputId, int? timeoutMs)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+            return inputId is null && timeoutMs is null
+                ? (null, null)
+                : (null, "An input id or milestone timeout was given without a milestone.");
+        if (!TryParse<DiagnosticMilestone>(name, out var milestone))
+            return (null, $"Unsupported milestone '{name}'. Supported: {string.Join(", ", All<DiagnosticMilestone>())}.");
+        return (new DiagnosticMilestoneRequest { Milestone = milestone, InputId = inputId, TimeoutMs = timeoutMs }, null);
+    }
 }

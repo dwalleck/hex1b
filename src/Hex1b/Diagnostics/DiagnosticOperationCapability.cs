@@ -37,4 +37,8 @@ public sealed class DiagnosticOperationCapability
     /// <summary>Exact limitations of the operation.</summary>
     [JsonPropertyName("limitations")]
     public IReadOnlyList<string> Limitations { get; init; } = [];
+
+    /// <summary>Milestones this operation can wait for on this target.</summary>
+    [JsonPropertyName("milestones")]
+    public IReadOnlyList<DiagnosticMilestoneCapability> Milestones { get; init; } = [];
 }

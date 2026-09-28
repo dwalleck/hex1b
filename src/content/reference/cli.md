@@ -188,6 +188,9 @@ hex1b capture screenshot <id> [options]
 | `--timeout` | int | `30` | Timeout in seconds for `--wait` |
 | `--scrollback` | int | `0` | Rows of retained terminal-model history to include (not native scrollback) |
 | `--authorize` | string | | Opt in to `non-screen-metadata`, `editor-text`, or `raw-input` (repeatable or comma-separated) |
+| `--milestone` | string | | Wait for `input-accepted`, `input-processed`, `frame-published` or `model-applied` of `--input-id` before capturing ([input milestones](../guide/diagnostic-capture.md#input-milestones)) |
+| `--input-id` | long | | The input id to wait for (the last id `keys` or `mouse` printed) |
+| `--milestone-timeout` | int | `5000` | Maximum milestone wait in milliseconds (1–60000) |
 
 Without `--json`, the command writes the rendered content (or saves it with `--output`). With
 `--json`, it writes the full contract result: outcome, content, geometry, history coverage,
@@ -325,6 +328,8 @@ hex1b capture recording playback --file demo.cast --player
 
 Send keystrokes to a terminal.
 
+On success, a diagnostics-enabled target reports the ids its events received: `Accepted inputs 3-5: …`, or `{firstId, lastId, meaning}` with `--json`. `mouse click` and `mouse drag` do the same. Pass the last id to `--input-id` on a capture.
+
 ```bash
 hex1b keys <id> [options]
 ```
@@ -433,6 +438,9 @@ hex1b app tree <id> [options]
 | `--depth` | int | Limit printed tree depth (text output) |
 | `--no-perf` | flag | Hide timing (text output) |
 | `--authorize` | string[] | `editor-text` includes the focused editor's text (repeatable or comma-separated) |
+| `--milestone` | string | Wait for `input-accepted`, `input-processed`, `frame-published` or `model-applied` of `--input-id` before capturing |
+| `--input-id` | long | The input id to wait for (the last id `keys` or `mouse` printed) |
+| `--milestone-timeout` | int | Maximum wait in milliseconds (1–60000; default 5000) |
 
 **Examples:**
 

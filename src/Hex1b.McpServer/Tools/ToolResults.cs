@@ -1,3 +1,4 @@
+using Hex1b.Diagnostics;
 using System.Text.Json.Serialization;
 
 namespace Hex1b.McpServer.Tools;
@@ -86,6 +87,10 @@ public class SendInputResult
 
     [JsonPropertyName("charactersSent")]
     public int CharactersSent { get; init; }
+
+    [JsonPropertyName("acceptedInput")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DiagnosticAcceptedInput? AcceptedInput { get; init; }
 }
 
 public class ResizeTerminalResult

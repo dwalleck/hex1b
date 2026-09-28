@@ -98,6 +98,7 @@ Sends a mouse click to a terminal.
   - `identity.applicationFrame`: the frame's identity
 - Local PTY sessions report `no-application-layer`; a flow between steps reports `no-active-application`
 - Inline flow-step frames use step-local coordinates (row 0 is the step's first row): translate before clicking
+- To see the effect of an input, send it (sends return `acceptedInput.lastId`), then capture with `milestone` = `frame-published` (or `model-applied`) and `inputId`: the result names the frame that actually processed the input instead of whatever frame came next
 - Essential for understanding why clicks aren't working or focus is wrong
 
 ### Session Management

@@ -536,13 +536,13 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         return request.Method?.ToLowerInvariant() switch
         {
             "info" => HandleInfoRequest(),
-            "capture" => HandleCaptureRequest(request.Capture),
+            "capture" => await HandleCaptureRequestAsync(request.Capture),
             "capabilities" => HandleCapabilitiesRequest(),
-            TerminalDiagnostics.ApplicationFrameOperation => HandleApplicationFrameRequest(request.ApplicationFrame),
-            "input" => await HandleInputRequestAsync(request.Data),
-            "key" => await HandleKeyRequestAsync(request.Key, request.Modifiers),
-            "click" => HandleClickRequest(request.X, request.Y, request.Button),
-            "drag" => HandleDragRequest(request.X, request.Y, request.X2, request.Y2, request.Button),
+            TerminalDiagnostics.ApplicationFrameOperation => await HandleApplicationFrameRequestAsync(request.ApplicationFrame),
+            "input" => await TrackedSendAsync(() => HandleInputRequestAsync(request.Data)),
+            "key" => await TrackedSendAsync(() => HandleKeyRequestAsync(request.Key, request.Modifiers)),
+            "click" => await TrackedSendAsync(() => Task.FromResult(HandleClickRequest(request.X, request.Y, request.Button))),
+            "drag" => await TrackedSendAsync(() => Task.FromResult(HandleDragRequest(request.X, request.Y, request.X2, request.Y2, request.Button))),
             "resize" => await HandleResizeRequestAsync(request.X, request.Y),
             "shutdown" => HandleShutdownRequest(),
             "record-start" => await HandleRecordStartRequestAsync(request),
@@ -567,13 +567,26 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         };
     }
 
-    private DiagnosticsResponse HandleCaptureRequest(DiagnosticCaptureRequest? request)
+    // Runs a send and reports the input ids its events were assigned, when the target tracks input.
+    private async Task<DiagnosticsResponse> TrackedSendAsync(Func<Task<DiagnosticsResponse>> send)
+    {
+        if (_diagnostics is null)
+            return await send();
+        DiagnosticsResponse? response = null;
+        var accepted = await _diagnostics.TrackSendAsync(async () => response = await send());
+        if (response!.Success)
+            response.AcceptedInput = accepted;
+        return response;
+    }
+
+    private async Task<DiagnosticsResponse> HandleCaptureRequestAsync(DiagnosticCaptureRequest? request)
     {
         var result = request is null
             ? TerminalDiagnostics.Problem(DiagnosticOutcome.InvalidRequest, "missing-capture-request",
                 "The capture method requires a capture request.")
-            : _diagnostics?.Capture(request)
-                ?? TerminalDiagnostics.Problem(DiagnosticOutcome.Unavailable, "target-not-initialized",
+            : _diagnostics is { } diagnostics
+                ? await diagnostics.CaptureAsync(request)
+                : TerminalDiagnostics.Problem(DiagnosticOutcome.Unavailable, "target-not-initialized",
                     "The terminal is not initialized.");
 
         return new DiagnosticsResponse
@@ -584,10 +597,11 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         };
     }
 
-    private DiagnosticsResponse HandleApplicationFrameRequest(DiagnosticApplicationFrameRequest? request)
+    private async Task<DiagnosticsResponse> HandleApplicationFrameRequestAsync(DiagnosticApplicationFrameRequest? request)
     {
-        var result = _diagnostics?.CaptureApplicationFrame(request ?? new DiagnosticApplicationFrameRequest())
-            ?? TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Unavailable, "target-not-initialized",
+        var result = _diagnostics is { } diagnostics
+            ? await diagnostics.CaptureApplicationFrameAsync(request ?? new DiagnosticApplicationFrameRequest())
+            : TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Unavailable, "target-not-initialized",
                 "The terminal is not initialized.");
         return new DiagnosticsResponse
         {

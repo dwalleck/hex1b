@@ -91,4 +91,11 @@ internal sealed class DiagnosticsResponse
     /// </summary>
     [JsonPropertyName("applicationFrame")]
     public DiagnosticApplicationFrameResult? ApplicationFrame { get; set; }
+
+    /// <summary>
+    /// For "input", "key", "click" and "drag": the input ids the send was assigned, when the
+    /// target tracks input.
+    /// </summary>
+    [JsonPropertyName("acceptedInput")]
+    public DiagnosticAcceptedInput? AcceptedInput { get; set; }
 }

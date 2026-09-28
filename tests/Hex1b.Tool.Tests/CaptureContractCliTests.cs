@@ -447,6 +447,142 @@ public class CaptureContractCliTests
         StringAssert.Contains(text, "\\u001b]0;pwned");
     }
 
+    [TestMethod]
+    public async Task Milestone_AttachedApp_SendThenCaptureEachStageLikeTheEngine()
+    {
+        await using var target = await StartFrameAppAsync();
+
+        var (sendExit, sendOut, sendErr) = await RunCliAsync("keys", Pid, "--key", "Q", "--ctrl", "--json");
+        Assert.AreEqual(0, sendExit, sendErr);
+        using var accepted = JsonDocument.Parse(sendOut);
+        var inputId = accepted.RootElement.GetProperty("lastId").GetInt64();
+        StringAssert.Contains(accepted.RootElement.GetProperty("meaning").GetString(), "Queued for the application");
+
+        foreach (var stage in new[] { "input-processed", "frame-published", "model-applied" })
+        {
+            var (exitCode, stdout, stderr) = await RunCliAsync("capture", "screenshot", Pid, "--json",
+                "--milestone", stage, "--input-id", inputId.ToString());
+            Assert.AreEqual(0, exitCode, $"{stage}: {stderr}");
+            using var json = JsonDocument.Parse(stdout);
+            var milestone = json.RootElement.GetProperty("milestone");
+            Assert.AreEqual(stage, milestone.GetProperty("milestone").GetString());
+            Assert.IsTrue(milestone.GetProperty("met").GetBoolean(), stage);
+            StringAssert.Contains(stderr, $"Milestone {stage} for input {inputId}: met");
+
+            var engine = await new TerminalDiagnostics(target, "CliFrames").CaptureAsync(new DiagnosticCaptureRequest
+            {
+                Milestone = new DiagnosticMilestoneRequest { Milestone = DiagnosticContractNames.TryParse<DiagnosticMilestone>(stage, out var parsed) ? parsed : default, InputId = inputId },
+            });
+            var engineMilestone = System.Text.Json.JsonSerializer.SerializeToElement(engine.Milestone!, DiagnosticsJsonContext.Default.Options);
+            Assert.IsTrue(JsonElement.DeepEquals(WithoutTimestamps(engineMilestone), WithoutTimestamps(milestone)),
+                $"{stage}: CLI milestone differs from the engine's.\nengine: {engineMilestone}\ncli:    {milestone}");
+        }
+
+        var (_, plain, _) = await RunCliAsync("capture", "screenshot", Pid, "--json", "--milestone", "input-processed", "--input-id", inputId.ToString());
+        var (_, raw, _) = await RunCliAsync("capture", "screenshot", Pid, "--json", "--milestone", "input-processed", "--input-id", inputId.ToString(),
+            "--authorize", "raw-input");
+        // Compare parsed values: the JSON encoder escapes '+', so a raw string search proves nothing.
+        var plainInput = JsonDocument.Parse(plain).RootElement.GetProperty("milestone").GetProperty("input");
+        var rawInput = JsonDocument.Parse(raw).RootElement.GetProperty("milestone").GetProperty("input");
+        Assert.IsFalse(plainInput.TryGetProperty("payload", out _), $"raw key payload in a default CLI milestone result: {plainInput}");
+        Assert.AreEqual("Q+Control", rawInput.GetProperty("payload").GetString(), "raw-input did not include the key payload");
+
+        var (treeExit, tree, treeErr) = await RunCliAsync("app", "tree", Pid, "--json", "--milestone", "frame-published", "--input-id", inputId.ToString());
+        Assert.AreEqual(0, treeExit, treeErr);
+        using var treeJson = JsonDocument.Parse(tree);
+        Assert.IsGreaterThanOrEqualTo(inputId, treeJson.RootElement.GetProperty("milestone").GetProperty("frame").GetProperty("processedInput").GetInt64());
+    }
+
+    [TestMethod]
+    public async Task Milestone_InvalidNameIsAnInvalidRequest()
+    {
+        await using var target = await StartFrameAppAsync();
+
+        var (exitCode, stdout, _) = await RunCliAsync("capture", "screenshot", Pid, "--json", "--milestone", "whenever", "--input-id", "1");
+
+        Assert.AreEqual(1, exitCode);
+        using var json = JsonDocument.Parse(stdout);
+        Assert.AreEqual("invalid-request", json.RootElement.GetProperty("outcome").GetString());
+        Assert.AreEqual("invalid-milestone", json.RootElement.GetProperty("problem").GetProperty("code").GetString());
+    }
+
+    [TestMethod]
+    public async Task Milestone_LocalHostedPty_ReportsAcceptanceOnly()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var config = new TerminalHostConfig { Width = 40, Height = 6 };
+        if (OperatingSystem.IsWindows())
+        {
+            config.Command = "powershell";
+            config.Arguments = ["-NoProfile", "-Command", "Start-Sleep 60"];
+        }
+        else
+        {
+            config.Command = "/bin/sh";
+            config.Arguments = ["-c", "exec sleep 60"];
+        }
+
+        await WaitForSocketReleaseAsync(cts.Token);
+        var host = TerminalHost.RunAsync(config, cts.Token);
+        try
+        {
+            await WaitForSocketAsync(cts.Token);
+            var (sendExit, sendOut, sendErr) = await RunCliAsync("keys", Pid, "--text", "hi", "--json");
+            Assert.AreEqual(0, sendExit, sendErr);
+            using var accepted = JsonDocument.Parse(sendOut);
+            var inputId = accepted.RootElement.GetProperty("lastId").GetInt64().ToString();
+            StringAssert.Contains(accepted.RootElement.GetProperty("meaning").GetString(), "child process");
+
+            var (acceptedExit, _, acceptedErr) = await RunCliAsync("capture", "screenshot", Pid, "--json", "--milestone", "input-accepted", "--input-id", inputId);
+            var (processedExit, processedOut, _) = await RunCliAsync("capture", "screenshot", Pid, "--json", "--milestone", "input-processed", "--input-id", inputId);
+
+            Assert.AreEqual(0, acceptedExit, acceptedErr);
+            Assert.AreEqual(1, processedExit);
+            using var processed = JsonDocument.Parse(processedOut);
+            Assert.AreEqual("unavailable", processed.RootElement.GetProperty("outcome").GetString());
+            Assert.AreEqual("input-consumption-unobservable", processed.RootElement.GetProperty("problem").GetProperty("code").GetString());
+        }
+        finally
+        {
+            await cts.CancelAsync();
+            try { await host; } catch (OperationCanceledException) { }
+        }
+    }
+
+    [TestMethod]
+    public async Task Milestone_FlowStep_FrameMetAndModelApplicationUnobservable()
+    {
+        await WaitForSocketReleaseAsync(TestContext.Current.CancellationToken);
+        await using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithHex1bFlow(async flow =>
+            {
+                var step = flow.Step(_ => new VStackWidget([new TextBlockWidget("MSTEP"), new TextBoxWidget("")]));
+                await step.WaitForCompletionAsync(TestContext.Current.CancellationToken);
+            })
+            .WithHeadless()
+            .WithDimensions(40, 8)
+            .WithDiagnostics(appName: "CliMilestoneFlow", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync(TestContext.Current.CancellationToken);
+        await WaitForSocketAsync(TestContext.Current.CancellationToken);
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.ContainsText("MSTEP"), TimeSpan.FromSeconds(10), "flow step rendered")
+            .Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
+
+        var (_, sendOut, _) = await RunCliAsync("keys", Pid, "--key", "Q", "--json");
+        var inputId = JsonDocument.Parse(sendOut).RootElement.GetProperty("lastId").GetInt64().ToString();
+        var (treeExit, tree, treeErr) = await RunCliAsync("app", "tree", Pid, "--json", "--milestone", "frame-published", "--input-id", inputId);
+        var (modelExit, model, _) = await RunCliAsync("capture", "screenshot", Pid, "--json", "--milestone", "model-applied", "--input-id", inputId);
+
+        Assert.AreEqual(0, treeExit, treeErr);
+        using var treeJson = JsonDocument.Parse(tree);
+        Assert.AreEqual(treeJson.RootElement.GetProperty("frame").GetProperty("applicationInstanceId").GetString(),
+            treeJson.RootElement.GetProperty("milestone").GetProperty("frame").GetProperty("applicationInstanceId").GetString());
+        Assert.AreEqual(1, modelExit);
+        Assert.AreEqual("model-application-unobservable",
+            JsonDocument.Parse(model).RootElement.GetProperty("problem").GetProperty("code").GetString());
+    }
+
     // === Helpers ===
 
     private static string Pid => Environment.ProcessId.ToString();
@@ -557,6 +693,18 @@ public class CaptureContractCliTests
 
         Assert.Fail("the application never stayed idle across a CLI capture");
         return default;
+    }
+
+    // Record timestamps differ in precision between serializers; compare the rest exactly.
+    private static JsonElement WithoutTimestamps(JsonElement milestone)
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(milestone.GetRawText())!;
+        if (node["input"] is System.Text.Json.Nodes.JsonObject input)
+        {
+            input.Remove("acceptedAt");
+            input.Remove("processedAt");
+        }
+        return JsonDocument.Parse(node.ToJsonString()).RootElement.Clone();
     }
 
     private static JsonElement ToJson(DiagnosticApplicationFrameResult result) =>

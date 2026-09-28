@@ -21,6 +21,7 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
     private static readonly Option<string?> s_waitOption = new("--wait") { Description = "Wait for text to appear before capturing" };
     private static readonly Option<int> s_timeoutOption = new("--timeout") { DefaultValueFactory = _ => 30, Description = "Timeout in seconds for --wait" };
     private static readonly Option<int> s_scrollbackOption = new("--scrollback") { DefaultValueFactory = _ => 0, Description = "Rows of retained terminal-model history to include (not native scrollback)" };
+    private static readonly MilestoneOptions s_milestone = new();
     private static readonly Option<string[]> s_authorizeOption = new("--authorize")
     {
         Description = "Opt in to content beyond the rendered screen: non-screen-metadata, editor-text, or raw-input (repeatable or comma-separated)"
@@ -43,6 +44,7 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
         Options.Add(s_timeoutOption);
         Options.Add(s_scrollbackOption);
         Options.Add(s_authorizeOption);
+        s_milestone.AddTo(this);
     }
 
     protected override async Task<int> ExecuteAsync(ParseResult parseResult, CancellationToken cancellationToken)
@@ -70,6 +72,18 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
             isPng ? "svg" : format, scrollback, authorizations, isPng ? SvgToPngConverter.EmbeddedFontFamily : null);
         if (invalid != null)
             return WriteFailure(invalid, json);
+        var (milestone, invalidMilestone) = s_milestone.Parse(parseResult);
+        if (invalidMilestone != null)
+            return WriteFailure(TerminalDiagnostics.Problem(DiagnosticOutcome.InvalidRequest, "invalid-milestone", invalidMilestone), json);
+        if (milestone != null)
+            request = new DiagnosticCaptureRequest
+            {
+                Format = request!.Format,
+                HistoryRows = request.HistoryRows,
+                FontFamily = request.FontFamily,
+                Authorizations = request.Authorizations,
+                Milestone = milestone,
+            };
 
         var resolved = _resolver.Resolve(id);
         if (!resolved.Success)
@@ -89,9 +103,12 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
         if (result.Outcome != DiagnosticOutcome.Captured)
             return WriteFailure(result, json);
 
-        // Stdout carries only content or JSON; the partial-content warning goes to stderr in every mode.
+        // Stdout carries only content or JSON; the partial-content warning and the milestone
+        // summary go to stderr in every mode.
         if (TerminalDiagnostics.DescribePartialContent(result) is { } partial)
             Formatter.WriteError(partial);
+        if (result.Milestone is { } observed)
+            Formatter.WriteError(MilestoneOptions.Describe(observed));
 
         if (isPng)
         {
@@ -160,6 +177,8 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
         if (json)
             WriteResult(result);
         Formatter.WriteError($"{DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}");
+        if (result.Milestone is { } observed)
+            Formatter.WriteError(MilestoneOptions.Describe(observed));
         return 1;
     }
 

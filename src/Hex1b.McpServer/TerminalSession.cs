@@ -246,13 +246,13 @@ public sealed class TerminalSession : IAsyncDisposable
     /// </summary>
     /// <param name="text">The text to send.</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task SendInputAsync(string text, CancellationToken ct = default)
+    public async Task<DiagnosticAcceptedInput?> SendInputAsync(string text, CancellationToken ct = default)
     {
         if (_disposed || _process.HasExited)
-            return;
+            return null;
 
         var bytes = Encoding.UTF8.GetBytes(text);
-        await _process.WriteInputAsync(bytes, ct);
+        return await Diagnostics.TrackSendAsync(async () => await _process.WriteInputAsync(bytes, ct));
     }
 
     /// <summary>
@@ -261,17 +261,17 @@ public sealed class TerminalSession : IAsyncDisposable
     /// <param name="key">The key to send (e.g., "Enter", "Tab", "Escape", "Up", "Down", "Left", "Right").</param>
     /// <param name="modifiers">Key modifiers (e.g., "Ctrl", "Alt", "Shift").</param>
     /// <param name="ct">Cancellation token.</param>
-    public async Task SendKeyAsync(string key, string[]? modifiers = null, CancellationToken ct = default)
+    public async Task<DiagnosticAcceptedInput?> SendKeyAsync(string key, string[]? modifiers = null, CancellationToken ct = default)
     {
         if (_disposed || _process.HasExited)
-            return;
+            return null;
 
         var bytes = TranslateKey(key, modifiers);
-        if (bytes.Length > 0)
-        {
-            await _process.WriteInputAsync(bytes, ct);
-        }
+        if (bytes.Length == 0)
+            return null;
+        return await Diagnostics.TrackSendAsync(async () => await _process.WriteInputAsync(bytes, ct));
     }
+
 
     /// <summary>
     /// Resizes the terminal.

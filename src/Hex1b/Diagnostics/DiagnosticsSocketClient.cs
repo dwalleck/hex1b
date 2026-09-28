@@ -79,8 +79,8 @@ internal sealed class DiagnosticsSocketClient
         string socketPath, DiagnosticCaptureRequest request, CancellationToken cancellationToken = default)
     {
         var (response, problem) = await ExchangeAsync(socketPath,
-            new DiagnosticsRequest { Method = TerminalDiagnostics.CaptureOperation, Capture = request }, cancellationToken)
-            .ConfigureAwait(false);
+            new DiagnosticsRequest { Method = TerminalDiagnostics.CaptureOperation, Capture = request }, cancellationToken,
+            MilestoneWait(request.Milestone)).ConfigureAwait(false);
         if (problem is not null)
             return TerminalDiagnostics.Problem(problem.Value.Outcome, problem.Value.Code, problem.Value.Message);
 
@@ -102,7 +102,7 @@ internal sealed class DiagnosticsSocketClient
     {
         var (response, problem) = await ExchangeAsync(socketPath,
             new DiagnosticsRequest { Method = TerminalDiagnostics.ApplicationFrameOperation, ApplicationFrame = request },
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken, MilestoneWait(request.Milestone)).ConfigureAwait(false);
         if (problem is not null)
             return TerminalDiagnostics.FrameProblem(problem.Value.Outcome, problem.Value.Code, problem.Value.Message);
 
@@ -281,12 +281,16 @@ internal sealed class DiagnosticsSocketClient
             ?? new DiagnosticsResponse { Success = false, Error = "Failed to deserialize response" };
     }
 
+    // A milestone capture may legitimately wait its whole timeout before the target answers.
+    private static TimeSpan MilestoneWait(DiagnosticMilestoneRequest? milestone) =>
+        milestone is null ? TimeSpan.Zero : TimeSpan.FromMilliseconds(Math.Max(0, milestone.TimeoutMs ?? 5_000));
+
     private async Task<(DiagnosticsResponse? Response, (DiagnosticOutcome Outcome, string Code, string Message)? Problem)> ExchangeAsync(
-        string socketPath, DiagnosticsRequest request, CancellationToken cancellationToken)
+        string socketPath, DiagnosticsRequest request, CancellationToken cancellationToken, TimeSpan extraWait = default)
     {
         try
         {
-            return (await SendAsync(socketPath, request, cancellationToken, _observationTimeout).ConfigureAwait(false), null);
+            return (await SendAsync(socketPath, request, cancellationToken, _observationTimeout + extraWait).ConfigureAwait(false), null);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

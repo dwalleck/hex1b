@@ -70,6 +70,8 @@ internal sealed class KeysCommand : BaseCommand
                 Formatter.WriteError(response.Error ?? "Failed to send text");
                 return 1;
             }
+
+            MilestoneOptions.WriteAccepted(Formatter, response.AcceptedInput, parseResult.GetValue(RootCommand.JsonOption));
         }
 
         if (key != null)
@@ -92,6 +94,8 @@ internal sealed class KeysCommand : BaseCommand
                 Formatter.WriteError(response.Error ?? "Failed to send key");
                 return 1;
             }
+
+            MilestoneOptions.WriteAccepted(Formatter, response.AcceptedInput, parseResult.GetValue(RootCommand.JsonOption));
         }
 
         return 0;

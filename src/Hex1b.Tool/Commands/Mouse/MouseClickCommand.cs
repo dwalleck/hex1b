@@ -57,6 +57,8 @@ internal sealed class MouseClickCommand : BaseCommand
             return 1;
         }
 
+        MilestoneOptions.WriteAccepted(Formatter, response.AcceptedInput, parseResult.GetValue(RootCommand.JsonOption));
+
         return 0;
     }
 }

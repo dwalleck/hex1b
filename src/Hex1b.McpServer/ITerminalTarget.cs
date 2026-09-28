@@ -64,12 +64,14 @@ public interface ITerminalTarget : IAsyncDisposable
     /// <summary>
     /// Sends text input to the terminal.
     /// </summary>
-    Task SendInputAsync(string text, CancellationToken ct = default);
+    /// <returns>The input ids the send was assigned, or <see langword="null"/> when the target does not track input.</returns>
+    Task<DiagnosticAcceptedInput?> SendInputAsync(string text, CancellationToken ct = default);
 
     /// <summary>
     /// Sends a special key to the terminal.
     /// </summary>
-    Task SendKeyAsync(string key, string[]? modifiers = null, CancellationToken ct = default);
+    /// <returns>The input ids the send was assigned, or <see langword="null"/> when the target does not track input.</returns>
+    Task<DiagnosticAcceptedInput?> SendKeyAsync(string key, string[]? modifiers = null, CancellationToken ct = default);
 
     /// <summary>
     /// Sends a mouse click at the specified cell position.
@@ -78,7 +80,8 @@ public interface ITerminalTarget : IAsyncDisposable
     /// <param name="y">Row (0-based).</param>
     /// <param name="button">Mouse button to click.</param>
     /// <param name="ct">Cancellation token.</param>
-    Task SendMouseClickAsync(int x, int y, MouseButton button = MouseButton.Left, CancellationToken ct = default);
+    /// <returns>The input ids the send was assigned, or <see langword="null"/> when the target does not track input.</returns>
+    Task<DiagnosticAcceptedInput?> SendMouseClickAsync(int x, int y, MouseButton button = MouseButton.Left, CancellationToken ct = default);
 
     /// <summary>
     /// Captures the terminal model through the shared diagnostic contract. Target, transport,

@@ -144,7 +144,7 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
 
         try
         {
-            await target.SendMouseClickAsync(x, y, mouseButton, ct);
+            var accepted = await target.SendMouseClickAsync(x, y, mouseButton, ct);
             
             return new SendMouseClickResult
             {
@@ -153,7 +153,8 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
                 Message = $"Clicked {button} at ({x}, {y})",
                 X = x,
                 Y = y,
-                Button = button
+                Button = button,
+                AcceptedInput = accepted
             };
         }
         catch (Exception ex)
@@ -194,7 +195,7 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
 
         try
         {
-            await target.SendKeyAsync(key, modifierArray, ct);
+            var accepted = await target.SendKeyAsync(key, modifierArray, ct);
             
             var modStr = modifierArray != null ? $" with {string.Join("+", modifierArray)}" : "";
             return new SendKeyResult
@@ -203,7 +204,8 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
                 SessionId = sessionId,
                 Message = $"Sent key '{key}'{modStr}",
                 Key = key,
-                Modifiers = modifierArray
+                Modifiers = modifierArray,
+                AcceptedInput = accepted
             };
         }
         catch (Exception ex)
@@ -227,6 +229,9 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
         [Description("Optional file path to save the content. When provided, content is written to the file and omitted from capture.content.")] string? savePath = null,
         [Description(CaptureToolSupport.HistoryRowsDescription)] int historyRows = 0,
         [Description(CaptureToolSupport.AuthorizeDescription)] string? authorize = null,
+        [Description(CaptureToolSupport.MilestoneDescription)] string? milestone = null,
+        [Description(CaptureToolSupport.InputIdDescription)] long? inputId = null,
+        [Description(CaptureToolSupport.MilestoneTimeoutDescription)] int? milestoneTimeoutMs = null,
         CancellationToken ct = default)
     {
         var target = sessionManager.GetTarget(sessionId);
@@ -243,7 +248,8 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
 
         try
         {
-            return await CaptureToolSupport.CaptureAsync(target.CaptureAsync, format, historyRows, authorize, savePath, ct, sessionId);
+            return await CaptureToolSupport.CaptureAsync(target.CaptureAsync, format, historyRows, authorize, savePath, ct, sessionId,
+                milestone: milestone, inputId: inputId, milestoneTimeoutMs: milestoneTimeoutMs);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -264,6 +270,9 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
     public async Task<CallToolResult> CaptureApplicationFrame(
         [Description("Session ID of the terminal target")] string sessionId,
         [Description(CaptureToolSupport.FrameAuthorizeDescription)] string? authorize = null,
+        [Description(CaptureToolSupport.MilestoneDescription)] string? milestone = null,
+        [Description(CaptureToolSupport.InputIdDescription)] long? inputId = null,
+        [Description(CaptureToolSupport.MilestoneTimeoutDescription)] int? milestoneTimeoutMs = null,
         CancellationToken ct = default)
     {
         var target = sessionManager.GetTarget(sessionId);
@@ -271,7 +280,8 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
             ? CaptureToolSupport.FrameResult(
                 TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Unavailable, "session-not-found", $"Session '{sessionId}' not found."),
                 sessionId, processId: null)
-            : await CaptureToolSupport.CaptureApplicationFrameAsync(target.CaptureApplicationFrameAsync, authorize, ct, sessionId);
+            : await CaptureToolSupport.CaptureApplicationFrameAsync(target.CaptureApplicationFrameAsync, authorize, ct, sessionId,
+                milestone: milestone, inputId: inputId, milestoneTimeoutMs: milestoneTimeoutMs);
         return CaptureToolSupport.ToCallToolResult(result);
     }
 
@@ -474,6 +484,10 @@ public class SendMouseClickResult
     [JsonPropertyName("button")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Button { get; init; }
+
+    [JsonPropertyName("acceptedInput")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DiagnosticAcceptedInput? AcceptedInput { get; init; }
 }
 
 public class SendKeyResult
@@ -494,6 +508,10 @@ public class SendKeyResult
     [JsonPropertyName("modifiers")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string[]? Modifiers { get; init; }
+
+    [JsonPropertyName("acceptedInput")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DiagnosticAcceptedInput? AcceptedInput { get; init; }
 }
 
 public class DiagnosticCapabilitiesToolResult

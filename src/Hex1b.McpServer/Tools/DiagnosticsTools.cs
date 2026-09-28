@@ -160,7 +160,8 @@ public class DiagnosticsTools
                 Success = true,
                 ProcessId = processId,
                 Message = $"Sent input to process {processId}",
-                CharactersSent = processedInput.Length
+                CharactersSent = processedInput.Length,
+                AcceptedInput = response.AcceptedInput
             };
         }
         catch (Exception ex)
@@ -181,6 +182,9 @@ public class DiagnosticsTools
     public async Task<CallToolResult> GetHex1bTree(
         [Description("Process ID of the Hex1b application")] int processId,
         [Description(CaptureToolSupport.FrameAuthorizeDescription)] string? authorize = null,
+        [Description(CaptureToolSupport.MilestoneDescription)] string? milestone = null,
+        [Description(CaptureToolSupport.InputIdDescription)] long? inputId = null,
+        [Description(CaptureToolSupport.MilestoneTimeoutDescription)] int? milestoneTimeoutMs = null,
         CancellationToken ct = default)
     {
         var unavailable = CheckTarget(processId, out var socketPath);
@@ -189,7 +193,8 @@ public class DiagnosticsTools
                 TerminalDiagnostics.FrameProblem(DiagnosticOutcome.Unavailable, "target-unreachable", unavailable),
                 sessionId: null, processId)
             : await CaptureToolSupport.CaptureApplicationFrameAsync(
-                (request, token) => Client.CaptureApplicationFrameAsync(socketPath, request, token), authorize, ct, processId: processId);
+                (request, token) => Client.CaptureApplicationFrameAsync(socketPath, request, token), authorize, ct, processId: processId,
+                milestone: milestone, inputId: inputId, milestoneTimeoutMs: milestoneTimeoutMs);
         return CaptureToolSupport.ToCallToolResult(result);
     }
 
@@ -276,4 +281,8 @@ public class SendInputToHex1bTerminalResult
 
     [JsonPropertyName("charactersSent")]
     public int CharactersSent { get; init; }
+
+    [JsonPropertyName("acceptedInput")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DiagnosticAcceptedInput? AcceptedInput { get; init; }
 }

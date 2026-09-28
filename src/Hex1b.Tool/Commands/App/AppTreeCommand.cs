@@ -20,6 +20,7 @@ internal sealed class AppTreeCommand : BaseCommand
     private static readonly Option<bool> s_popupsOption = new("--popups") { Description = "Include the popup stack" };
     private static readonly Option<int?> s_depthOption = new("--depth") { Description = "Limit printed tree depth (text output only)" };
     private static readonly Option<bool> s_noPerfOption = new("--no-perf") { Description = "Hide performance timing (text output only)" };
+    private static readonly MilestoneOptions s_milestone = new();
     private static readonly Option<string[]> s_authorizeOption = new("--authorize")
     {
         Description = "Opt in to content beyond the frame's defaults: editor-text includes the focused editor's text (repeatable or comma-separated)"
@@ -41,6 +42,7 @@ internal sealed class AppTreeCommand : BaseCommand
         Options.Add(s_depthOption);
         Options.Add(s_noPerfOption);
         Options.Add(s_authorizeOption);
+        s_milestone.AddTo(this);
     }
 
     protected override async Task<int> ExecuteAsync(ParseResult parseResult, CancellationToken cancellationToken)
@@ -57,6 +59,11 @@ internal sealed class AppTreeCommand : BaseCommand
         var (request, invalid) = DiagnosticContractNames.ParseApplicationFrameRequest(authorizations);
         if (invalid != null)
             return WriteFailure(invalid, json);
+        var (milestone, invalidMilestone) = s_milestone.Parse(parseResult);
+        if (invalidMilestone != null)
+            return WriteFailure(TerminalDiagnostics.FrameProblem(DiagnosticOutcome.InvalidRequest, "invalid-milestone", invalidMilestone), json);
+        if (milestone != null)
+            request = new DiagnosticApplicationFrameRequest { Authorizations = request!.Authorizations, Milestone = milestone };
 
         var resolved = _resolver.Resolve(id);
         if (!resolved.Success)
@@ -78,6 +85,8 @@ internal sealed class AppTreeCommand : BaseCommand
 
         var frame = result.Frame!;
         var showPerf = !hidePerf && frame.Timings is not null;
+        if (result.Milestone is { } observed)
+            Formatter.WriteLine(Safe(MilestoneOptions.Describe(observed)));
         Formatter.WriteLine($"Frame {frame.FrameId}: {frame.Columns}x{frame.Rows}, {(frame.WroteOutput ? "wrote output" : "no output")}");
         if (showPerf)
             Formatter.WriteLine($"Timing: build={frame.Timings!.BuildMs:F2}ms reconcile={frame.Timings.ReconcileMs:F2}ms render={frame.Timings.RenderMs:F2}ms");
@@ -199,6 +208,8 @@ internal sealed class AppTreeCommand : BaseCommand
         if (json)
             WriteResult(result);
         Formatter.WriteError($"{DiagnosticContractNames.Of(result.Outcome)} ({Safe(result.Problem?.Code)}): {Safe(result.Problem?.Message)}");
+        if (result.Milestone is { } observed)
+            Formatter.WriteError(Safe(MilestoneOptions.Describe(observed)));
         return 1;
     }
 

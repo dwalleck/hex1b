@@ -47,15 +47,15 @@ public sealed class LocalTerminalTarget : ITerminalTarget
     public TerminalSession Session => _session;
 
     /// <inheritdoc />
-    public Task SendInputAsync(string text, CancellationToken ct = default)
+    public Task<DiagnosticAcceptedInput?> SendInputAsync(string text, CancellationToken ct = default)
         => _session.SendInputAsync(text, ct);
 
     /// <inheritdoc />
-    public Task SendKeyAsync(string key, string[]? modifiers = null, CancellationToken ct = default)
+    public Task<DiagnosticAcceptedInput?> SendKeyAsync(string key, string[]? modifiers = null, CancellationToken ct = default)
         => _session.SendKeyAsync(key, modifiers, ct);
 
     /// <inheritdoc />
-    public async Task SendMouseClickAsync(int x, int y, MouseButton button = MouseButton.Left, CancellationToken ct = default)
+    public async Task<DiagnosticAcceptedInput?> SendMouseClickAsync(int x, int y, MouseButton button = MouseButton.Left, CancellationToken ct = default)
     {
         // SGR mouse encoding: ESC [ < button ; column ; row M (press) m (release)
         // Columns and rows are 1-based in the protocol
@@ -64,16 +64,16 @@ public sealed class LocalTerminalTarget : ITerminalTarget
         var btn = (int)button;
         
         var mouseSequence = $"\x1b[<{btn};{col};{row}M\x1b[<{btn};{col};{row}m";
-        await _session.SendInputAsync(mouseSequence, ct);
+        return await _session.SendInputAsync(mouseSequence, ct);
     }
 
     /// <inheritdoc />
     public Task<DiagnosticCaptureResult> CaptureAsync(DiagnosticCaptureRequest request, CancellationToken ct = default)
-        => Task.FromResult(_session.Diagnostics.Capture(request));
+        => _session.Diagnostics.CaptureAsync(request, ct);
 
     /// <inheritdoc />
     public Task<DiagnosticApplicationFrameResult> CaptureApplicationFrameAsync(DiagnosticApplicationFrameRequest request, CancellationToken ct = default)
-        => Task.FromResult(_session.Diagnostics.CaptureApplicationFrame(request));
+        => _session.Diagnostics.CaptureApplicationFrameAsync(request, ct);
 
     /// <inheritdoc />
     public Task<DiagnosticCapabilities> GetDiagnosticCapabilitiesAsync(CancellationToken ct = default)

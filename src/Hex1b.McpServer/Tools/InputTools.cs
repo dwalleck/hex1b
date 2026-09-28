@@ -49,14 +49,15 @@ public class InputTools(TerminalSessionManager sessionManager)
                 .Replace("\\e", "\x1b")
                 .Replace("\\\\", "\\");
 
-            await session.SendInputAsync(unescaped, ct);
+            var accepted = await session.SendInputAsync(unescaped, ct);
 
             return new SendInputResult
             {
                 Success = true,
                 SessionId = sessionId,
                 Message = $"Sent {unescaped.Length} character(s) to terminal.",
-                CharactersSent = unescaped.Length
+                CharactersSent = unescaped.Length,
+                AcceptedInput = accepted
             };
         }
         catch (Exception ex)
@@ -103,7 +104,7 @@ public class InputTools(TerminalSessionManager sessionManager)
 
         try
         {
-            await session.SendKeyAsync(key, modifiers, ct);
+            var accepted = await session.SendKeyAsync(key, modifiers, ct);
 
             var modifierStr = modifiers?.Length > 0 ? $"{string.Join("+", modifiers)}+" : "";
             return new SendInputResult
@@ -111,7 +112,8 @@ public class InputTools(TerminalSessionManager sessionManager)
                 Success = true,
                 SessionId = sessionId,
                 Message = $"Sent key {modifierStr}{key} to terminal.",
-                CharactersSent = 1
+                CharactersSent = 1,
+                AcceptedInput = accepted
             };
         }
         catch (Exception ex)

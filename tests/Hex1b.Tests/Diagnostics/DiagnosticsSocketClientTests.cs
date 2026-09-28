@@ -352,6 +352,30 @@ public class DiagnosticsSocketClientTests
     }
 
     [TestMethod]
+    public async Task Milestone_ExchangeLastsTheMilestoneTimeoutBeyondTheObservationLimit()
+    {
+        // The target answers after 600 ms: past a 200 ms observation limit, within 200 ms + 1,000 ms.
+        var answer = """{"success":false,"capture":{"contractVersion":1,"outcome":"timed-out","problem":{"code":"milestone-timed-out","message":"late"}}}""";
+        await using var server = await FakeServer.StartAsync(_ =>
+        {
+            Thread.Sleep(600);
+            return answer;
+        });
+        var client = new DiagnosticsSocketClient(TimeSpan.FromMilliseconds(200));
+
+        var withMilestone = await client.CaptureAsync(server.Path, new DiagnosticCaptureRequest
+        {
+            Milestone = new DiagnosticMilestoneRequest { Milestone = DiagnosticMilestone.InputProcessed, InputId = 1, TimeoutMs = 1000 },
+        }, TestContext.Current.CancellationToken);
+        var immediate = await client.CaptureAsync(server.Path, new DiagnosticCaptureRequest(), TestContext.Current.CancellationToken);
+
+        Assert.AreEqual((DiagnosticOutcome.TimedOut, "milestone-timed-out"), (withMilestone.Outcome, withMilestone.Problem?.Code),
+            "the client cut off a milestone wait at its observation limit");
+        Assert.AreEqual((DiagnosticOutcome.Failed, "timeout"), (immediate.Outcome, immediate.Problem?.Code),
+            "fixture: without a milestone the observation limit applies");
+    }
+
+    [TestMethod]
     public async Task ApplicationFrame_TargetWithoutTheMethod_IsIncompatible()
     {
         await using var server = await FakeServer.StartAsync(_ => """{"success":false,"error":"Unknown method: application-frame"}""");

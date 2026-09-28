@@ -12,7 +12,17 @@ public sealed partial class Hex1bTerminal
     }
 
     /// <summary>The session's input milestone tracker; present only when diagnostics are enabled.</summary>
-    internal Diagnostics.InputMilestoneTracker? InputMilestones { get; }
+    internal Diagnostics.InputMilestoneTracker? InputMilestones { get; private set; }
+
+    /// <summary>
+    /// Gives a terminal whose workload is not a Hex1b application an acceptance-only tracker, so
+    /// diagnostic sends receive ids; called when a diagnostics engine attaches.
+    /// </summary>
+    internal void EnsureAcceptanceTracker()
+    {
+        if (InputMilestones is null && _workload is not Hex1bAppWorkloadAdapter)
+            InputMilestones = new Diagnostics.InputMilestoneTracker(acceptanceOnly: true);
+    }
 
     // Counts model events: output application batches, geometry changes, and synchronized-update
     // timeout releases. Advanced and read only under _bufferLock, so a model read names exactly

@@ -30,20 +30,36 @@ internal static class CaptureToolSupport
         string? savePath,
         CancellationToken ct,
         string? sessionId = null,
-        int? processId = null)
+        int? processId = null,
+        string? milestone = null,
+        long? inputId = null,
+        int? milestoneTimeoutMs = null)
     {
         var authorizations = authorize?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var (request, invalid) = DiagnosticContractNames.ParseCaptureRequest(format, historyRows, authorizations);
+        var (milestoneRequest, invalidMilestone) = DiagnosticContractNames.ParseMilestone(milestone, inputId, milestoneTimeoutMs);
+        if (invalid is null && invalidMilestone is not null)
+            invalid = TerminalDiagnostics.Problem(DiagnosticOutcome.InvalidRequest, "invalid-milestone", invalidMilestone);
+        if (invalid is null && milestoneRequest is not null)
+            request = new DiagnosticCaptureRequest
+            {
+                Format = request!.Format,
+                HistoryRows = request.HistoryRows,
+                FontFamily = request.FontFamily,
+                Authorizations = request.Authorizations,
+                Milestone = milestoneRequest,
+            };
         var result = invalid ?? await capture(request!, ct);
+        var observed = result.Milestone is { } milestoneResult ? " " + DescribeMilestone(milestoneResult) : "";
 
         if (result.Outcome != DiagnosticOutcome.Captured)
             return Create(result, sessionId, processId,
-                $"Capture {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}");
+                $"Capture {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}{observed}");
 
         var geometry = result.Geometry is { } size ? $"{size.Columns}x{size.Rows}" : "unknown-size";
         var partial = TerminalDiagnostics.DescribePartialContent(result) is { } note ? " " + note : "";
         if (string.IsNullOrEmpty(savePath))
-            return Create(result, sessionId, processId, $"Captured {geometry} terminal model as {format.ToLowerInvariant()}.{partial}");
+            return Create(result, sessionId, processId, $"Captured {geometry} terminal model as {format.ToLowerInvariant()}.{partial}{observed}");
 
         var directory = Path.GetDirectoryName(savePath);
         if (!string.IsNullOrEmpty(directory))
@@ -73,13 +89,34 @@ internal static class CaptureToolSupport
         string? authorize,
         CancellationToken ct,
         string? sessionId = null,
-        int? processId = null)
+        int? processId = null,
+        string? milestone = null,
+        long? inputId = null,
+        int? milestoneTimeoutMs = null)
     {
         var authorizations = authorize?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var (request, invalid) = DiagnosticContractNames.ParseApplicationFrameRequest(authorizations);
+        var (milestoneRequest, invalidMilestone) = DiagnosticContractNames.ParseMilestone(milestone, inputId, milestoneTimeoutMs);
+        if (invalid is null && invalidMilestone is not null)
+            invalid = TerminalDiagnostics.FrameProblem(DiagnosticOutcome.InvalidRequest, "invalid-milestone", invalidMilestone);
+        if (invalid is null && milestoneRequest is not null)
+            request = new DiagnosticApplicationFrameRequest { Authorizations = request!.Authorizations, Milestone = milestoneRequest };
         var result = invalid ?? await capture(request!, ct);
         return FrameResult(result, sessionId, processId);
     }
+
+    public const string MilestoneDescription =
+        "Optional: wait (bounded) for a milestone of an input before capturing: input-accepted, input-processed, frame-published, or model-applied. Requires inputId (the lastId a send returned).";
+
+    public const string InputIdDescription = "The input id to wait for; required with milestone.";
+
+    public const string MilestoneTimeoutDescription = "Maximum milestone wait in milliseconds (1-60000; default 5000).";
+
+    private static string DescribeMilestone(DiagnosticMilestoneResult milestone) =>
+        $"Milestone {DiagnosticContractNames.Of(milestone.Milestone)} for input {milestone.InputId}: {(milestone.Met ? "met" : "not met")} " +
+        $"(accepted {milestone.AcceptedInput}, processed {milestone.ProcessedInput}" +
+        (milestone.Frame is { } frame ? $", frame {frame.FrameId}" : "") +
+        (milestone.ModelSequence is { } sequence ? $", model sequence {sequence}" : "") + ").";
 
     /// <summary>
     /// Writes a frame tool result as the tool's text content. Frames nest two JSON levels per
@@ -113,9 +150,10 @@ internal static class CaptureToolSupport
         Success = result.Outcome == DiagnosticOutcome.Captured,
         SessionId = sessionId,
         ProcessId = processId,
-        Message = result.Frame is { } frame
+        Message = (result.Frame is { } frame
             ? $"Captured application frame {frame.FrameId} ({frame.Columns}x{frame.Rows})."
-            : $"Application frame {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}",
+            : $"Application frame {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}")
+            + (result.Milestone is { } milestone ? " " + DescribeMilestone(milestone) : ""),
         ApplicationFrame = ToJson(result),
     };
 

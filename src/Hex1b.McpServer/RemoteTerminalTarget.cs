@@ -108,20 +108,22 @@ public sealed class RemoteTerminalTarget : ITerminalTarget
     }
 
     /// <inheritdoc />
-    public async Task SendInputAsync(string text, CancellationToken ct = default)
+    public async Task<DiagnosticAcceptedInput?> SendInputAsync(string text, CancellationToken ct = default)
     {
-        await _client.SendAsync(_socketPath, new DiagnosticsRequest { Method = "input", Data = text }, ct);
+        var response = await _client.SendAsync(_socketPath, new DiagnosticsRequest { Method = "input", Data = text }, ct);
+        return response.AcceptedInput;
     }
 
     /// <inheritdoc />
-    public async Task SendKeyAsync(string key, string[]? modifiers = null, CancellationToken ct = default)
+    public async Task<DiagnosticAcceptedInput?> SendKeyAsync(string key, string[]? modifiers = null, CancellationToken ct = default)
     {
         // Use the "key" method which injects proper key events via the workload adapter
-        await _client.SendAsync(_socketPath, new DiagnosticsRequest { Method = "key", Key = key, Modifiers = modifiers }, ct);
+        var response = await _client.SendAsync(_socketPath, new DiagnosticsRequest { Method = "key", Key = key, Modifiers = modifiers }, ct);
+        return response.AcceptedInput;
     }
 
     /// <inheritdoc />
-    public async Task SendMouseClickAsync(int x, int y, MouseButton button = MouseButton.Left, CancellationToken ct = default)
+    public async Task<DiagnosticAcceptedInput?> SendMouseClickAsync(int x, int y, MouseButton button = MouseButton.Left, CancellationToken ct = default)
     {
         // Use the "click" method which injects proper mouse events via the workload adapter
         var buttonStr = button switch
@@ -132,7 +134,8 @@ public sealed class RemoteTerminalTarget : ITerminalTarget
             _ => "left"
         };
         
-        await _client.SendAsync(_socketPath, new DiagnosticsRequest { Method = "click", X = x, Y = y, Button = buttonStr }, ct);
+        var response = await _client.SendAsync(_socketPath, new DiagnosticsRequest { Method = "click", X = x, Y = y, Button = buttonStr }, ct);
+        return response.AcceptedInput;
     }
 
     /// <inheritdoc />

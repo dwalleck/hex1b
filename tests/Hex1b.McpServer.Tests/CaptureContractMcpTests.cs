@@ -309,15 +309,36 @@ public class CaptureContractMcpTests : McpServerTestBase
                 .Single(l => l.GetProperty("layer").GetString() == "application-frame").GetProperty("available").GetBoolean(),
                 "a diagnostics-enabled app publishes application frames");
             StringAssert.Contains(FrameLayerReason(localCaps), "not a Hex1b application");
+            // The operations are the same; only milestone availability depends on the target.
             Assert.AreEqual(
-                attachedCaps.GetProperty("operations").ToString(),
-                localCaps.GetProperty("operations").ToString(),
+                WithoutMilestoneAvailability(attachedCaps.GetProperty("operations")),
+                WithoutMilestoneAvailability(localCaps.GetProperty("operations")),
                 "local and attached targets must describe the same capture operation");
+            CollectionAssert.AreEquivalent(new[] { "input-accepted", "input-processed", "frame-published", "model-applied" },
+                AvailableMilestones(attachedCaps), "a diagnostics-enabled app supports every milestone");
+            CollectionAssert.AreEquivalent(new[] { "input-accepted" }, AvailableMilestones(localCaps),
+                "a PTY session can only report acceptance");
         }
         finally
         {
             await CallAsync(client, "remove_session", new() { ["sessionId"] = local });
         }
+
+        static string WithoutMilestoneAvailability(JsonElement operations)
+        {
+            var node = System.Text.Json.Nodes.JsonNode.Parse(operations.GetRawText())!;
+            foreach (var operation in node.AsArray())
+                foreach (var milestone in operation!["milestones"]!.AsArray())
+                {
+                    milestone!.AsObject().Remove("available");
+                    milestone.AsObject().Remove("reason");
+                }
+            return node.ToJsonString();
+        }
+
+        static string[] AvailableMilestones(JsonElement capabilities) => capabilities.GetProperty("operations").EnumerateArray()
+            .Single(o => o.GetProperty("operation").GetString() == "capture").GetProperty("milestones").EnumerateArray()
+            .Where(m => m.GetProperty("available").GetBoolean()).Select(m => m.GetProperty("milestone").GetString()!).ToArray();
 
         static string FrameLayerReason(JsonElement capabilities) => capabilities.GetProperty("layers").EnumerateArray()
             .Single(l => l.GetProperty("layer").GetString() == "application-frame").GetProperty("reason").GetString()!;
@@ -433,6 +454,78 @@ public class CaptureContractMcpTests : McpServerTestBase
         StringAssert.Contains(result.GetProperty("applicationFrame").GetProperty("frame").GetProperty("root").GetRawText(), "\"LEAF\"");
     }
 
+    [TestMethod]
+    public async Task Milestone_AttachedApp_SendThenCaptureEachStage()
+    {
+        await using var terminal = await StartFrameAppAsync();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var sessionId = await ConnectAttachedAsync(client);
+
+        // send_terminal_key is registered twice (pre-existing); send through the Hex1b input tool.
+        var send = await CallAsync(client, "send_input_to_hex1b_terminal", new() { ["processId"] = Environment.ProcessId, ["input"] = "q" });
+        Assert.IsTrue(send.GetProperty("success").GetBoolean(), send.ToString());
+        var accepted = send.GetProperty("acceptedInput");
+        var inputId = accepted.GetProperty("lastId").GetInt64();
+        StringAssert.Contains(accepted.GetProperty("meaning").GetString(), "Queued for the application");
+
+        var processed = await CallAsync(client, "capture_terminal_screen", new()
+        {
+            ["sessionId"] = sessionId, ["milestone"] = "input-processed", ["inputId"] = inputId,
+        });
+        var framed = await CallAsync(client, "capture_application_frame", new()
+        {
+            ["sessionId"] = sessionId, ["milestone"] = "frame-published", ["inputId"] = inputId,
+        });
+        var applied = await CallAsync(client, "capture_terminal_screen", new()
+        {
+            ["sessionId"] = sessionId, ["milestone"] = "model-applied", ["inputId"] = inputId, ["authorize"] = "raw-input",
+        });
+
+        Assert.IsTrue(processed.GetProperty("capture").GetProperty("milestone").GetProperty("met").GetBoolean(), processed.ToString());
+        StringAssert.Contains(processed.GetProperty("message").GetString(), $"Milestone input-processed for input {inputId}: met");
+        Assert.IsFalse(processed.GetProperty("capture").GetProperty("milestone").GetProperty("input").TryGetProperty("payload", out _),
+            "raw key payload in a default MCP milestone result");
+        var frame = framed.GetProperty("applicationFrame").GetProperty("milestone").GetProperty("frame");
+        Assert.IsGreaterThanOrEqualTo(inputId, frame.GetProperty("processedInput").GetInt64());
+        var appliedMilestone = applied.GetProperty("capture").GetProperty("milestone");
+        Assert.IsTrue(appliedMilestone.GetProperty("met").GetBoolean(), applied.ToString());
+        StringAssert.Contains(appliedMilestone.GetProperty("input").GetProperty("payload").GetString(), "\"q\"",
+            "raw-input did not include the typed payload");
+    }
+
+    [TestMethod]
+    public async Task Milestone_LocalSession_ReportsAcceptanceOnly()
+    {
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var local = await StartLocalSessionAsync(client);
+        try
+        {
+            var send = await CallAsync(client, "send_terminal_input", new() { ["sessionId"] = local, ["text"] = "echo hi" });
+            var accepted = send.GetProperty("acceptedInput");
+            var inputId = accepted.GetProperty("lastId").GetInt64();
+            var processed = await CallAsync(client, "capture_terminal_screen", new()
+            {
+                ["sessionId"] = local, ["milestone"] = "input-processed", ["inputId"] = inputId,
+            });
+            var acceptedCapture = await CallAsync(client, "capture_terminal_screen", new()
+            {
+                ["sessionId"] = local, ["milestone"] = "input-accepted", ["inputId"] = inputId,
+            });
+
+            StringAssert.Contains(accepted.GetProperty("meaning").GetString(), "child process");
+            var capture = processed.GetProperty("capture");
+            Assert.AreEqual("unavailable", capture.GetProperty("outcome").GetString());
+            Assert.AreEqual("input-consumption-unobservable", capture.GetProperty("problem").GetProperty("code").GetString());
+            Assert.IsTrue(acceptedCapture.GetProperty("success").GetBoolean(), acceptedCapture.ToString());
+        }
+        finally
+        {
+            await CallAsync(client, "remove_session", new() { ["sessionId"] = local });
+        }
+    }
+
     // === Helpers ===
 
     private async Task<JsonElement> CallAsync(McpClient client, string tool, Dictionary<string, object?> arguments)
@@ -440,6 +533,7 @@ public class CaptureContractMcpTests : McpServerTestBase
         var result = await client.CallToolAsync(tool, arguments, cancellationToken: TestCancellationToken);
         var text = result.Content.OfType<TextContentBlock>().FirstOrDefault()?.Text;
         Assert.IsNotNull(text, $"{tool} returned no text content");
+        Assert.IsTrue(text.TrimStart().StartsWith('{'), $"{tool} returned a non-JSON reply: {text}");
         // Application frames nest deeper than the default reader depth of 64.
         return JsonSerializer.Deserialize<JsonElement>(text, new JsonSerializerOptions { MaxDepth = 1024 });
     }
