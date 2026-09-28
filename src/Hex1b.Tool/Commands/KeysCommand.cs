@@ -94,7 +94,7 @@ internal sealed class KeysCommand : BaseCommand
             if (!response.Success)
             {
                 // The text send before it was delivered: report its ids even though the key failed.
-                MilestoneOptions.WriteAccepted(Formatter, accepted, parseResult.GetValue(RootCommand.JsonOption));
+                MilestoneOptions.WriteAccepted(Formatter, accepted, parseResult.GetValue(RootCommand.JsonOption), several: text != null && key != null);
                 Formatter.WriteError(response.Error ?? "Failed to send key");
                 return 1;
             }
@@ -102,7 +102,7 @@ internal sealed class KeysCommand : BaseCommand
             accepted.Add(response.AcceptedInput);
         }
 
-        MilestoneOptions.WriteAccepted(Formatter, accepted, parseResult.GetValue(RootCommand.JsonOption));
+        MilestoneOptions.WriteAccepted(Formatter, accepted, parseResult.GetValue(RootCommand.JsonOption), several: text != null && key != null);
         return 0;
     }
 }

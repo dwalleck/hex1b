@@ -325,6 +325,9 @@ public sealed class TerminalDiagnostics
             return null;
         }
 
+        // Sends do not nest: waiting for a turn this flow already holds would never end.
+        if (tracker.OwnsTurn)
+            throw new InvalidOperationException("A diagnostic send cannot start inside another send on the same terminal.");
         await tracker.WaitForSendTurnAsync(cancellationToken).ConfigureAwait(false);
         using var scope = tracker.BeginSend();
         var delivered = await send().ConfigureAwait(false);

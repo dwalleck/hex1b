@@ -911,10 +911,19 @@ public class InputMilestoneTests
         // A diagnostic send takes the send turn, then the terminal's input write lock. A native
         // SendInputAsync (attach sessions) and the terminal's replies to the application's cursor
         // position queries take the write lock too.
+        var tracker = terminal.InputMilestones!;
+        var foreign = 0;
         var sends = Task.Run(async () =>
         {
             for (var i = 0; i < Rounds; i++)
-                ranges.Add((await diagnostics.TrackSendAsync(() => terminal.SendInputAsync("ab"u8.ToArray()), "text"))!);
+            {
+                var range = (await diagnostics.TrackSendAsync(() => terminal.SendInputAsync("ab"u8.ToArray()), "text"))!;
+                ranges.Add(range);
+                // Checked at once, while the records are still retained.
+                for (var id = range.FirstId; id <= range.LastId; id++)
+                    if (tracker.Record(id)?.Source != "diagnostic-send")
+                        Interlocked.Increment(ref foreign);
+            }
         });
         Task natives;
         using (ExecutionContext.SuppressFlow())
@@ -931,18 +940,26 @@ public class InputMilestoneTests
                 await Task.Yield();
             }
         });
-        var both = Task.WhenAll(sends, natives, queries);
+        // Writers that bypass the input write lock pass the turn per event.
+        Task keysAndResizes;
+        using (ExecutionContext.SuppressFlow())
+            keysAndResizes = Task.Run(async () =>
+            {
+                for (var i = 0; i < Rounds; i++)
+                {
+                    workload.SendKey(Hex1bKey.K, 'k');
+                    await workload.ApplyQueuedResize(21 - i % 2, 3);
+                }
+            });
+        var both = Task.WhenAll(sends, natives, queries, keysAndResizes);
 
         Assert.AreSame(both, await Task.WhenAny(both, Task.Delay(TimeSpan.FromSeconds(20), TestContext.Current.CancellationToken)),
             "a diagnostic send and a native write deadlocked on the send turn and the input write lock");
         await both;
-        var tracker = terminal.InputMilestones!;
-        Assert.IsGreaterThanOrEqualTo(Rounds * 4, tracker.AcceptedInput);
+        Assert.IsGreaterThanOrEqualTo(Rounds * 6, tracker.AcceptedInput);
         foreach (var range in ranges)
-        {
             Assert.AreEqual(1, range.LastId - range.FirstId, "a send's range is not exactly its two events");
-            Assert.AreEqual("diagnostic-send", tracker.Record(range.FirstId)?.Source ?? "diagnostic-send");
-        }
+        Assert.AreEqual(0, foreign, "another writer's input landed inside a send's range");
     }
 
     [TestMethod]
@@ -970,6 +987,53 @@ public class InputMilestoneTests
         for (var i = 0; i < 200 && tracker.AcceptedInput < 2; i++)
             await Task.Delay(10, ct);
         Assert.IsGreaterThan(1L, tracker.AcceptedInput, "fixture: the terminal sent no cursor position reply");
+    }
+
+    [TestMethod]
+    public async Task SendTurn_AWriteForkedInsideASendKeepsTheTurnUntilItFinishes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 3).Build();
+        var tracker = terminal.InputMilestones!;
+        // Stands in for the send's own long write: the input write lock is held while the fork waits.
+        var writeLock = (SemaphoreSlim)typeof(Hex1bTerminal)
+            .GetField("_workloadInputWriteLock", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(terminal)!;
+        await writeLock.WaitAsync(ct);
+
+        await tracker.WaitForSendTurnAsync(ct);
+        var send = tracker.BeginSend();
+        var forked = Task.Run(() => terminal.SendInputAsync("f"u8.ToArray(), ct));
+        await Task.Delay(100, ct);
+        send.Dispose();
+        Task native;
+        using (ExecutionContext.SuppressFlow())
+            native = Task.Run(() => terminal.SendInputAsync("n"u8.ToArray(), ct));
+        await Task.Delay(100, ct);
+        writeLock.Release();
+
+        var both = Task.WhenAll(forked, native);
+        Assert.AreSame(both, await Task.WhenAny(both, Task.Delay(TimeSpan.FromSeconds(5), ct)),
+            "a write forked inside a send lost the turn to a native writer and deadlocked");
+        await both;
+        Assert.AreEqual(2, tracker.AcceptedInput);
+    }
+
+    [TestMethod]
+    public async Task SendTurn_ASendCannotNestInsideAnother()
+    {
+        var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 3).Build();
+        var diagnostics = new TerminalDiagnostics(terminal, "nested");
+        var tracker = terminal.InputMilestones!;
+        await tracker.WaitForSendTurnAsync(TestContext.Current.CancellationToken);
+        using var held = tracker.BeginNativeTurn();
+
+        var nested = diagnostics.TrackSendAsync(() => Task.FromResult(true), "key")
+            .WaitAsync(TimeSpan.FromSeconds(3), TestContext.Current.CancellationToken);
+
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => nested, "a nested send waited for the turn its own flow holds");
     }
 
     [TestMethod]

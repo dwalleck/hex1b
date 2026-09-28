@@ -93,6 +93,25 @@ internal sealed class InputMilestoneTracker
     /// <summary>True when the current async flow already holds this session's send turn.</summary>
     internal bool OwnsTurn => OwnSend() is not null;
 
+    /// <summary>
+    /// Pins the turn this async flow holds (its own scope, or one it inherited from the send that
+    /// forked it) for a write under the input write lock, so the turn outlives the write even when
+    /// the send ends first. Null when the flow holds no turn and must take one.
+    /// </summary>
+    internal IDisposable? PinOwnTurn() =>
+        CurrentSend.Value is { } send && ReferenceEquals(send.Tracker, this) && send.TryPin() ? new TurnPin(send) : null;
+
+    private sealed class TurnPin(SendScope scope) : IDisposable
+    {
+        private int _released;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) == 0)
+                scope.Unpin();
+        }
+    }
+
     private static SendScope Enter(SendScope scope)
     {
         CurrentSend.Value = scope;
@@ -529,13 +548,43 @@ internal sealed class InputMilestoneTracker
     /// </summary>
     internal sealed class SendScope(InputMilestoneTracker tracker, bool native) : IDisposable
     {
-        private int _disposed;
+        private readonly object _sync = new();
+        private bool _disposed;
+        private int _pins;
 
         internal InputMilestoneTracker Tracker { get; } = tracker;
 
         internal bool Native { get; } = native;
 
-        internal bool Ended => Volatile.Read(ref _disposed) != 0;
+        /// <summary>
+        /// True once the scope is disposed and no write pinned it: the turn is released, so a task
+        /// forked inside the send is native from then on.
+        /// </summary>
+        internal bool Ended
+        {
+            get { lock (_sync) return _disposed && _pins == 0; }
+        }
+
+        // A write that relies on this scope's turn keeps it until the write finishes.
+        internal bool TryPin()
+        {
+            lock (_sync)
+            {
+                if (_disposed && _pins == 0)
+                    return false;
+                _pins++;
+                return true;
+            }
+        }
+
+        internal void Unpin()
+        {
+            bool release;
+            lock (_sync)
+                release = --_pins == 0 && _disposed;
+            if (release)
+                Tracker._sendGate.Release();
+        }
 
         public long? FirstId { get; private set; }
 
@@ -549,11 +598,19 @@ internal sealed class InputMilestoneTracker
 
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0)
-                return;
+            bool release;
+            lock (_sync)
+            {
+                if (_disposed)
+                    return;
+                _disposed = true;
+                release = _pins == 0;
+            }
+
             if (ReferenceEquals(CurrentSend.Value, this))
                 CurrentSend.Value = null;
-            Tracker._sendGate.Release();
+            if (release)
+                Tracker._sendGate.Release();
         }
     }
 

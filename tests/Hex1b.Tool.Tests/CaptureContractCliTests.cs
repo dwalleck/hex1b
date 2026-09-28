@@ -588,7 +588,9 @@ public class CaptureContractCliTests
 
         Assert.AreEqual(1, exitCode, "fixture: the key send must fail");
         using var json = JsonDocument.Parse(stdout);
-        Assert.IsGreaterThan(0L, json.RootElement.GetProperty("lastId").GetInt64(), $"the delivered text's ids were not reported: {stdout} {stderr}");
+        // The command makes two sends, so its JSON is an array whether or not the second fails.
+        Assert.AreEqual(JsonValueKind.Array, json.RootElement.ValueKind, stdout);
+        Assert.IsGreaterThan(0L, json.RootElement[0].GetProperty("lastId").GetInt64(), $"the delivered text's ids were not reported: {stdout} {stderr}");
     }
 
     [TestMethod]

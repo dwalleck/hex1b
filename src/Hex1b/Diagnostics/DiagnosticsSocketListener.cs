@@ -671,11 +671,16 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
 
     private const string ChildProcessExitedError = "The child process has exited; the input was not delivered.";
 
-    // A PTY child that has exited silently drops writes, so a send must not report them delivered.
-    private bool ChildProcessExited() => _terminal?.Workload switch
+    // A child process that has exited silently drops writes, so a send must not report them
+    // delivered. A child that exits after this check and before the write can still be counted.
+    private bool ChildProcessExited() => HasExited(_terminal?.Workload);
+
+    private static bool HasExited(IHex1bTerminalWorkloadAdapter? workload) => workload switch
     {
         Hex1bTerminalChildProcess child => child.HasExited,
         StandardProcessWorkloadAdapter process => process.HasExited,
+        DiagnosticShellWorkloadAdapter shell => shell.HasExited,
+        PlaceholderWorkloadAdapter placeholder => HasExited(placeholder.ActiveChild),
         _ => false,
     };
 

@@ -59,12 +59,13 @@ internal sealed class MilestoneOptions
     }
 
     /// <summary>
-    /// Prints the accepted ranges of a command's sends: one send as one JSON object, several as
-    /// one JSON array, so <c>--json</c> output is always a single document.
+    /// Prints the accepted ranges of a command's sends: a command that makes one send prints one
+    /// JSON object, and one that makes several prints one JSON array (of the sends that were
+    /// delivered, even when a later send failed), so <c>--json</c> output has one shape per command.
     /// </summary>
-    public static void WriteAccepted(OutputFormatter formatter, IReadOnlyList<DiagnosticAcceptedInput?> sends, bool json)
+    public static void WriteAccepted(OutputFormatter formatter, IReadOnlyList<DiagnosticAcceptedInput?> sends, bool json, bool several)
     {
-        if (sends.Count == 1 || !json)
+        if (!several || !json)
         {
             foreach (var accepted in sends)
                 WriteAccepted(formatter, accepted, json);
