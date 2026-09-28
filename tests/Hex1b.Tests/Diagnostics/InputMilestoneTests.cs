@@ -1191,6 +1191,41 @@ public class InputMilestoneTests
     }
 
     [TestMethod]
+    public void Accept_ARejectedWriteRemovesOnlyItsOwnOccurrence()
+    {
+        var tracker = new InputMilestoneTracker();
+        var evt = Key();
+        Assert.IsTrue(tracker.Accept(evt, _ => true));
+
+        Assert.IsFalse(tracker.Accept(evt, _ => false));
+
+        Assert.AreEqual(1L, tracker.IdOf(evt), "a rejected write removed the pending occurrence of the same event");
+        Assert.AreEqual(1, tracker.AcceptedInput);
+    }
+
+    [TestMethod]
+    public async Task Accept_AFailedWriteRemovesItsOwnOccurrenceNotANewerOne()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var tracker = new InputMilestoneTracker();
+        var evt = Key();
+
+        // Unsupported but possible: the write accepts the same event again, then fails. The inner
+        // accept's occurrence is the real one; the outer's must be the one removed.
+        await tracker.WaitForSendTurnAsync(ct);
+        using (tracker.BeginSend())
+            Assert.ThrowsExactly<InvalidOperationException>(() => tracker.Accept(evt, e =>
+            {
+                tracker.Accept(e, _ => true);
+                throw new InvalidOperationException("write failed");
+            }));
+        tracker.Processed(evt, "app");
+
+        Assert.AreEqual("app", tracker.Record(1)!.ProcessedBy, "processing reached a removed occurrence, not the accepted one");
+        Assert.IsNull(tracker.IdOf(evt));
+    }
+
+    [TestMethod]
     public async Task SendTurn_WaitIsCancellable()
     {
         var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
