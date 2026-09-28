@@ -1,5 +1,6 @@
 using System.CommandLine;
 using System.Diagnostics;
+using Hex1b.Diagnostics;
 using Hex1b.Tool.Infrastructure;
 using Microsoft.Extensions.Logging;
 
@@ -19,11 +20,11 @@ internal sealed class TerminalAttachCommand : BaseCommand
     private static readonly Option<int> s_portOption = new("--port") { Description = "Connect to a WebSocket-exposed host at ws://localhost:{port}/ws/attach" };
 
     private readonly TerminalIdResolver _resolver;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     public TerminalAttachCommand(
         TerminalIdResolver resolver,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<TerminalAttachCommand> logger)
         : base("attach", "Attach to a terminal (Ctrl+] for commands)", formatter, logger)
@@ -93,7 +94,7 @@ internal sealed class TerminalAttachCommand : BaseCommand
     /// Core attach logic, usable from both the attach command and terminal start --attach.
     /// </summary>
     internal static async Task<int> RunAttachAsync(
-        IAttachTransport transport, string displayId, TerminalClient client,
+        IAttachTransport transport, string displayId, DiagnosticsSocketClient client,
         bool resize, bool lead, CancellationToken cancellationToken)
     {
         await using var app = new AttachTuiApp(transport, displayId, client, resize, lead);
@@ -104,7 +105,7 @@ internal sealed class TerminalAttachCommand : BaseCommand
     /// Web-based attach: starts a Kestrel server with xterm.js frontend.
     /// </summary>
     internal static async Task<int> RunWebAttachAsync(
-        string socketPath, string displayId, TerminalClient client,
+        string socketPath, string displayId, DiagnosticsSocketClient client,
         int port, CancellationToken cancellationToken)
     {
         await using var app = new AttachWebApp(socketPath, displayId, client, port);

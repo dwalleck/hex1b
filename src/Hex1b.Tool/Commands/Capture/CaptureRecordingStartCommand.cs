@@ -11,7 +11,7 @@ namespace Hex1b.Tool.Commands.Capture;
 internal sealed class CaptureRecordingStartCommand : BaseCommand
 {
     private readonly TerminalIdResolver _resolver;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     private static readonly Argument<string> s_idArgument = new("id") { Description = "Terminal ID (or prefix)" };
     private static readonly Option<string> s_outputOption = new("--output") { Description = "Output .cast file path", Required = true };
@@ -20,7 +20,7 @@ internal sealed class CaptureRecordingStartCommand : BaseCommand
 
     public CaptureRecordingStartCommand(
         TerminalIdResolver resolver,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<CaptureRecordingStartCommand> logger)
         : base("start", "Start recording a terminal session", formatter, logger)

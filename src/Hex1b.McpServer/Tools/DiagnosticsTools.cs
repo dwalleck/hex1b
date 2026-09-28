@@ -1,24 +1,20 @@
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Net.Sockets;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Hex1b.Diagnostics;
 using ModelContextProtocol.Server;
 
 namespace Hex1b.McpServer.Tools;
 
 /// <summary>
 /// MCP tools for discovering and capturing Hex1b terminals that have diagnostics enabled.
+/// All socket access goes through the shared diagnostics client.
 /// </summary>
 [McpServerToolType]
 public class DiagnosticsTools
 {
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
+    private static readonly DiagnosticsSocketClient Client = new();
 
     /// <summary>
     /// Lists all Hex1b terminals that have diagnostics enabled via WithDiagnostics().
@@ -28,7 +24,7 @@ public class DiagnosticsTools
     public async Task<GetHex1bStacksResult> GetHex1bStacksWithDiagnosticsEnabled(
         CancellationToken ct = default)
     {
-        var socketDir = GetSocketDirectory();
+        var socketDir = McpDiagnosticsPresentationFilter.GetSocketDirectory();
         var stacks = new List<Hex1bStackInfo>();
 
         if (!Directory.Exists(socketDir))
@@ -42,17 +38,12 @@ public class DiagnosticsTools
             };
         }
 
-        var socketFiles = Directory.GetFiles(socketDir, "*.diagnostics.socket");
-
-        foreach (var socketPath in socketFiles)
+        foreach (var socketPath in Directory.GetFiles(socketDir, "*.diagnostics.socket"))
         {
-            var fileName = Path.GetFileName(socketPath);
-            var pidStr = fileName.Replace(".diagnostics.socket", "");
-            
+            var pidStr = Path.GetFileName(socketPath).Replace(".diagnostics.socket", "");
             if (!int.TryParse(pidStr, out var pid))
                 continue;
 
-            // Check if process is still running
             if (!IsProcessRunning(pid))
             {
                 // Clean up stale socket
@@ -61,18 +52,33 @@ public class DiagnosticsTools
                 continue;
             }
 
-            // Try to connect and get info
-            var info = await TryGetInfoAsync(socketPath, pid, ct);
-            if (info != null)
-            {
-                stacks.Add(info);
-            }
+            var info = await Client.TryProbeAsync(socketPath, ct);
+            stacks.Add(info is { Success: true }
+                ? new Hex1bStackInfo
+                {
+                    SocketPath = socketPath,
+                    AppName = info.AppName ?? "Unknown",
+                    ProcessId = info.ProcessId ?? pid,
+                    StartTime = info.StartTime,
+                    Width = info.Width ?? 0,
+                    Height = info.Height ?? 0,
+                    IsResponsive = true
+                }
+                : new Hex1bStackInfo
+                {
+                    SocketPath = socketPath,
+                    AppName = "Unknown",
+                    ProcessId = pid,
+                    Width = 0,
+                    Height = 0,
+                    IsResponsive = false
+                });
         }
 
         return new GetHex1bStacksResult
         {
             Success = true,
-            Message = stacks.Count > 0 
+            Message = stacks.Count > 0
                 ? $"Found {stacks.Count} Hex1b stack(s) with diagnostics enabled."
                 : "No Hex1b stacks with diagnostics enabled found.",
             StackCount = stacks.Count,
@@ -83,102 +89,41 @@ public class DiagnosticsTools
     /// <summary>
     /// Captures the terminal state from a Hex1b application with diagnostics enabled.
     /// </summary>
-    [McpServerTool, Description("Captures the terminal state from a Hex1b application with diagnostics enabled. Saves the capture to a file as ANSI, SVG, or text format. Use GetHex1bSkill for comprehensive MCP documentation.")]
-    public async Task<CaptureHex1bTerminalResult> CaptureHex1bTerminal(
+    [McpServerTool, Description("Captures the terminal model of a Hex1b application with diagnostics enabled and saves the content to a file (ansi, svg, html, or text). Returns the shared diagnostic capture result with geometry, history coverage, identity, and content coverage; the content itself is in the file. Use GetHex1bSkill for comprehensive MCP documentation.")]
+    public async Task<CaptureToolResult> CaptureHex1bTerminal(
         [Description("Process ID of the Hex1b application to capture")] int processId,
         [Description("File path to save the capture (required).")] string savePath,
-        [Description("Capture format: 'ansi' or 'svg' (default: 'ansi')")] string format = "ansi",
+        [Description("Capture format: 'ansi', 'svg', 'html', or 'text' (default: 'ansi')")] string format = "ansi",
+        [Description(CaptureToolSupport.HistoryRowsDescription)] int historyRows = 0,
+        [Description(CaptureToolSupport.AuthorizeDescription)] string? authorize = null,
         CancellationToken ct = default)
     {
-        var socketPath = GetSocketPath(processId);
-
-        if (!File.Exists(socketPath))
+        var unavailable = CheckTarget(processId, out var socketPath);
+        if (unavailable != null)
         {
-            return new CaptureHex1bTerminalResult
+            return new CaptureToolResult
             {
                 Success = false,
                 ProcessId = processId,
-                Message = $"No diagnostics socket found for process {processId}. Ensure the application is running with WithDiagnostics() enabled."
-            };
-        }
-
-        if (!IsProcessRunning(processId))
-        {
-            // Clean up stale socket
-            try { File.Delete(socketPath); }
-            catch { /* ignore */ }
-
-            return new CaptureHex1bTerminalResult
-            {
-                Success = false,
-                ProcessId = processId,
-                Message = $"Process {processId} is no longer running."
+                Message = unavailable,
+                Capture = CaptureToolSupport.ToJson(TerminalDiagnostics.Problem(DiagnosticOutcome.Unavailable, "target-unreachable", unavailable))
             };
         }
 
         try
         {
-            using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-            await socket.ConnectAsync(new UnixDomainSocketEndPoint(socketPath), ct);
-
-            await using var stream = new NetworkStream(socket, ownsSocket: false);
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            await using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-
-            // Send capture request
-            var request = new { method = "capture", format = format.ToLowerInvariant() };
-            await writer.WriteLineAsync(JsonSerializer.Serialize(request, JsonOptions));
-
-            // Read response
-            var responseLine = await reader.ReadLineAsync(ct);
-            if (string.IsNullOrEmpty(responseLine))
-            {
-                return new CaptureHex1bTerminalResult
-                {
-                    Success = false,
-                    ProcessId = processId,
-                    Message = "No response from diagnostics socket."
-                };
-            }
-
-            var response = JsonSerializer.Deserialize<DiagnosticsResponse>(responseLine, JsonOptions);
-            if (response == null || !response.Success)
-            {
-                return new CaptureHex1bTerminalResult
-                {
-                    Success = false,
-                    ProcessId = processId,
-                    Message = response?.Error ?? "Unknown error from diagnostics socket."
-                };
-            }
-
-            // Save to file
-            var directory = Path.GetDirectoryName(savePath);
-            if (!string.IsNullOrEmpty(directory))
-            {
-                Directory.CreateDirectory(directory);
-            }
-
-            await File.WriteAllTextAsync(savePath, response.Data, ct);
-
-            return new CaptureHex1bTerminalResult
-            {
-                Success = true,
-                ProcessId = processId,
-                Message = $"Captured {response.Width}x{response.Height} terminal to {savePath}",
-                SavedPath = savePath,
-                Format = format.ToLowerInvariant(),
-                Width = response.Width ?? 0,
-                Height = response.Height ?? 0
-            };
+            return await CaptureToolSupport.CaptureAsync(
+                (request, token) => Client.CaptureAsync(socketPath, request, token),
+                format, historyRows, authorize, savePath, ct, processId: processId);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return new CaptureHex1bTerminalResult
+            return new CaptureToolResult
             {
                 Success = false,
                 ProcessId = processId,
-                Message = $"Failed to capture terminal: {ex.Message}"
+                Message = $"Failed to save capture: {ex.Message}",
+                Capture = CaptureToolSupport.ToJson(TerminalDiagnostics.Problem(DiagnosticOutcome.Failed, "save-failed", ex.Message))
             };
         }
     }
@@ -192,67 +137,21 @@ public class DiagnosticsTools
         [Description("The input to send. Supports escape sequences like \\n for newline, \\t for tab, \\x1b for escape.")] string input,
         CancellationToken ct = default)
     {
-        var socketPath = GetSocketPath(processId);
-
-        if (!File.Exists(socketPath))
-        {
-            return new SendInputToHex1bTerminalResult
-            {
-                Success = false,
-                ProcessId = processId,
-                Message = $"No diagnostics socket found for process {processId}. Ensure the application is running with WithDiagnostics() enabled."
-            };
-        }
-
-        if (!IsProcessRunning(processId))
-        {
-            try { File.Delete(socketPath); }
-            catch { /* ignore */ }
-
-            return new SendInputToHex1bTerminalResult
-            {
-                Success = false,
-                ProcessId = processId,
-                Message = $"Process {processId} is no longer running."
-            };
-        }
+        var unavailable = CheckTarget(processId, out var socketPath);
+        if (unavailable != null)
+            return new SendInputToHex1bTerminalResult { Success = false, ProcessId = processId, Message = unavailable };
 
         try
         {
-            using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-            await socket.ConnectAsync(new UnixDomainSocketEndPoint(socketPath), ct);
-
-            await using var stream = new NetworkStream(socket, ownsSocket: false);
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            await using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-
-            // Process escape sequences in input
             var processedInput = ProcessEscapeSequences(input);
-
-            // Send input request
-            var request = new { method = "input", data = processedInput };
-            await writer.WriteLineAsync(JsonSerializer.Serialize(request, JsonOptions));
-
-            // Read response
-            var responseLine = await reader.ReadLineAsync(ct);
-            if (string.IsNullOrEmpty(responseLine))
+            var response = await Client.SendAsync(socketPath, new DiagnosticsRequest { Method = "input", Data = processedInput }, ct);
+            if (!response.Success)
             {
                 return new SendInputToHex1bTerminalResult
                 {
                     Success = false,
                     ProcessId = processId,
-                    Message = "No response from diagnostics socket."
-                };
-            }
-
-            var response = JsonSerializer.Deserialize<DiagnosticsResponse>(responseLine, JsonOptions);
-            if (response == null || !response.Success)
-            {
-                return new SendInputToHex1bTerminalResult
-                {
-                    Success = false,
-                    ProcessId = processId,
-                    Message = response?.Error ?? "Unknown error from diagnostics socket."
+                    Message = response.Error ?? "Unknown error from diagnostics socket."
                 };
             }
 
@@ -278,69 +177,25 @@ public class DiagnosticsTools
     /// <summary>
     /// Gets the widget/node tree from a Hex1b application for debugging.
     /// </summary>
-    [McpServerTool, Description("Gets the widget/node tree, popup stack, and focus ring information from a Hex1b application. Use this to debug hit testing, focus, and layout issues. Essential for understanding why clicks aren't working or focus is wrong. Use GetHex1bSkill for comprehensive documentation.")]
+    [McpServerTool, Description("Gets the widget/node tree, popup stack, focus ring, and frame timing information from a Hex1b application. Use this to debug hit testing, focus, and layout issues. Essential for understanding why clicks aren't working or focus is wrong. Use GetHex1bSkill for comprehensive documentation.")]
     public async Task<GetHex1bTreeResult> GetHex1bTree(
         [Description("Process ID of the Hex1b application")] int processId,
         CancellationToken ct = default)
     {
-        var socketPath = GetSocketPath(processId);
-
-        if (!File.Exists(socketPath))
-        {
-            return new GetHex1bTreeResult
-            {
-                Success = false,
-                ProcessId = processId,
-                Message = $"No diagnostics socket found for process {processId}. Ensure the application is running with WithDiagnostics() enabled."
-            };
-        }
-
-        if (!IsProcessRunning(processId))
-        {
-            try { File.Delete(socketPath); }
-            catch { /* ignore */ }
-
-            return new GetHex1bTreeResult
-            {
-                Success = false,
-                ProcessId = processId,
-                Message = $"Process {processId} is no longer running."
-            };
-        }
+        var unavailable = CheckTarget(processId, out var socketPath);
+        if (unavailable != null)
+            return new GetHex1bTreeResult { Success = false, ProcessId = processId, Message = unavailable };
 
         try
         {
-            using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-            await socket.ConnectAsync(new UnixDomainSocketEndPoint(socketPath), ct);
-
-            await using var stream = new NetworkStream(socket, ownsSocket: false);
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            await using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-
-            // Send tree request
-            var request = new { method = "tree" };
-            await writer.WriteLineAsync(JsonSerializer.Serialize(request, JsonOptions));
-
-            // Read response
-            var responseLine = await reader.ReadLineAsync(ct);
-            if (string.IsNullOrEmpty(responseLine))
+            var response = await Client.SendAsync(socketPath, new DiagnosticsRequest { Method = "tree" }, ct);
+            if (!response.Success)
             {
                 return new GetHex1bTreeResult
                 {
                     Success = false,
                     ProcessId = processId,
-                    Message = "No response from diagnostics socket."
-                };
-            }
-
-            var response = JsonSerializer.Deserialize<TreeDiagnosticsResponse>(responseLine, JsonOptions);
-            if (response == null || !response.Success)
-            {
-                return new GetHex1bTreeResult
-                {
-                    Success = false,
-                    ProcessId = processId,
-                    Message = response?.Error ?? "Unknown error from diagnostics socket."
+                    Message = response.Error ?? "Unknown error from diagnostics socket."
                 };
             }
 
@@ -351,9 +206,10 @@ public class DiagnosticsTools
                 Message = $"Retrieved tree from {response.Width}x{response.Height} terminal",
                 Width = response.Width ?? 0,
                 Height = response.Height ?? 0,
-                Tree = response.Tree,
-                Popups = response.Popups,
-                FocusInfo = response.FocusInfo
+                Tree = ToElement(response.Tree),
+                Popups = ToElement(response.Popups),
+                FocusInfo = ToElement(response.FocusInfo),
+                FrameInfo = ToElement(response.FrameInfo)
             };
         }
         catch (Exception ex)
@@ -365,6 +221,24 @@ public class DiagnosticsTools
                 Message = $"Failed to get tree: {ex.Message}"
             };
         }
+    }
+
+    private static JsonElement? ToElement<T>(T? value) where T : class =>
+        value is null ? null : JsonSerializer.SerializeToElement(value, DiagnosticsJsonOptions.Default.GetTypeInfo(typeof(T)));
+
+    // Returns why the target cannot be reached, or null when its socket is live.
+    private static string? CheckTarget(int processId, out string socketPath)
+    {
+        socketPath = Path.Combine(McpDiagnosticsPresentationFilter.GetSocketDirectory(), $"{processId}.diagnostics.socket");
+        if (!File.Exists(socketPath))
+            return $"No diagnostics socket found for process {processId}. Ensure the application is running with WithDiagnostics() enabled.";
+
+        if (IsProcessRunning(processId))
+            return null;
+
+        try { File.Delete(socketPath); }
+        catch { /* ignore */ }
+        return $"Process {processId} is no longer running.";
     }
 
     private static string ProcessEscapeSequences(string input)
@@ -379,17 +253,6 @@ public class DiagnosticsTools
             .Replace("\\\\", "\\");
     }
 
-    private static string GetSocketDirectory()
-    {
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        return Path.Combine(home, ".hex1b", "sockets");
-    }
-
-    private static string GetSocketPath(int pid)
-    {
-        return Path.Combine(GetSocketDirectory(), $"{pid}.diagnostics.socket");
-    }
-
     private static bool IsProcessRunning(int pid)
     {
         try
@@ -401,119 +264,6 @@ public class DiagnosticsTools
         {
             return false;
         }
-    }
-
-    private static async Task<Hex1bStackInfo?> TryGetInfoAsync(string socketPath, int pid, CancellationToken ct)
-    {
-        try
-        {
-            using var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-            socket.ReceiveTimeout = 2000;
-            socket.SendTimeout = 2000;
-            
-            await socket.ConnectAsync(new UnixDomainSocketEndPoint(socketPath), ct);
-
-            await using var stream = new NetworkStream(socket, ownsSocket: false);
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            await using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-
-            // Send info request
-            var request = new { method = "info" };
-            await writer.WriteLineAsync(JsonSerializer.Serialize(request, JsonOptions));
-
-            // Read response with timeout
-            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            cts.CancelAfter(TimeSpan.FromSeconds(2));
-            
-            var responseLine = await reader.ReadLineAsync(cts.Token);
-            if (string.IsNullOrEmpty(responseLine))
-                return null;
-
-            var response = JsonSerializer.Deserialize<DiagnosticsResponse>(responseLine, JsonOptions);
-            if (response == null || !response.Success)
-                return null;
-
-            return new Hex1bStackInfo
-            {
-                SocketPath = socketPath,
-                AppName = response.AppName ?? "Unknown",
-                ProcessId = response.ProcessId ?? pid,
-                StartTime = response.StartTime,
-                Width = response.Width ?? 0,
-                Height = response.Height ?? 0,
-                IsResponsive = true
-            };
-        }
-        catch
-        {
-            // Socket exists but not responsive
-            return new Hex1bStackInfo
-            {
-                SocketPath = socketPath,
-                AppName = "Unknown",
-                ProcessId = pid,
-                Width = 0,
-                Height = 0,
-                IsResponsive = false
-            };
-        }
-    }
-
-    /// <summary>
-    /// Response from diagnostics socket (mirrors protocol types).
-    /// </summary>
-    private sealed class DiagnosticsResponse
-    {
-        [JsonPropertyName("success")]
-        public bool Success { get; set; }
-
-        [JsonPropertyName("error")]
-        public string? Error { get; set; }
-
-        [JsonPropertyName("appName")]
-        public string? AppName { get; set; }
-
-        [JsonPropertyName("processId")]
-        public int? ProcessId { get; set; }
-
-        [JsonPropertyName("startTime")]
-        public DateTimeOffset? StartTime { get; set; }
-
-        [JsonPropertyName("width")]
-        public int? Width { get; set; }
-
-        [JsonPropertyName("height")]
-        public int? Height { get; set; }
-
-        [JsonPropertyName("data")]
-        public string? Data { get; set; }
-    }
-    
-    /// <summary>
-    /// Response from diagnostics socket for tree method.
-    /// </summary>
-    private sealed class TreeDiagnosticsResponse
-    {
-        [JsonPropertyName("success")]
-        public bool Success { get; set; }
-
-        [JsonPropertyName("error")]
-        public string? Error { get; set; }
-
-        [JsonPropertyName("width")]
-        public int? Width { get; set; }
-
-        [JsonPropertyName("height")]
-        public int? Height { get; set; }
-
-        [JsonPropertyName("tree")]
-        public JsonElement? Tree { get; set; }
-        
-        [JsonPropertyName("popups")]
-        public JsonElement? Popups { get; set; }
-        
-        [JsonPropertyName("focusInfo")]
-        public JsonElement? FocusInfo { get; set; }
     }
 }
 
@@ -559,32 +309,6 @@ public class Hex1bStackInfo
     public required bool IsResponsive { get; init; }
 }
 
-public class CaptureHex1bTerminalResult
-{
-    [JsonPropertyName("success")]
-    public required bool Success { get; init; }
-
-    [JsonPropertyName("processId")]
-    public required int ProcessId { get; init; }
-
-    [JsonPropertyName("message")]
-    public required string Message { get; init; }
-
-    [JsonPropertyName("savedPath")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? SavedPath { get; init; }
-
-    [JsonPropertyName("format")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? Format { get; init; }
-
-    [JsonPropertyName("width")]
-    public int Width { get; init; }
-
-    [JsonPropertyName("height")]
-    public int Height { get; init; }
-}
-
 public class SendInputToHex1bTerminalResult
 {
     [JsonPropertyName("success")]
@@ -628,4 +352,8 @@ public class GetHex1bTreeResult
     [JsonPropertyName("focusInfo")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? FocusInfo { get; init; }
+
+    [JsonPropertyName("frameInfo")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? FrameInfo { get; init; }
 }

@@ -11,7 +11,7 @@ namespace Hex1b.Tool.Commands;
 internal sealed class AssertCommand : BaseCommand
 {
     private readonly TerminalIdResolver _resolver;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     private static readonly Argument<string> s_idArgument = new("id") { Description = "Terminal ID (or prefix)" };
     private static readonly Option<string?> s_textPresentOption = new("--text-present") { Description = "Assert text is visible on screen" };
@@ -20,7 +20,7 @@ internal sealed class AssertCommand : BaseCommand
 
     public AssertCommand(
         TerminalIdResolver resolver,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<AssertCommand> logger)
         : base("assert", "Assert on terminal content for scripting and CI", formatter, logger)
@@ -61,16 +61,16 @@ internal sealed class AssertCommand : BaseCommand
         {
             while (!timeoutCts.Token.IsCancellationRequested)
             {
-                var response = await _client.SendAsync(resolved.SocketPath!,
-                    new DiagnosticsRequest { Method = "capture", Format = "text" }, timeoutCts.Token);
+                var capture = await _client.CaptureAsync(resolved.SocketPath!,
+                    new DiagnosticCaptureRequest { Format = DiagnosticCaptureFormat.Text }, timeoutCts.Token);
 
-                if (!response.Success)
+                if (capture.Outcome != DiagnosticOutcome.Captured)
                 {
-                    Formatter.WriteError(response.Error ?? "Capture failed");
+                    Formatter.WriteError($"Capture {DiagnosticContractNames.Of(capture.Outcome)} ({capture.Problem?.Code}): {capture.Problem?.Message}");
                     return 1;
                 }
 
-                var screenText = response.Data ?? "";
+                var screenText = capture.Content!;
 
                 if (textPresent != null && screenText.Contains(textPresent, StringComparison.Ordinal))
                 {

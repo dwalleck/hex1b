@@ -1,6 +1,7 @@
 using System.IO.Pipelines;
 using System.Text;
 using Hex1b;
+using Hex1b.Diagnostics;
 using Hex1b.Theming;
 using Hex1b.Tokens;
 using Hex1b.Tool.Infrastructure;
@@ -16,7 +17,7 @@ internal sealed class AttachTuiApp : IAsyncDisposable
 {
     private readonly IAttachTransport _transport;
     private readonly string _displayId;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
     private readonly bool _initialResize;
     private readonly bool _claimLead;
 
@@ -38,7 +39,7 @@ internal sealed class AttachTuiApp : IAsyncDisposable
     private TerminalWidgetHandle? _handle;
     private CancellationTokenSource? _appCts;
 
-    public AttachTuiApp(IAttachTransport transport, string displayId, TerminalClient client, bool resize, bool lead)
+    public AttachTuiApp(IAttachTransport transport, string displayId, DiagnosticsSocketClient client, bool resize, bool lead)
     {
         _transport = transport;
         _displayId = displayId;

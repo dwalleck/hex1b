@@ -182,7 +182,7 @@ public class TerminalSessionStartupTests
                 ct: timeout.Token))
             {
                 Assert.IsTrue(await session.WaitForTextAsync(
-                    directory.Name, TimeSpan.FromSeconds(10), timeout.Token), session.CaptureText());
+                    directory.Name, TimeSpan.FromSeconds(10), timeout.Token), session.Diagnostics.Capture(new Hex1b.Diagnostics.DiagnosticCaptureRequest()).Content);
                 Assert.AreEqual(0, await session.WaitForExitAsync(timeout.Token));
             }
 

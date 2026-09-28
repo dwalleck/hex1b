@@ -67,6 +67,8 @@
     <InternalsVisibleTo Include="Hex1b.Benchmarks" />
     <InternalsVisibleTo Include="Hex1b.Tool" />
     <InternalsVisibleTo Include="Hex1b.Tool.Tests" />
+    <InternalsVisibleTo Include="Hex1b.McpServer" />
+    <InternalsVisibleTo Include="Hex1b.McpServer.Tests" />
     <InternalsVisibleTo Include="hex1bpty" />
     <InternalsVisibleTo Include="SixelTerminalDemo" />
   </ItemGroup>

@@ -170,7 +170,7 @@ Capture terminal output including screenshots and recordings.
 
 ### `capture screenshot`
 
-Capture a terminal screen screenshot.
+Capture the terminal model through the shared [diagnostic capture contract](/reference/diagnostic-capture).
 
 ```bash
 hex1b capture screenshot <id> [options]
@@ -182,11 +182,17 @@ hex1b capture screenshot <id> [options]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--format` | string | `text` | Output format: `text`, `ansi`, `svg`, or `html` |
-| `--output` | string | | Save to file instead of stdout |
+| `--format` | string | `text` | Output format: `text`, `ansi`, `svg`, `html`, or `png` |
+| `--output` | string | | Save to file instead of stdout (required for `png`) |
 | `--wait` | string | | Wait for text to appear before capturing |
 | `--timeout` | int | `30` | Timeout in seconds for `--wait` |
-| `--scrollback` | int | `0` | Number of scrollback lines to include |
+| `--scrollback` | int | `0` | Rows of retained terminal-model history to include (not native scrollback) |
+| `--authorize` | string | | Opt in to `non-screen-metadata`, `editor-text`, or `raw-input` (repeatable) |
+
+Without `--json`, the command writes the rendered content (or saves it with `--output`). With
+`--json`, it writes the full contract result: outcome, content, geometry, history coverage,
+identity, content coverage, unavailable fields, and limitations. A non-`captured` outcome exits
+with code `1` and writes `outcome (code): message` to stderr.
 
 **Examples:**
 
@@ -194,14 +200,29 @@ hex1b capture screenshot <id> [options]
 # Plain text to stdout
 hex1b capture screenshot abc123
 
+# Styled ANSI with correlation and coverage metadata
+hex1b capture screenshot abc123 --format ansi --json
+
 # SVG with colors saved to file
 hex1b capture screenshot abc123 --format svg --output screen.svg
 
 # Wait for app to be ready, then capture
 hex1b capture screenshot abc123 --wait "Ready" --timeout 10 --format ansi
 
-# Include scrollback history
+# Include 100 rows of retained model history (requires WithScrollback on the target)
 hex1b capture screenshot abc123 --scrollback 100
+
+# Include hyperlink targets and the window title
+hex1b capture screenshot abc123 --format ansi --authorize non-screen-metadata --json
+```
+
+### `capture capabilities`
+
+Describe the diagnostic operations, formats, authorizations, and evidence layers a terminal
+supports, with the reason for each unavailable layer. Always writes JSON.
+
+```bash
+hex1b capture capabilities <id>
 ```
 
 ### `capture recording start`

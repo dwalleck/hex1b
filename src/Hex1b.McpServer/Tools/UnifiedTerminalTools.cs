@@ -1,5 +1,7 @@
 using System.ComponentModel;
+using System.Text.Json;
 using System.Text.Json.Serialization;
+using Hex1b.Diagnostics;
 using ModelContextProtocol.Server;
 
 namespace Hex1b.McpServer.Tools;
@@ -215,85 +217,65 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
     }
 
     /// <summary>
-    /// Captures the terminal screen as text, ANSI, or SVG.
+    /// Captures the terminal model of any target through the shared diagnostic contract.
     /// </summary>
-    [McpServerTool, Description("Captures the terminal screen from any connected target. Can save to a file or return the content. Works with both local and remote terminals.")]
-    public async Task<CaptureTerminalResult> CaptureTerminalScreen(
+    [McpServerTool, Description("Captures the terminal screen from any connected target (local or remote) through the shared diagnostic contract. ANSI preserves cell styles. Returns capture.outcome, content, geometry, history coverage, identity (process/session/build/configuration/acquisition clock), content coverage (included/excluded/unavailable), and limitations. Use get_terminal_diagnostic_capabilities to discover supported formats and limits.")]
+    public async Task<CaptureToolResult> CaptureTerminalScreen(
         [Description("Session ID of the terminal target")] string sessionId,
-        [Description("Capture format: 'text', 'ansi', or 'svg' (default: 'text')")] string format = "text",
-        [Description("Optional file path to save the capture. If not provided, content is returned in the response.")] string? savePath = null,
+        [Description("Capture format: 'text', 'ansi', 'svg', or 'html' (default: 'text')")] string format = "text",
+        [Description("Optional file path to save the content. When provided, content is written to the file and omitted from capture.content.")] string? savePath = null,
+        [Description(CaptureToolSupport.HistoryRowsDescription)] int historyRows = 0,
+        [Description(CaptureToolSupport.AuthorizeDescription)] string? authorize = null,
         CancellationToken ct = default)
     {
         var target = sessionManager.GetTarget(sessionId);
         if (target == null)
         {
-            return new CaptureTerminalResult
+            return new CaptureToolResult
             {
                 Success = false,
                 SessionId = sessionId,
-                Message = $"Session '{sessionId}' not found."
+                Message = $"Session '{sessionId}' not found.",
+                Capture = CaptureToolSupport.ToJson(TerminalDiagnostics.Problem(DiagnosticOutcome.Unavailable, "session-not-found", $"Session '{sessionId}' not found."))
             };
         }
 
         try
         {
-            string content;
-            switch (format.ToLowerInvariant())
-            {
-                case "svg":
-                    content = await target.CaptureSvgAsync(null, ct);
-                    break;
-                case "ansi":
-                    content = await target.CaptureAnsiAsync(null, ct);
-                    break;
-                default:
-                    content = await target.CaptureTextAsync(ct);
-                    break;
-            }
-
-            if (!string.IsNullOrEmpty(savePath))
-            {
-                var directory = Path.GetDirectoryName(savePath);
-                if (!string.IsNullOrEmpty(directory))
-                {
-                    Directory.CreateDirectory(directory);
-                }
-                await File.WriteAllTextAsync(savePath, content, ct);
-                
-                return new CaptureTerminalResult
-                {
-                    Success = true,
-                    SessionId = sessionId,
-                    Message = $"Captured {target.Width}x{target.Height} terminal to {savePath}",
-                    Format = format,
-                    SavedPath = savePath,
-                    Width = target.Width,
-                    Height = target.Height
-                };
-            }
-            else
-            {
-                return new CaptureTerminalResult
-                {
-                    Success = true,
-                    SessionId = sessionId,
-                    Message = $"Captured {target.Width}x{target.Height} terminal",
-                    Format = format,
-                    Content = content,
-                    Width = target.Width,
-                    Height = target.Height
-                };
-            }
+            return await CaptureToolSupport.CaptureAsync(target.CaptureAsync, format, historyRows, authorize, savePath, ct, sessionId);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return new CaptureTerminalResult
+            return new CaptureToolResult
             {
                 Success = false,
                 SessionId = sessionId,
-                Message = $"Failed to capture: {ex.Message}"
+                Message = $"Failed to save capture: {ex.Message}",
+                Capture = CaptureToolSupport.ToJson(TerminalDiagnostics.Problem(DiagnosticOutcome.Failed, "save-failed", ex.Message))
             };
         }
+    }
+
+    /// <summary>
+    /// Describes the diagnostic capabilities of any target.
+    /// </summary>
+    [McpServerTool, Description("Describes what diagnostic observations a terminal target supports: operations, formats, timing, authorizations, evidence layers (terminal model, application frame, native delivery, native presentation) with reasons for unavailable layers, and exact limitations.")]
+    public async Task<DiagnosticCapabilitiesToolResult> GetTerminalDiagnosticCapabilities(
+        [Description("Session ID of the terminal target")] string sessionId,
+        CancellationToken ct = default)
+    {
+        var target = sessionManager.GetTarget(sessionId);
+        var capabilities = target is null
+            ? TerminalDiagnostics.CapabilitiesProblem(DiagnosticOutcome.Unavailable, "session-not-found", $"Session '{sessionId}' not found.")
+            : await target.GetDiagnosticCapabilitiesAsync(ct);
+
+        return new DiagnosticCapabilitiesToolResult
+        {
+            Success = capabilities.Outcome == DiagnosticOutcome.Captured,
+            SessionId = sessionId,
+            Message = capabilities.Problem?.Message ?? "Described diagnostic capabilities.",
+            Capabilities = CaptureToolSupport.ToJson(capabilities)
+        };
     }
 
     /// <summary>
@@ -484,7 +466,7 @@ public class SendKeyResult
     public string[]? Modifiers { get; init; }
 }
 
-public class CaptureTerminalResult
+public class DiagnosticCapabilitiesToolResult
 {
     [JsonPropertyName("success")]
     public required bool Success { get; init; }
@@ -495,23 +477,8 @@ public class CaptureTerminalResult
     [JsonPropertyName("message")]
     public required string Message { get; init; }
 
-    [JsonPropertyName("format")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? Format { get; init; }
-
-    [JsonPropertyName("content")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? Content { get; init; }
-
-    [JsonPropertyName("savedPath")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? SavedPath { get; init; }
-
-    [JsonPropertyName("width")]
-    public int Width { get; init; }
-
-    [JsonPropertyName("height")]
-    public int Height { get; init; }
+    [JsonPropertyName("capabilities")]
+    public required JsonElement Capabilities { get; init; }
 }
 
 // WaitForTextResult is defined in ToolResults.cs

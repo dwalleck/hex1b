@@ -11,13 +11,13 @@ namespace Hex1b.Tool.Commands.Capture;
 internal sealed class CaptureRecordingStopCommand : BaseCommand
 {
     private readonly TerminalIdResolver _resolver;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     private static readonly Argument<string> s_idArgument = new("id") { Description = "Terminal ID (or prefix)" };
 
     public CaptureRecordingStopCommand(
         TerminalIdResolver resolver,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<CaptureRecordingStopCommand> logger)
         : base("stop", "Stop recording a terminal session", formatter, logger)

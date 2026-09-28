@@ -2715,7 +2715,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 _activityState.Progress,
                 _activityState.ShellIntegration,
                 _activityState.WorkingDirectory,
-                [.. _commandMarks]);
+                [.. _commandMarks],
+                _scrollbackBuffer?.Count ?? 0);
         }
     }
 

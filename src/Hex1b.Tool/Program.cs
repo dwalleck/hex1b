@@ -1,4 +1,5 @@
 using System.CommandLine;
+using Hex1b.Diagnostics;
 using Hex1b.Tool.Commands;
 using Hex1b.Tool.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
@@ -23,7 +24,7 @@ public class Program
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
 
         // Infrastructure services
-        builder.Services.AddSingleton<TerminalClient>();
+        builder.Services.AddSingleton<DiagnosticsSocketClient>();
         builder.Services.AddSingleton<TerminalDiscovery>();
         builder.Services.AddSingleton<TerminalIdResolver>();
         builder.Services.AddSingleton<OutputFormatter>();
@@ -49,6 +50,7 @@ public class Program
 
         // Capture commands
         builder.Services.AddTransient<Commands.Capture.CaptureScreenshotCommand>();
+        builder.Services.AddTransient<Commands.Capture.CaptureCapabilitiesCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureRecordingStartCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureRecordingStopCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureRecordingStatusCommand>();

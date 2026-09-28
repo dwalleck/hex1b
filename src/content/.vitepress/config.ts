@@ -90,7 +90,8 @@ export default defineConfig({
         {
           text: 'CLI Reference',
           items: [
-            { text: 'hex1b', link: '/reference/cli' }
+            { text: 'hex1b', link: '/reference/cli' },
+            { text: 'Diagnostic capture', link: '/reference/diagnostic-capture' }
           ]
         },
         {

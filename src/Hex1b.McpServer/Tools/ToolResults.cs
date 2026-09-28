@@ -112,62 +112,6 @@ public class ResizeTerminalResult
     public int NewHeight { get; init; }
 }
 
-public class CaptureTextResult
-{
-    [JsonPropertyName("success")]
-    public required bool Success { get; init; }
-
-    [JsonPropertyName("sessionId")]
-    public required string SessionId { get; init; }
-
-    [JsonPropertyName("message")]
-    public required string Message { get; init; }
-
-    [JsonPropertyName("text")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? Text { get; init; }
-
-    [JsonPropertyName("width")]
-    public int Width { get; init; }
-
-    [JsonPropertyName("height")]
-    public int Height { get; init; }
-
-    [JsonPropertyName("hasExited")]
-    public bool HasExited { get; init; }
-
-    [JsonPropertyName("exitCode")]
-    public int? ExitCode { get; init; }
-}
-
-public class CaptureScreenshotResult
-{
-    [JsonPropertyName("success")]
-    public required bool Success { get; init; }
-
-    [JsonPropertyName("sessionId")]
-    public required string SessionId { get; init; }
-
-    [JsonPropertyName("message")]
-    public required string Message { get; init; }
-
-    [JsonPropertyName("savedPath")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public string? SavedPath { get; init; }
-
-    [JsonPropertyName("width")]
-    public int Width { get; init; }
-
-    [JsonPropertyName("height")]
-    public int Height { get; init; }
-
-    [JsonPropertyName("hasExited")]
-    public bool HasExited { get; init; }
-
-    [JsonPropertyName("exitCode")]
-    public int? ExitCode { get; init; }
-}
-
 public class WaitForTextResult
 {
     [JsonPropertyName("success")]

@@ -11,13 +11,13 @@ namespace Hex1b.Tool.Commands.Capture;
 internal sealed class CaptureRecordingStatusCommand : BaseCommand
 {
     private readonly TerminalIdResolver _resolver;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     private static readonly Argument<string> s_idArgument = new("id") { Description = "Terminal ID (or prefix)" };
 
     public CaptureRecordingStatusCommand(
         TerminalIdResolver resolver,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<CaptureRecordingStatusCommand> logger)
         : base("status", "Show recording status of a terminal session", formatter, logger)

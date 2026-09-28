@@ -21,10 +21,10 @@ internal sealed class AttachWebApp : IAsyncDisposable
 {
     private readonly string _socketPath;
     private readonly string _displayId;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
     private readonly int _port;
 
-    public AttachWebApp(string socketPath, string displayId, TerminalClient client, int port)
+    public AttachWebApp(string socketPath, string displayId, DiagnosticsSocketClient client, int port)
     {
         _socketPath = socketPath;
         _displayId = displayId;

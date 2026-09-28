@@ -9,16 +9,10 @@ namespace Hex1b.Diagnostics;
 internal sealed class DiagnosticsRequest
 {
     /// <summary>
-    /// The method to invoke: "info", "capture", or "input".
+    /// The method to invoke, for example "info", "capture", "capabilities", or "input".
     /// </summary>
     [JsonPropertyName("method")]
     public string Method { get; set; } = "";
-
-    /// <summary>
-    /// For "capture" method, the format: "ansi" or "svg".
-    /// </summary>
-    [JsonPropertyName("format")]
-    public string? Format { get; set; }
 
     /// <summary>
     /// For "input" method, the characters to send to the terminal.
@@ -57,12 +51,6 @@ internal sealed class DiagnosticsRequest
     public string? Button { get; set; }
 
     /// <summary>
-    /// For "capture" method, the number of scrollback lines to include (default 0).
-    /// </summary>
-    [JsonPropertyName("scrollbackLines")]
-    public int? ScrollbackLines { get; set; }
-
-    /// <summary>
     /// For "drag" method, the destination X position (column, 0-based).
     /// </summary>
     [JsonPropertyName("x2")]
@@ -93,8 +81,8 @@ internal sealed class DiagnosticsRequest
     public double? IdleLimit { get; set; }
 
     /// <summary>
-    /// For "capture" method with "svg" or "html" format, overrides the font family used in rendering.
+    /// For "capture" method, the shared diagnostic capture request.
     /// </summary>
-    [JsonPropertyName("fontFamily")]
-    public string? FontFamily { get; set; }
+    [JsonPropertyName("capture")]
+    public DiagnosticCaptureRequest? Capture { get; set; }
 }

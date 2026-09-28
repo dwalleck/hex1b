@@ -13,11 +13,11 @@ internal sealed class TerminalInfoCommand : BaseCommand
     private static readonly Argument<string> s_idArgument = new("id") { Description = "Terminal ID (or prefix)" };
 
     private readonly TerminalIdResolver _resolver;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     public TerminalInfoCommand(
         TerminalIdResolver resolver,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<TerminalInfoCommand> logger)
         : base("info", "Show terminal details", formatter, logger)

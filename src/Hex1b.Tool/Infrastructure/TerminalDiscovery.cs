@@ -63,7 +63,7 @@ internal sealed class TerminalDiscovery
     /// Removes socket files that are not reachable (stale sockets from exited processes).
     /// Returns the number of sockets removed.
     /// </summary>
-    public async Task<int> CleanStaleAsync(TerminalClient client, CancellationToken cancellationToken = default)
+    public async Task<int> CleanStaleAsync(DiagnosticsSocketClient client, CancellationToken cancellationToken = default)
     {
         var terminals = Scan();
         var removed = 0;

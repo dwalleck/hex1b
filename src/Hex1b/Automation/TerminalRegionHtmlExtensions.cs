@@ -59,7 +59,7 @@ public static class TerminalRegionHtmlExtensions
         }
 
         // Build cell data as JSON for JavaScript (includes group IDs for related cells)
-        var cellData = BuildCellDataJson(region, hyperlinkGroups);
+        var cellData = BuildCellDataJson(region, hyperlinkGroups, options.IncludeHyperlinkTargets);
 
         // For HTML, create options with grids enabled (we'll hide them via CSS initially)
         var htmlSvgOptions = new TerminalSvgOptions
@@ -862,7 +862,8 @@ public static class TerminalRegionHtmlExtensions
         return sb.ToString();
     }
 
-    private static string BuildCellDataJson(IHex1bTerminalRegion region, Dictionary<object, string> hyperlinkGroups)
+    private static string BuildCellDataJson(IHex1bTerminalRegion region, Dictionary<object, string> hyperlinkGroups,
+        bool includeHyperlinkTargets)
     {
         var rows = new List<string>();
 
@@ -941,7 +942,7 @@ public static class TerminalRegionHtmlExtensions
 
                 // Include hyperlink data if present (with group ID for highlighting related cells)
                 string hyperlink;
-                if (cell.TrackedHyperlink is { } trackedLink && cell.HyperlinkData != null)
+                if (includeHyperlinkTargets && cell.TrackedHyperlink is { } trackedLink && cell.HyperlinkData != null)
                 {
                     var groupName = hyperlinkGroups.TryGetValue(trackedLink, out var g) ? g : "";
                     hyperlink = $"{{\"uri\":\"{EscapeJsonString(cell.HyperlinkData.Uri)}\",\"params\":\"{EscapeJsonString(cell.HyperlinkData.Parameters)}\",\"group\":\"{groupName}\"}}";

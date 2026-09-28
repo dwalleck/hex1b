@@ -42,6 +42,7 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
     private bool _bracketedPasteEnabled;
     
     private Hex1bTerminal? _terminal;
+    private TerminalDiagnostics? _diagnostics;
     private AsciinemaRecorder? _recorder;
     private Socket? _listenerSocket;
     private Task? _listenTask;
@@ -91,6 +92,7 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
     public void SetTerminal(Hex1bTerminal terminal)
     {
         _terminal = terminal;
+        _diagnostics = new TerminalDiagnostics(terminal, _appName);
     }
 
     /// <summary>
@@ -532,7 +534,8 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         return request.Method?.ToLowerInvariant() switch
         {
             "info" => HandleInfoRequest(),
-            "capture" => HandleCaptureRequest(request.Format, request.ScrollbackLines, request.FontFamily),
+            "capture" => HandleCaptureRequest(request.Capture),
+            "capabilities" => HandleCapabilitiesRequest(),
             "input" => await HandleInputRequestAsync(request.Data),
             "key" => await HandleKeyRequestAsync(request.Key, request.Modifiers),
             "click" => HandleClickRequest(request.X, request.Y, request.Button),
@@ -562,63 +565,33 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
         };
     }
 
-    private DiagnosticsResponse HandleCaptureRequest(string? format, int? scrollbackLines, string? fontFamily)
+    private DiagnosticsResponse HandleCaptureRequest(DiagnosticCaptureRequest? request)
     {
-        if (_terminal == null)
-        {
-            return new DiagnosticsResponse { Success = false, Error = "Terminal not initialized" };
-        }
-
-        format = format?.ToLowerInvariant() ?? "ansi";
-
-        var scrollback = Math.Max(0, scrollbackLines ?? 0);
-        using var snapshot = scrollback > 0
-            ? _terminal.CreateSnapshot(scrollback)
-            : _terminal.CreateSnapshot();
-        
-        string data;
-        if (format == "svg")
-        {
-            var svgOptions = new TerminalSvgOptions { ShowCellGrid = false };
-            if (fontFamily != null)
-            {
-                svgOptions.FontFamily = $"'{fontFamily}'";
-            }
-            data = snapshot.ToSvg(svgOptions);
-        }
-        else if (format == "html")
-        {
-            var htmlOptions = new TerminalSvgOptions { ShowCellGrid = false };
-            if (fontFamily != null)
-            {
-                htmlOptions.FontFamily = $"'{fontFamily}'";
-            }
-            data = snapshot.ToHtml(htmlOptions);
-        }
-        else if (format == "ansi")
-        {
-            data = snapshot.ToAnsi(new TerminalAnsiOptions 
-            { 
-                IncludeClearScreen = true,
-                IncludeTrailingNewline = true
-            });
-        }
-        else if (format == "text")
-        {
-            // Plain text output - cells in row/column order without ANSI codes
-            data = snapshot.GetText();
-        }
-        else
-        {
-            return new DiagnosticsResponse { Success = false, Error = $"Unknown format: {format}" };
-        }
+        var result = request is null
+            ? TerminalDiagnostics.Problem(DiagnosticOutcome.InvalidRequest, "missing-capture-request",
+                "The capture method requires a capture request.")
+            : _diagnostics?.Capture(request)
+                ?? TerminalDiagnostics.Problem(DiagnosticOutcome.Unavailable, "target-not-initialized",
+                    "The terminal is not initialized.");
 
         return new DiagnosticsResponse
         {
-            Success = true,
-            Width = _terminal.Width,
-            Height = _terminal.Height,
-            Data = data
+            Success = result.Outcome == DiagnosticOutcome.Captured,
+            Error = result.Problem?.Message,
+            Capture = result
+        };
+    }
+
+    private DiagnosticsResponse HandleCapabilitiesRequest()
+    {
+        var capabilities = _diagnostics?.GetCapabilities()
+            ?? TerminalDiagnostics.CapabilitiesProblem(DiagnosticOutcome.Unavailable, "target-not-initialized",
+                "The terminal is not initialized.");
+        return new DiagnosticsResponse
+        {
+            Success = capabilities.Outcome == DiagnosticOutcome.Captured,
+            Error = capabilities.Problem?.Message,
+            Capabilities = capabilities
         };
     }
 

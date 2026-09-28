@@ -72,7 +72,8 @@ hex1b terminal start --attach -- vim
 
 | Command | Description |
 |---------|-------------|
-| `capture screenshot` | Capture terminal screen (text, ANSI, SVG, HTML, or PNG) |
+| `capture screenshot` | Capture the terminal model (text, styled ANSI, SVG, HTML, or PNG); `--json` returns the full [diagnostic capture contract](https://hex1b.dev/reference/diagnostic-capture) result |
+| `capture capabilities` | Describe supported diagnostic operations, authorizations, and unavailable evidence layers |
 | `capture recording start` | Begin recording a session to a `.cast` file |
 | `capture recording stop` | Stop an active recording |
 | `capture recording status` | Check recording status |

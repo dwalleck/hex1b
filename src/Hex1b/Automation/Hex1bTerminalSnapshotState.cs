@@ -37,4 +37,5 @@ internal sealed record Hex1bTerminalSnapshotState(
     TerminalProgress Progress,
     TerminalShellIntegration ShellIntegration,
     TerminalWorkingDirectory WorkingDirectory,
-    IReadOnlyList<TerminalCommandMark> CommandMarks);
+    IReadOnlyList<TerminalCommandMark> CommandMarks,
+    int RetainedHistoryRows);

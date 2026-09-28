@@ -25,10 +25,10 @@ internal sealed class TerminalStartCommand : BaseCommand
         Description = "Command and arguments to run (after --). Defaults to PowerShell on Windows or bash on Linux/macOS."
     };
 
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     public TerminalStartCommand(
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<TerminalStartCommand> logger)
         : base("start", "Start a hosted terminal", formatter, logger)

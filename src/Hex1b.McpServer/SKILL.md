@@ -28,21 +28,37 @@ Discovers and connects to all Hex1b applications with diagnostics enabled.
 
 ### Capture Tools
 
+All capture tools return `capture`, the shared diagnostic capture contract result (the same
+shape the `hex1b capture screenshot --json` CLI returns). Check `capture.outcome` first: only
+`captured` carries content. `unavailable`, `invalid-request`, and `failed` include
+`capture.problem.code` and a message. Absent fields are listed in `capture.unavailableFields`
+with a reason. They are never reported as zero.
+
+Default content is the rendered screen, plus retained model history when requested. Hyperlink
+targets, titles, editor text, and raw input are `excluded` in `capture.contentCoverage` unless
+authorized. Rendered text can still contain secrets.
+
 #### `CaptureHex1bTerminal`
-Captures the terminal screen state.
+Captures a Hex1b application by process ID and saves the content to a file.
 - Parameters:
   - `processId`: Process ID of the Hex1b application
   - `savePath`: File path to save the capture
-  - `format`: "ansi", "svg", or "text" (default: "ansi")
-- Use for visual debugging and documentation
+  - `format`: "ansi", "svg", "html", or "text" (default: "ansi")
+  - `historyRows`: Rows of retained terminal-model history (not native scrollback)
+  - `authorize`: Comma-separated `non-screen-metadata`, `editor-text`, `raw-input`
 
 #### `CaptureTerminalScreen`
-Captures the terminal screen in various formats.
+Captures any local or remote target.
 - Parameters:
   - `sessionId`: Session ID of connected terminal
-  - `format`: "text", "ansi", or "svg"
-  - `savePath`: Optional file path to save
-- Unified capture for both local and remote terminals
+  - `format`: "text", "ansi" (keeps cell styles), "svg", or "html"
+  - `savePath`: Optional file path; content then goes to the file instead of `capture.content`
+  - `historyRows`, `authorize`: as above
+
+#### `GetTerminalDiagnosticCapabilities`
+Describes supported operations, formats, timing (`immediate` only), authorizations, and
+evidence layers. The application-frame, native-delivery, and native-presentation layers are
+reported unavailable, each with a reason.
 
 ### Input Tools
 

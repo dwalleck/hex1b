@@ -11,7 +11,7 @@ namespace Hex1b.Tool.Commands.Mouse;
 internal sealed class MouseClickCommand : BaseCommand
 {
     private readonly TerminalIdResolver _resolver;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     private static readonly Argument<string> s_idArgument = new("id") { Description = "Terminal ID (or prefix)" };
     private static readonly Argument<int> s_xArgument = new("x") { Description = "Column (0-based)" };
@@ -20,7 +20,7 @@ internal sealed class MouseClickCommand : BaseCommand
 
     public MouseClickCommand(
         TerminalIdResolver resolver,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<MouseClickCommand> logger)
         : base("click", "Send a mouse click at coordinates", formatter, logger)

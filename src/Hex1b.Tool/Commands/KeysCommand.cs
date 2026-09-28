@@ -11,7 +11,7 @@ namespace Hex1b.Tool.Commands;
 internal sealed class KeysCommand : BaseCommand
 {
     private readonly TerminalIdResolver _resolver;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     private static readonly Argument<string> s_idArgument = new("id") { Description = "Terminal ID (or prefix)" };
     private static readonly Option<string?> s_keyOption = new("--key") { Description = "Named key (Enter, Tab, Escape, F1, UpArrow, etc.)" };
@@ -22,7 +22,7 @@ internal sealed class KeysCommand : BaseCommand
 
     public KeysCommand(
         TerminalIdResolver resolver,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<KeysCommand> logger)
         : base("keys", "Send keystrokes to a terminal", formatter, logger)

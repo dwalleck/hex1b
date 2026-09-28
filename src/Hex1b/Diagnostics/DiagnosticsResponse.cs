@@ -51,7 +51,7 @@ internal sealed class DiagnosticsResponse
     public int? Height { get; set; }
 
     /// <summary>
-    /// For "capture" method: the captured content (ANSI or SVG).
+    /// Method-specific payload, for example the attach screen or an input acknowledgement.
     /// </summary>
     [JsonPropertyName("data")]
     public string? Data { get; set; }
@@ -97,4 +97,16 @@ internal sealed class DiagnosticsResponse
     /// </summary>
     [JsonPropertyName("recordingPath")]
     public string? RecordingPath { get; set; }
+
+    /// <summary>
+    /// For "capture" method: the shared diagnostic capture result, including failures.
+    /// </summary>
+    [JsonPropertyName("capture")]
+    public DiagnosticCaptureResult? Capture { get; set; }
+
+    /// <summary>
+    /// For "capabilities" method: what the target supports.
+    /// </summary>
+    [JsonPropertyName("capabilities")]
+    public DiagnosticCapabilities? Capabilities { get; set; }
 }

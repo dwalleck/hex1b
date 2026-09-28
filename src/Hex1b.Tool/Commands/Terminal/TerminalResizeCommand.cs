@@ -15,11 +15,11 @@ internal sealed class TerminalResizeCommand : BaseCommand
     private static readonly Option<int?> s_heightOption = new("--height") { Description = "New height in rows" };
 
     private readonly TerminalIdResolver _resolver;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     public TerminalResizeCommand(
         TerminalIdResolver resolver,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<TerminalResizeCommand> logger)
         : base("resize", "Resize a terminal", formatter, logger)

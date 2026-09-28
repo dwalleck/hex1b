@@ -9,4 +9,7 @@ namespace Hex1b.Diagnostics;
 internal static class DiagnosticsJsonOptions
 {
     public static readonly JsonSerializerOptions Default = DiagnosticsJsonContext.Default.Options;
+
+    /// <summary>Indented output for human-facing clients, using the same source-generated contract.</summary>
+    public static readonly JsonSerializerOptions Indented = new(DiagnosticsJsonContext.Default.Options) { WriteIndented = true };
 }

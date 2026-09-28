@@ -1,4 +1,5 @@
 using System.CommandLine;
+using System.Text.Json;
 using Hex1b.Diagnostics;
 using Hex1b.Tool.Infrastructure;
 using Microsoft.Extensions.Logging;
@@ -6,23 +7,29 @@ using Microsoft.Extensions.Logging;
 namespace Hex1b.Tool.Commands.Capture;
 
 /// <summary>
-/// Captures a terminal screen screenshot in various formats.
+/// Captures a terminal screen screenshot in various formats through the shared diagnostic
+/// capture contract.
 /// </summary>
 internal sealed class CaptureScreenshotCommand : BaseCommand
 {
     private readonly TerminalIdResolver _resolver;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     private static readonly Argument<string> s_idArgument = new("id") { Description = "Terminal ID (or prefix)" };
     private static readonly Option<string> s_formatOption = new("--format") { DefaultValueFactory = _ => "text", Description = "Output format: text, ansi, svg, html, or png" };
     private static readonly Option<string?> s_outputOption = new("--output") { Description = "Save to file instead of stdout (required for png)" };
     private static readonly Option<string?> s_waitOption = new("--wait") { Description = "Wait for text to appear before capturing" };
     private static readonly Option<int> s_timeoutOption = new("--timeout") { DefaultValueFactory = _ => 30, Description = "Timeout in seconds for --wait" };
-    private static readonly Option<int> s_scrollbackOption = new("--scrollback") { DefaultValueFactory = _ => 0, Description = "Number of scrollback lines to include" };
+    private static readonly Option<int> s_scrollbackOption = new("--scrollback") { DefaultValueFactory = _ => 0, Description = "Rows of retained terminal-model history to include (not native scrollback)" };
+    private static readonly Option<string[]> s_authorizeOption = new("--authorize")
+    {
+        Description = "Opt in to content beyond the rendered screen: non-screen-metadata, editor-text, or raw-input (repeatable)",
+        AllowMultipleArgumentsPerToken = true
+    };
 
     public CaptureScreenshotCommand(
         TerminalIdResolver resolver,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<CaptureScreenshotCommand> logger)
         : base("screenshot", "Capture a terminal screen screenshot", formatter, logger)
@@ -36,6 +43,7 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
         Options.Add(s_waitOption);
         Options.Add(s_timeoutOption);
         Options.Add(s_scrollbackOption);
+        Options.Add(s_authorizeOption);
     }
 
     protected override async Task<int> ExecuteAsync(ParseResult parseResult, CancellationToken cancellationToken)
@@ -46,6 +54,8 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
         var waitText = parseResult.GetValue(s_waitOption);
         var timeout = parseResult.GetValue(s_timeoutOption);
         var scrollback = parseResult.GetValue(s_scrollbackOption);
+        var authorizations = parseResult.GetValue(s_authorizeOption);
+        var json = parseResult.GetValue(RootCommand.JsonOption);
 
         var isPng = string.Equals(format, "png", StringComparison.OrdinalIgnoreCase);
 
@@ -55,6 +65,12 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
             return 1;
         }
 
+        // PNG is rasterized locally from an SVG capture rendered with the font embedded in this tool.
+        var (request, invalid) = DiagnosticContractNames.ParseCaptureRequest(
+            isPng ? "svg" : format, scrollback, authorizations, isPng ? SvgToPngConverter.EmbeddedFontFamily : null);
+        if (invalid != null)
+            return WriteFailure(invalid, json);
+
         var resolved = _resolver.Resolve(id);
         if (!resolved.Success)
         {
@@ -62,72 +78,70 @@ internal sealed class CaptureScreenshotCommand : BaseCommand
             return 1;
         }
 
-        // Wait for text if requested
         if (waitText != null)
         {
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeout));
-
-            while (!timeoutCts.Token.IsCancellationRequested)
-            {
-                var textResponse = await _client.SendAsync(resolved.SocketPath!,
-                    new DiagnosticsRequest { Method = "capture", Format = "text" }, timeoutCts.Token);
-
-                if (textResponse is { Success: true, Data: not null } && textResponse.Data.Contains(waitText, StringComparison.Ordinal))
-                {
-                    break;
-                }
-
-                await Task.Delay(250, timeoutCts.Token);
-            }
+            var waitFailure = await WaitForTextAsync(resolved.SocketPath!, waitText, timeout, cancellationToken);
+            if (waitFailure != null)
+                return WriteFailure(waitFailure, json);
         }
 
-        // For PNG, capture as SVG first then convert
-        var captureFormat = isPng ? "svg" : format;
-
-        // When rendering to PNG, resolve a monospace font that's actually installed
-        // and pass it through the protocol so the SVG is generated correctly.
-        string? fontFamily = isPng ? ResolveMonospaceFont() : null;
-
-        var response = await _client.SendAsync(resolved.SocketPath!,
-            new DiagnosticsRequest { Method = "capture", Format = captureFormat, ScrollbackLines = scrollback > 0 ? scrollback : null, FontFamily = fontFamily }, cancellationToken);
-
-        if (!response.Success)
-        {
-            Formatter.WriteError(response.Error ?? "Capture failed");
-            return 1;
-        }
+        var result = await _client.CaptureAsync(resolved.SocketPath!, request!, cancellationToken);
+        if (result.Outcome != DiagnosticOutcome.Captured)
+            return WriteFailure(result, json);
 
         if (isPng)
         {
-            var pngBytes = ConvertSvgToPng(response.Data!);
+            var pngBytes = SvgToPngConverter.Convert(result.Content!);
             await File.WriteAllBytesAsync(outputPath!, pngBytes, cancellationToken);
-            Formatter.WriteLine($"Saved to {outputPath}");
         }
         else if (outputPath != null)
         {
-            await File.WriteAllTextAsync(outputPath, response.Data, cancellationToken);
+            await File.WriteAllTextAsync(outputPath, result.Content, cancellationToken);
+        }
+
+        if (json)
+            WriteResult(result);
+        else if (outputPath != null)
             Formatter.WriteLine($"Saved to {outputPath}");
-        }
-        else if (parseResult.GetValue(RootCommand.JsonOption))
-        {
-            Formatter.WriteJson(new
-            {
-                width = response.Width,
-                height = response.Height,
-                format,
-                data = response.Data
-            });
-        }
         else
-        {
-            Console.Write(response.Data);
-        }
+            Console.Write(result.Content);
 
         return 0;
     }
 
-    private static byte[] ConvertSvgToPng(string svgContent) => SvgToPngConverter.Convert(svgContent);
+    private async Task<DiagnosticCaptureResult?> WaitForTextAsync(string socketPath, string waitText, int timeoutSeconds, CancellationToken cancellationToken)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+        var textRequest = new DiagnosticCaptureRequest { Format = DiagnosticCaptureFormat.Text };
+        try
+        {
+            while (true)
+            {
+                var text = await _client.CaptureAsync(socketPath, textRequest, timeoutCts.Token);
+                if (text.Outcome != DiagnosticOutcome.Captured)
+                    return text;
+                if (text.Content!.Contains(waitText, StringComparison.Ordinal))
+                    return null;
 
-    private static string? ResolveMonospaceFont() => SvgToPngConverter.EmbeddedFontFamily;
+                await Task.Delay(250, timeoutCts.Token);
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return TerminalDiagnostics.Problem(DiagnosticOutcome.Failed, "timeout",
+                $"Text '{waitText}' did not appear within {timeoutSeconds}s.");
+        }
+    }
+
+    private int WriteFailure(DiagnosticCaptureResult result, bool json)
+    {
+        if (json)
+            WriteResult(result);
+        Formatter.WriteError($"{DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}");
+        return 1;
+    }
+
+    private static void WriteResult(DiagnosticCaptureResult result) =>
+        Console.WriteLine(JsonSerializer.Serialize(result, DiagnosticsJsonOptions.Indented.GetTypeInfo(typeof(DiagnosticCaptureResult))));
 }

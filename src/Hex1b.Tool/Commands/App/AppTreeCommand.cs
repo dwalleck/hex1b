@@ -12,7 +12,7 @@ namespace Hex1b.Tool.Commands.App;
 internal sealed class AppTreeCommand : BaseCommand
 {
     private readonly TerminalIdResolver _resolver;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     private static readonly Argument<string> s_idArgument = new("id") { Description = "Terminal ID (or prefix)" };
     private static readonly Option<bool> s_focusOption = new("--focus") { Description = "Include focus ring info" };
@@ -22,7 +22,7 @@ internal sealed class AppTreeCommand : BaseCommand
 
     public AppTreeCommand(
         TerminalIdResolver resolver,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<AppTreeCommand> logger)
         : base("tree", "Inspect the widget/node tree of a TUI application", formatter, logger)

@@ -1,5 +1,6 @@
 using System.Text;
 using Hex1b.Automation;
+using Hex1b.Diagnostics;
 using Hex1b.Theming;
 
 namespace Hex1b.McpServer;
@@ -85,6 +86,11 @@ public sealed class TerminalSession : IAsyncDisposable
     /// </summary>
     public string? ActiveRecordingPath => _asciinemaRecorder.FilePath;
 
+    /// <summary>
+    /// Gets the shared diagnostics engine observing this session's terminal model.
+    /// </summary>
+    public TerminalDiagnostics Diagnostics { get; }
+
     private TerminalSession(
         string id,
         Hex1bTerminalChildProcess process,
@@ -110,6 +116,7 @@ public sealed class TerminalSession : IAsyncDisposable
         WorkingDirectory = workingDirectory;
         AsciinemaFilePath = initialAsciinemaFilePath;
         StartedAt = DateTimeOffset.UtcNow;
+        Diagnostics = new TerminalDiagnostics(terminal, command);
     }
 
     /// <summary>
@@ -280,27 +287,6 @@ public sealed class TerminalSession : IAsyncDisposable
         _width = width;
         _height = height;
         await _process.ResizeAsync(width, height, ct);
-    }
-
-    /// <summary>
-    /// Captures the current terminal screen as text.
-    /// </summary>
-    /// <returns>The terminal screen content as text.</returns>
-    public string CaptureText()
-    {
-        using var snapshot = _terminal.CreateSnapshot();
-        return snapshot.GetText();
-    }
-
-    /// <summary>
-    /// Captures the current terminal screen as SVG.
-    /// </summary>
-    /// <param name="options">Optional SVG rendering options.</param>
-    /// <returns>An SVG representation of the terminal screen.</returns>
-    public string CaptureSvg(TerminalSvgOptions? options = null)
-    {
-        using var snapshot = _terminal.CreateSnapshot();
-        return snapshot.ToSvg(options);
     }
 
     /// <summary>

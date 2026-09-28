@@ -1,4 +1,4 @@
-using Hex1b.Automation;
+using Hex1b.Diagnostics;
 
 namespace Hex1b.McpServer;
 
@@ -81,19 +81,15 @@ public interface ITerminalTarget : IAsyncDisposable
     Task SendMouseClickAsync(int x, int y, MouseButton button = MouseButton.Left, CancellationToken ct = default);
 
     /// <summary>
-    /// Captures the terminal screen as plain text.
+    /// Captures the terminal model through the shared diagnostic contract. Target, transport,
+    /// and request problems are reported through the result's outcome rather than thrown.
     /// </summary>
-    Task<string> CaptureTextAsync(CancellationToken ct = default);
+    Task<DiagnosticCaptureResult> CaptureAsync(DiagnosticCaptureRequest request, CancellationToken ct = default);
 
     /// <summary>
-    /// Captures the terminal screen as SVG.
+    /// Describes the target's diagnostic capabilities and their limits.
     /// </summary>
-    Task<string> CaptureSvgAsync(TerminalSvgOptions? options = null, CancellationToken ct = default);
-
-    /// <summary>
-    /// Captures the terminal screen as ANSI escape sequences.
-    /// </summary>
-    Task<string> CaptureAnsiAsync(TerminalAnsiOptions? options = null, CancellationToken ct = default);
+    Task<DiagnosticCapabilities> GetDiagnosticCapabilitiesAsync(CancellationToken ct = default);
 
     /// <summary>
     /// Waits for specific text to appear on the terminal screen.

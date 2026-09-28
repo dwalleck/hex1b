@@ -1,5 +1,4 @@
-using System.Text;
-using Hex1b.Automation;
+using Hex1b.Diagnostics;
 
 namespace Hex1b.McpServer;
 
@@ -69,21 +68,12 @@ public sealed class LocalTerminalTarget : ITerminalTarget
     }
 
     /// <inheritdoc />
-    public Task<string> CaptureTextAsync(CancellationToken ct = default)
-        => Task.FromResult(_session.CaptureText());
+    public Task<DiagnosticCaptureResult> CaptureAsync(DiagnosticCaptureRequest request, CancellationToken ct = default)
+        => Task.FromResult(_session.Diagnostics.Capture(request));
 
     /// <inheritdoc />
-    public Task<string> CaptureSvgAsync(TerminalSvgOptions? options = null, CancellationToken ct = default)
-        => Task.FromResult(_session.CaptureSvg(options));
-
-    /// <inheritdoc />
-    public Task<string> CaptureAnsiAsync(TerminalAnsiOptions? options = null, CancellationToken ct = default)
-    {
-        // TerminalSession doesn't have CaptureAnsi, we need to add it or use snapshot directly
-        // For now, capture via text (we can enhance this later)
-        var text = _session.CaptureText();
-        return Task.FromResult(text);
-    }
+    public Task<DiagnosticCapabilities> GetDiagnosticCapabilitiesAsync(CancellationToken ct = default)
+        => Task.FromResult(_session.Diagnostics.GetCapabilities());
 
     /// <inheritdoc />
     public Task<bool> WaitForTextAsync(string text, TimeSpan timeout, CancellationToken ct = default)

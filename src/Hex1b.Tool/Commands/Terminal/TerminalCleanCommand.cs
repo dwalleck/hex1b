@@ -1,4 +1,5 @@
 using System.CommandLine;
+using Hex1b.Diagnostics;
 using Hex1b.Tool.Infrastructure;
 using Microsoft.Extensions.Logging;
 
@@ -10,11 +11,11 @@ namespace Hex1b.Tool.Commands.Terminal;
 internal sealed class TerminalCleanCommand : BaseCommand
 {
     private readonly TerminalDiscovery _discovery;
-    private readonly TerminalClient _client;
+    private readonly DiagnosticsSocketClient _client;
 
     public TerminalCleanCommand(
         TerminalDiscovery discovery,
-        TerminalClient client,
+        DiagnosticsSocketClient client,
         OutputFormatter formatter,
         ILogger<TerminalCleanCommand> logger)
         : base("clean", "Remove stale terminal sockets", formatter, logger)
