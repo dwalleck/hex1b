@@ -154,41 +154,72 @@ public class ApplicationFrameTests
     }
 
     [TestMethod]
-    public void Clipping_FollowsTheCompositorNotTheClipMode()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Clipping_VisibleBoundsMatchTheRenderedScreen(bool caching)
     {
-        // Hand-arranged content larger than its container, which stacks never produce.
-        static TextBlockNode Tall() => new() { Text = "tall" };
+        await using var harness = await AppHarness.StartAsync(ctx => new VStackWidget(
+        [
+            // Two expanded sections: the accordion swaps its clip rect section by section.
+            new AccordionWidget(
+            [
+                new AccordionSectionWidget(s => [s.Text("SEC-A-one"), s.Text("SEC-A-two")]).Title("TitleA").Expanded(),
+                new AccordionSectionWidget(s => [s.Text("SEC-B-one"), s.Text("SEC-B-two")]).Title("TitleB").Expanded(),
+            ]).MultipleExpanded().FixedHeight(6),
+            new BorderWidget(new VStackWidget(
+            [
+                new LayoutWidget(new VStackWidget([.. Enumerable.Range(0, 5).Select(i => (Hex1bWidget)new TextBlockWidget($"OVF-{i}"))]),
+                    ClipMode.Overflow).FixedHeight(2),
+            ])).FixedHeight(5),
+            ctx.VScrollPanel(v => Enumerable.Range(0, 12).Select(i => (Hex1bWidget)v.Text($"ROW-{i:00}")).ToArray()).FixedHeight(4),
+            // A window's title bar is drawn outside the window's content clip.
+            ctx.WindowPanel().FixedHeight(8),
+        ]), columns: 40, rows: 24, configure: options => options.EnableRenderCaching = caching);
 
-        var overflowText = Tall();
-        var inner = new LayoutNode { ClipMode = ClipMode.Overflow, Child = overflowText };
-        var outer = new LayoutNode { ClipMode = ClipMode.Overflow, Child = inner };
-        outer.Arrange(new Rect(0, 0, 10, 4));
-        inner.Arrange(new Rect(0, 0, 10, 2));
-        overflowText.Arrange(new Rect(0, 0, 10, 5));
+        await harness.NextPassAsync(() =>
+        {
+            FindNode<ScrollPanelNode>(harness.App.RootNode)!.ScrollBy(5);
+            var panel = FindNode<WindowPanelNode>(harness.App.RootNode)!;
+            panel.Windows.Open(panel.Windows.Window(_ => new TextBlockWidget("WIN-BODY")).Title("WIN-TITLE").Size(24, 5).Position(2, 1));
+        });
+        await harness.WaitForQuietAsync();
 
-        var surfaceText = Tall();
-        var container = new PassThroughNode { Child = surfaceText };
-        var region = new LayoutNode { ClipMode = ClipMode.Clip, Child = container };
-        region.Arrange(new Rect(0, 0, 10, 10));
-        container.Arrange(new Rect(0, 0, 10, 3));
-        surfaceText.Arrange(new Rect(0, 0, 10, 5));
+        var frame = harness.Capture().Frame!;
+        var screen = harness.Terminal.GetScreenText().Split('\n').Select(line => line.TrimEnd('\r')).ToArray();
+        Assert.AreEqual(frame.FrameId, harness.Capture().Frame!.FrameId, "fixture: the app kept rendering while the screen was read");
 
-        DiagnosticFrameNode Leaf(Hex1bNode root) =>
-            ApplicationFrameProjector.Project(root, new FocusRing(), "stub", 1, 10, 10, wroteOutput: true, timings: null)
-                .Root!.Children[0].Children[0];
+        var nodes = new List<(DiagnosticFrameNode Node, Rect Expected)>();
+        Walk(frame.Root!, new Rect(0, 0, frame.Columns, frame.Rows), nodes);
+        // Text blocks draw their text verbatim; other text nodes add decoration.
+        var texts = nodes.Select(n => n.Node).Where(n => n.Type == nameof(TextBlockNode) && n.Text is { Length: >= 4 } t && !t.Contains('\n')).ToList();
+        var mismatches = new List<string>();
+        foreach (var node in texts.Where(n => texts.Count(other => other.Text == n.Text) == 1))
+        {
+            var text = node.Text!;
+            var onScreen = screen.Any(line => line.Contains(text, StringComparison.Ordinal));
+            var shown = node.ClipState switch
+            {
+                DiagnosticClipState.FullyClipped => !onScreen,
+                DiagnosticClipState.Visible => Cells(screen, node.Bounds.X, node.Bounds.Y, Math.Min(text.Length, node.Bounds.Width))
+                    == text[..Math.Min(text.Length, node.Bounds.Width)],
+                _ => node.VisibleBounds.Y != node.Bounds.Y
+                    || Cells(screen, node.VisibleBounds.X, node.VisibleBounds.Y, node.VisibleBounds.Width)
+                        == text.PadRight(node.Bounds.Width).Substring(node.VisibleBounds.X - node.Bounds.X, node.VisibleBounds.Width),
+            };
+            if (!shown)
+                mismatches.Add($"{text}: {node.ClipState} visible {Describe(node.VisibleBounds)} but on screen={onScreen}");
+        }
 
-        var insetText = Tall();
-        var inset = new InsetOverflowNode { Child = insetText };
-        inset.Arrange(new Rect(0, 0, 10, 10));
-        insetText.Arrange(new Rect(0, 0, 10, 5));
-        var insetLeaf = ApplicationFrameProjector.Project(inset, new FocusRing(), "stub", 1, 10, 10, wroteOutput: true, timings: null)
-            .Root!.Children[0];
-
-        Assert.AreEqual("0,0,10,2", Describe(Leaf(outer).VisibleBounds), "an overflow region still clips what is composited through it");
-        Assert.AreEqual("1,1,9,4", Describe(insetLeaf.VisibleBounds), "an overflow provider's clip rect applies even where it differs from its bounds");
-        Assert.AreEqual("0,0,10,3", Describe(Leaf(region).VisibleBounds), "a node below a clip region draws on a surface of its own bounds");
-        Assert.AreEqual(DiagnosticClipState.PartiallyClipped, Leaf(region).ClipState);
+        Assert.IsEmpty(mismatches, $"caching={caching}:\n{string.Join("\n", mismatches)}\n{string.Join("\n", screen)}");
+        string StateOf(string text) => DiagnosticContractNames.Of(texts.Single(n => n.Text == text).ClipState);
+        Assert.AreEqual("visible", StateOf("WIN-TITLE"), "fixture: the window title bar is drawn");
+        Assert.AreEqual("visible", StateOf("SEC-A-one"), "fixture: the first expanded section is drawn");
+        Assert.AreEqual("fully-clipped", StateOf("ROW-00"), "fixture: rows scrolled out are not drawn");
+        Assert.AreEqual("fully-clipped", StateOf("OVF-4"), "fixture: rows past the overflow region are not drawn");
     }
+
+    private static string Cells(string[] screen, int x, int y, int width) =>
+        y < 0 || y >= screen.Length ? "" : screen[y].PadRight(x + width).Substring(x, width);
 
     [TestMethod]
     public void EditorMetadata_StaleCursorsAreClampedToTheSnapshot()
@@ -859,44 +890,6 @@ public class ApplicationFrameTests
         public PublishedApplicationFrame? LatestFrame => frame;
     }
 
-    // An Overflow provider whose clip rect is inset from its bounds.
-    internal sealed class InsetOverflowNode : Hex1bNode, ILayoutProvider
-    {
-        public Hex1bNode? Child { get; set; }
-
-        public ILayoutProvider? ParentLayoutProvider { get; set; }
-
-        public Rect ClipRect => new(Bounds.X + 1, Bounds.Y + 1, Bounds.Width - 1, Bounds.Height - 1);
-
-        public ClipMode ClipMode => ClipMode.Overflow;
-
-        public bool ShouldRenderAt(int x, int y) => LayoutProviderHelper.ShouldRenderAt(this, x, y);
-
-        public (int adjustedX, string clippedText) ClipString(int x, int y, string text) => LayoutProviderHelper.ClipString(this, x, y, text);
-
-        public override IEnumerable<Hex1bNode> GetChildren() => Child is null ? [] : [Child];
-
-        protected override Size MeasureCore(Constraints constraints) => constraints.Constrain(new Size(1, 1));
-
-        public override void Render(Hex1bRenderContext context)
-        {
-        }
-    }
-
-    // A container that is not a layout provider.
-    internal sealed class PassThroughNode : Hex1bNode
-    {
-        public Hex1bNode? Child { get; set; }
-
-        public override IEnumerable<Hex1bNode> GetChildren() => Child is null ? [] : [Child];
-
-        protected override Size MeasureCore(Constraints constraints) => constraints.Constrain(new Size(1, 1));
-
-        public override void Render(Hex1bRenderContext context)
-        {
-        }
-    }
-
     internal sealed record AlwaysDirtyWidget : Hex1bWidget
     {
         internal override Task<Hex1bNode> ReconcileAsync(Hex1bNode? existingNode, ReconcileContext context)
@@ -970,11 +963,13 @@ public class ApplicationFrameTests
         public TerminalDiagnostics Diagnostics { get; }
 
         public static async Task<AppHarness> StartAsync(Func<RootContext, Hex1bWidget> build, bool publish = true,
-            int columns = 40, int rows = 6)
+            int columns = 40, int rows = 6, Action<Hex1bAppOptions>? configure = null)
         {
             var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = publish };
             var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(columns, rows).Build();
-            var app = new Hex1bApp(build, new Hex1bAppOptions { WorkloadAdapter = workload });
+            var options = new Hex1bAppOptions { WorkloadAdapter = workload };
+            configure?.Invoke(options);
+            var app = new Hex1bApp(build, options);
             var harness = new AppHarness(terminal, app);
             harness._run = app.RunAsync(harness._cts.Token);
             await harness.WaitForPassAsync(1);

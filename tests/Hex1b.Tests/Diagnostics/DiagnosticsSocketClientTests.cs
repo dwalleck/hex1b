@@ -315,6 +315,25 @@ public class DiagnosticsSocketClientTests
     }
 
     [TestMethod]
+    [DataRow("""{"popups":[null],"focus":{"focusables":[]}}""")]
+    [DataRow("""{"popups":[],"focus":{"focusables":[null]}}""")]
+    [DataRow("""{"popups":[],"focus":null}""")]
+    [DataRow("""{"popups":[],"focus":{"focusables":[]},"focusedEditor":{"bounds":{},"carets":[],"selections":[null]}}""")]
+    [DataRow("""{"popups":[],"focus":{"focusables":[]},"focusedEditor":{"bounds":{},"carets":[],"selections":[{"start":null,"end":{}}]}}""")]
+    [DataRow("""{"popups":[],"focus":{"focusables":[]},"root":{"type":"x","hitTestBounds":{},"contentBounds":{},"visibleBounds":{},"children":[]}}""")]
+    [DataRow("""{"popups":[],"focus":{"focusables":[]},"root":{"type":"x","bounds":{},"hitTestBounds":{},"contentBounds":{},"visibleBounds":{},"children":[null]}}""")]
+    public async Task ApplicationFrame_MalformedCapturedFrame_IsProtocolError(string frame)
+    {
+        var response = """{"success":true,"applicationFrame":{"contractVersion":1,"outcome":"captured","identity":{},"frame":""" + frame + "}}";
+        await using var server = await FakeServer.StartAsync(_ => response);
+
+        var result = await new DiagnosticsSocketClient().CaptureApplicationFrameAsync(server.Path,
+            new DiagnosticApplicationFrameRequest(), TestContext.Current.CancellationToken);
+
+        Assert.AreEqual((DiagnosticOutcome.Failed, "protocol-error"), (result.Outcome, result.Problem?.Code), frame);
+    }
+
+    [TestMethod]
     public async Task ApplicationFrame_MalformedEntriesAndStrayFrames_NeverThrow()
     {
         var withNullCaret = """{"success":true,"applicationFrame":{"contractVersion":1,"outcome":"captured","identity":{},"frame":{"popups":[],"focus":{"focusables":[]},"focusedEditor":{"bounds":{},"carets":[null],"selections":[]}}}}""";

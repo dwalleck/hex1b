@@ -38,6 +38,12 @@ public abstract class Hex1bNode
     /// </summary>
     internal long DiagLastRenderedTimestamp { get; set; }
 
+    /// <summary>
+    /// The absolute clip this node was last composited through by <c>RenderChild</c>, recorded
+    /// only while diagnostics are enabled; <see langword="null"/> when it never was.
+    /// </summary>
+    internal Rect? DiagCompositeClip { get; set; }
+
     // --- Per-node metrics fields ---
 
     /// <summary>

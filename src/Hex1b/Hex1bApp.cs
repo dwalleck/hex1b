@@ -1374,6 +1374,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
             CellMetrics = cellMetrics,
             CachingEnabled = _enableRenderCaching,
             Metrics = _metrics.NodeRenderDuration != null ? _metrics : null,
+            RecordsCompositeClips = _diagnosticTimingEnabled,
             SurfacePool = _surfacePool,
             KgpRegistry = _kgpRegistry
         };

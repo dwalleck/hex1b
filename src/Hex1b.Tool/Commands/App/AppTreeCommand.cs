@@ -164,23 +164,35 @@ internal sealed class AppTreeCommand : BaseCommand
 
     private static string Safe(string? text)
     {
-        if (string.IsNullOrEmpty(text) || !text.Any(IsUnsafe))
-            return text ?? "";
-        var escaped = new System.Text.StringBuilder(text.Length + 8);
-        foreach (var c in text)
+        if (string.IsNullOrEmpty(text))
+            return "";
+        var escaped = new System.Text.StringBuilder(text.Length);
+        for (var i = 0; i < text.Length;)
         {
-            if (IsUnsafe(c))
-                escaped.Append("\\u").Append(((int)c).ToString("x4", System.Globalization.CultureInfo.InvariantCulture));
+            // Lone surrogates are escaped; anything decoded is judged as a whole scalar, so format
+            // characters outside the BMP (for example tag characters) are caught too.
+            if (System.Text.Rune.DecodeFromUtf16(text.AsSpan(i), out var rune, out var consumed) != System.Buffers.OperationStatus.Done)
+            {
+                escaped.Append("\\u").Append(((int)text[i]).ToString("x4", System.Globalization.CultureInfo.InvariantCulture));
+                i++;
+                continue;
+            }
+
+            if (IsUnsafe(rune))
+                escaped.Append(rune.IsBmp ? "\\u" : "\\U").Append(rune.Value.ToString(rune.IsBmp ? "x4" : "x8", System.Globalization.CultureInfo.InvariantCulture));
             else
-                escaped.Append(c);
+                escaped.Append(text, i, consumed);
+            i += consumed;
         }
+
         return escaped.ToString();
     }
 
-    // Control characters, and format characters such as bidirectional overrides that reorder
-    // what the reader sees.
-    private static bool IsUnsafe(char c) =>
-        char.IsControl(c) || char.GetUnicodeCategory(c) == System.Globalization.UnicodeCategory.Format;
+    // Control and format characters (bidirectional overrides, tags) and line or paragraph
+    // separators change what the reader sees without being visible themselves.
+    private static bool IsUnsafe(System.Text.Rune rune) => System.Text.Rune.GetUnicodeCategory(rune) is
+        System.Globalization.UnicodeCategory.Control or System.Globalization.UnicodeCategory.Format
+        or System.Globalization.UnicodeCategory.LineSeparator or System.Globalization.UnicodeCategory.ParagraphSeparator;
 
     private int WriteFailure(DiagnosticApplicationFrameResult result, bool json)
     {

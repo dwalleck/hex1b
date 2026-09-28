@@ -89,6 +89,9 @@ public class SurfaceRenderContext : Hex1bRenderContext
     /// </summary>
     internal Diagnostics.Hex1bMetrics? Metrics { get; init; }
 
+    /// <summary>Whether children record their composite clip for application-frame diagnostics.</summary>
+    internal bool RecordsCompositeClips { get; init; }
+
     /// <summary>
     /// Optional surface pool for reusing temporary surfaces during rendering.
     /// </summary>
@@ -968,6 +971,11 @@ public class SurfaceRenderContext : Hex1bRenderContext
     public override void RenderChild(Hex1bNode child)
     {
         if (child == null) return;
+
+        // Every path below draws the child within this clip (the current provider chain, or this
+        // surface when there is none); diagnostics report it as what the child can show.
+        if (RecordsCompositeClips)
+            child.DiagCompositeClip = GetEffectiveCurrentClipRect();
         
         // If caching is disabled, render directly into this surface
         // UNLESS there's a layout provider requiring clipping (e.g., ScrollPanel viewport)
@@ -1008,6 +1016,7 @@ public class SurfaceRenderContext : Hex1bRenderContext
                         MouseY = MouseY,
                         CellMetrics = CellMetrics,
                         Metrics = Metrics,
+                        RecordsCompositeClips = RecordsCompositeClips,
                         SurfacePool = pool,
                         _capabilities = _capabilities,
                         _kgpRegistry = _kgpRegistry,
@@ -1185,6 +1194,7 @@ public class SurfaceRenderContext : Hex1bRenderContext
                 MouseY = MouseY,
                 CellMetrics = CellMetrics,  // Propagate cell metrics for sixel sizing
                 Metrics = Metrics,
+                RecordsCompositeClips = RecordsCompositeClips,
                 SurfacePool = SurfacePool, // Propagate the pool so descendants (EffectPanel temp surfaces, nested RenderChild surfaces) reuse buffers instead of falling back to `new Surface`.
                 _capabilities = _capabilities,
                 _kgpRegistry = _kgpRegistry,
