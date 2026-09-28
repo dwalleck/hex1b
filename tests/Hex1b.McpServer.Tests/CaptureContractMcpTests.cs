@@ -126,6 +126,49 @@ public class CaptureContractMcpTests : McpServerTestBase
     }
 
     [TestMethod]
+    public async Task CaptureTerminalScreen_ReportsModelSequenceAndSyncDisclosure()
+    {
+        await using var terminal = await StartAttachedAppAsync();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var attached = await ConnectAttachedAsync(client);
+        var local = await StartLocalSessionAsync(client);
+        var engine = new TerminalDiagnostics(terminal, "McpAttached");
+        try
+        {
+            var staticCapture = (await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = attached })).GetProperty("capture");
+            Assert.AreEqual(engine.Capture(new DiagnosticCaptureRequest()).Identity!.ModelSequence,
+                staticCapture.GetProperty("identity").GetProperty("modelSequence").GetInt64(),
+                "MCP and the in-process engine disagree on a static model");
+
+            terminal.ApplyTokens(AnsiTokenizer.Tokenize("\x1b[?2026h"));
+            var enginePending = engine.Capture(new DiagnosticCaptureRequest());
+            var pending = (await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = attached })).GetProperty("capture");
+            Assert.IsTrue(pending.TryGetProperty("synchronizedUpdate", out var sync), "missing synchronizedUpdate");
+            Assert.IsTrue(sync.GetProperty("active").GetBoolean(), "MCP did not disclose the pending synchronized update");
+            Assert.AreEqual(enginePending.SynchronizedUpdate!.StartedAtSequence, sync.GetProperty("startedAtSequence").GetInt64());
+
+            var beforeOutput = (await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = local }))
+                .GetProperty("capture").GetProperty("identity").GetProperty("modelSequence").GetInt64();
+            await CallAsync(client, "send_terminal_input", new()
+            {
+                ["sessionId"] = local,
+                ["text"] = OperatingSystem.IsWindows() ? "Write-Host ('SEQ' + 'OUT')\r" : "echo SEQ''OUT\r"
+            });
+            var wait = await CallAsync(client, "wait_for_terminal_text", new() { ["sessionId"] = local, ["text"] = "SEQOUT", ["timeoutSeconds"] = 10 });
+            Assert.IsTrue(wait.GetProperty("found").GetBoolean(), wait.ToString());
+            var localCapture = (await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = local })).GetProperty("capture");
+            Assert.IsTrue(localCapture.GetProperty("identity").GetProperty("modelSequence").GetInt64() > beforeOutput,
+                "PTY output reached the local session's model without advancing its sequence");
+            Assert.IsTrue(localCapture.TryGetProperty("synchronizedUpdate", out _), "missing synchronizedUpdate for the local session");
+        }
+        finally
+        {
+            await CallAsync(client, "remove_session", new() { ["sessionId"] = local });
+        }
+    }
+
+    [TestMethod]
     public async Task CaptureHex1bTerminal_SavesStyledContentAndReturnsContractMetadata()
     {
         await using var terminal = await StartAttachedAppAsync();

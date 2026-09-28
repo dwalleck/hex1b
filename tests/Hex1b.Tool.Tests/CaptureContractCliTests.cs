@@ -93,6 +93,9 @@ public class CaptureContractCliTests
             Assert.AreEqual(config.Command, root.GetProperty("identity").GetProperty("applicationName").GetString());
             AssertUnavailable(root, "identity.applicationFrame", "not a Hex1b application");
             AssertUnavailable(root, "history.availableRows", "not configured");
+            Assert.IsTrue(root.GetProperty("identity").GetProperty("modelSequence").GetInt64() > 0,
+                "PTY output reached the hosted model without advancing its sequence");
+            Assert.IsFalse(root.GetProperty("synchronizedUpdate").GetProperty("active").GetBoolean());
 
             using var model = ApplyToModel(root.GetProperty("content").GetString()!, 40, 6);
             var cell = FindCell(model, "LOCALGREEN");
@@ -108,6 +111,37 @@ public class CaptureContractCliTests
         {
             await cts.CancelAsync();
             try { await host; } catch (OperationCanceledException) { }
+        }
+    }
+
+    [TestMethod]
+    public async Task Screenshot_ReportsModelSequenceAndSyncDisclosure()
+    {
+        await using var target = await StartAttachedAppAsync();
+        var engine = new TerminalDiagnostics(target, "CliAttached");
+
+        var (staticExit, staticOut, staticErr) = await RunCliAsync("capture", "screenshot", Pid, "--json");
+        var engineStatic = engine.Capture(new DiagnosticCaptureRequest());
+
+        Assert.AreEqual(0, staticExit, staticErr);
+        using (var json = JsonDocument.Parse(staticOut))
+        {
+            Assert.AreEqual(engineStatic.Identity!.ModelSequence,
+                json.RootElement.GetProperty("identity").GetProperty("modelSequence").GetInt64(),
+                "CLI and the in-process engine disagree on a static model");
+            Assert.IsFalse(json.RootElement.GetProperty("synchronizedUpdate").GetProperty("active").GetBoolean());
+        }
+
+        target.ApplyTokens(AnsiTokenizer.Tokenize("\x1b[?2026h"));
+        var enginePending = engine.Capture(new DiagnosticCaptureRequest());
+        var (pendingExit, pendingOut, pendingErr) = await RunCliAsync("capture", "screenshot", Pid, "--json");
+
+        Assert.AreEqual(0, pendingExit, pendingErr);
+        using (var json = JsonDocument.Parse(pendingOut))
+        {
+            Assert.IsTrue(json.RootElement.TryGetProperty("synchronizedUpdate", out var sync), "missing synchronizedUpdate");
+            Assert.IsTrue(sync.GetProperty("active").GetBoolean(), "CLI did not disclose the pending synchronized update");
+            Assert.AreEqual(enginePending.SynchronizedUpdate!.StartedAtSequence, sync.GetProperty("startedAtSequence").GetInt64());
         }
     }
 
