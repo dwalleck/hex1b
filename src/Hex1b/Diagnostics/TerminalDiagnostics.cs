@@ -767,7 +767,8 @@ public sealed class TerminalDiagnostics
         var sources = new Diagnostics.Cases.CaseSources(
             _terminal.InputMilestones,
             _terminal.Workload as Hex1bAppWorkloadAdapter,
-            _terminal.NativeDelivery);
+            _terminal.NativeDelivery,
+            _terminal.StopDiagnosticCaseWithCheckpoint);
         Diagnostics.Cases.DiagnosticCaseRecorder.BeforeArmForTesting.Value?.Invoke();
         var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase((fresh, unsupported, configuration) =>
             new Diagnostics.Cases.DiagnosticCaseRecorder(new DiagnosticCaseManifest
@@ -829,6 +830,42 @@ public sealed class TerminalDiagnostics
         await recorder.StopAsync(DiagnosticCaseStopReason.Requested).WaitAsync(cancellationToken).ConfigureAwait(false);
         return recorder.Describe();
     }
+
+    /// <summary>
+    /// Marks a boundary in the active case: a checkpoint of the model's state (with <c>reapplication-data</c>;
+    /// otherwise the boundary only) at the current model sequence. It never waits for the case's writer.
+    /// </summary>
+    /// <param name="label">
+    /// A label a re-application can target: 1 to 64 letters, digits, <c>.</c>, <c>_</c>, <c>:</c> or <c>-</c>,
+    /// other than <c>stop</c>. Absent, the mark is labelled <c>mark-</c> and its ordinal.
+    /// </param>
+    public DiagnosticCaseMarkResult MarkCase(string? label = null)
+    {
+        if (label is not null && !IsCaseLabel(label))
+        {
+            return new DiagnosticCaseMarkResult
+            {
+                Outcome = DiagnosticOutcome.InvalidRequest,
+                Problem = new DiagnosticProblem
+                {
+                    Code = "invalid-label",
+                    Message = "label must be 1 to 64 letters, digits, '.', '_', ':' or '-', and not 'stop'.",
+                },
+            };
+        }
+
+        return _terminal.DiagnosticCase is { } recorder
+            ? _terminal.MarkDiagnosticCase(recorder, label)
+            : new DiagnosticCaseMarkResult
+            {
+                Outcome = DiagnosticOutcome.Unavailable,
+                Problem = new DiagnosticProblem { Code = "no-active-case", Message = "No case is recording this terminal." },
+            };
+    }
+
+    /// <summary>Whether a mark label is valid; shared by the engine and its clients.</summary>
+    internal static bool IsCaseLabel(string label) =>
+        label.Length is >= 1 and <= 64 && label != "stop" && label.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or ':' or '-');
 
     /// <summary>Reports the active case's state, bounds, progress and per-stream counts.</summary>
     public DiagnosticCaseResult GetCaseStatus() =>

@@ -2,10 +2,11 @@ namespace Hex1b.Diagnostics.Cases;
 
 /// <summary>
 /// The terminal-side sources a case reads besides the model: the input tracker it observes, the
-/// application adapter whose published frames it reads, and the native delivery ring it pulls from.
-/// Each may be absent.
+/// application adapter whose published frames it reads, the native delivery ring it pulls from, and the
+/// terminal's stop, which takes the stop checkpoint in the same hold of the model lock. Each may be absent.
 /// </summary>
-internal sealed record CaseSources(InputMilestoneTracker? Input, Hex1bAppWorkloadAdapter? Application, NativeDeliveryRecorder? Delivery)
+internal sealed record CaseSources(InputMilestoneTracker? Input, Hex1bAppWorkloadAdapter? Application, NativeDeliveryRecorder? Delivery,
+    Action<DiagnosticCaseRecorder, DiagnosticCaseStopReason>? StopWithCheckpoint = null)
 {
     // Read when a frame is published, not at start: a case started at construction precedes the app's
     // registration, and a flow swaps the registered app per step.

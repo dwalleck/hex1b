@@ -18,7 +18,7 @@ public sealed class ConsolePresentationAdapter :
     IGeometryGatedPresentationAdapter,
     IObservableGatedPresentation,
     ITerminalReflowProvider,
-    IInternalTerminalReflowProvider,
+    IInternalTerminalReflowProvider, IReflowStrategySource,
     ICursorPositionSource,
     IFlowTerminalHostProfileSource,
     IFlowCurrentGeometrySource
@@ -269,6 +269,8 @@ public sealed class ConsolePresentationAdapter :
 
     /// <inheritdoc/>
     public ReflowResult Reflow(ReflowContext context) => _reflowStrategy.Reflow(context);
+
+    ITerminalReflowProvider IReflowStrategySource.ReflowStrategy => _reflowStrategy;
 
     bool IInternalTerminalReflowProvider.TryReflowWithAnchors(
         ReflowContext context,

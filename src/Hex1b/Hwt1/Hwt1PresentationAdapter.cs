@@ -77,7 +77,7 @@ namespace Hex1b;
 /// </remarks>
 public sealed class Hwt1PresentationAdapter :
     ICellImpactAwarePresentationAdapter, ITerminalLifecycleAwarePresentationAdapter,
-    ITerminalReflowProvider, IInternalTerminalReflowProvider
+    ITerminalReflowProvider, IInternalTerminalReflowProvider, IReflowStrategySource
 {
     private readonly Channel<bool> _dirty = Channel.CreateBounded<bool>(
         new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite });
@@ -157,6 +157,8 @@ public sealed class Hwt1PresentationAdapter :
 
     /// <inheritdoc/>
     public ReflowResult Reflow(ReflowContext context) => _reflowStrategy.Reflow(context);
+
+    ITerminalReflowProvider IReflowStrategySource.ReflowStrategy => _reflowStrategy;
 
     bool IInternalTerminalReflowProvider.TryReflowWithAnchors(
         ReflowContext context,

@@ -37,7 +37,6 @@ public sealed partial class Hex1bTerminal
 
     private void CaptureCaseConfiguration(Hex1bTerminalOptions options)
     {
-        var reflow = _presentation as Reflow.ITerminalReflowProvider;
         _caseConfiguration = new DiagnosticCaseModelConfiguration
         {
             Width = _width,
@@ -46,13 +45,12 @@ public sealed partial class Hex1bTerminal
             CommandMarkHistoryCapacity = _commandMarkHistoryCapacity,
             CustomMarkerLimit = _customMarkerLimit,
             EscapeSequenceTimeoutMs = _escapeTimeout.TotalMilliseconds,
-            ReflowEnabled = reflow is { ReflowEnabled: true },
-            ReflowProvider = reflow is { ReflowEnabled: true } ? reflow.GetType().FullName : null,
+            ReflowEnabled = _presentation is Reflow.ITerminalReflowProvider { ReflowEnabled: true },
+            ReflowStrategy = CaseConfiguration.ReflowStrategyId(_presentation),
             Presentation = _presentation.GetType().FullName ?? "",
             Workload = _workload.GetType().FullName ?? "",
-            Capabilities = _presentation.Capabilities.ToString(),
-            // The Sixel policy record carries every per-image limit; the per-screen byte budget is separate.
-            Graphics = $"{options.CreateSixelPolicy()} MaximumRetainedBytesPerScreen={options.Graphics.MaximumRetainedBytesPerScreen}",
+            Capabilities = CaseConfiguration.Capabilities(_presentation.Capabilities),
+            Graphics = CaseConfiguration.Graphics(options.Graphics),
         };
     }
 
@@ -78,6 +76,82 @@ public sealed partial class Hex1bTerminal
             InputMilestones?.SetStreamObserver(recorder);
             Volatile.Write(ref _diagnosticCase, recorder);
             return (recorder, null, null);
+        }
+    }
+
+    /// <summary>
+    /// Stops a recording case in one hold of the model lock, with its stop checkpoint: no model event falls
+    /// between the checkpoint and the stop. The case calls this for every stop but a collector failure.
+    /// </summary>
+    internal void StopDiagnosticCaseWithCheckpoint(DiagnosticCaseRecorder recorder, DiagnosticCaseStopReason reason)
+    {
+        lock (_bufferLock)
+        {
+            if (recorder.IsRecording)
+            {
+                var (state, milliseconds, problem) = TakeCaseCheckpointUnsafe(recorder);
+                recorder.RecordStopCheckpoint(_modelSequence, state, milliseconds, problem);
+            }
+            recorder.StopRecording(reason);
+        }
+    }
+
+    /// <summary>
+    /// Marks a boundary in a recording case: a checkpoint at the current model sequence, taken between two
+    /// model events. At most <see cref="DiagnosticCaseRecorder.MaxPendingMarks"/> marks await the writer; a
+    /// mark beyond is refused before any state is taken.
+    /// </summary>
+    internal DiagnosticCaseMarkResult MarkDiagnosticCase(DiagnosticCaseRecorder recorder, string? label)
+    {
+        if (!recorder.IsRecording)
+            return MarkProblem("no-active-case", "No case is recording this terminal.");
+        if (!recorder.TryReserveMark())
+            return MarkProblem("busy", $"{DiagnosticCaseRecorder.MaxPendingMarks} marks already await the case's writer.") with { CaseId = recorder.CaseId };
+        lock (_bufferLock)
+        {
+            if (!recorder.IsRecording)
+            {
+                recorder.ReleaseMark();
+                return MarkProblem("no-active-case", "No case is recording this terminal.");
+            }
+
+            DiagnosticCaseRecorder.BeforeMarkCaptureForTesting.Value?.Invoke();
+            var (state, milliseconds, problem) = TakeCaseCheckpointUnsafe(recorder);
+            DiagnosticCaseRecorder.AfterMarkCaptureForTesting.Value?.Invoke();
+            var (ordinal, name) = recorder.RecordMark(label, _modelSequence, state, milliseconds, problem);
+            return new DiagnosticCaseMarkResult
+            {
+                Outcome = DiagnosticOutcome.Captured,
+                CaseId = recorder.CaseId,
+                Label = name,
+                CheckpointOrdinal = ordinal,
+                ModelSequence = _modelSequence,
+                StateRecorded = state is not null,
+            };
+        }
+    }
+
+    private static DiagnosticCaseMarkResult MarkProblem(string code, string message) => new()
+    {
+        Outcome = DiagnosticOutcome.Unavailable,
+        Problem = new DiagnosticProblem { Code = code, Message = message },
+    };
+
+    // Must hold _bufferLock. The state only with reapplication-data; a projection that fails leaves the
+    // boundary without state rather than failing the stop or the mark.
+    private (DiagnosticModelState? State, double? Milliseconds, string? Problem) TakeCaseCheckpointUnsafe(DiagnosticCaseRecorder recorder)
+    {
+        if (!recorder.IncludeModelPayloads)
+            return (null, null, "requires reapplication-data");
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            var state = CaptureModelState();
+            return (state, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds, null);
+        }
+        catch (Exception error)
+        {
+            return (null, null, DiagnosticCaseRecorder.Bounded($"capture-failed: {error.GetType().Name}: {error.Message}"));
         }
     }
 

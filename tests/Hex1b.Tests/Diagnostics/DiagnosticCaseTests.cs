@@ -12,7 +12,7 @@ namespace Hex1b.Tests.Diagnostics;
 /// stored owner-only, with a checkpoint that is complete only for a fresh model.
 /// </summary>
 [TestClass]
-public class DiagnosticCaseTests
+public partial class DiagnosticCaseTests
 {
     private const UnixFileMode OwnerDirectory = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
     private const UnixFileMode OwnerFile = UnixFileMode.UserRead | UnixFileMode.UserWrite;
@@ -803,8 +803,22 @@ public class DiagnosticCaseTests
         var broken = Path.Combine(root.Path, "broken");
         Directory.CreateDirectory(broken);
         Assert.AreEqual("invalid-artifact", DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = broken }).Problem?.Code);
-        File.WriteAllText(Path.Combine(broken, "manifest.json"), File.ReadAllText(Path.Combine(stopped.Path!, "manifest.json")).Replace("\"formatVersion\":1", "\"formatVersion\":2"));
+        File.WriteAllText(Path.Combine(broken, "manifest.json"), File.ReadAllText(Path.Combine(stopped.Path!, "manifest.json")).Replace("\"formatVersion\":2", "\"formatVersion\":3"));
         Assert.AreEqual("unsupported-format", DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = broken }).Problem?.Code);
+
+        // A format 1 manifest (ticket 07: configuration strings) is still inspected, its strings dropped.
+        var legacy = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Path.Combine(stopped.Path!, "manifest.json")))!;
+        legacy["formatVersion"] = 1;
+        var legacyConfiguration = legacy["checkpoint"]!["configuration"]!.AsObject();
+        legacyConfiguration.Remove("reflowStrategy");
+        legacyConfiguration["capabilities"] = "TerminalCapabilities { SupportsMouse = True }";
+        legacyConfiguration["graphics"] = "SixelCompatibilityPolicy { }";
+        legacyConfiguration["reflowProvider"] = null;
+        File.WriteAllText(Path.Combine(broken, "manifest.json"), legacy.ToJsonString());
+        var legacyInspection = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = broken });
+        Assert.AreEqual(DiagnosticOutcome.Captured, legacyInspection.Outcome, legacyInspection.Problem?.Message);
+        Assert.AreEqual(1, legacyInspection.Manifest!.FormatVersion);
+        Assert.AreEqual("unrecorded", legacyInspection.Manifest.Checkpoint.Configuration!.ReflowStrategy);
     }
 
     /// <summary>A diagnostics-enabled Hex1b application on a headless terminal, with a focused editor.</summary>

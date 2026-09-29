@@ -71,6 +71,21 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// <summary>An exception the writer's disposal throws, taken from the arming flow while a test has set it.</summary>
     internal static readonly AsyncLocal<Exception?> WriterDisposeFaultForTesting = new();
 
+    /// <summary>
+    /// Runs on the marking thread inside the model lock, right after a mark took its state, while a test has
+    /// set it (to compare the mark with the model in the same locked section).
+    /// </summary>
+    internal static readonly AsyncLocal<Action?> AfterMarkCaptureForTesting = new();
+
+    /// <summary>
+    /// Runs on the marking thread inside the model lock, before the mark takes its state, while a test has set
+    /// it (a test can change the model there, re-entering the lock, to show the state is taken in that hold).
+    /// </summary>
+    internal static readonly AsyncLocal<Action?> BeforeMarkCaptureForTesting = new();
+
+    /// <summary>At most this many marks await the writer; a mark beyond is refused (design approval item 2).</summary>
+    internal const int MaxPendingMarks = 64;
+
     /// <summary>A shorter drain bound for tests, taken from the arming flow while a test has set it.</summary>
     internal static readonly AsyncLocal<TimeSpan?> DrainTimeoutForTesting = new();
 
@@ -160,6 +175,19 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     // Set when a stop gave up waiting for the writer: whatever it has not written is declared missing.
     private int _drainAbandoned;
     private ITimer? _timeLimit;
+
+    // Checkpoints taken and not yet written: marks in the order taken, and at most one stop checkpoint. Held
+    // outside the queue, so overload cannot drop them; each is written after the model events before it.
+    private readonly System.Collections.Concurrent.ConcurrentQueue<PendingCheckpoint> _checkpoints = new();
+    private PendingCheckpoint? _stopCheckpoint;
+    private bool _stopCheckpointSettled;
+    // Marks reserved or awaiting the writer; bounded, and reserved before any state is taken.
+    private int _pendingMarks;
+    private long _checkpointsTaken;
+    private long _checkpointsWritten;
+    private long _checkpointsDropped;
+
+    private readonly record struct PendingCheckpoint(long ModelSequence, DiagnosticCaseCheckpointEvent Checkpoint);
 
     // Streams that failed stop recording; their failure is written outside the queue.
     private readonly bool[] _failed = new bool[StreamCount];
@@ -429,8 +457,86 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         }
     }
 
-    /// <summary>Asks the case to stop without waiting; the first reason wins.</summary>
+    /// <summary>Reserves a place for a mark; false when <see cref="MaxPendingMarks"/> already await the writer.</summary>
+    internal bool TryReserveMark()
+    {
+        while (true)
+        {
+            var pending = Volatile.Read(ref _pendingMarks);
+            if (pending >= MaxPendingMarks)
+                return false;
+            if (Interlocked.CompareExchange(ref _pendingMarks, pending + 1, pending) == pending)
+                return true;
+        }
+    }
+
+    /// <summary>Returns a reservation that recorded no mark.</summary>
+    internal void ReleaseMark() => Interlocked.Decrement(ref _pendingMarks);
+
+    /// <summary>
+    /// Records a reserved mark's checkpoint. The caller holds the model lock, so every model event before it
+    /// has been offered, and the case is recording. Returns its ordinal and label.
+    /// </summary>
+    internal (long Ordinal, string Label) RecordMark(string? label, long modelSequence, DiagnosticModelState? state,
+        double? milliseconds, string? reason)
+    {
+        var ordinal = Interlocked.Increment(ref _checkpointsTaken);
+        var name = label ?? $"mark-{ordinal}";
+        _checkpoints.Enqueue(new PendingCheckpoint(modelSequence, Checkpoint(ordinal, name, "mark", state, milliseconds, reason)));
+        if (_signal.CurrentCount == 0)
+            _signal.Release();
+        return (ordinal, name);
+    }
+
+    /// <summary>
+    /// Records the stop checkpoint. The caller holds the model lock and stops the case in the same hold, so
+    /// the checkpoint is the model's state at the stop; only the first is kept.
+    /// </summary>
+    internal void RecordStopCheckpoint(long modelSequence, DiagnosticModelState? state, double? milliseconds, string? reason)
+    {
+        if (_stopCheckpoint is not null)
+            return;
+        _stopCheckpoint = new PendingCheckpoint(modelSequence,
+            Checkpoint(Interlocked.Increment(ref _checkpointsTaken), "stop", "stop", state, milliseconds, reason));
+    }
+
+    private static DiagnosticCaseCheckpointEvent Checkpoint(long ordinal, string label, string trigger, DiagnosticModelState? state,
+        double? milliseconds, string? reason) => new()
+        {
+            Ordinal = ordinal,
+            Label = label,
+            Trigger = trigger,
+            Status = state is null ? "unavailable" : "recorded",
+            Reason = state is null ? reason ?? "unavailable" : null,
+            CaptureMilliseconds = state is null ? null : milliseconds,
+            State = state,
+        };
+
+    /// <summary>
+    /// Asks the case to stop without waiting; the first reason wins. While recording, the terminal stops it
+    /// in one hold of the model lock with its stop checkpoint (a collector failure takes none).
+    /// </summary>
     internal void RequestStop(DiagnosticCaseStopReason reason)
+    {
+        if (reason != DiagnosticCaseStopReason.CollectorFailed && IsRecording && _sources.StopWithCheckpoint is { } stop)
+        {
+            try
+            {
+                stop(this, reason);
+            }
+            finally
+            {
+                // The callback stops the case; this is a no-op then, and stops it if the callback failed first.
+                StopRecording(reason);
+            }
+            return;
+        }
+
+        StopRecording(reason);
+    }
+
+    /// <summary>Stops recording: the first reason wins. The terminal's stop callback calls this under the model lock.</summary>
+    internal void StopRecording(DiagnosticCaseStopReason reason)
     {
         Interlocked.CompareExchange(ref _stopReason, (int)reason, -1);
         // Marked before the state changes, so a writer that sees the stop always sees the mark (first mark wins).
@@ -475,6 +581,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             {
                 _writerGate?.Wait();
                 var stopping = Volatile.Read(ref _state) != Recording;
+                // Checkpoints taken before this pass: their model events were offered before them, so they are
+                // in the queue drained below (or declared lost) and precede them in the artifact.
+                var readyCheckpoints = _checkpoints.Count;
                 // Loss and failures first: they do not depend on the queue draining.
                 WriteLoss(final: false);
                 WriteStreamFailures();
@@ -487,7 +596,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 }
 
                 var drained = DrainQueue();
-                if (!drained || !PullDelivery())
+                if (!drained || !PullDelivery() || !WriteCheckpoints(readyCheckpoints, EventLimit))
                 {
                     // The size bound: the case ends, and what it could not write is missing, delivery records
                     // the terminal made before the stop included.
@@ -624,6 +733,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         WriteIntervalEndIfPending(long.MaxValue);
         WriteLoss(final: true);
         WriteStreamFailures();
+        WriteRemainingCheckpoints();
         // Missing ranges that did not fit under the size bound: one range of unknown extent per stream. Their
         // counts are declared only once the summary is written; a summary that fails leaves them unaccounted.
         for (var index = 0; index < StreamCount; index++)
@@ -763,7 +873,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     }
 
     // Case records are numbered by the writer alone, and only when written.
-    private bool AppendCase(string kind, long? modelSequence, DiagnosticCaseRecord record, long limit)
+    private bool AppendCase(string kind, long? modelSequence, DiagnosticCaseRecord? record, long limit,
+        DiagnosticCaseCheckpointEvent? checkpoint = null)
     {
         var ordinal = _ordinals[(int)CaseStream.Case] + 1;
         if (!Append(CaseStream.Case, new DiagnosticCaseEvent
@@ -774,10 +885,73 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             Kind = kind,
             ModelSequence = modelSequence,
             Record = record,
+            Checkpoint = checkpoint,
         }, limit))
             return false;
         _ordinals[(int)CaseStream.Case] = ordinal;
         return true;
+    }
+
+    // Writes up to `count` pending marks, oldest first; false when one could not be written at all (the case
+    // is then at its size bound, and the rest are written or declared as it closes).
+    private bool WriteCheckpoints(int count, long limit)
+    {
+        for (var i = 0; i < count && _checkpoints.TryPeek(out var pending); i++)
+        {
+            if (!WriteCheckpoint(pending, limit))
+                return false;
+            _checkpoints.TryDequeue(out _);
+            ReleaseMark();
+        }
+        return true;
+    }
+
+    // A checkpoint whose state does not fit is written without it (status missing, reason size-limit), so the
+    // boundary stays in the artifact; false when not even that fits.
+    private bool WriteCheckpoint(in PendingCheckpoint pending, long limit)
+    {
+        var written = AppendCase("checkpoint", pending.ModelSequence, null, limit, pending.Checkpoint)
+            || (pending.Checkpoint.State is not null
+                && AppendCase("checkpoint", pending.ModelSequence, null, limit,
+                    pending.Checkpoint with { Status = "missing", Reason = "size-limit", CaptureMilliseconds = null, State = null }));
+        _writer.TrimBuffer();
+        if (written)
+            Interlocked.Increment(ref _checkpointsWritten);
+        return written;
+    }
+
+    // As the case closes: every mark still pending, then the stop checkpoint. Those that cannot be written at
+    // all are declared missing as ranges of checkpoint ordinals; a range that fails leaves them unaccounted.
+    private void WriteRemainingCheckpoints()
+    {
+        var unwritten = new List<long>();
+        while (_checkpoints.TryDequeue(out var pending))
+        {
+            if (!WriteCheckpoint(pending, RangeLimit))
+                unwritten.Add(pending.Checkpoint.Ordinal);
+            ReleaseMark();
+        }
+
+        if (!_stopCheckpointSettled && _stopCheckpoint is { } stop)
+        {
+            _stopCheckpointSettled = true;
+            if (!WriteCheckpoint(stop, RangeLimit))
+                unwritten.Add(stop.Checkpoint.Ordinal);
+        }
+
+        unwritten.Sort();
+        for (var start = 0; start < unwritten.Count;)
+        {
+            var end = start;
+            while (end + 1 < unwritten.Count && unwritten[end + 1] == unwritten[end] + 1)
+                end++;
+            var from = unwritten[start];
+            var to = unwritten[end];
+            if (AppendCase("missing", null, new DiagnosticCaseRecord { Stream = "checkpoint", FromOrdinal = from, ToOrdinal = to, Reason = "size-limit" },
+                    ClosingLimit))
+                Interlocked.Add(ref _checkpointsDropped, to - from + 1);
+            start = end + 1;
+        }
     }
 
     // Writes the interval end before the first model event at or after it (or at the end of the case).
@@ -890,6 +1064,15 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         LastCaseSequence = Volatile.Read(ref _lastWritten) is var last and >= 0 ? last : null,
         BytesWritten = _writer.BytesWritten,
         Streams = DescribeStreams(declaredOnly: true),
+        Checkpoints = DescribeCheckpoints(),
+    };
+
+    private DiagnosticCaseStreamStatus DescribeCheckpoints() => new()
+    {
+        Stream = "checkpoint",
+        Offered = Interlocked.Read(ref _checkpointsTaken),
+        Written = Interlocked.Read(ref _checkpointsWritten),
+        Dropped = Interlocked.Read(ref _checkpointsDropped),
     };
 
     // Status reports every loss as it happens; the completion only loss whose range the artifact declares.
@@ -935,6 +1118,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             ElapsedSeconds = ((end ?? _timeProvider.GetUtcNow()) - Manifest.StartedAt).TotalSeconds,
             BytesWritten = _writer.BytesWritten,
             Streams = DescribeStreams(),
+            Checkpoints = DescribeCheckpoints(),
             StopReason = state == Recording || reason < 0 ? null : (DiagnosticCaseStopReason)reason,
         };
     }

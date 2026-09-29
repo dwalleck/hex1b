@@ -67,6 +67,10 @@ public sealed record DiagnosticCaseResult
     [JsonPropertyName("streams")]
     public IReadOnlyList<DiagnosticCaseStreamStatus> Streams { get; init; } = [];
 
+    /// <summary>Checkpoints taken, written and declared missing so far.</summary>
+    [JsonPropertyName("checkpoints")]
+    public DiagnosticCaseStreamStatus? Checkpoints { get; init; }
+
     /// <summary>Why the case stopped; absent while it records.</summary>
     [JsonPropertyName("stopReason")]
     public DiagnosticCaseStopReason? StopReason { get; init; }

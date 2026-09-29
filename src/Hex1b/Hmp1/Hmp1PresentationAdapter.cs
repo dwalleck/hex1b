@@ -37,7 +37,7 @@ namespace Hex1b;
 /// </para>
 /// </remarks>
 public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentationAdapter,
-    ITerminalReflowProvider, IInternalTerminalReflowProvider
+    ITerminalReflowProvider, IInternalTerminalReflowProvider, IReflowStrategySource
 {
     private readonly List<Hmp1ClientSession> _sessions = [];
     private readonly Hmp1OutputProjection _outputProjection = new();
@@ -129,6 +129,8 @@ public sealed class Hmp1PresentationAdapter : ITerminalLifecycleAwarePresentatio
 
     /// <inheritdoc/>
     public ReflowResult Reflow(ReflowContext context) => _reflowStrategy.Reflow(context);
+
+    ITerminalReflowProvider IReflowStrategySource.ReflowStrategy => _reflowStrategy;
 
     bool IInternalTerminalReflowProvider.TryReflowWithAnchors(
         ReflowContext context,

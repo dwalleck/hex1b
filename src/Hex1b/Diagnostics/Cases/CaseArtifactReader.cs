@@ -46,7 +46,7 @@ internal static class CaseArtifactReader
         {
             try
             {
-                manifest = JsonSerializer.Deserialize(File.ReadAllBytes(manifestPath), DiagnosticsJsonContext.Default.DiagnosticCaseManifest);
+                manifest = ReadManifest(File.ReadAllBytes(manifestPath));
             }
             catch (JsonException error)
             {
@@ -57,8 +57,8 @@ internal static class CaseArtifactReader
             if (manifest is null || manifest.Checkpoint is null || manifest.Streams is null || manifest.Bounds is null
                 || manifest.Streams.Any(s => s?.Stream is null))
                 return Problem(DiagnosticOutcome.Failed, "invalid-artifact", "The manifest is empty or incomplete.") with { Path = path };
-            if (manifest.FormatVersion != CaseArtifactWriter.FormatVersion)
-                return Problem(DiagnosticOutcome.Failed, "unsupported-format", $"Artifact format {manifest.FormatVersion} is not supported (expected {CaseArtifactWriter.FormatVersion}).") with { Path = path };
+            if (manifest.FormatVersion is not (CaseArtifactWriter.FormatVersion or CaseArtifactWriter.LegacyFormatVersion))
+                return Problem(DiagnosticOutcome.Failed, "unsupported-format", $"Artifact format {manifest.FormatVersion} is not supported (expected {CaseArtifactWriter.LegacyFormatVersion} or {CaseArtifactWriter.FormatVersion}).") with { Path = path };
 
             scan = Scan(System.IO.Path.Combine(path, CaseArtifactWriter.EventsFile), request.Since ?? 0, request.Limit ?? 0);
 
@@ -100,6 +100,27 @@ internal static class CaseArtifactReader
             Intervals = DescribeIntervals(manifest, completion, state, scan),
             Events = scan.Page,
         };
+    }
+
+    /// <summary>
+    /// Reads a manifest. Format 1 recorded the capabilities, graphics limits and reflow provider as
+    /// descriptive strings; they are dropped (the reflow strategy reads <c>unrecorded</c>), so the case stays
+    /// inspectable, while re-application refuses it by its format.
+    /// </summary>
+    internal static DiagnosticCaseManifest? ReadManifest(byte[] bytes)
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(bytes);
+        if (node is System.Text.Json.Nodes.JsonObject root
+            && root["formatVersion"] is System.Text.Json.Nodes.JsonValue version
+            && version.TryGetValue<int>(out var number) && number == CaseArtifactWriter.LegacyFormatVersion
+            && root["checkpoint"]?["configuration"] is System.Text.Json.Nodes.JsonObject configuration)
+        {
+            configuration.Remove("capabilities");
+            configuration.Remove("graphics");
+            configuration.Remove("reflowProvider");
+            configuration["reflowStrategy"] = "unrecorded";
+        }
+        return node?.Deserialize(DiagnosticsJsonContext.Default.DiagnosticCaseManifest);
     }
 
     private static DiagnosticCaseInspection Problem(DiagnosticOutcome outcome, string code, string message) => new()
@@ -157,8 +178,11 @@ internal static class CaseArtifactReader
             }
 
             result.LastCaseSequence = item.CaseSequence;
+            // Pages carry checkpoints without their state, which can be large; re-application reads it.
             if (limit > 0 && item.CaseSequence > since && result.Page.Count < limit)
-                result.Page.Add(item);
+                result.Page.Add(item.Checkpoint is { State: not null } checkpoint
+                    ? item with { Checkpoint = checkpoint with { State = null, StateOmitted = true } }
+                    : item);
 
             if (item.Stream == "case")
             {

@@ -31,4 +31,11 @@ public sealed record DiagnosticCaseCompletion
     /// <summary>Per-stream counts at stop.</summary>
     [JsonPropertyName("streams")]
     public IReadOnlyList<DiagnosticCaseStreamStatus> Streams { get; init; } = [];
+
+    /// <summary>
+    /// Checkpoints taken (<c>offered</c>), written as a checkpoint record (<c>written</c>, with or without
+    /// state), and declared missing by a <c>missing</c> range of stream <c>checkpoint</c> (<c>dropped</c>).
+    /// </summary>
+    [JsonPropertyName("checkpoints")]
+    public DiagnosticCaseStreamStatus? Checkpoints { get; init; }
 }

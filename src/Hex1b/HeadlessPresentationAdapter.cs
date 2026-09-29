@@ -43,7 +43,7 @@ public sealed class HeadlessPresentationAdapter :
     IHex1bTerminalPresentationAdapter,
     INonNativePresentation,
     ITerminalReflowProvider,
-    IInternalTerminalReflowProvider,
+    IInternalTerminalReflowProvider, IReflowStrategySource,
     IAsyncDisposable,
     IDisposable
 {
@@ -147,6 +147,8 @@ public sealed class HeadlessPresentationAdapter :
 
     /// <inheritdoc/>
     public ReflowResult Reflow(ReflowContext context) => _reflowStrategy.Reflow(context);
+
+    ITerminalReflowProvider IReflowStrategySource.ReflowStrategy => _reflowStrategy;
 
     bool IInternalTerminalReflowProvider.TryReflowWithAnchors(
         ReflowContext context,

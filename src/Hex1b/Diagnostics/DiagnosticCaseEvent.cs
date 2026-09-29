@@ -68,4 +68,8 @@ public sealed record DiagnosticCaseEvent
     /// <summary>A case record: an interval end or a missing range.</summary>
     [JsonPropertyName("record")]
     public DiagnosticCaseRecord? Record { get; init; }
+
+    /// <summary>A checkpoint (case records of kind <c>checkpoint</c>).</summary>
+    [JsonPropertyName("checkpoint")]
+    public DiagnosticCaseCheckpointEvent? Checkpoint { get; init; }
 }

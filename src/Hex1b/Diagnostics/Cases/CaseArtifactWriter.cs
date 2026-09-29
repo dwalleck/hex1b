@@ -11,13 +11,16 @@ namespace Hex1b.Diagnostics.Cases;
 /// </summary>
 internal sealed class CaseArtifactWriter : IDisposable
 {
-    internal const int FormatVersion = 1;
+    // Format 2 records the model configuration structurally and adds checkpoint records; format 1 cases
+    // are still inspected (their configuration strings are dropped), never re-applied.
+    internal const int FormatVersion = 2;
+    internal const int LegacyFormatVersion = 1;
     internal const string ManifestFile = "manifest.json";
     internal const string EventsFile = "events.jsonl";
     internal const string CompletionFile = "completion.json";
 
     private readonly string _directory;
-    private readonly ArrayBufferWriter<byte> _json = new(512);
+    private ArrayBufferWriter<byte> _json = new(512);
     private FileStream? _events;
     private long _bytesWritten;
 
@@ -71,6 +74,13 @@ internal sealed class CaseArtifactWriter : IDisposable
     private int _lastLineBytes;
 
     internal void Flush() => _events?.Flush();
+
+    /// <summary>Lets go of a serialization buffer a checkpoint grew, so a case does not hold it for its life.</summary>
+    internal void TrimBuffer()
+    {
+        if (_json.Capacity > 1024 * 1024)
+            _json = new ArrayBufferWriter<byte>(512);
+    }
 
     internal void WriteCompletion(DiagnosticCaseCompletion completion)
     {

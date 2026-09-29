@@ -14,6 +14,11 @@ public sealed partial class Hex1bTerminal
     /// </summary>
     internal static IReadOnlyDictionary<string, string> ModelStateFieldCoverage { get; } = BuildModelStateFieldCoverage();
 
+    // Projections taken, so a test can tell that a case takes one only at a mark or a stop.
+    private long _modelStateCaptures;
+
+    internal long ModelStateCapturesForTesting { get { lock (_bufferLock) return _modelStateCaptures; } }
+
     /// <summary>
     /// Reads the model's full text state (profile <c>text-state/1</c>) in one hold of the model lock.
     /// It never changes the model; lazily assigned text identities are left unassigned.
@@ -22,6 +27,7 @@ public sealed partial class Hex1bTerminal
     {
         lock (_bufferLock)
         {
+            _modelStateCaptures++;
             var styles = new ModelStyleTable();
             var screen = ProjectScreen(_screenBuffer, styles);
             var savedMain = _savedMainScreenBuffer is { } main ? ProjectScreen(main, styles) : null;
@@ -395,7 +401,7 @@ public sealed partial class Hex1bTerminal
             "_presentation", "_presentationFilters", "_presentationInputChannel", "_presentationOwnsResize", "_pumpFaultTcs",
             "_runCallback", "_scrollbackCallback", "_timeProvider", "_workload", "_workloadFilters",
             "_workloadInputWriteLock", "_outputBytesRead", "_trackedObjects", "_currentGraphicsImpacts",
-            "_activityRestoreBaseline", "_activityRestoreDepth", "_selectedHistoryCount",
+            "_activityRestoreBaseline", "_activityRestoreDepth", "_selectedHistoryCount", "_modelStateCaptures",
             "ActivityStateChanged", "CommandMarkAdded", "IconNameChanged", "PresentationInvalidated", "ProgressChanged",
             "ShellIntegrationChanged", "WindowTitleChanged", "WorkingDirectoryChanged");
 

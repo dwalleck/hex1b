@@ -4,7 +4,8 @@ namespace Hex1b.Diagnostics;
 
 /// <summary>
 /// The configuration that determines a fresh terminal model's state: a fresh model built with these
-/// values holds the same state (checkpoint profile <c>fresh-model/1</c>).
+/// values holds the same state (checkpoint profile <c>fresh-model/1</c>). Format 2 records every value
+/// structurally, so a model can be rebuilt from it.
 /// </summary>
 public sealed record DiagnosticCaseModelConfiguration
 {
@@ -36,9 +37,13 @@ public sealed record DiagnosticCaseModelConfiguration
     [JsonPropertyName("reflowEnabled")]
     public bool ReflowEnabled { get; init; }
 
-    /// <summary>The reflow provider type, when reflow is enabled.</summary>
-    [JsonPropertyName("reflowProvider")]
-    public string? ReflowProvider { get; init; }
+    /// <summary>
+    /// The presentation's reflow strategy (<c>none</c>, <c>kitty</c>, <c>xterm</c>, ...), whether or not reflow
+    /// is enabled: the strategy also decides whether absolute positioning clears soft wraps. A strategy
+    /// this build cannot name is <c>custom:</c> and its type.
+    /// </summary>
+    [JsonPropertyName("reflowStrategy")]
+    public string ReflowStrategy { get; init; } = "none";
 
     /// <summary>The presentation adapter type.</summary>
     [JsonPropertyName("presentation")]
@@ -50,9 +55,9 @@ public sealed record DiagnosticCaseModelConfiguration
 
     /// <summary>The presentation's terminal capabilities, which may come from the environment.</summary>
     [JsonPropertyName("capabilities")]
-    public string Capabilities { get; init; } = "";
+    public DiagnosticCaseCapabilities Capabilities { get; init; } = new();
 
     /// <summary>Graphics policy and retained-resource limits.</summary>
     [JsonPropertyName("graphics")]
-    public string Graphics { get; init; } = "";
+    public DiagnosticCaseGraphicsLimits Graphics { get; init; } = new();
 }
