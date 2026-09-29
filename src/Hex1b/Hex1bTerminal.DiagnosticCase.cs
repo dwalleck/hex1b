@@ -167,14 +167,15 @@ public sealed partial class Hex1bTerminal
     // what is left of the case. A projection that fails leaves the boundary without state rather than
     // failing the stop or the mark.
     // Returns the checkpoint's model sequence with it: the current one, or, when the checkpoint is re-entered
-    // from inside an application (a callback), the last completed one, as the boundary only.
+    // from inside an application (a callback), the boundary only, at the sequence before the application the
+    // case has not yet recorded, or at the current one when there is none.
     private (long Sequence, DiagnosticCaseRecorder.CheckpointCapture Capture) TakeCaseCheckpointUnsafe(DiagnosticCaseRecorder recorder,
         bool forSizeLimitStop)
     {
         // Inside any application (a callback's mark or stop, the lock being re-entrant) the model is half
-        // applied. The boundary is the last completed sequence while the case still holds the application
-        // unoffered, and the current one otherwise: a nested event offered it early, the case was armed
-        // inside the callback, or its model stream failed.
+        // applied. The boundary is the sequence before the application while the case has not yet recorded
+        // it (for a nested application, the outer one, itself unfinished), and the current one otherwise: a
+        // nested event recorded it early, the case was armed inside the callback, or its model stream failed.
         if (_captureApplicationDepth > 0)
             return (recorder.ApplicationInProgress ? _modelSequence - 1 : _modelSequence,
                 new(null, null, "unavailable", "mid-application: taken inside an application that had not finished", 0));
