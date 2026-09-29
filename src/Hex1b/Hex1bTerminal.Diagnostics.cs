@@ -24,6 +24,22 @@ public sealed partial class Hex1bTerminal
             InputMilestones = new Diagnostics.InputMilestoneTracker(acceptanceOnly: true);
     }
 
+    /// <summary>
+    /// The session's native delivery recorder; present only when a diagnostics engine is attached and
+    /// the presentation can report its writes.
+    /// </summary>
+    internal Diagnostics.NativeDeliveryRecorder? NativeDelivery { get; private set; }
+
+    /// <summary>
+    /// Arms native delivery recording when the presentation is observable; called when a diagnostics
+    /// engine attaches. Writes made before this are not covered.
+    /// </summary>
+    internal void EnsureNativeDeliveryRecorder()
+    {
+        if (NativeDelivery is null && _presentation is IObservableNativePresentation observable)
+            NativeDelivery = new Diagnostics.NativeDeliveryRecorder(observable.DeliveryLayer);
+    }
+
     // Counts model events: output application batches, geometry changes, and synchronized-update
     // timeout releases. Advanced and read only under _bufferLock, so a model read names exactly
     // the state it copied.

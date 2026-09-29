@@ -48,6 +48,13 @@ internal interface IConsoleDriver : IDisposable
     /// </summary>
     /// <param name="data">Data to write.</param>
     void Write(ReadOnlySpan<byte> data);
+
+    /// <summary>
+    /// Writes like <see cref="Write(ReadOnlySpan{byte})"/>, advancing <paramref name="progress"/> by the
+    /// bytes the host takes. A driver that cannot see partial progress reports none, so a failure's
+    /// accepted bytes are unknown.
+    /// </summary>
+    void Write(ReadOnlySpan<byte> data, NativeWriteProgress progress) => Write(data);
     
     /// <summary>
     /// Flush stdout.

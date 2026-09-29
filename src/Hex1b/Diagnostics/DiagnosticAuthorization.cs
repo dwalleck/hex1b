@@ -17,4 +17,7 @@ public enum DiagnosticAuthorization
 
     /// <summary>Raw keyboard input.</summary>
     RawInput,
+
+    /// <summary>Bytes a terminal wrote to its native presentation (screen output).</summary>
+    NativeOutput,
 }

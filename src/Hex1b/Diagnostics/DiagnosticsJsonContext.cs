@@ -17,6 +17,8 @@ namespace Hex1b.Diagnostics;
 [JsonSerializable(typeof(DiagnosticApplicationFrameResult))]
 [JsonSerializable(typeof(DiagnosticAcceptedInput))]
 [JsonSerializable(typeof(DiagnosticAcceptedInput[]))]
+[JsonSerializable(typeof(DiagnosticDeliveryRequest))]
+[JsonSerializable(typeof(DiagnosticDeliveryResult))]
 [JsonSerializable(typeof(string))]
 [JsonSerializable(typeof(int))]
 [JsonSerializable(typeof(bool))]

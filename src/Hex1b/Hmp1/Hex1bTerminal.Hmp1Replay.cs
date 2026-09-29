@@ -69,7 +69,8 @@ public sealed partial class Hex1bTerminal
         if (rawPassthrough && !_disposed && _presentation is not null)
         {
             var started = Stopwatch.GetTimestamp();
-            await _presentation.WriteOutputAsync(bytes, ct).ConfigureAwait(false);
+            await WritePresentationAsync(_presentation, bytes, Diagnostics.DiagnosticDeliverySource.WorkloadOutput,
+                Diagnostics.DiagnosticDeliveryPhase.BeforeModel, outputSequence: 0, ct).ConfigureAwait(false);
             _metrics.TerminalRawPassthroughDuration.Record(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
             _metrics.TerminalOutputBytes.Record(bytes.Length);
         }
@@ -171,7 +172,8 @@ public sealed partial class Hex1bTerminal
             ct.ThrowIfCancellationRequested();
             ObjectDisposedException.ThrowIf(_disposed, this);
             var filteredBytes = AnsiTokenUtf8Serializer.Serialize(filtered);
-            await _presentation.WriteOutputAsync(filteredBytes, ct).ConfigureAwait(false);
+            await WritePresentationAsync(_presentation, filteredBytes, Diagnostics.DiagnosticDeliverySource.WorkloadOutput,
+                Diagnostics.DiagnosticDeliveryPhase.AfterModel, outputSequence: 0, ct).ConfigureAwait(false);
             _metrics.TerminalOutputBytes.Record(filteredBytes.Length);
         }
     }

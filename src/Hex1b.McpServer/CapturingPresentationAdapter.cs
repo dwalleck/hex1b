@@ -5,7 +5,7 @@ namespace Hex1b.McpServer;
 /// A presentation adapter that captures output but doesn't display it anywhere.
 /// Used to enable the terminal's output pump so the screen buffer gets populated.
 /// </summary>
-internal sealed class CapturingPresentationAdapter : IHex1bTerminalPresentationAdapter
+internal sealed class CapturingPresentationAdapter : IHex1bTerminalPresentationAdapter, INonNativePresentation
 {
     private readonly TaskCompletionSource _disconnected = new();
     private int _width;

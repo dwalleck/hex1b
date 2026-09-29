@@ -16,6 +16,7 @@ namespace Hex1b;
 public sealed class ConsolePresentationAdapter :
     IHex1bTerminalPresentationAdapter,
     IGeometryGatedPresentationAdapter,
+    IObservableNativePresentation,
     ITerminalReflowProvider,
     IInternalTerminalReflowProvider,
     ICursorPositionSource,
@@ -347,15 +348,32 @@ public sealed class ConsolePresentationAdapter :
     /// <inheritdoc />
     public ValueTask WriteOutputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
     {
-        if (_disposed) return ValueTask.CompletedTask;
+        WriteCore(data, progress: null);
+        return ValueTask.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    string IObservableNativePresentation.DeliveryLayer => "console";
+
+    ValueTask<NativeWriteResult> IObservableNativePresentation.WriteObservedAsync(
+        ReadOnlyMemory<byte> data, NativeWriteProgress progress, CancellationToken ct) =>
+        ValueTask.FromResult(WriteCore(data, progress) ? NativeWriteResult.Accepted : NativeWriteResult.Refuse("presentation-disposed"));
+
+    // The one write path; false when the adapter is disposed and nothing was written.
+    private bool WriteCore(ReadOnlyMemory<byte> data, NativeWriteProgress? progress)
+    {
+        if (_disposed) return false;
 
         lock (_driverWriteSync)
         {
-            _driver.Write(data.Span);
+            if (progress is null)
+                _driver.Write(data.Span);
+            else
+                _driver.Write(data.Span, progress);
             _driver.Flush();
         }
 
-        return ValueTask.CompletedTask;
+        return true;
     }
 
     /// <summary>
@@ -375,7 +393,15 @@ public sealed class ConsolePresentationAdapter :
         ReadOnlyMemory<byte> data,
         int expectedWidth,
         int expectedHeight,
-        CancellationToken ct)
+        CancellationToken ct) =>
+        ValueTask.FromResult(WriteIfGeometryCore(data, expectedWidth, expectedHeight, progress: null));
+
+    ValueTask<NativeDeliveryOutcome> IObservableNativePresentation.WriteObservedIfGeometryAsync(
+        ReadOnlyMemory<byte> data, int expectedWidth, int expectedHeight, NativeWriteProgress progress, CancellationToken ct) =>
+        ValueTask.FromResult(WriteIfGeometryCore(data, expectedWidth, expectedHeight, progress));
+
+    private NativeDeliveryOutcome WriteIfGeometryCore(ReadOnlyMemory<byte> data, int expectedWidth, int expectedHeight,
+        NativeWriteProgress? progress)
     {
         if (_disposed)
         {
@@ -387,12 +413,15 @@ public sealed class ConsolePresentationAdapter :
             var (width, height) = _driver.GetGeometry();
             if (width != expectedWidth || height != expectedHeight)
             {
-                return ValueTask.FromResult(NativeDeliveryOutcome.GeometryChanged);
+                return NativeDeliveryOutcome.GeometryChanged;
             }
 
-            _driver.Write(data.Span);
+            if (progress is null)
+                _driver.Write(data.Span);
+            else
+                _driver.Write(data.Span, progress);
             _driver.Flush();
-            return ValueTask.FromResult(NativeDeliveryOutcome.Applied);
+            return NativeDeliveryOutcome.Applied;
         }
     }
 

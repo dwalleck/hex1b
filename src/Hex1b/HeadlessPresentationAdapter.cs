@@ -41,6 +41,7 @@ namespace Hex1b;
 /// </example>
 public sealed class HeadlessPresentationAdapter :
     IHex1bTerminalPresentationAdapter,
+    INonNativePresentation,
     ITerminalReflowProvider,
     IInternalTerminalReflowProvider,
     IAsyncDisposable,

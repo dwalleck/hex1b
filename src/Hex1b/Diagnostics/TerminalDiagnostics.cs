@@ -47,6 +47,26 @@ public sealed class TerminalDiagnostics
     /// <summary>Name of the application-frame operation.</summary>
     public const string ApplicationFrameOperation = "application-frame";
 
+    /// <summary>Operation name for the native delivery record.</summary>
+    public const string DeliveryOperation = "delivery";
+
+    /// <summary>Most delivery records one request may return.</summary>
+    internal const int MaxDeliveryRecords = NativeDeliveryRecorder.MaxRecords;
+    private const string NoNativePresentation =
+        "The terminal has no native presentation (headless or captured output), so there is no native delivery to observe.";
+    private const string DeliveryUnobservable =
+        "The terminal's presentation does not report what its writes did, so native delivery is not observable.";
+    private const string AcceptedIsNotPresentationLimitation =
+        "An accepted write means the host operating system or transport took the bytes; it is not an acknowledgment that anything was displayed.";
+    private const string FailureObservabilityLimitation =
+        "A failed write is observable only while the process survives it: closing a host terminal that is the process's controlling terminal ends the process (SIGHUP) before any write fails.";
+    private const string InProgressLimitation =
+        "A write still in progress is reported once it completes; later records wait behind it so a since-continuation never skips one.";
+    private const string DeliveryBoundsLimitation =
+        "The session keeps the most recent 4,096 records and 1 MiB of written bytes (64 KiB per record); evictions and truncation are reported.";
+    private static readonly IReadOnlyList<string> DeliveryLimitations =
+        [AcceptedIsNotPresentationLimitation, FailureObservabilityLimitation, InProgressLimitation, DeliveryBoundsLimitation, ObservationalLimitation];
+
     private const string ModelCaptureIsNotAFrame =
         "A terminal-model capture is not an application frame; the application-frame operation returns frames, acquired separately.";
     private const string FramePublicationDisabled =
@@ -79,8 +99,6 @@ public sealed class TerminalDiagnostics
         "Rendered application text can contain secrets. Editor text is withheld by default; editor-text includes the focused editor's text only.";
     private const string NoApplicationLayer =
         "The workload is not a Hex1b application, so there are no application frames.";
-    private const string NativeDeliveryUnavailable =
-        "Native delivery outcomes are not observed through the diagnostics contract.";
     private const string NativePresentationUnavailable =
         "What a native terminal host physically displayed is not observable by Hex1b.";
 
@@ -121,6 +139,7 @@ public sealed class TerminalDiagnostics
             ?? Assembly.GetEntryAssembly()?.GetName().Name
             ?? "Hex1bApp";
         _terminal.EnsureAcceptanceTracker();
+        _terminal.EnsureNativeDeliveryRecorder();
     }
 
     /// <summary>
@@ -544,6 +563,113 @@ public sealed class TerminalDiagnostics
     }
 
     /// <summary>
+    /// Returns the session's native delivery record: every write the terminal made to its presentation
+    /// since recording started, and what the presentation did with each. Never waits, and never writes
+    /// to the presentation. Target and request problems are reported through the outcome.
+    /// </summary>
+    /// <param name="request">Which records to return, and authorizations.</param>
+    public DiagnosticDeliveryResult CaptureDelivery(DiagnosticDeliveryRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var limit = request.Limit ?? MaxDeliveryRecords;
+        if (limit is < 1 or > MaxDeliveryRecords)
+            return DeliveryProblem(DiagnosticOutcome.InvalidRequest, "invalid-limit", $"limit must be 1 to {MaxDeliveryRecords}.");
+        if (request.Since is < 0)
+            return DeliveryProblem(DiagnosticOutcome.InvalidRequest, "invalid-since", "since must be zero or greater.");
+        foreach (var authorization in request.Authorizations ?? [])
+        {
+            if (!Enum.IsDefined(authorization))
+                return DeliveryProblem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", $"Unsupported authorization '{authorization}'.");
+        }
+
+        if (_terminal.IsDisposed)
+            return DeliveryProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
+        if (_terminal.NativeDelivery is not { } recorder)
+            return _terminal.PresentationAdapter is INonNativePresentation
+                ? DeliveryProblem(DiagnosticOutcome.Unavailable, "no-native-presentation", NoNativePresentation)
+                : DeliveryProblem(DiagnosticOutcome.Unavailable, "presentation-delivery-unobservable", DeliveryUnobservable);
+
+        var includeBytes = request.Authorizations?.Contains(DiagnosticAuthorization.NativeOutput) == true;
+        var startTimestamp = Stopwatch.GetTimestamp();
+        var wallClockStart = DateTimeOffset.UtcNow;
+        var snapshot = recorder.Read(request.Since ?? 0, limit, includeBytes);
+        var endTimestamp = Stopwatch.GetTimestamp();
+        var wallClockEnd = DateTimeOffset.UtcNow;
+
+        var unavailable = new List<DiagnosticUnavailableField>
+        {
+            new() { Field = "identity.modelSequence", Reason = "A delivery record is not a model observation; each record carries modelSequenceAtStart." },
+            new() { Field = "identity.applicationFrame", Reason = "Delivery records link to frames through outputSequence and frame output marks, never by timing." },
+            new() { Field = "identity.applicationInstanceId", Reason = "Delivery records are per terminal session, not per application instance." },
+        };
+        if (snapshot.Records.Any(r => r.Source == DiagnosticDeliverySource.TerminalControl))
+            unavailable.Add(new DiagnosticUnavailableField
+            {
+                Field = "records.outputSequence",
+                Reason = "Terminal-control writes carry no workload output item and no phase.",
+            });
+        if (_terminal.InputMilestones is null or { AcceptanceOnly: true })
+            unavailable.Add(new DiagnosticUnavailableField
+            {
+                Field = "records.outputSequence",
+                Reason = "The session does not track input milestones, so writes carry no output-item sequence.",
+            });
+
+        var identity = DescribeIdentity(DiagnosticLayer.NativeDelivery, modelSequence: null, applicationFrame: null,
+            applicationInstanceId: null, _terminal.PresentationAdapter is Reflow.ITerminalReflowProvider { ReflowEnabled: true },
+            new DiagnosticAcquisition
+            {
+                ClockDomain = "process-monotonic",
+                Frequency = Stopwatch.Frequency,
+                StartTimestamp = startTimestamp,
+                EndTimestamp = endTimestamp,
+                WallClockStart = wallClockStart,
+                WallClockEnd = wallClockEnd,
+            }, unavailable);
+
+        return new DiagnosticDeliveryResult
+        {
+            Outcome = DiagnosticOutcome.Captured,
+            DeliveryLayer = recorder.DeliveryLayer,
+            CoverageStartedAt = recorder.CoverageStartedAt,
+            CoverageStartTimestamp = recorder.CoverageStartTimestamp,
+            Records = snapshot.Records,
+            Totals = snapshot.Totals,
+            EvictedRecords = snapshot.EvictedRecords,
+            WritesInProgress = snapshot.WritesInProgress,
+            Identity = identity,
+            ContentCoverage =
+            [
+                includeBytes
+                    ? new DiagnosticContentCoverage
+                    {
+                        Content = DiagnosticContentClass.NativeOutput,
+                        State = DiagnosticCoverageState.Included,
+                        Reason = "Records carry their retained bytes; evicted or truncated bytes are flagged per record.",
+                    }
+                    : new DiagnosticContentCoverage
+                    {
+                        Content = DiagnosticContentClass.NativeOutput,
+                        State = DiagnosticCoverageState.Excluded,
+                        Reason = "Requires native-output authorization.",
+                    },
+            ],
+            UnavailableFields = unavailable,
+            Limitations = DeliveryLimitations,
+        };
+    }
+
+    /// <summary>
+    /// Creates a delivery result for an operation that returned no records.
+    /// </summary>
+    internal static DiagnosticDeliveryResult DeliveryProblem(DiagnosticOutcome outcome, string code, string message) => new()
+    {
+        Outcome = outcome,
+        Problem = new DiagnosticProblem { Code = code, Message = message },
+        UnavailableFields = [new DiagnosticUnavailableField { Field = "identity", Reason = "No delivery record was read." }],
+    };
+
+    /// <summary>
     /// Creates an application-frame result for an operation that produced no frame.
     /// </summary>
     internal static DiagnosticApplicationFrameResult FrameProblem(DiagnosticOutcome outcome, string code, string message) => new()
@@ -624,6 +750,14 @@ public sealed class TerminalDiagnostics
                 },
                 new DiagnosticOperationCapability
                 {
+                    Operation = DeliveryOperation,
+                    Layer = DiagnosticLayer.NativeDelivery,
+                    Timing = [ImmediateTiming],
+                    Authorizations = [DiagnosticAuthorization.NativeOutput],
+                    Limitations = DeliveryLimitations,
+                },
+                new DiagnosticOperationCapability
+                {
                     Operation = ApplicationFrameOperation,
                     Layer = DiagnosticLayer.ApplicationFrame,
                     Timing = ["latest-published"],
@@ -641,7 +775,13 @@ public sealed class TerminalDiagnostics
                     Available = frameLayer.Code is null or "no-active-application",
                     Reason = frameLayer.Reason,
                 },
-                new DiagnosticLayerCapability { Layer = DiagnosticLayer.NativeDelivery, Reason = NativeDeliveryUnavailable },
+                _terminal.NativeDelivery is { } recorder
+                    ? new DiagnosticLayerCapability { Layer = DiagnosticLayer.NativeDelivery, Available = true, Reason = $"Delivery layer: {recorder.DeliveryLayer}." }
+                    : new DiagnosticLayerCapability
+                    {
+                        Layer = DiagnosticLayer.NativeDelivery,
+                        Reason = _terminal.PresentationAdapter is INonNativePresentation ? NoNativePresentation : DeliveryUnobservable,
+                    },
                 new DiagnosticLayerCapability { Layer = DiagnosticLayer.NativePresentation, Reason = NativePresentationUnavailable },
             ],
         };

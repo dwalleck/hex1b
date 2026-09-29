@@ -561,8 +561,34 @@ internal sealed class FakeConsoleDriver : IConsoleDriver
 
     public void Write(ReadOnlySpan<byte> data)
     {
+        Interlocked.Increment(ref _writeCount);
+        if (_failure is { } failure)
+        {
+            _failure = null;
+            _written.AddRange(data[..failure.AcceptedBytes].ToArray());
+            throw failure.Error;
+        }
+
         _written.AddRange(data.ToArray());
     }
+
+    /// <summary>Writes, reporting partial progress when a failure was injected.</summary>
+    public void Write(ReadOnlySpan<byte> data, NativeWriteProgress progress)
+    {
+        if (_failure is { } failure)
+            progress.Advance(failure.AcceptedBytes);
+        Write(data);
+        progress.Advance(data.Length);
+    }
+
+    private (int AcceptedBytes, Exception Error)? _failure;
+    private int _writeCount;
+
+    /// <summary>Number of writes made to this driver.</summary>
+    public int WriteCount => Volatile.Read(ref _writeCount);
+
+    /// <summary>Makes the next write take <paramref name="acceptedBytes"/> bytes and then throw <paramref name="error"/>.</summary>
+    public void FailNextWrite(int acceptedBytes, Exception error) => _failure = (acceptedBytes, error);
 
     public void Flush()
     {

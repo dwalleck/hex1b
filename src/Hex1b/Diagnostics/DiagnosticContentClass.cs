@@ -31,4 +31,7 @@ public enum DiagnosticContentClass
 
     /// <summary>Raw keyboard input bytes sent to the target.</summary>
     RawInput,
+
+    /// <summary>Bytes a terminal wrote to its native presentation.</summary>
+    NativeOutput,
 }

@@ -1383,6 +1383,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         byte[]? pooledBuffer,
         List<AnsiToken>? pooledTokens,
         Action<List<AnsiToken>>? pooledTokensReturn,
+        long outputSequence,
         CancellationToken ct)
     {
         var adapter = _workload as Hex1bAppWorkloadAdapter
@@ -1417,8 +1418,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 }
             }
 
-            var outcome = await gated
-                .WriteOutputIfGeometryAsync(data, delivery.ExpectedWidth, delivery.ExpectedHeight, ct)
+            var outcome = await WritePresentationIfGeometryAsync(
+                    gated, data, delivery.ExpectedWidth, delivery.ExpectedHeight, outputSequence, ct)
                 .ConfigureAwait(false);
 
             if (outcome == NativeDeliveryOutcome.GeometryChanged)
@@ -1673,6 +1674,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                             pooledItemBuffer,
                             pooledItemTokens,
                             pooledItemTokensReturn,
+                            readItem.MilestoneSequence,
                             ct).ConfigureAwait(false);
                         // Handled whether presentation applied or refused it: a refused batch
                         // was composed for a superseded geometry and is recomposed.
@@ -1739,7 +1741,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     // Native/raw presentations own the original workload bytes. Forward each
                     // ordinary read before framing, decoding, filters, raster work, or snapshots.
                     var passthroughStarted = Stopwatch.GetTimestamp();
-                    await _presentation.WriteOutputAsync(data, ct);
+                    await WritePresentationAsync(_presentation, data, Diagnostics.DiagnosticDeliverySource.WorkloadOutput,
+                        Diagnostics.DiagnosticDeliveryPhase.BeforeModel, readItem.MilestoneSequence, ct);
                     _metrics.TerminalRawPassthroughDuration.Record(
                         Stopwatch.GetElapsedTime(passthroughStarted).TotalMilliseconds);
                     _metrics.TerminalOutputBytes.Record(data.Length);
@@ -1817,9 +1820,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         }
 
                         var passthroughStarted = Stopwatch.GetTimestamp();
-                        await (_presentation ?? throw new InvalidOperationException(
-                            "A model-gated delivery requires a presentation adapter."))
-                            .WriteOutputAsync(data, ct);
+                        await WritePresentationAsync(_presentation ?? throw new InvalidOperationException(
+                            "A model-gated delivery requires a presentation adapter."), data,
+                            Diagnostics.DiagnosticDeliverySource.WorkloadOutput, Diagnostics.DiagnosticDeliveryPhase.AfterModel, readItem.MilestoneSequence, ct);
                         _metrics.TerminalRawPassthroughDuration.Record(
                             Stopwatch.GetElapsedTime(passthroughStarted).TotalMilliseconds);
                         _metrics.TerminalOutputBytes.Record(data.Length);
@@ -1946,7 +1949,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                             VerifyObserversPreservedOutput(appliedTokens, filteredTokens);
 
                         var filteredBytes = Tokens.AnsiTokenUtf8Serializer.Serialize(filteredTokens);
-                        await _presentation.WriteOutputAsync(filteredBytes, ct);
+                        await WritePresentationAsync(_presentation, filteredBytes, Diagnostics.DiagnosticDeliverySource.WorkloadOutput,
+                            Diagnostics.DiagnosticDeliveryPhase.AfterModel, readItem.MilestoneSequence, ct);
                         _metrics.TerminalOutputBytes.Record(filteredBytes.Length);
                     }
                     else if (acceptedDelivery is not null)
@@ -1954,7 +1958,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         // Accepted model-gated raw output was intentionally held back before
                         // tokenization; forward the original bytes only after model application.
                         var passthroughStarted = Stopwatch.GetTimestamp();
-                        await _presentation.WriteOutputAsync(data, ct);
+                        await WritePresentationAsync(_presentation, data, Diagnostics.DiagnosticDeliverySource.WorkloadOutput,
+                            Diagnostics.DiagnosticDeliveryPhase.AfterModel, readItem.MilestoneSequence, ct);
                         _metrics.TerminalRawPassthroughDuration.Record(
                             Stopwatch.GetElapsedTime(passthroughStarted).TotalMilliseconds);
                         _metrics.TerminalOutputBytes.Record(data.Length);
@@ -8121,7 +8126,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 "\x1b[?2004l" + // Disable bracketed paste mode
                 "\x1b[?25h" +   // Show cursor
                 "\x1b[?1049l";  // Exit alternate screen
-            _presentation.WriteOutputAsync(System.Text.Encoding.UTF8.GetBytes(exitSequences), default).AsTask().GetAwaiter().GetResult();
+            WritePresentationAsync(_presentation, System.Text.Encoding.UTF8.GetBytes(exitSequences), Diagnostics.DiagnosticDeliverySource.TerminalControl,
+                phase: null, outputSequence: 0, default).AsTask().GetAwaiter().GetResult();
             _presentation.FlushAsync().AsTask().GetAwaiter().GetResult();
             
             _presentation.ExitRawModeAsync().AsTask().GetAwaiter().GetResult();
@@ -8167,7 +8173,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 "\x1b[0m" +     // Reset text attributes (prevents inverted text from leaking)
                 "\x1b[?25h" +   // Show cursor
                 "\x1b[?1049l";  // Exit alternate screen
-            await _presentation.WriteOutputAsync(System.Text.Encoding.UTF8.GetBytes(exitSequences), default);
+            await WritePresentationAsync(_presentation, System.Text.Encoding.UTF8.GetBytes(exitSequences), Diagnostics.DiagnosticDeliverySource.TerminalControl,
+                phase: null, outputSequence: 0, default);
             await _presentation.FlushAsync();
             
             // Exit raw mode before disposing
