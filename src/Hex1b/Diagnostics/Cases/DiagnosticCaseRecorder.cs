@@ -206,6 +206,19 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     private int _marksInProgress;
     // Estimated bytes of checkpoint state taken and not yet written.
     private long _pendingStateBytes;
+    private long _lastOfferedModelSequence;
+
+    /// <summary>
+    /// The last model event offered to the case: the boundary a checkpoint names when it cannot read the model
+    /// (a wedged model lock), since an application begun but not yet offered is not in the artifact.
+    /// </summary>
+    internal long LastOfferedModelSequence => Volatile.Read(ref _lastOfferedModelSequence);
+
+    /// <summary>
+    /// Whether an application has begun and not yet been offered. The caller holds the model lock: a checkpoint
+    /// taken then (re-entered from inside the application) would see it half applied.
+    /// </summary>
+    internal bool ApplicationInProgress => _application is not null;
     private long _checkpointsTaken;
     private long _checkpointsWritten;
     private long _checkpointsDropped;
@@ -338,6 +351,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         try
         {
             Offer(CaseStream.Model, kind, modelSequence, width, height, length, payload, null);
+            Volatile.Write(ref _lastOfferedModelSequence, modelSequence);
         }
         catch (Exception error)
         {

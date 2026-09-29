@@ -48,11 +48,16 @@ public sealed partial class Hex1bTerminal
     /// </summary>
     internal long EstimateModelStateJsonBytesUnsafe() => EstimateModelStateCellsUnsafe() * 24 + 4 * 1024;
 
+    // Retained rows keep the width they were written at (a resize without reflow leaves them), so history is
+    // counted row by row: O(rows), no cell read.
     private long EstimateModelStateCellsUnsafe()
     {
         var cells = (long)_width * _height * (_savedMainScreenBuffer is null ? 1 : 2);
         if (_scrollbackBuffer is { Count: > 0 } history)
-            cells += (long)history.Count * Math.Max(_width, 1);
+        {
+            for (var row = 0; row < history.Count; row++)
+                cells += history.GetEntryAt(row).Row.Cells.Length;
+        }
         return cells;
     }
 

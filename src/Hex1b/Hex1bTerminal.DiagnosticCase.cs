@@ -95,7 +95,7 @@ public sealed partial class Hex1bTerminal
             {
                 if (recorder.IsRecording)
                 {
-                    recorder.RecordStopCheckpoint(Interlocked.Read(ref _modelSequence), new DiagnosticCaseRecorder.CheckpointCapture(null, null,
+                    recorder.RecordStopCheckpoint(recorder.LastOfferedModelSequence, new DiagnosticCaseRecorder.CheckpointCapture(null, null,
                         "unavailable", $"model-lock-busy: the model lock was not free within {StopCheckpointLockTimeout.TotalSeconds:0} s", 0));
                 }
                 recorder.StopRecording(reason);
@@ -103,7 +103,10 @@ public sealed partial class Hex1bTerminal
             }
 
             if (recorder.IsRecording)
-                recorder.RecordStopCheckpoint(_modelSequence, TakeCaseCheckpointUnsafe(recorder, reason == DiagnosticCaseStopReason.SizeLimit));
+            {
+                var (sequence, capture) = TakeCaseCheckpointUnsafe(recorder, reason == DiagnosticCaseStopReason.SizeLimit);
+                recorder.RecordStopCheckpoint(sequence, capture);
+            }
             recorder.StopRecording(reason);
         }
         finally
@@ -136,16 +139,16 @@ public sealed partial class Hex1bTerminal
             }
 
             DiagnosticCaseRecorder.BeforeMarkCaptureForTesting.Value?.Invoke();
-            var capture = TakeCaseCheckpointUnsafe(recorder, forSizeLimitStop: false);
+            var (sequence, capture) = TakeCaseCheckpointUnsafe(recorder, forSizeLimitStop: false);
             DiagnosticCaseRecorder.AfterMarkCaptureForTesting.Value?.Invoke();
-            var (ordinal, name) = recorder.RecordMark(label, _modelSequence, capture);
+            var (ordinal, name) = recorder.RecordMark(label, sequence, capture);
             return new DiagnosticCaseMarkResult
             {
                 Outcome = DiagnosticOutcome.Captured,
                 CaseId = recorder.CaseId,
                 Label = name,
                 CheckpointOrdinal = ordinal,
-                ModelSequence = _modelSequence,
+                ModelSequence = sequence,
                 StateRecorded = capture.State is not null,
                 StateReason = capture.State is null ? capture.Reason : null,
             };
@@ -162,25 +165,30 @@ public sealed partial class Hex1bTerminal
     // both judged from geometry before any state is read. A size-limit stop skips a state that could not fit
     // what is left of the case. A projection that fails leaves the boundary without state rather than
     // failing the stop or the mark.
-    private DiagnosticCaseRecorder.CheckpointCapture TakeCaseCheckpointUnsafe(DiagnosticCaseRecorder recorder, bool forSizeLimitStop)
+    // Returns the checkpoint's model sequence with it: the current one, or, when the checkpoint is re-entered
+    // from inside an application (a callback), the last completed one, as the boundary only.
+    private (long Sequence, DiagnosticCaseRecorder.CheckpointCapture Capture) TakeCaseCheckpointUnsafe(DiagnosticCaseRecorder recorder,
+        bool forSizeLimitStop)
     {
+        if (recorder.ApplicationInProgress)
+            return (_modelSequence - 1, new(null, null, "unavailable", "mid-application: taken inside an application that had not finished", 0));
         if (!recorder.IncludeModelPayloads)
-            return new(null, null, "unavailable", "requires reapplication-data", 0);
+            return (_modelSequence, new(null, null, "unavailable", "requires reapplication-data", 0));
         if (forSizeLimitStop && EstimateModelStateJsonBytesUnsafe() > recorder.StopCheckpointRoom)
-            return new(null, null, "missing", "size-limit", 0);
+            return (_modelSequence, new(null, null, "missing", "size-limit", 0));
         var estimate = EstimateModelStateBytesUnsafe();
         if (!recorder.TryReserveStateBytes(estimate))
-            return new(null, null, "unavailable", "pending-state budget: the checkpoints awaiting the writer already hold their share of state", 0);
+            return (_modelSequence, new(null, null, "unavailable", "pending-state budget: the checkpoints awaiting the writer already hold their share of state", 0));
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
             var state = CaptureModelState();
-            return new(state, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds, "recorded", null, estimate);
+            return (_modelSequence, new(state, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds, "recorded", null, estimate));
         }
         catch (Exception error)
         {
             recorder.ReleaseStateBytes(estimate);
-            return new(null, null, "unavailable", DiagnosticCaseRecorder.Bounded($"capture-failed: {error.GetType().Name}: {error.Message}"), 0);
+            return (_modelSequence, new(null, null, "unavailable", DiagnosticCaseRecorder.Bounded($"capture-failed: {error.GetType().Name}: {error.Message}"), 0));
         }
     }
 

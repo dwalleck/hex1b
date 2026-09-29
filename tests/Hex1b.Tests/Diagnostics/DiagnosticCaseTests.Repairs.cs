@@ -82,6 +82,91 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
+    public async Task Stop_ModelLockBusyInsideAnApplicationNamesTheLastRecordedEvent()
+    {
+        // F28: a wedge inside an application (a blocking title callback) leaves that application unrecorded; the
+        // stop checkpoint names the last event the case holds, so it stays a boundary of the artifact.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        var (terminal, path) = Checkpointed(root, workload);
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        terminal.WindowTitleChanged += _ =>
+        {
+            entered.Set();
+            release.Wait(TimeSpan.FromSeconds(30));
+        };
+        await using (terminal)
+        {
+            await workload.WriteAndWaitAsync(terminal, "before ");
+            workload.Enqueue("\u001b]0;wedged\u0007after"u8.ToArray());
+            Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken), "fixture: the callback never ran");
+            var stop = new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+            var finished = await Task.WhenAny(stop, Task.Delay(TimeSpan.FromSeconds(8), TestContext.Current.CancellationToken)) == stop;
+            release.Set();
+            Assert.IsTrue(finished, "the stop waited on the wedged application");
+        }
+
+        var artifact = Artifact.Read(path);
+        var lastEvent = artifact.ModelEvents().Max(e => e.GetProperty("modelSequence").GetInt64());
+        var stopLine = StopCheckpoint(artifact);
+        Assert.AreEqual(lastEvent, stopLine.GetProperty("modelSequence").GetInt64(), "the stop checkpoint names an event the case does not hold");
+        StringAssert.StartsWith(stopLine.GetProperty("checkpoint").GetProperty("reason").GetString(), "model-lock-busy");
+        var result = Reapply(path, label: "stop");
+        Assert.AreEqual((DiagnosticOutcome.Captured, "unavailable", lastEvent), (result.Outcome, result.Comparison, result.AppliedThrough),
+            $"{result.Problem?.Code} {result.Problem?.Message}");
+    }
+
+    [TestMethod]
+    public async Task Mark_ReenteredInsideAnApplicationRecordsTheBoundary()
+    {
+        // F28: a mark from a callback inside an application would see it half applied; it records the boundary
+        // at the last completed model event instead.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        var (terminal, path) = Checkpointed(root, workload);
+        var diagnostics = new TerminalDiagnostics(terminal);
+        DiagnosticCaseMarkResult? inside = null;
+        terminal.WindowTitleChanged += _ => inside ??= diagnostics.MarkCase("inside");
+        long before;
+        await using (terminal)
+        {
+            await workload.WriteAndWaitAsync(terminal, "before ");
+            before = terminal.CurrentModelSequence;
+            await workload.WriteAndWaitAsync(terminal, "\u001b]0;titled\u0007after");
+            await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        Assert.IsNotNull(inside, "fixture: the callback never marked");
+        Assert.AreEqual((false, before), (inside.StateRecorded, inside.ModelSequence));
+        StringAssert.StartsWith(inside.StateReason, "mid-application");
+        var result = Reapply(path, label: "inside");
+        Assert.AreEqual((DiagnosticOutcome.Captured, "unavailable", before), (result.Outcome, result.Comparison, result.AppliedThrough));
+    }
+
+    [TestMethod]
+    public async Task Budget_EstimateCountsHistoryAtItsOwnWidth()
+    {
+        // F29: rows retained at 250 columns stay 250 cells wide after the model narrows; the estimate must count them.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        var (terminal, _) = Checkpointed(root, workload, width: 250, height: 5, scrollback: 3_000);
+        await using (terminal)
+        {
+            await workload.WriteAndWaitAsync(terminal, string.Concat(Enumerable.Range(0, 3_000).Select(i => new string('w', 250) + "\r\n")));
+            terminal.Resize(20, 5);
+            var state = terminal.CaptureModelState();
+            var cells = state.Screen.Sum(r => (long)r.Cells.Count) + state.History!.Rows.Sum(r => (long)r.Cells.Count);
+            Assert.IsGreaterThan(500_000L, cells, "fixture: history did not keep its width");
+            var modelLock = typeof(Hex1bTerminal).GetField("_bufferLock", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(terminal)!;
+            long estimate;
+            lock (modelLock)
+                estimate = terminal.EstimateModelStateBytesUnsafe();
+            Assert.IsGreaterThanOrEqualTo(cells * 40, estimate, $"the estimate {estimate} undercounts {cells} cells");
+        }
+    }
+
+    [TestMethod]
     public async Task Reapply_ConfigurationProblemsAreIncompatible()
     {
         // F3, F4: missing, unknown and impossible configuration values are refused naming the field, before
@@ -107,6 +192,9 @@ public partial class DiagnosticCaseTests
             (c => c["someFutureSetting"] = 1, "configuration.someFutureSetting: unknown field"),
             (c => c["width"] = 0, "configuration.width"),
             (c => c["escapeSequenceTimeoutMs"] = 1e308, "configuration.escapeSequenceTimeoutMs"),
+            (c => c["scrollbackCapacity"] = int.MaxValue, "configuration.scrollbackCapacity"),
+            (c => c["capabilities"]!["sixelCellMetrics"] = new JsonObject { ["height"] = 20, ["source"] = "Direct", ["reliability"] = "Authoritative" },
+                "capabilities.sixelCellMetrics.width: missing"),
         })
         {
             var result = await Edited(edit);

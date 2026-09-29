@@ -936,6 +936,13 @@ public class CaptureContractCliTests
         StringAssert.Contains(unknown, "unknown-model-sequence");
         var (invalidExit, _, invalid) = await RunCliAsync("capture", "case", "reapply", path, "--to", "case:x");
         Assert.AreEqual((1, true), (invalidExit, invalid.Contains("invalid-target", StringComparison.Ordinal)), invalid);
+
+        // An interrupted case's unknown tail: past its end is beyond-interval, with the last valid boundary.
+        File.Delete(Path.Combine(path, "completion.json"));
+        var (beyondExit, _, beyond) = await RunCliAsync("capture", "case", "reapply", path, "--to", "999999");
+        Assert.AreEqual(1, beyondExit);
+        StringAssert.Contains(beyond, "beyond-interval");
+        StringAssert.Contains(beyond, "Re-applicable through model sequence");
     }
 
     // The client's JSON equals the contract object's, apart from fields that differ per run.

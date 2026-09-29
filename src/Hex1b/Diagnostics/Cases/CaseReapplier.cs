@@ -140,7 +140,8 @@ internal static class CaseReapplier
         // A complete case whose model stream lost nothing knows every model sequence it has: one past its last is
         // not a boundary of this case. Otherwise (a lost or unknown tail) it is beyond the re-applicable interval.
         var modelComplete = inspection.Streams.FirstOrDefault(s => s.Stream == "model") is { State: "complete" };
-        if (inspection.CompletionState == DiagnosticCaseCompletionState.Complete && modelComplete && target > resolution.LastModelSequence)
+        if (request.ToModelSequence is not null && inspection.CompletionState == DiagnosticCaseCompletionState.Complete && modelComplete
+            && target > resolution.LastModelSequence)
             return Refuse(DiagnosticOutcome.InvalidRequest, "unknown-model-sequence",
                 $"Model sequence {target} is past the case's last recorded model event, {resolution.LastModelSequence}.") with { Target = targetRecord };
         if (target > intervalEnd)
@@ -161,7 +162,7 @@ internal static class CaseReapplier
         {
             replica = BuildReplica(configuration, strategy, capabilities, clock);
         }
-        catch (Exception error) when (error is ArgumentException or InvalidOperationException or OverflowException)
+        catch (Exception error) when (error is ArgumentException or InvalidOperationException or OverflowException or OutOfMemoryException)
         {
             return Refuse(DiagnosticOutcome.Unavailable, "incompatible", DiagnosticCaseRecorder.Bounded($"configuration: {error.Message}"));
         }

@@ -58,6 +58,9 @@ internal static class CaseConfiguration
         return null;
     }
 
+    /// <summary>The most retained rows a re-applied model is built with; a recorded capacity above it is refused.</summary>
+    internal const int MaxScrollbackCapacity = 1_000_000;
+
     // Format 2 fields a model cannot be rebuilt without. Absent nullable fields (scrollbackCapacity,
     // customMarkerLimit, sixelCellMetrics) mean none, as they are written only when set.
     private static readonly string[] RequiredFields =
@@ -98,6 +101,14 @@ internal static class CaseConfiguration
             if (raw["graphics"]?[field] is null)
                 return $"graphics.{field}: missing";
         }
+        if (raw["capabilities"]?["sixelCellMetrics"] is System.Text.Json.Nodes.JsonObject metrics)
+        {
+            foreach (var field in new[] { "width", "height", "source", "reliability" })
+            {
+                if (metrics[field] is null)
+                    return $"capabilities.sixelCellMetrics.{field}: missing";
+            }
+        }
         if (configuration.Unknown is { Count: > 0 } unknown)
             return $"configuration.{unknown.Keys.Order(StringComparer.Ordinal).First()}: unknown field";
         if (configuration.Graphics?.Unknown is { Count: > 0 } unknownGraphics)
@@ -106,8 +117,8 @@ internal static class CaseConfiguration
             return $"configuration.width: {configuration.Width} is not 1 to 10,000";
         if (configuration.Height is < 1 or > 10_000)
             return $"configuration.height: {configuration.Height} is not 1 to 10,000";
-        if (configuration.ScrollbackCapacity is < 1)
-            return $"configuration.scrollbackCapacity: {configuration.ScrollbackCapacity} is not positive";
+        if (configuration.ScrollbackCapacity is < 1 or > MaxScrollbackCapacity)
+            return $"configuration.scrollbackCapacity: {configuration.ScrollbackCapacity} is not 1 to {MaxScrollbackCapacity:N0}";
         if (configuration.CommandMarkHistoryCapacity < 0)
             return $"configuration.commandMarkHistoryCapacity: {configuration.CommandMarkHistoryCapacity} is negative";
         if (configuration.CustomMarkerLimit is < 0)
