@@ -22,6 +22,9 @@ internal sealed class NativeDeliveryRecorder
     /// <summary>Counts recorders constructed in the current async flow while a test has set a counter.</summary>
     internal static readonly AsyncLocal<StrongBox<int>?> ConstructionsForTesting = new();
 
+    /// <summary>Runs inside construction in the current async flow while a test has set it, so a test can hold arming.</summary>
+    internal static readonly AsyncLocal<Action?> ConstructingForTesting = new();
+
     private readonly object _sync = new();
     private readonly Entry?[] _ring = new Entry?[MaxRecords];
     private long _started;
@@ -42,6 +45,7 @@ internal sealed class NativeDeliveryRecorder
         CoverageStartTimestamp = Stopwatch.GetTimestamp();
         if (ConstructionsForTesting.Value is { } counter)
             Interlocked.Increment(ref counter.Value);
+        ConstructingForTesting.Value?.Invoke();
     }
 
     internal string DeliveryLayer { get; }

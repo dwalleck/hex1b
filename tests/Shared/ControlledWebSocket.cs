@@ -32,7 +32,7 @@ internal sealed class ControlledWebSocket : WebSocket
             if (ThrowStateOnThread == System.Environment.CurrentManagedThreadId)
             {
                 ThrowStateOnThread = null;
-                throw new System.InvalidOperationException("State unavailable.");
+                throw StateException ?? new System.InvalidOperationException("State unavailable.");
             }
 
             return CurrentState;
@@ -41,6 +41,9 @@ internal sealed class ControlledWebSocket : WebSocket
 
     /// <summary>The next read of <see cref="State"/> on this managed thread throws, once.</summary>
     public int? ThrowStateOnThread { get; set; }
+
+    /// <summary>What a throwing <see cref="State"/> throws; an <see cref="System.InvalidOperationException"/> when unset.</summary>
+    public System.Exception? StateException { get; set; }
 
     /// <summary>Sends are not kept, so a test can measure the sender's own allocations.</summary>
     public bool DiscardSends { get; set; }

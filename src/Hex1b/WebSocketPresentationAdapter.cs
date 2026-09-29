@@ -212,9 +212,14 @@ public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAda
         {
             declined = TryStartWrite(data);
         }
+        catch (Exception error) when (error is WebSocketException or OperationCanceledException)
+        {
+            // Swallowed, as the write has always swallowed socket errors and cancellation.
+            return default;
+        }
         catch (Exception error)
         {
-            // As an async write always did: a failure faults the returned task, never throws.
+            // As an async write always did: any other failure faults the returned task, never throws.
             return ValueTask.FromException(error);
         }
 
@@ -227,7 +232,24 @@ public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAda
     async ValueTask<NativeWriteResult> IObservableNativePresentation.WriteObservedAsync(
         ReadOnlyMemory<byte> data, NativeWriteProgress progress, CancellationToken ct)
     {
-        switch (TryStartWrite(data))
+        string? declined;
+        try
+        {
+            declined = TryStartWrite(data);
+        }
+        catch (Exception error) when (error is WebSocketException or OperationCanceledException)
+        {
+            // Known exactly: nothing was sent before the socket's state could not be read.
+            progress.Observe();
+            return NativeWriteResult.Fail(error);
+        }
+        catch
+        {
+            progress.Observe();
+            throw;
+        }
+
+        switch (declined)
         {
             case "":
                 return NativeWriteResult.Accepted;

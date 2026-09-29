@@ -65,7 +65,7 @@ public sealed class TerminalDiagnostics
     private const string DisposalLimitation =
         "Writes made while the terminal is disposed (its exit sequences) are readable only in-process: the diagnostics socket closes at session end.";
     private const string PresentationQueriesLimitation =
-        "Writes a presentation makes on its own (cursor-position queries, capability probes) are not terminal writes and are not recorded. A WebSocket's held incomplete UTF-8 tail is recorded with the write that carried it, and sent with the next write's message or as U+FFFD at disposal.";
+        "Writes a presentation makes on its own (cursor-position queries, capability probes) are not terminal writes and are not recorded. A WebSocket's held incomplete UTF-8 tail is recorded with the write that carried it, and sent with a later write's message, or as U+FFFD at disposal.";
     private const string DeliveryBoundsLimitation =
         "The session keeps the most recent 4,096 records and 1 MiB of written bytes (64 KiB per record); evictions and truncation are reported.";
     private static readonly IReadOnlyList<string> DeliveryLimitations =

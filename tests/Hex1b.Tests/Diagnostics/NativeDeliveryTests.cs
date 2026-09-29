@@ -685,22 +685,47 @@ public class NativeDeliveryTests
     }
 
     [TestMethod]
-    public async Task WebSocket_AThrowingStateFaultsTheWriteAndStillDisposes()
+    [DataRow("invalid-operation")]
+    [DataRow("websocket")]
+    [DataRow("canceled")]
+    public async Task WebSocket_AThrowingStateBehavesAsBeforeAndStillDisposes(string kind)
     {
-        var socket = new ControlledWebSocket();
+        Exception error = kind switch
+        {
+            "websocket" => new WebSocketException("The remote party closed the connection."),
+            "canceled" => new OperationCanceledException(),
+            _ => new InvalidOperationException("State unavailable."),
+        };
+        // As the write always did: socket errors and cancellation are swallowed, anything else faults.
+        var swallowed = kind != "invalid-operation";
+        var socket = new ControlledWebSocket { StateException = error };
         var websocket = new WebSocketPresentationAdapter(socket, 40, 6);
         var text = Encoding.UTF8.GetBytes("output");
 
         socket.ThrowStateOnThread = Environment.CurrentManagedThreadId;
         ValueTask unarmed = default;
         var thrown = Record(() => unarmed = websocket.WriteOutputAsync(text));
-        Assert.IsNull(thrown, "the write threw instead of faulting its task, as the async write always did");
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await unarmed);
+        Assert.IsNull(thrown, "the write threw instead of returning a task, as the async write always did");
+        if (swallowed)
+            await unarmed;
+        else
+            Assert.AreSame(error, await Assert.ThrowsAsync<InvalidOperationException>(async () => await unarmed));
 
         socket.ThrowStateOnThread = Environment.CurrentManagedThreadId;
-        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await ((IObservableNativePresentation)(object)websocket).WriteObservedAsync(text, new NativeWriteProgress(), default));
+        var progress = new NativeWriteProgress();
+        var observed = (IObservableNativePresentation)(object)websocket;
+        if (swallowed)
+        {
+            var result = await observed.WriteObservedAsync(text, progress, default);
+            Assert.IsTrue(result.Failed, "a swallowed error was not reported to the observer");
+            StringAssert.Contains(result.Error, error.GetType().Name);
+        }
+        else
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(async () => await observed.WriteObservedAsync(text, progress, default));
+        }
 
+        Assert.AreEqual((true, 0), (progress.Observed, progress.BytesAccepted), "nothing was sent, and the observer must know it");
         // Both writers were completed, so disposal does not wait for them.
         await websocket.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
@@ -709,6 +734,36 @@ public class NativeDeliveryTests
             try { action(); return null; }
             catch (Exception error) { return error; }
         }
+    }
+
+    [TestMethod]
+    public async Task Arming_IsAtomicWithDisposal()
+    {
+        await using var harness = await ConsoleHarness.StartAsync(diagnostics: false);
+        using var constructing = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        NativeDeliveryRecorder.ConstructingForTesting.Value = () =>
+        {
+            constructing.Set();
+            release.Wait(TimeSpan.FromSeconds(10));
+        };
+
+        // Arming is held inside its check-and-set while the terminal is disposed.
+        var attaching = Task.Run(() => new TerminalDiagnostics(harness.Terminal, "delivery"));
+        Assert.IsTrue(constructing.Wait(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken), "fixture: arming never started");
+        NativeDeliveryRecorder.ConstructingForTesting.Value = null;
+        var disposing = Task.Run(async () => await harness.Terminal.DisposeAsync());
+        var disposedWhileArming = await Task.WhenAny(disposing, Task.Delay(300, TestContext.Current.CancellationToken)) == disposing;
+        release.Set();
+        var diagnostics = await attaching.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        await disposing.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        var result = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest());
+
+        // Arming came first, so the disposal it held back is recorded; it never arms an ended session.
+        Assert.IsFalse(disposedWhileArming, "disposal completed while arming was between its check and its set");
+        Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome, result.Problem?.Message);
+        Assert.IsTrue(result.Records.Any(r => r.Source == DiagnosticDeliverySource.TerminalControl),
+            "the terminal was armed, but the exit writes of the disposal that followed were not recorded");
     }
 
     [TestMethod]
