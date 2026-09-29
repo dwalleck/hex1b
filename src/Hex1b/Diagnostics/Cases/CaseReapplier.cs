@@ -390,8 +390,7 @@ internal static class CaseReapplier
             Write("recorded.json", JsonSerializer.SerializeToUtf8Bytes(recorded, DiagnosticsJsonContext.Default.DiagnosticModelState));
         foreach (var (name, content) in previews ?? new Dictionary<string, string>())
             Write(name, System.Text.Encoding.UTF8.GetBytes(content));
-        files.Add("result.json");
-        var final = result with { Files = files };
+        var final = result with { Files = [.. files, "result.json"] };
         Write("result.json", JsonSerializer.SerializeToUtf8Bytes(final, DiagnosticsJsonContext.Default.DiagnosticCaseReapplyResult));
         return final;
     }

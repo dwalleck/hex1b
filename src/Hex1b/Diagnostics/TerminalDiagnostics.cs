@@ -59,12 +59,17 @@ public sealed class TerminalDiagnostics
     /// <inheritdoc cref="CaseStartOperation"/>
     public const string CaseStatusOperation = "case-status";
 
+    /// <summary>Operation name for marking a boundary in the active case (a checkpoint).</summary>
+    public const string CaseMarkOperation = "case-mark";
+
     private static readonly IReadOnlyList<string> CaseLimitations =
     [
         "The case writes to the target's filesystem; offline inspect reads the artifact without the target.",
         "One case records a terminal at a time; a checkpoint is complete only when recording starts before the model's first event.",
         "Events past 4,096 queued (or 8 MiB) are dropped newest-first and recorded as missing ranges.",
         "A stop waits at most 10 s for queued events; the unwritten tail is recorded as missing.",
+        "Marks and stops record a text-state checkpoint (state only with reapplication-data); at most 64 marks await the writer, and graphics are never compared.",
+        "Re-application is offline, from the artifact alone, and compares only at recorded checkpoints.",
     ];
 
     /// <summary>Most delivery records one request may return.</summary>

@@ -3,7 +3,7 @@ using System.CommandLine;
 namespace Hex1b.Tool.Commands.Capture;
 
 /// <summary>
-/// Parent command grouping bounded diagnostic case operations (start, stop, status, inspect).
+/// Parent command grouping bounded diagnostic case operations (start, stop, status, mark, inspect, reapply).
 /// </summary>
 internal sealed class CaptureCaseCommand : Command
 {
@@ -11,12 +11,16 @@ internal sealed class CaptureCaseCommand : Command
         CaptureCaseStartCommand startCommand,
         CaptureCaseStopCommand stopCommand,
         CaptureCaseStatusCommand statusCommand,
-        CaptureCaseInspectCommand inspectCommand)
+        CaptureCaseInspectCommand inspectCommand,
+        CaptureCaseMarkCommand markCommand,
+        CaptureCaseReapplyCommand reapplyCommand)
         : base("case", "Record a bounded diagnostic case: the terminal's original input and correlated evidence, to a local artifact")
     {
         Subcommands.Add(startCommand);
         Subcommands.Add(stopCommand);
         Subcommands.Add(statusCommand);
+        Subcommands.Add(markCommand);
         Subcommands.Add(inspectCommand);
+        Subcommands.Add(reapplyCommand);
     }
 }

@@ -108,11 +108,13 @@ Use it to tell a wrong layout or a slow model from output that never reached the
 - `accepted` means the host took the bytes, not that anything was displayed; local PTY sessions report `no-native-presentation`
 - To read incrementally, pass the last returned record's `sequence` as the next `since`; `totals.lastSequence` can skip a write still in progress
 
-#### Diagnostic cases (`start_diagnostic_case`, `stop_diagnostic_case`, `get_diagnostic_case_status`, `inspect_diagnostic_case`)
+#### Diagnostic cases (`start_diagnostic_case`, `stop_diagnostic_case`, `get_diagnostic_case_status`, `mark_diagnostic_case`, `inspect_diagnostic_case`, `reapply_diagnostic_case`)
 Use a case to keep evidence of a problem you cannot reproduce on demand: it records to a local directory you can inspect after the process is gone.
 - To record from the first byte, start the session with `recordCase: true` (with `caseAuthorize: "reapplication-data"` to keep the model's input bytes); a case started later records from then on with checkpoint `unsupported`
 - `start_diagnostic_case` takes `sessionId`, optional `maxBytes`, `maxSeconds`, `authorize` (comma-separated: `reapplication-data`, `raw-input`, `editor-text`, `native-output`) and `directory`; one case per terminal (`case-active`)
 - `stop_diagnostic_case` returns `case.path` and `case.stopReason`; pass the path to `inspect_diagnostic_case` (optional `since`, `limit`) for `completionState`, per-stream `missing` ranges and the re-applicable `intervals`
+- `mark_diagnostic_case` (`sessionId`, optional `label`) records a checkpoint at the current model sequence while the case records; the stop records one labelled `stop`. Mark just before and just after the moment you want to examine
+- `reapply_diagnostic_case` (`path`, `to`: `12`, `case:34`, or a label such as `stop`) rebuilds the model offline and compares it with the recorded checkpoint. `matched` means the recording reproduces that state; `different` lists typed differences (`screen[r][c].text`, `modes.<name>`, …) with per-surface counts; `unavailable` says why nothing was compared (no checkpoint, no state, graphics). `injectFault` (e.g. `cell-text`) proves the comparison catches a change and labels the result `faultInjected`; never report a faulted result as the case's outcome
 - Losses are always recorded: overload drops the newest events past 4,096 queued, and size limits, drain timeouts and failures each leave a `missing` range with its reason
 
 ### Session Management

@@ -265,7 +265,9 @@ and native delivery, written by the target to an owner-only local directory.
 hex1b capture case start <id> [options]
 hex1b capture case status <id>
 hex1b capture case stop <id>
+hex1b capture case mark <id> [--label NAME]
 hex1b capture case inspect <path> [--since N] [--limit N]
+hex1b capture case reapply <path> --to TARGET [--inject-fault KIND] [--max-differences N] [--preview FORMAT]
 ```
 
 | `start` option | Type | Default | Description |
@@ -281,9 +283,27 @@ byte, use `hex1b terminal start --record-case`. `stop` waits at most 10 s for qu
 is `complete`, `interrupted` or `truncated`. It also reports per-stream coverage and missing
 ranges, the re-applicable model interval, and, with `--limit`, a page of events.
 
+`mark` records a checkpoint in the active case at the model's current sequence. With
+`reapplication-data` the checkpoint holds the model's full text state; otherwise it records the
+boundary only. `--label` is 1–64 letters, digits, `.`, `_`, `:` or `-`, and not `stop`. The default
+is `mark-` and the checkpoint's ordinal.
+
+`reapply` rebuilds the model offline from the case's recorded configuration and applies its
+recorded events up to a target. It then compares the result with the checkpoint recorded there.
+Each run writes its own directory, `reapplications/<n>`, inside the case.
+
+| `reapply` option | Type | Default | Description |
+|------------------|------|---------|-------------|
+| `--to` | string | (required) | A model sequence (`12`), a case sequence (`case:34`), or a checkpoint label (`label:name`, or the bare name; `stop` is the stop checkpoint) |
+| `--inject-fault` | string | | A declared fault to inject before comparing (repeatable or comma-separated): `cell-text`, `cell-style`, `cursor`, `mode`, `title`, `charset`, `tab-stop`, `pending-input`, `history-row`, `history-rows`. The result is labelled `faultInjected` |
+| `--max-differences` | int | `1000` | Most differences listed (1–100000); every difference is counted |
+| `--preview` | string | | `text`, `ansi`, `svg`, `html` (repeatable or comma-separated) |
+
+`reapply` exits 0 when the comparison is `matched`, and 2 when it is `different` or `unavailable`.
+
 Without `--json` each command prints a summary. With `--json` it writes the full contract result.
 Refusals exit 1 with the problem code (`case-active`, `no-active-case`, `storage-refused`,
-`invalid-bounds`, …).
+`invalid-bounds`, `busy`, `invalid-label`, `incompatible`, `beyond-interval`, …).
 
 ### `capture recording start`
 

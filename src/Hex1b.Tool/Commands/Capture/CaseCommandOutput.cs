@@ -63,6 +63,53 @@ internal static class CaseCommandOutput
         return 0;
     }
 
+    public static int Write(OutputFormatter formatter, DiagnosticCaseMarkResult result, bool json)
+    {
+        if (json)
+            Console.WriteLine(JsonSerializer.Serialize(result, DiagnosticsJsonOptions.Indented.GetTypeInfo(typeof(DiagnosticCaseMarkResult))));
+        if (result.Outcome != DiagnosticOutcome.Captured)
+            return Failure(formatter, result.Outcome, result.Problem);
+        if (json)
+            return 0;
+
+        formatter.WriteLine($"Case {AppTreeCommand.Safe(result.CaseId)} marked '{AppTreeCommand.Safe(result.Label)}' " +
+            $"(checkpoint {result.CheckpointOrdinal}) at model sequence {result.ModelSequence}" +
+            (result.StateRecorded == true ? "" : "; boundary only (state needs reapplication-data)"));
+        return 0;
+    }
+
+    public static int Write(OutputFormatter formatter, DiagnosticCaseReapplyResult result, bool json)
+    {
+        if (json)
+            Console.WriteLine(JsonSerializer.Serialize(result, DiagnosticsJsonOptions.Indented.GetTypeInfo(typeof(DiagnosticCaseReapplyResult))));
+        if (result.Outcome != DiagnosticOutcome.Captured)
+        {
+            Failure(formatter, result.Outcome, result.Problem);
+            if (!json && result.LastValidModelSequence is { } last)
+                formatter.WriteError($"Re-applicable through model sequence {last} (ends: {AppTreeCommand.Safe(result.IntervalEndReason)})");
+            return 1;
+        }
+        if (json)
+            return result.Comparison == "matched" ? 0 : 2;
+
+        var target = result.Target!;
+        formatter.WriteLine($"Re-applied to model sequence {target.ModelSequence}" +
+            (target.Label is { } label ? $" ('{AppTreeCommand.Safe(label)}')" : "") + $": {AppTreeCommand.Safe(result.Comparison)}" +
+            (result.ComparisonReason is { } reason ? $" ({AppTreeCommand.Safe(reason)})" : ""));
+        if (result.FaultInjected)
+            formatter.WriteLine($"Fault injected: {string.Join(", ", result.Faults.Select(f => $"{AppTreeCommand.Safe(f.Kind)} at {AppTreeCommand.Safe(f.Path)}"))}");
+        if (result.Differences is { Total: > 0 } differences)
+        {
+            formatter.WriteLine($"Differences: {differences.Total}" + (differences.Truncated ? $" (first {differences.Differences.Count} listed)" : "") +
+                $"; by surface: {string.Join(", ", differences.BySurface.Select(s => $"{AppTreeCommand.Safe(s.Key)} {s.Value}"))}");
+            foreach (var difference in differences.Differences.Take(20))
+                formatter.WriteLine($"  {AppTreeCommand.Safe(difference.Path)}: {AppTreeCommand.Safe(difference.Recorded ?? "(absent)")} recorded, " +
+                    $"{AppTreeCommand.Safe(difference.Reapplied ?? "(absent)")} re-applied");
+        }
+        formatter.WriteLine($"Run: {AppTreeCommand.Safe(result.RunPath)} ({string.Join(", ", result.Files.Select(AppTreeCommand.Safe))})");
+        return result.Comparison == "matched" ? 0 : 2;
+    }
+
     private static int Failure(OutputFormatter formatter, DiagnosticOutcome outcome, DiagnosticProblem? problem)
     {
         formatter.WriteError($"{DiagnosticContractNames.Of(outcome)} ({AppTreeCommand.Safe(problem?.Code)}): {AppTreeCommand.Safe(problem?.Message)}");

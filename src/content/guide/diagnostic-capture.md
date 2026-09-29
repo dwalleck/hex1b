@@ -311,8 +311,10 @@ Start a case in one of two ways:
   or the socket method `case-start`. A model that has already applied output has no re-applicable
   checkpoint, so the case records from now on with its checkpoint `unsupported` (`not-fresh`).
 
-Stop the case with `hex1b capture case stop`, `stop_diagnostic_case`, or `case-stop`. Read its
-progress with `hex1b capture case status`, `get_diagnostic_case_status`, or `case-status`. Inspect
+Stop the case with `hex1b capture case stop`, `stop_diagnostic_case`, or `case-stop`. Mark a
+boundary while it records with `hex1b capture case mark`, `mark_diagnostic_case`, or `case-mark`.
+Read its progress with `hex1b capture case status`, `get_diagnostic_case_status`, or `case-status`.
+Re-apply it offline with `hex1b capture case reapply` or `reapply_diagnostic_case`. Inspect
 a finished (or broken) artifact offline, without the process that wrote it, with
 `hex1b capture case inspect <path>` or `inspect_diagnostic_case`.
 
@@ -356,10 +358,14 @@ Problem codes: `invalid-bounds`, `unsupported-authorization` and `invalid-direct
 A case directory holds three files:
 
 - `manifest.json`: identities, bounds, authorizations, start path, checkpoint, and each stream's
-  coverage (`included`, or `unavailable` with why);
+  coverage (`included`, or `unavailable` with why). Format 2 records the model configuration
+  structurally: dimensions, scrollback and command-mark capacity, the reflow strategy by name
+  (`none`, `kitty`, `xterm`, ...; `custom:` and a type for one this build cannot name), every
+  capability field, and the graphics limits;
 - `events.jsonl`: one event per line, prefixed by its CRC-32 in hex and a tab;
 - `completion.json`: written last, by rename. It holds the stop reason, the last case sequence,
-  bytes written, and per-stream counts.
+  bytes written, per-stream counts, and checkpoint counts (`checkpoints`: taken, written, and
+  declared missing).
 
 Events are numbered by `caseSequence` in file order. Each stream also numbers its own events by
 `ordinal`:
@@ -370,10 +376,37 @@ Events are numbered by `caseSequence` in file order. Each stream also numbers it
 | `input` | `accepted` and `processed`, with input ids (text only with `raw-input`) |
 | `frames` | `published`: the frame's identity, and its projection (editor text only with `editor-text`) |
 | `delivery` | `delivery`: the native delivery record (bytes only with `native-output`) |
-| `case` | `missing` ranges, `interval-end`, and `stream-failed` |
+| `case` | `missing` ranges, `interval-end`, `stream-failed`, and `checkpoint` |
 
 Streams a target cannot observe are declared `unavailable` in the manifest. For example, frames
 are unavailable for PTY workloads, and delivery for headless terminals.
+
+### Checkpoints and marks
+
+A case records a `checkpoint` when it stops (requested, time limit, size limit, or disposal, before
+disposal resets anything) and at each mark, but not after a collector failure. A checkpoint is
+taken in one hold of the model lock, between two model events, at the model sequence it names.
+
+- With `reapplication-data` it carries the model's full text state (`state`, profile
+  `text-state/1`): both screens, retained history, styles, the cursor and saved cursors, modes,
+  margins, tab stops, character sets, rendition, titles and the title stack, activity, command
+  marks, grapheme continuation, and output held between chunks. Graphics state or a DCS in
+  progress is named in `state.unsupported`; such a checkpoint is never compared.
+- Without it, the checkpoint records the boundary only (`status: unavailable`,
+  `reason: requires reapplication-data`).
+- A state too large for the case's size bound is written without it (`status: missing`,
+  `reason: size-limit`), and the case keeps recording. A checkpoint that cannot be written at all is
+  declared by a `missing` range of stream `checkpoint` (checkpoint ordinals).
+
+A mark (`case-mark`) takes an optional label: 1–64 letters, digits, `.`, `_`, `:` or `-`, other
+than `stop` (the stop checkpoint's label). By default the label is `mark-` and the checkpoint's
+ordinal. It returns the label, the checkpoint ordinal and the model sequence. A mark never waits
+for the case writer. At most 64 marks can await it; a mark beyond that is refused `busy` before
+any state is taken. Problem codes: `invalid-label` (`invalid-request`); `no-active-case` and `busy`
+(`unavailable`).
+
+A checkpoint costs one pass over the model's cells under its lock: about 0.1–0.25 s and 60 MiB for
+250 columns with 10,000 history rows. A case takes none until a mark or its stop.
 
 ### Bounds and losses
 
@@ -432,7 +465,60 @@ Problem codes: `invalid-path`, `invalid-limit` and `invalid-since` (`invalid-req
 checkpoint, bounds or streams), `unreadable-artifact` and `unsupported-format` (`failed`).
 
 Each inspection reads and verifies the whole artifact, because coverage and the verified prefix
-depend on every line. Paging with `since` does not skip that work.
+depend on every line. Paging with `since` does not skip that work. A page carries checkpoints
+without their state (`stateOmitted: true`); re-application reads it. A format 1 case (written before
+checkpoints) is still inspected, with its configuration strings left out.
+
+### Re-apply
+
+Re-application reads a case offline and needs nothing from the process that wrote it. It checks
+everything first: the case directory must be owner-only, the artifact is verified as inspection
+does, the format must be 2, and its configuration and the target must be ones this build can
+rebuild. Then it builds a detached model from the recorded configuration, whose pumps never
+start and whose presentation is never written, on a virtual clock. It streams the verified
+events to that model one line at a time, up to the target:
+
+- each `application` as one raw chunk through the output pump's own path (the model's decoder,
+  escape prefix and DCS framer carry across chunks, as they did live);
+- each `resize` with its recorded geometry;
+- each `synchronized-update-timeout` by advancing the virtual clock exactly the 1 s timeout. The
+  clock moves at no other time, so a slow re-application never fires a timeout on its own.
+
+After every event the model's sequence must equal the recorded one; a mismatch ends the run as
+`different` at that event. The reconstructed state is then compared with the checkpoint recorded at
+the target, field by field:
+
+| `comparison` | Meaning |
+|--------------|---------|
+| `matched` | every field equal |
+| `different` | typed `differences`: paths such as `screen[3][5].text`, `history.rows[12][0].style.foreground` or `modes.wraparound`, in the projection's order, counted per surface (`bySurface`), listed up to `maxDifferences` (default 1,000) |
+| `unavailable` | no checkpoint at the target, one without state, or one naming `graphics` or `dcs-continuation` (`comparisonReason` says which) |
+
+The target is a model sequence (`12`; `0` is the fresh model), a case sequence (`case:34`, of a
+checkpoint or a model event), or a checkpoint label (`label:name`, or the bare name). A label that
+names several checkpoints is refused with their case sequences. `--inject-fault` (`faults`) changes
+the reconstructed state at a declared path before comparing (`cell-text`, `cell-style`, `cursor`,
+`mode`, `title`, `charset`, `tab-stop`, `pending-input`, `history-row`, `history-rows`). Such a
+result is labelled `faultInjected`, and is never the recorded path's outcome.
+
+Each run writes a new owner-only directory, `reapplications/<n>` in the case, and never changes
+the case's own files. It holds `result.json`, the complete reconstructed state (`reapplied.json`),
+the recorded state (`recorded.json`), and any previews:
+
+- `reapplied.txt`, `.ansi`, `.svg` and `.html`: the reconstructed model through the capture exporters;
+- `recorded.txt`: the recorded checkpoint's screen text (with a `text` preview).
+
+Problem codes: `invalid-path`, `invalid-target`, `invalid-max-differences`, `invalid-fault`,
+`invalid-preview`, `unknown-label`, `ambiguous-label`, `unknown-case-sequence`, `not-a-boundary`
+and `fault-not-applicable` (`invalid-request`); `case-not-found`, `incompatible` (an old format,
+or an unknown reflow strategy, capability, graphics field or projection profile, named in the
+message), `no-valid-interval` and `beyond-interval` (with `lastValidModelSequence` and
+`intervalEndReason`) (`unavailable`); `storage-refused` and `reapplication-failed` (with
+`appliedThrough`) (`failed`).
+
+Re-application streams the events file, so its memory is the model and one event, not the file: a
+119 MiB events file re-applies in about 133 MiB. It compares only at recorded checkpoints, and only
+on the build that recorded the case: a later build may render the same bytes differently.
 
 ## Capabilities
 

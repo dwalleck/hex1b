@@ -1,0 +1,52 @@
+using System.CommandLine;
+using Hex1b.Diagnostics;
+using Hex1b.Tool.Infrastructure;
+using Microsoft.Extensions.Logging;
+
+namespace Hex1b.Tool.Commands.Capture;
+
+/// <summary>
+/// Re-applies a recorded case offline, without the process that wrote it: a detached model rebuilt from the
+/// case's configuration applies its recorded events up to a target and is compared with the checkpoint
+/// recorded there. Each run writes its own directory inside the case.
+/// </summary>
+internal sealed class CaptureCaseReapplyCommand : BaseCommand
+{
+    private static readonly Argument<string> s_pathArgument = new("path") { Description = "Case directory" };
+    private static readonly Option<string> s_toOption = new("--to")
+    {
+        Description = "Target: a model sequence (12), a case sequence (case:34), or a checkpoint label (label:name, or the bare name)",
+        Required = true,
+    };
+    private static readonly Option<string[]> s_faultOption = new("--inject-fault")
+    {
+        Description = "Inject a declared fault into the reconstructed state before comparing (repeatable or comma-separated); the result is labelled"
+    };
+    private static readonly Option<int?> s_maxDifferencesOption = new("--max-differences")
+    {
+        Description = "Most differences listed (1-100000; default 1000); every difference is counted"
+    };
+    private static readonly Option<string[]> s_previewOption = new("--preview")
+    {
+        Description = "Previews to write (repeatable or comma-separated): text, ansi, svg, html"
+    };
+
+    public CaptureCaseReapplyCommand(OutputFormatter formatter, ILogger<CaptureCaseReapplyCommand> logger)
+        : base("reapply", "Re-apply a diagnostic case offline to a boundary and compare it with the recorded checkpoint", formatter, logger)
+    {
+        Arguments.Add(s_pathArgument);
+        Options.Add(s_toOption);
+        Options.Add(s_faultOption);
+        Options.Add(s_maxDifferencesOption);
+        Options.Add(s_previewOption);
+    }
+
+    protected override Task<int> ExecuteAsync(ParseResult parseResult, CancellationToken cancellationToken)
+    {
+        var json = parseResult.GetValue(RootCommand.JsonOption);
+        var (request, invalid) = DiagnosticContractNames.ParseCaseReapplyRequest(parseResult.GetValue(s_pathArgument)!,
+            parseResult.GetValue(s_toOption), parseResult.GetValue(s_faultOption), parseResult.GetValue(s_maxDifferencesOption),
+            parseResult.GetValue(s_previewOption));
+        return Task.FromResult(CaseCommandOutput.Write(Formatter, invalid ?? DiagnosticCaseReapplier.Reapply(request!), json));
+    }
+}

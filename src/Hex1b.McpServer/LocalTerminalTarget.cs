@@ -87,6 +87,9 @@ public sealed class LocalTerminalTarget : ITerminalTarget
     public Task<DiagnosticCaseResult> GetCaseStatusAsync(CancellationToken ct = default)
         => Task.FromResult(_session.Diagnostics.GetCaseStatus());
 
+    public Task<DiagnosticCaseMarkResult> MarkCaseAsync(string? label, CancellationToken ct = default)
+        => Task.FromResult(_session.Diagnostics.MarkCase(label));
+
     /// <inheritdoc />
     public Task<DiagnosticCapabilities> GetDiagnosticCapabilitiesAsync(CancellationToken ct = default)
         => Task.FromResult(_session.Diagnostics.GetCapabilities());

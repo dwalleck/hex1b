@@ -694,6 +694,110 @@ public class CaptureContractMcpTests : McpServerTestBase
         }
     }
 
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_MarkAndReapplyMatchTheEngineAndTheReapplier()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        // Recorded from construction, so the case is re-applicable.
+        await using var terminal = await StartAttachedAppAsync(new DiagnosticCaseStartRequest
+        {
+            Directory = root.Path,
+            Authorizations = [DiagnosticAuthorization.ReapplicationData],
+        });
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var sessionId = await ConnectAttachedAsync(client);
+        var engine = new TerminalDiagnostics(terminal, "McpMark");
+
+        var unknown = await CallAsync(client, "mark_diagnostic_case", new() { ["sessionId"] = "no-such-session" });
+        Assert.AreEqual("session-not-found", unknown.GetProperty("mark").GetProperty("problem").GetProperty("code").GetString());
+        var invalid = await CallAsync(client, "mark_diagnostic_case", new() { ["sessionId"] = sessionId, ["label"] = "stop" });
+        AssertJsonEquals(engine.MarkCase("stop"), invalid.GetProperty("mark"), "invalid label");
+        var mark = await CallAsync(client, "mark_diagnostic_case", new() { ["sessionId"] = sessionId, ["label"] = "mcp-mark" });
+        Assert.IsTrue(mark.GetProperty("success").GetBoolean(), mark.ToString());
+        var recorder = terminal.DiagnosticCase!;
+        var stop = await CallAsync(client, "stop_diagnostic_case", new() { ["sessionId"] = sessionId });
+        var path = stop.GetProperty("case").GetProperty("path").GetString()!;
+        var none = await CallAsync(client, "mark_diagnostic_case", new() { ["sessionId"] = sessionId });
+        AssertJsonEquals(engine.MarkCase(), none.GetProperty("mark"), "mark without a case");
+        var line = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path, Limit = 4096 }).Events
+            .Single(e => e.Checkpoint?.Label == "mcp-mark");
+        AssertJsonEquals(new DiagnosticCaseMarkResult
+        {
+            Outcome = DiagnosticOutcome.Captured,
+            CaseId = recorder.CaseId,
+            Label = "mcp-mark",
+            CheckpointOrdinal = line.Checkpoint!.Ordinal,
+            ModelSequence = line.ModelSequence,
+            StateRecorded = true,
+        }, mark.GetProperty("mark"), "mark");
+
+        foreach (var (arguments, request) in new (Dictionary<string, object?>, DiagnosticCaseReapplyRequest)[]
+        {
+            (new() { ["path"] = path, ["to"] = "mcp-mark" }, new() { Path = path, ToLabel = "mcp-mark" }),
+            (new() { ["path"] = path, ["to"] = "mcp-mark", ["preview"] = "ansi" }, new() { Path = path, ToLabel = "mcp-mark", Previews = ["ansi"] }),
+            (new() { ["path"] = path, ["to"] = "stop", ["injectFault"] = "cell-text,title", ["maxDifferences"] = 1 },
+                new() { Path = path, ToLabel = "stop", Faults = ["cell-text", "title"], MaxDifferences = 1 }),
+            (new() { ["path"] = path, ["to"] = $"case:{line.CaseSequence}", ["preview"] = "text,html" },
+                new() { Path = path, ToCaseSequence = line.CaseSequence, Previews = ["text", "html"] }),
+            (new() { ["path"] = path, ["to"] = "999999" }, new() { Path = path, ToModelSequence = 999_999 }),
+        })
+        {
+            var result = await CallAsync(client, "reapply_diagnostic_case", arguments);
+            var expected = DiagnosticCaseReapplier.Reapply(request);
+            Assert.AreNotEqual("no-valid-interval", expected.Problem?.Code, "fixture: the case is not re-applicable");
+            Assert.AreEqual(expected.Outcome == DiagnosticOutcome.Captured, result.GetProperty("success").GetBoolean(), result.ToString());
+            AssertJsonEquals(expected, result.GetProperty("reapplication"), string.Join(" ", arguments.Values), "runPath");
+        }
+
+        // A local session records from its first byte, marks, and re-applies to matched.
+        var local = await CallAsync(client, "start_bash_terminal", new()
+        {
+            ["width"] = 60,
+            ["height"] = 10,
+            ["workingDirectory"] = Path.GetTempPath(),
+            ["recordCase"] = true,
+            ["caseDirectory"] = root.Path,
+            ["caseAuthorize"] = "reapplication-data",
+        });
+        var localId = local.GetProperty("sessionId").GetString()!;
+        try
+        {
+            await CallAsync(client, "send_terminal_input", new() { ["sessionId"] = localId, ["text"] = "echo MARK-$((40+2))\r" });
+            var wait = await CallAsync(client, "wait_for_terminal_text", new() { ["sessionId"] = localId, ["text"] = "MARK-42", ["timeoutSeconds"] = 10 });
+            Assert.IsTrue(wait.GetProperty("found").GetBoolean(), wait.ToString());
+            var localMark = await CallAsync(client, "mark_diagnostic_case", new() { ["sessionId"] = localId, ["label"] = "echoed" });
+            Assert.IsTrue(localMark.GetProperty("success").GetBoolean(), localMark.ToString());
+            var localStop = await CallAsync(client, "stop_diagnostic_case", new() { ["sessionId"] = localId });
+            var reapplied = await CallAsync(client, "reapply_diagnostic_case", new()
+            {
+                ["path"] = localStop.GetProperty("case").GetProperty("path").GetString(),
+                ["to"] = "echoed",
+            });
+            Assert.AreEqual("matched", reapplied.GetProperty("reapplication").GetProperty("comparison").GetString(), reapplied.ToString());
+        }
+        finally
+        {
+            await CallAsync(client, "remove_session", new() { ["sessionId"] = localId });
+        }
+    }
+
+    // The tool's JSON equals the contract object's, apart from fields that differ per run.
+    private static void AssertJsonEquals<T>(T expected, JsonElement actual, string what, params string[] ignored)
+    {
+        var expectedNode = System.Text.Json.Nodes.JsonNode.Parse(JsonSerializer.Serialize(expected, DiagnosticsJsonContext.Default.GetTypeInfo(typeof(T))!))!.AsObject();
+        var actualNode = System.Text.Json.Nodes.JsonNode.Parse(actual.GetRawText())!.AsObject();
+        foreach (var field in ignored)
+        {
+            expectedNode.Remove(field);
+            actualNode.Remove(field);
+        }
+        Assert.IsTrue(System.Text.Json.Nodes.JsonNode.DeepEquals(expectedNode, actualNode), $"{what}: MCP differs.\nexpected: {expectedNode}\nmcp:      {actualNode}");
+    }
+
     private static void AssertCaseEquals(DiagnosticCaseResult engine, JsonElement client, string operation, params string[] volatileFields)
     {
         var expected = System.Text.Json.Nodes.JsonNode.Parse(JsonSerializer.Serialize(engine, DiagnosticsJsonContext.Default.DiagnosticCaseResult))!.AsObject();
@@ -808,21 +912,21 @@ public class CaptureContractMcpTests : McpServerTestBase
         return connect.GetProperty("sessionId").GetString()!;
     }
 
-    private static async Task<Hex1bTerminal> StartAttachedAppAsync()
+    private static async Task<Hex1bTerminal> StartAttachedAppAsync(DiagnosticCaseStartRequest? recordCase = null)
     {
         var socketPath = McpDiagnosticsPresentationFilter.GetSocketPath();
         for (var attempt = 0; attempt < 100 && File.Exists(socketPath); attempt++)
             await Task.Delay(50);
 
-        var terminal = Hex1bTerminal.CreateBuilder()
+        var builder = Hex1bTerminal.CreateBuilder()
             .WithDimensions(40, 5)
             .WithHeadless()
             .WithScrollback(50)
             .WithHex1bApp(_ => new ThemePanelWidget(
                 theme => theme.Set(GlobalTheme.ForegroundColor, Styled),
                 new TextBlockWidget("STYLED")))
-            .WithDiagnostics(appName: "McpAttached", forceEnable: true)
-            .Build();
+            .WithDiagnostics(appName: "McpAttached", forceEnable: true);
+        var terminal = (recordCase is null ? builder : builder.WithDiagnosticCase(recordCase)).Build();
         _ = terminal.RunAsync();
 
         var client = new DiagnosticsSocketClient();

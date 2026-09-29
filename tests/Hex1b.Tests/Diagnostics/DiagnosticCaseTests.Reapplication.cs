@@ -475,6 +475,7 @@ public partial class DiagnosticCaseTests
                 foreach (var file in Directory.GetFiles(run.RunPath!))
                     Assert.AreEqual(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(file), file);
                 CollectionAssert.AreEquivalent(new[] { "reapplied.json", "recorded.json", "result.json" }, Directory.GetFiles(run.RunPath!).Select(Path.GetFileName).ToArray());
+                CollectionAssert.AreEqual(new[] { "reapplied.json", "recorded.json", "result.json" }, run.Files.ToArray(), "the result lists its files wrongly");
             }
 
             var loose = await RecordCaseAsync(root, [new("loose")], new HeadlessPresentationAdapter(20, 4));

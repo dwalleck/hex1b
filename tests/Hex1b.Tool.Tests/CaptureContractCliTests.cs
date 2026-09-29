@@ -860,6 +860,99 @@ public class CaptureContractCliTests
 
     [TestMethod]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_MarkAndReapplyMatchTheEngineAndTheReapplier()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        // Recorded from construction, so the case is re-applicable.
+        await using var target = await StartAttachedAppAsync(new DiagnosticCaseStartRequest
+        {
+            Directory = root.Path,
+            Authorizations = [DiagnosticAuthorization.ReapplicationData],
+        });
+        var engine = new TerminalDiagnostics(target, "CliMark");
+
+        // Refusals equal the engine's own.
+        var (badExit, bad, _) = await RunCliAsync("capture", "case", "mark", Pid, "--label", "stop", "--json");
+        Assert.AreEqual(1, badExit);
+        AssertJsonEquals(engine.MarkCase("stop"), bad, "invalid label");
+
+        // A mark equals the checkpoint the target wrote.
+        var (markExit, mark, markErr) = await RunCliAsync("capture", "case", "mark", Pid, "--label", "cli-mark", "--json");
+        Assert.AreEqual(0, markExit, markErr);
+        var (textExit, text, _) = await RunCliAsync("capture", "case", "mark", Pid, "--label", "cli-text");
+        Assert.AreEqual(0, textExit);
+        StringAssert.Contains(text, "marked 'cli-text'");
+        var recorder = target.DiagnosticCase!;
+        var (stopExit, stop, stopErr) = await RunCliAsync("capture", "case", "stop", Pid, "--json");
+        Assert.AreEqual(0, stopExit, stopErr);
+        var path = JsonDocument.Parse(stop).RootElement.GetProperty("path").GetString()!;
+        var (noneExit, none, _) = await RunCliAsync("capture", "case", "mark", Pid, "--json");
+        Assert.AreEqual(1, noneExit);
+        AssertJsonEquals(engine.MarkCase(), none, "mark without a case");
+        var line = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path, Limit = 4096 }).Events
+            .Single(e => e.Checkpoint?.Label == "cli-mark");
+        AssertJsonEquals(new DiagnosticCaseMarkResult
+        {
+            Outcome = DiagnosticOutcome.Captured,
+            CaseId = recorder.CaseId,
+            Label = "cli-mark",
+            CheckpointOrdinal = line.Checkpoint!.Ordinal,
+            ModelSequence = line.ModelSequence,
+            StateRecorded = true,
+        }, mark, "mark");
+
+        // Re-application equals the reapplier's for the same request, apart from each run's own directory.
+        foreach (var (args, request) in new (string[], DiagnosticCaseReapplyRequest)[]
+        {
+            (["--to", "cli-mark"], new() { Path = path, ToLabel = "cli-mark" }),
+            (["--to", "label:stop", "--inject-fault", "cell-text,mode", "--max-differences", "1"],
+                new() { Path = path, ToLabel = "stop", Faults = ["cell-text", "mode"], MaxDifferences = 1 }),
+            (["--to", line.ModelSequence!.Value.ToString(), "--preview", "text", "--preview", "svg"],
+                new() { Path = path, ToModelSequence = line.ModelSequence, Previews = ["text", "svg"] }),
+            (["--to", $"case:{line.CaseSequence}"], new() { Path = path, ToCaseSequence = line.CaseSequence }),
+            (["--to", "999999"], new() { Path = path, ToModelSequence = 999_999 }),
+        })
+        {
+            var (exit, json, err) = await RunCliAsync(["capture", "case", "reapply", path, .. args, "--json"]);
+            var expected = DiagnosticCaseReapplier.Reapply(request);
+            Assert.AreNotEqual("no-valid-interval", expected.Problem?.Code, "fixture: the case is not re-applicable");
+            Assert.AreEqual(expected.Outcome != DiagnosticOutcome.Captured ? 1 : expected.Comparison == "matched" ? 0 : 2, exit, err);
+            AssertJsonEquals(expected, json, string.Join(" ", args), "runPath");
+            if (request.ToLabel == "cli-mark")
+                Assert.AreEqual("matched", expected.Comparison, expected.ComparisonReason);
+        }
+
+        var (matchedExit, matched, matchedErr) = await RunCliAsync("capture", "case", "reapply", path, "--to", "cli-mark");
+        Assert.AreEqual(0, matchedExit, matchedErr + matched);
+        StringAssert.Contains(matched, "('cli-mark'): matched");
+        var (faultExit, faulted, _) = await RunCliAsync("capture", "case", "reapply", path, "--to", "cli-mark", "--inject-fault", "cursor");
+        Assert.AreEqual(2, faultExit);
+        StringAssert.Contains(faulted, "Fault injected: cursor at cursor.x");
+        var (beyondExit, _, beyond) = await RunCliAsync("capture", "case", "reapply", path, "--to", "999999");
+        Assert.AreEqual(1, beyondExit);
+        StringAssert.Contains(beyond, "beyond-interval");
+        StringAssert.Contains(beyond, "Re-applicable through model sequence");
+        var (invalidExit, _, invalid) = await RunCliAsync("capture", "case", "reapply", path, "--to", "case:x");
+        Assert.AreEqual((1, true), (invalidExit, invalid.Contains("invalid-target", StringComparison.Ordinal)), invalid);
+    }
+
+    // The client's JSON equals the contract object's, apart from fields that differ per run.
+    private static void AssertJsonEquals<T>(T expected, string actualJson, string what, params string[] ignored)
+    {
+        var expectedNode = System.Text.Json.Nodes.JsonNode.Parse(JsonSerializer.Serialize(expected, DiagnosticsJsonContext.Default.GetTypeInfo(typeof(T))!))!.AsObject();
+        var actualNode = System.Text.Json.Nodes.JsonNode.Parse(actualJson)!.AsObject();
+        foreach (var field in ignored)
+        {
+            expectedNode.Remove(field);
+            actualNode.Remove(field);
+        }
+        Assert.IsTrue(System.Text.Json.Nodes.JsonNode.DeepEquals(expectedNode, actualNode), $"{what}: the CLI differs.\nexpected: {expectedNode}\ncli:      {actualNode}");
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task Case_HostedPtyRecordsFromConstruction()
     {
         if (!OperatingSystem.IsLinux())
@@ -1015,18 +1108,18 @@ public class CaptureContractCliTests
         }
     }
 
-    private static async Task<Hex1bTerminal> StartAttachedAppAsync()
+    private static async Task<Hex1bTerminal> StartAttachedAppAsync(DiagnosticCaseStartRequest? recordCase = null)
     {
         await WaitForSocketReleaseAsync(TestContext.Current.CancellationToken);
-        var terminal = Hex1bTerminal.CreateBuilder()
+        var builder = Hex1bTerminal.CreateBuilder()
             .WithDimensions(40, 5)
             .WithHeadless()
             .WithScrollback(50)
             .WithHex1bApp(_ => new ThemePanelWidget(
                 theme => theme.Set(GlobalTheme.ForegroundColor, Styled),
                 new TextBlockWidget("STYLED")))
-            .WithDiagnostics(appName: "CliAttached", forceEnable: true)
-            .Build();
+            .WithDiagnostics(appName: "CliAttached", forceEnable: true);
+        var terminal = (recordCase is null ? builder : builder.WithDiagnosticCase(recordCase)).Build();
         _ = terminal.RunAsync(TestContext.Current.CancellationToken);
         await WaitForSocketAsync(TestContext.Current.CancellationToken);
         await new Hex1bTerminalInputSequenceBuilder()

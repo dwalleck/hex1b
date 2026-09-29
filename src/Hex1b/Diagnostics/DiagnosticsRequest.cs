@@ -103,4 +103,8 @@ internal sealed class DiagnosticsRequest
     /// </summary>
     [JsonPropertyName("caseStart")]
     public DiagnosticCaseStartRequest? CaseStart { get; set; }
+
+    /// <summary>For "case-mark" method, the checkpoint's label; absent means <c>mark-</c> and its ordinal.</summary>
+    [JsonPropertyName("caseMarkLabel")]
+    public string? CaseMarkLabel { get; set; }
 }

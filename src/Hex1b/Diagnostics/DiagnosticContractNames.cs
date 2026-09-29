@@ -109,6 +109,45 @@ internal static class DiagnosticContractNames
         return (new DiagnosticCaseStartRequest { MaxBytes = maxBytes, MaxSeconds = maxSeconds, Authorizations = parsed, Directory = root }, null);
     }
 
+    /// <summary>
+    /// Builds a re-application request from client text, the one parser every client uses. The target is
+    /// a model sequence (<c>12</c>), a case sequence (<c>case:34</c>), or a label (<c>label:name</c>, or any
+    /// other text); faults and previews are repeatable and comma-separated. The reapplier validates the rest.
+    /// </summary>
+    public static (DiagnosticCaseReapplyRequest? Request, DiagnosticCaseReapplyResult? Invalid) ParseCaseReapplyRequest(
+        string path, string? to, IEnumerable<string>? faults, int? maxDifferences, IEnumerable<string>? previews)
+    {
+        static DiagnosticCaseReapplyResult Invalid(string code, string message) => new()
+        {
+            Outcome = DiagnosticOutcome.InvalidRequest,
+            Problem = new DiagnosticProblem { Code = code, Message = message },
+        };
+
+        if (string.IsNullOrWhiteSpace(to))
+            return (null, Invalid("invalid-target", "Name the target: a model sequence (12), a case sequence (case:34), or a label (label:name)."));
+        var request = new DiagnosticCaseReapplyRequest { Path = path, MaxDifferences = maxDifferences };
+        if (to.StartsWith("case:", StringComparison.Ordinal))
+        {
+            if (!long.TryParse(to.AsSpan(5), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var caseSequence))
+                return (null, Invalid("invalid-target", $"'{to}' is not case: followed by a case sequence."));
+            request = request with { ToCaseSequence = caseSequence };
+        }
+        else if (long.TryParse(to, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var modelSequence))
+        {
+            request = request with { ToModelSequence = modelSequence };
+        }
+        else
+        {
+            request = request with { ToLabel = to.StartsWith("label:", StringComparison.Ordinal) ? to[6..] : to };
+        }
+
+        static string[]? Split(IEnumerable<string>? values) =>
+            values?.SelectMany(value => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).ToArray() is { Length: > 0 } list
+                ? list
+                : null;
+        return (request with { Faults = Split(faults), Previews = Split(previews) }, null);
+    }
+
     private static bool TryParseAuthorizations(IEnumerable<string>? names, out List<DiagnosticAuthorization> parsed, out string unsupported)
     {
         parsed = [];

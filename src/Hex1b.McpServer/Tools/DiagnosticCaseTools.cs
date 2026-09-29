@@ -6,7 +6,8 @@ using ModelContextProtocol.Server;
 namespace Hex1b.McpServer.Tools;
 
 /// <summary>
-/// MCP tools for bounded diagnostic cases: start, stop and status through a target, and offline inspection.
+/// MCP tools for bounded diagnostic cases: start, stop, status and mark through a target, and offline inspection
+/// and re-application.
 /// The tools translate arguments and wrap the shared contract results; every policy stays in the engine.
 /// </summary>
 [McpServerToolType]
@@ -76,6 +77,62 @@ public class DiagnosticCaseTools(TerminalSessionManager sessionManager)
                 ? $"Case {inspection.Manifest!.CaseId} is {DiagnosticContractNames.Of(inspection.CompletionState!.Value)}; {inspection.Events.Count} events on this page."
                 : $"Inspect {DiagnosticContractNames.Of(inspection.Outcome)} ({inspection.Problem?.Code}): {inspection.Problem?.Message}",
             Inspection = JsonSerializer.SerializeToElement(inspection, DiagnosticsJsonContext.Default.DiagnosticCaseInspection),
+        };
+    }
+
+    /// <summary>
+    /// Marks a boundary in a target's active case.
+    /// </summary>
+    [McpServerTool, Description("Marks a boundary in the terminal target's active diagnostic case: a checkpoint of the terminal model's full text state at its current model sequence (with the reapplication-data authorization; otherwise the boundary only), which reapply_diagnostic_case can target and compare. Never waits for the case's writer; at most 64 marks can await it, and a mark beyond is refused 'busy'.")]
+    public async Task<CaseMarkToolResult> MarkDiagnosticCase(
+        [Description("Session ID of the terminal target")] string sessionId,
+        [Description("The checkpoint's label: 1-64 letters, digits, '.', '_', ':' or '-', not 'stop' (default mark-<ordinal>).")] string? label = null,
+        CancellationToken ct = default)
+    {
+        var target = sessionManager.GetTarget(sessionId);
+        var result = target == null
+            ? new DiagnosticCaseMarkResult
+            {
+                Outcome = DiagnosticOutcome.Unavailable,
+                Problem = new DiagnosticProblem { Code = "session-not-found", Message = $"Session '{sessionId}' not found." },
+            }
+            : await target.MarkCaseAsync(label, ct);
+        return new CaseMarkToolResult
+        {
+            Success = result.Outcome == DiagnosticOutcome.Captured,
+            SessionId = sessionId,
+            Message = result.Outcome == DiagnosticOutcome.Captured
+                ? $"Case {result.CaseId} marked '{result.Label}' at model sequence {result.ModelSequence}" +
+                  (result.StateRecorded == true ? "." : " (boundary only; the state needs reapplication-data).")
+                : $"Mark {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}",
+            Mark = JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticCaseMarkResult),
+        };
+    }
+
+    /// <summary>
+    /// Re-applies a case artifact offline and compares it with a recorded checkpoint.
+    /// </summary>
+    [McpServerTool, Description("Re-applies a recorded diagnostic case offline, without the process that wrote it: a detached terminal model rebuilt from the case's recorded configuration applies the recorded events up to a target boundary (each output chunk through the raw output path, each resize, each synchronized-update timeout on a virtual clock), then compares its full text state with the checkpoint recorded there: 'matched', 'different' (typed differences by path, counted per surface), or 'unavailable' (no checkpoint, no state, or graphics). Refuses a target past the case's re-applicable interval, an old or unknown format, and a case directory that is not owner-only. Writes only its own run directory inside the case: result.json, reapplied.json, recorded.json and any previews.")]
+    public CaseReapplyToolResult ReapplyDiagnosticCase(
+        [Description("The case directory (the 'path' a start or stop returned).")] string path,
+        [Description("Target: a model sequence (12), a case sequence (case:34), or a checkpoint label (label:name, or the bare name; 'stop' is the stop checkpoint).")] string to,
+        [Description("Declared faults to inject into the reconstructed state before comparing (comma-separated): cell-text, cell-style, cursor, mode, title, charset, tab-stop, pending-input, history-row, history-rows. The result is labelled faultInjected.")] string? injectFault = null,
+        [Description("Most differences listed (1-100000; default 1000). Every difference is counted.")] int? maxDifferences = null,
+        [Description("Previews to write (comma-separated): text, ansi, svg, html.")] string? preview = null)
+    {
+        var (request, invalid) = DiagnosticContractNames.ParseCaseReapplyRequest(path, to,
+            injectFault is null ? null : [injectFault], maxDifferences, preview is null ? null : [preview]);
+        var result = invalid ?? DiagnosticCaseReapplier.Reapply(request!);
+        return new CaseReapplyToolResult
+        {
+            Success = result.Outcome == DiagnosticOutcome.Captured,
+            Message = result.Outcome == DiagnosticOutcome.Captured
+                ? $"Re-applied to model sequence {result.Target!.ModelSequence}: {result.Comparison}" +
+                  (result.ComparisonReason is { } reason ? $" ({reason})" : "") +
+                  (result.Differences is { Total: > 0 } differences ? $"; {differences.Total} differences" : "") +
+                  (result.FaultInjected ? "; fault injected" : "") + $". Run: {result.RunPath}."
+                : $"Reapply {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}",
+            Reapplication = JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticCaseReapplyResult),
         };
     }
 

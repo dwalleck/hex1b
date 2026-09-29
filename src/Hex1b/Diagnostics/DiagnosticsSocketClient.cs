@@ -165,6 +165,39 @@ internal sealed class DiagnosticsSocketClient
     public Task<DiagnosticCaseResult> GetCaseStatusAsync(string socketPath, CancellationToken cancellationToken = default) =>
         CaseExchangeAsync(socketPath, new DiagnosticsRequest { Method = TerminalDiagnostics.CaseStatusOperation }, untimed: false, cancellationToken);
 
+    /// <summary>
+    /// Marks a boundary in an attached target's active case. Untimed like a start: a mark the target took is
+    /// never reported failed.
+    /// </summary>
+    public async Task<DiagnosticCaseMarkResult> MarkCaseAsync(string socketPath, string? label = null, CancellationToken cancellationToken = default)
+    {
+        var (response, problem) = await ExchangeAsync(socketPath,
+            new DiagnosticsRequest { Method = TerminalDiagnostics.CaseMarkOperation, CaseMarkLabel = label }, cancellationToken, untimed: true).ConfigureAwait(false);
+        if (problem is not null)
+            return MarkProblem(problem.Value.Outcome, problem.Value.Code, problem.Value.Message);
+        if (response!.CaseMark is not { } result)
+        {
+            var (outcome, code, message) = Unexpected(response);
+            return MarkProblem(outcome, code, message);
+        }
+
+        if (result.ContractVersion != TerminalDiagnostics.ContractVersion)
+            return MarkProblem(DiagnosticOutcome.Failed, "incompatible-target", VersionMessage(result.ContractVersion));
+        if (result.Outcome == DiagnosticOutcome.Captured
+            && (result.CaseId is null || result.Label is null || result.CheckpointOrdinal is null || result.ModelSequence is null || result.StateRecorded is null))
+            return MarkProblem(DiagnosticOutcome.Failed, "protocol-error", "The target reported a mark without its case, label, ordinal, model sequence or state flag.");
+        if (result.Outcome != DiagnosticOutcome.Captured && result.Problem is null)
+            return MarkProblem(DiagnosticOutcome.Failed, "protocol-error",
+                $"The target reported outcome '{DiagnosticContractNames.Of(result.Outcome)}' without a problem.");
+        return result;
+    }
+
+    private static DiagnosticCaseMarkResult MarkProblem(DiagnosticOutcome outcome, string code, string message) => new()
+    {
+        Outcome = outcome,
+        Problem = new DiagnosticProblem { Code = code, Message = message },
+    };
+
     private async Task<DiagnosticCaseResult> CaseExchangeAsync(string socketPath, DiagnosticsRequest request, bool untimed,
         CancellationToken cancellationToken)
     {

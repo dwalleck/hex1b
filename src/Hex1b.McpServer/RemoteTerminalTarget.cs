@@ -158,6 +158,9 @@ public sealed class RemoteTerminalTarget : ITerminalTarget
     public Task<DiagnosticCaseResult> GetCaseStatusAsync(CancellationToken ct = default)
         => _client.GetCaseStatusAsync(_socketPath, ct);
 
+    public Task<DiagnosticCaseMarkResult> MarkCaseAsync(string? label, CancellationToken ct = default)
+        => _client.MarkCaseAsync(_socketPath, label, ct);
+
     /// <inheritdoc />
     public Task<DiagnosticCapabilities> GetDiagnosticCapabilitiesAsync(CancellationToken ct = default)
         => _client.GetCapabilitiesAsync(_socketPath, ct);
