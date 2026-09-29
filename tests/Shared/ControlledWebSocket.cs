@@ -25,7 +25,25 @@ internal sealed class ControlledWebSocket : WebSocket
 
     public override string? CloseStatusDescription => null;
 
-    public override WebSocketState State => CurrentState;
+    public override WebSocketState State
+    {
+        get
+        {
+            if (ThrowStateOnThread == System.Environment.CurrentManagedThreadId)
+            {
+                ThrowStateOnThread = null;
+                throw new System.InvalidOperationException("State unavailable.");
+            }
+
+            return CurrentState;
+        }
+    }
+
+    /// <summary>The next read of <see cref="State"/> on this managed thread throws, once.</summary>
+    public int? ThrowStateOnThread { get; set; }
+
+    /// <summary>Sends are not kept, so a test can measure the sender's own allocations.</summary>
+    public bool DiscardSends { get; set; }
 
     public override string? SubProtocol => null;
 
@@ -56,8 +74,12 @@ internal sealed class ControlledWebSocket : WebSocket
     {
         if (YieldSends)
             return YieldThenSendAsync(buffer);
-        lock (Sent)
-            Sent.Add(buffer.ToArray());
+        if (!DiscardSends)
+        {
+            lock (Sent)
+                Sent.Add(buffer.ToArray());
+        }
+
         if (FailSends)
             throw new WebSocketException("The remote party closed the connection.");
         return ValueTask.CompletedTask;

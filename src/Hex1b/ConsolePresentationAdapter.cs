@@ -412,7 +412,18 @@ public sealed class ConsolePresentationAdapter :
 
         lock (_driverWriteSync)
         {
-            var (width, height) = _driver.GetGeometry();
+            int width, height;
+            try
+            {
+                (width, height) = _driver.GetGeometry();
+            }
+            catch
+            {
+                // Also known exactly: the geometry read failed before any byte was written.
+                progress?.Observe();
+                throw;
+            }
+
             if (width != expectedWidth || height != expectedHeight)
             {
                 return NativeDeliveryOutcome.GeometryChanged;

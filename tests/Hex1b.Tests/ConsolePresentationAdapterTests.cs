@@ -505,7 +505,17 @@ internal sealed class FakeConsoleDriver : IConsoleDriver
     public int Height => TerminalSize.Height;
 
     /// <inheritdoc />
-    public (int Width, int Height) GetGeometry() => TerminalSize;
+    public (int Width, int Height) GetGeometry()
+    {
+        if (Interlocked.Exchange(ref _geometryFailure, null) is { } failure)
+            throw failure;
+        return TerminalSize;
+    }
+
+    private Exception? _geometryFailure;
+
+    /// <summary>Makes the next geometry read throw <paramref name="error"/>.</summary>
+    public void FailNextGeometry(Exception error) => _geometryFailure = error;
 
     public Encoding InputEncoding { get; init; } = Console.InputEncoding;
 

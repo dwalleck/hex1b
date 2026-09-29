@@ -205,8 +205,21 @@ public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAda
     }
 
     /// <inheritdoc />
-    public ValueTask WriteOutputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default) =>
-        TryStartWrite(data) is null ? SendAsync(data, ct, observe: false) : default;
+    public ValueTask WriteOutputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
+    {
+        string? declined;
+        try
+        {
+            declined = TryStartWrite(data);
+        }
+        catch (Exception error)
+        {
+            // As an async write always did: a failure faults the returned task, never throws.
+            return ValueTask.FromException(error);
+        }
+
+        return declined is null ? SendAsync(data, ct, observe: false) : default;
+    }
 
     /// <inheritdoc />
     string IObservableNativePresentation.DeliveryLayer => "websocket";
@@ -246,7 +259,20 @@ public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAda
             return "";
         if (!TryBeginWriter())
             return "presentation-disposed";
-        if (_webSocket.State != WebSocketState.Open)
+
+        // Once begun, the writer is completed on every path out, or disposal would wait for it forever.
+        bool open;
+        try
+        {
+            open = _webSocket.State == WebSocketState.Open;
+        }
+        catch
+        {
+            CompleteWriter();
+            throw;
+        }
+
+        if (!open)
         {
             CompleteWriter();
             return "socket-not-open";

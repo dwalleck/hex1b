@@ -284,8 +284,9 @@ Outcomes:
   console presentation's cursor-position queries and capability probes. A WebSocket presentation
   holds back an incomplete UTF-8 sequence at the end of a write. The held bytes count in the
   `length` and `content` of the write that carried them, which is `accepted`. They are sent at the
-  start of the next write's message, outside that record's `length` and `content`, or, if no write
-  completes them, as U+FFFD when the presentation is disposed, with no record.
+  start of the next write's message, outside that record's `length` and `content`: completed by
+  it, or as U+FFFD if it does not complete them. If no further write comes, they are sent as
+  U+FFFD when the presentation is disposed, with no record.
 - Socket clients read one JSON line per request. The reply begins with a UTF-8 byte-order mark,
   which a raw client must skip (it may arrive in its own read).
 

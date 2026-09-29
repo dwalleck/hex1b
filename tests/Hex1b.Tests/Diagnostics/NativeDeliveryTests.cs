@@ -56,11 +56,13 @@ public class NativeDeliveryTests
         foreach (var filtered in new[] { false, true })
         {
             await using var harness = await ConsoleHarness.StartAsync(filter: filtered);
+            // A raw write reaches the driver before the model applies it, so settle on the model itself.
+            var start = harness.ModelSequence();
             await harness.WriteAsync("SETTLE");
-            var before = harness.ModelSequence();
+            var before = await harness.WaitForModelBeyondAsync(start);
 
             await harness.WriteAsync("PHASE-MARK");
-            var after = harness.ModelSequence();
+            var after = await harness.WaitForModelBeyondAsync(before);
             var record = harness.Capture(authorizations: [DiagnosticAuthorization.NativeOutput]).Records
                 .Single(r => Decode(r).Contains("PHASE-MARK", StringComparison.Ordinal));
 
@@ -338,26 +340,23 @@ public class NativeDeliveryTests
         Assert.AreEqual(4000, snapshot.Totals.Accepted);
 
         // Workload output racing the terminal's own exit sequences: the terminal is disposed while
-        // its pump is still running, not after the run was stopped.
-        var raced = 0;
+        // its pump is still running, not after the run was stopped. Which writes overlap is left to
+        // chance; Dispose_ExitWriteOverlappingAWorkloadWriteIsRecordedWithIt forces the overlap.
         for (var round = 0; round < 20; round++)
         {
             await using var harness = await ConsoleHarness.StartAsync();
             using var started = new ManualResetEventSlim();
-            var written = 0;
             var writer = Task.Run(() =>
             {
                 for (var i = 0; i < 200; i++)
                 {
                     try { harness.Workload.Write($"R{round}-{i}\r\n"); }
                     catch (ObjectDisposedException) { return; }
-                    Volatile.Write(ref written, i + 1);
                     if (i == 10)
                         started.Set();
                 }
             });
             started.Wait(TestContext.Current.CancellationToken);
-            var writtenAtDispose = Volatile.Read(ref written);
             await harness.Terminal.DisposeAsync();
             await writer;
             var read = harness.Capture();
@@ -369,13 +368,7 @@ public class NativeDeliveryTests
             Assert.AreEqual(read.Records.Count, read.Totals!.Accepted + read.Totals.Refused + read.Totals.Failed,
                 $"round {round}: a record was completed twice or not at all");
             Assert.IsTrue(read.Records.Any(r => r.Source == DiagnosticDeliverySource.TerminalControl), $"round {round}: the exit sequences were not recorded");
-            if (writtenAtDispose < 200)
-                raced++;
         }
-
-        // Disposal began while the writer was still enqueuing. Whether a pump write actually overlapped
-        // the exit write is left to chance here; Dispose_ExitWriteOverlappingAWorkloadWrite forces it.
-        Assert.IsGreaterThan(0, raced, "fixture: every writer finished before disposal began");
     }
 
     [TestMethod]
@@ -661,22 +654,97 @@ public class NativeDeliveryTests
         return GC.GetAllocatedBytesForCurrentThread() - start;
     }
 
-    // Measured with Measure on the pre-feature adapter (bbcabcf1), Debug build, sends that yield once.
-    private const long PreFeatureWebSocketBytesPer1000Writes = 552_000;
+    // Measured with Measure on the pre-feature adapter (bbcabcf1) swapped into this tree, in each
+    // configuration, with sends that complete asynchronously (yield once) and synchronously.
+#if DEBUG
+    private const long PreFeatureYieldingBytes = 552_000;
+    private const long PreFeatureSynchronousBytes = 336_000;
+#else
+    private const long PreFeatureYieldingBytes = 488_000;
+    private const long PreFeatureSynchronousBytes = 240_000;
+#endif
 
     [TestMethod]
-    public async Task Unarmed_WebSocketWriteAllocatesWhatItDidBeforeDeliveryRecording()
+    [DataRow(true)]
+    [DataRow(false)]
+    public async Task Unarmed_WebSocketWriteAllocatesWhatItDidBeforeDeliveryRecording(bool yieldingSends)
     {
-        var socket = new ControlledWebSocket { YieldSends = true };
+        // A yielding send finishes on a pool thread, which Measure does not count; a synchronous send
+        // keeps the whole write on this thread, so everything it allocates is counted.
+        var socket = new ControlledWebSocket { YieldSends = yieldingSends, DiscardSends = true };
         await using var websocket = new WebSocketPresentationAdapter(socket, 40, 6);
         var text = Encoding.UTF8.GetBytes("websocket output");
+        var budget = yieldingSends ? PreFeatureYieldingBytes : PreFeatureSynchronousBytes;
 
         var bytes = Measure(() => websocket.WriteOutputAsync(text));
 
         // Asynchronous completion leaves a few hundred bytes of noise per 1,000 writes; one more
         // field in the write's state machine is 8,000 or more.
-        Assert.IsLessThanOrEqualTo(PreFeatureWebSocketBytesPer1000Writes + 1000, bytes,
-            $"the unarmed WebSocket write allocates {bytes} bytes per 1,000 writes; before delivery recording it was {PreFeatureWebSocketBytesPer1000Writes}");
+        Assert.IsLessThanOrEqualTo(budget + 1000, bytes,
+            $"the unarmed WebSocket write allocates {bytes} bytes per 1,000 writes (yielding={yieldingSends}); before delivery recording it was {budget}");
+    }
+
+    [TestMethod]
+    public async Task WebSocket_AThrowingStateFaultsTheWriteAndStillDisposes()
+    {
+        var socket = new ControlledWebSocket();
+        var websocket = new WebSocketPresentationAdapter(socket, 40, 6);
+        var text = Encoding.UTF8.GetBytes("output");
+
+        socket.ThrowStateOnThread = Environment.CurrentManagedThreadId;
+        ValueTask unarmed = default;
+        var thrown = Record(() => unarmed = websocket.WriteOutputAsync(text));
+        Assert.IsNull(thrown, "the write threw instead of faulting its task, as the async write always did");
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await unarmed);
+
+        socket.ThrowStateOnThread = Environment.CurrentManagedThreadId;
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await ((IObservableNativePresentation)(object)websocket).WriteObservedAsync(text, new NativeWriteProgress(), default));
+
+        // Both writers were completed, so disposal does not wait for them.
+        await websocket.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+
+        static Exception? Record(Action action)
+        {
+            try { action(); return null; }
+            catch (Exception error) { return error; }
+        }
+    }
+
+    [TestMethod]
+    public async Task Unavailable_AnEngineAttachingWhileTheTerminalIsDisposedIsNotArmed()
+    {
+        var presentation = new LayerGatedPresentation();
+        var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(new Hex1bAppWorkloadAdapter())
+            .WithPresentation(presentation).WithDimensions(20, 3).Build();
+
+        // The attaching engine is past every check it makes before disposal, and waits there.
+        presentation.BlockNextLayerRead = true;
+        var attaching = Task.Run(() => new TerminalDiagnostics(terminal, "delivery"));
+        Assert.IsTrue(presentation.LayerRead.Wait(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken), "fixture: the engine never reached arming");
+        await terminal.DisposeAsync();
+        presentation.ResumeLayerRead.Set();
+        var diagnostics = await attaching.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        var result = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest());
+
+        Assert.IsNull(terminal.NativeDelivery, "a recorder was armed for a session disposed while it attached");
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "target-disposed"), (result.Outcome, result.Problem?.Code));
+    }
+
+    [TestMethod]
+    public async Task GatedFailure_AGeometryReadFailureTookNoBytes()
+    {
+        await using var harness = await ConsoleHarness.StartAsync();
+        harness.Driver.UsesDefaultProgress = true;
+        harness.Driver.FailNextGeometry(new InvalidOperationException("ioctl(TIOCGWINSZ) failed"));
+
+        var gated = harness.Workload.WriteRequiredIfGeometry("GATED-NO-GEOMETRY", 40, 6);
+        var failed = await harness.WaitForRecordAsync(r => r.Outcome == DiagnosticDeliveryOutcome.Failed);
+
+        Assert.AreEqual((DiagnosticDeliverySource.GatedDelivery, (int?)0), (failed.Source, failed.BytesAccepted),
+            "a gated write whose geometry read failed wrote nothing, and the record must say so");
+        StringAssert.Contains(failed.Error, "TIOCGWINSZ");
+        await Assert.ThrowsAsync<Exception>(() => gated.WaitAsync(TimeSpan.FromSeconds(5)), "fixture: the gated write did not fail");
     }
 
     [TestMethod]
@@ -790,6 +858,13 @@ public class NativeDeliveryTests
 
         public long ModelSequence() => Terminal.CurrentModelSequence;
 
+        public async Task<long> WaitForModelBeyondAsync(long previous)
+        {
+            for (var i = 0; i < 500 && ModelSequence() <= previous; i++)
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+            return ModelSequence();
+        }
+
         public async Task<DiagnosticDeliveryRecord> WaitForRecordAsync(Func<DiagnosticDeliveryRecord, bool> match)
         {
             for (var i = 0; i < 500; i++)
@@ -842,6 +917,48 @@ public class NativeDeliveryTests
         public ValueTask OnInputAsync(IReadOnlyList<AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
         public ValueTask OnResizeAsync(int width, int height, TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
         public ValueTask OnSessionEndAsync(TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+    }
+
+    // A presentation that reports its writes, and can hold one read of its delivery layer.
+    private sealed class LayerGatedPresentation : IHex1bTerminalPresentationAdapter, IObservableNativePresentation
+    {
+        public bool BlockNextLayerRead { get; set; }
+        public ManualResetEventSlim LayerRead { get; } = new();
+        public ManualResetEventSlim ResumeLayerRead { get; } = new();
+
+        public string DeliveryLayer
+        {
+            get
+            {
+                if (BlockNextLayerRead)
+                {
+                    BlockNextLayerRead = false;
+                    LayerRead.Set();
+                    ResumeLayerRead.Wait(TimeSpan.FromSeconds(10));
+                }
+
+                return "test";
+            }
+        }
+
+        public ValueTask<NativeWriteResult> WriteObservedAsync(ReadOnlyMemory<byte> data, NativeWriteProgress progress, CancellationToken ct) =>
+            ValueTask.FromResult(NativeWriteResult.Accepted);
+        public int Width => 20;
+        public int Height => 3;
+        public TerminalCapabilities Capabilities => TerminalCapabilities.Modern;
+        public event Action<int, int>? Resized { add { } remove { } }
+        public event Action? Disconnected { add { } remove { } }
+        public ValueTask WriteOutputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public async ValueTask<ReadOnlyMemory<byte>> ReadInputAsync(CancellationToken ct = default)
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            return ReadOnlyMemory<byte>.Empty;
+        }
+        public (int Row, int Column) GetCursorPosition() => (0, 0);
+        public ValueTask FlushAsync(CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask EnterRawModeAsync(CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask ExitRawModeAsync(CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     // A presentation that reports nothing about its writes.

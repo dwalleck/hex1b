@@ -41,9 +41,18 @@ public sealed partial class Hex1bTerminal
     {
         // An impact-aware presentation receives cell impacts rather than bytes through the helpers,
         // so its writes would not be recorded; it is reported unobservable instead.
-        if (NativeDelivery is null && !_disposed && _presentation is IObservableNativePresentation observable
-            && _presentation is not ICellImpactAwarePresentationAdapter)
-            Interlocked.CompareExchange(ref _nativeDelivery, new Diagnostics.NativeDeliveryRecorder(observable.DeliveryLayer), null);
+        if (NativeDelivery is not null || _presentation is not IObservableNativePresentation observable
+            || _presentation is ICellImpactAwarePresentationAdapter)
+            return;
+
+        var layer = observable.DeliveryLayer;
+        // Disposal sets _disposed under the same lock, so arming either precedes it (and its exit
+        // writes are recorded) or does not happen.
+        lock (_bufferLock)
+        {
+            if (!_disposed && _nativeDelivery is null)
+                Volatile.Write(ref _nativeDelivery, new Diagnostics.NativeDeliveryRecorder(layer));
+        }
     }
 
     // Counts model events: output application batches, geometry changes, and synchronized-update
