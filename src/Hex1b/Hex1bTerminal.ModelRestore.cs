@@ -1,0 +1,265 @@
+using Hex1b.Diagnostics;
+using Hex1b.Theming;
+
+namespace Hex1b;
+
+public sealed partial class Hex1bTerminal
+{
+    /// <summary>
+    /// Restores a <c>text-state/1</c> projection into this model: the inverse of the model-state projection
+    /// for the active text buffer. Only the case reapplier calls this, on a terminal whose pumps never started.
+    /// The geometry is set through the model's own resize (an empty model, so nothing reflows), then every
+    /// projected field is written in one hold of the model lock. Restored hyperlinks are this model's own
+    /// tracked objects, and an open synchronized update is re-entered on this model's clock. Identity, clock and
+    /// write-order fields keep this model's values, as the census classifies them.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// The state holds something this restore cannot represent (retained rows, a saved screen, titles, command
+    /// marks, pending input, or an unsupported surface), or the model has already applied output.
+    /// </exception>
+    internal void RestoreModelState(DiagnosticModelState state)
+    {
+        if (UnrestorableField(state) is { } field)
+            throw new InvalidOperationException($"The state cannot be restored: it holds {field}.");
+        lock (_bufferLock)
+        {
+            if (_modelSequence != 0 || (_scrollbackBuffer?.Count ?? 0) != 0)
+                throw new InvalidOperationException("Only a model that has applied nothing can be restored.");
+        }
+
+        if (state.Width != _width || state.Height != _height)
+            Resize(state.Width, state.Height);
+
+        lock (_bufferLock)
+        {
+            // The resize of an empty model moves no text into history; the model is still otherwise fresh.
+            _scrollbackBuffer?.Clear();
+            var cells = new TerminalCell[state.Styles.Count];
+            var built = new bool[state.Styles.Count];
+            for (var row = 0; row < state.Height; row++)
+            {
+                var projected = state.Screen[row].Cells;
+                for (var column = 0; column < state.Width; column++)
+                    SetCell(row, column, RestoreCell(projected[column], state.Styles, cells, built), damageSixel: false);
+            }
+
+            _cursorX = state.Cursor.X;
+            _cursorY = state.Cursor.Y;
+            _pendingWrap = state.Cursor.PendingWrap;
+            _cursorVisible = state.Cursor.Visible;
+            _cursorShape = state.Cursor.Shape;
+            _cursorProtected = state.Cursor.Protected;
+            _cursorSaved = state.SavedCursor is not null;
+            if (state.SavedCursor is { } saved)
+            {
+                _savedCursorX = saved.X;
+                _savedCursorY = saved.Y;
+                _savedPendingWrap = saved.PendingWrap;
+                _savedCursorProtected = saved.Protected ?? false;
+            }
+            _alternateScreenSavedCursorX = state.AlternateSavedCursor.X;
+            _alternateScreenSavedCursorY = state.AlternateSavedCursor.Y;
+            _alternateScreenSavedPendingWrap = state.AlternateSavedCursor.PendingWrap;
+
+            foreach (var (name, value) in state.Modes)
+                RestoreMode(name, value);
+            _protectedMode = ParseName<ProtectedMode>(state.ProtectedMode);
+            _scrollTop = state.Margins.Top;
+            _scrollBottom = state.Margins.Bottom;
+            _marginLeft = state.Margins.Left;
+            _marginRight = state.Margins.Right;
+            _tabStops = new bool[state.TabStops.Width];
+            foreach (var column in state.TabStops.Columns)
+                _tabStops[column] = true;
+            _charsetG0 = state.Charsets.G0[0];
+            _charsetG1 = state.Charsets.G1[0];
+            _charsetG2 = state.Charsets.G2[0];
+            _charsetG3 = state.Charsets.G3[0];
+            _activeCharsetSlot = state.Charsets.Active;
+
+            var rendition = state.Rendition;
+            _currentForeground = ParseColor(rendition.Foreground);
+            _currentBackground = ParseColor(rendition.Background);
+            _currentAttributes = ParseAttributes(rendition.Attributes);
+            _currentUnderlineColor = ParseColor(rendition.UnderlineColor);
+            _currentUnderlineStyle = ParseName<UnderlineStyle>(rendition.UnderlineStyle);
+            _currentHyperlink?.Release();
+            _currentHyperlink = rendition.HyperlinkUri is { } uri
+                ? _trackedObjects.GetOrCreateHyperlink(uri, rendition.HyperlinkParameters ?? "")
+                : null;
+
+            var activity = state.Activity;
+            SetActivityState(new TerminalActivityState(
+                new TerminalProgress(ParseName<TerminalProgressState>(activity.ProgressState), activity.ProgressPercentage),
+                new TerminalShellIntegration(ParseName<TerminalShellIntegrationPhase>(activity.ShellPhase), activity.LastExitCode),
+                new TerminalWorkingDirectory(activity.WorkingDirectoryUri, activity.WorkingDirectoryHost, activity.WorkingDirectoryPath)));
+            _nextCommandAnchorId = state.LastCommandAnchorId;
+
+            _hasLastPrintedCell = state.LastPrinted is not null;
+            if (state.LastPrinted is { } last)
+            {
+                _lastPrintedCellX = last.X;
+                _lastPrintedCellY = last.Y;
+                _lastPrintedCellWidth = last.Width;
+                // The original holds the cell as a copy, not a counted reference: the restored one does too.
+                var cell = RestoreCell(last.Cell, state.Styles, cells, built);
+                cell.TrackedHyperlink?.Release();
+                _lastPrintedCell = cell;
+            }
+            _pendingGraphemeCombine = state.PendingGraphemeCombine;
+
+            _modelSequence = state.ModelSequence;
+            // No pending input is restored (refused above), so the live continuation is empty; commit it.
+            CommitOutputContinuationUnsafe();
+            if (state.SynchronizedUpdate.Active)
+            {
+                // Re-entered on this model's clock, so the timeout fires only when that clock reaches it.
+                SetSynchronizedOutputMode(true);
+                _synchronizedOutputStartedSequence = state.SynchronizedUpdate.StartedAtSequence ?? state.ModelSequence;
+            }
+        }
+    }
+
+    // The first field of a state this restore cannot represent, or null. The case's start policy
+    // decides what a start checkpoint may hold; this is the restore's own precondition.
+    private static string? UnrestorableField(DiagnosticModelState state)
+    {
+        if (state.Profile != DiagnosticCaseCheckpointProfiles.TextState)
+            return $"profile '{state.Profile}'";
+        if (state.History is { Rows.Count: > 0 })
+            return "retained history rows";
+        if (state.SavedMainScreen is not null || state.ActiveBuffer != "main")
+            return "a saved main screen";
+        if (state.Titles.Window.Length > 0 || state.Titles.Icon.Length > 0 || state.Titles.Stack.Count > 0)
+            return "titles";
+        if (state.CommandMarks.Count > 0)
+            return "command marks";
+        if (state.PendingInput.EscapePrefix.Length > 0 || state.PendingInput.Utf8.Length > 0 || state.PendingInput.GroundEscape
+            || state.PendingInput.FramerUtf8Remaining != 0)
+            return "pending input";
+        if (state.Unsupported.Count > 0)
+            return $"unsupported surfaces ({string.Join(", ", state.Unsupported)})";
+        if (state.Screen.Count != state.Height || state.Screen.Any(row => row.Cells.Count != state.Width))
+            return "a screen whose rows do not match its geometry";
+        return null;
+    }
+
+    // One restored cell. A style's colours and attributes are parsed once; each cell holding a hyperlink takes
+    // its own counted reference from this model's store, as a cell written by output does.
+    private TerminalCell RestoreCell(DiagnosticModelCell projected, IReadOnlyList<DiagnosticModelStyle> styles,
+        TerminalCell[] cells, bool[] built)
+    {
+        if (!built[projected.Style])
+        {
+            var style = styles[projected.Style];
+            cells[projected.Style] = new TerminalCell(" ", ParseColor(style.Foreground), ParseColor(style.Background),
+                ParseAttributes(style.Attributes), UnderlineColor: ParseColor(style.UnderlineColor),
+                UnderlineStyle: ParseName<UnderlineStyle>(style.UnderlineStyle));
+            built[projected.Style] = true;
+        }
+
+        var template = styles[projected.Style];
+        var hyperlink = template.HyperlinkUri is { } uri ? _trackedObjects.GetOrCreateHyperlink(uri, template.HyperlinkParameters ?? "") : null;
+        return cells[projected.Style] with
+        {
+            Character = projected.Text,
+            TrackedHyperlink = hyperlink,
+            IsWideWrapPadding = projected.WideWrapPadding,
+        };
+    }
+
+    private void RestoreMode(string name, bool value)
+    {
+        switch (name)
+        {
+            case "application-cursor-keys": _appCursorKeysMode = value; break;
+            case "application-keypad": _appKeypadMode = value; break;
+            case "bracketed-paste": _bracketedPasteMode = value; break;
+            case "focus-event-reporting": _focusEventReporting = value; break;
+            case "grapheme-clusters": _graphemeClusterMode = value; break;
+            case "insert": _insertMode = value; break;
+            case "left-right-margins": _declrmm = value; break;
+            case "mouse-encoding-sgr": _mouseEncodingSgr = value; break;
+            case "mouse-encoding-urxvt": _mouseEncodingUrxvt = value; break;
+            case "mouse-encoding-utf8": _mouseEncodingUtf8 = value; break;
+            case "mouse-protocol-any": _mouseProtocolAny = value; break;
+            case "mouse-protocol-button": _mouseProtocolButton = value; break;
+            case "mouse-protocol-highlight": _mouseProtocolHighlight = value; break;
+            case "mouse-protocol-normal": _mouseProtocolNormal = value; break;
+            case "mouse-protocol-x10": _mouseProtocolX10 = value; break;
+            case "newline": _newlineMode = value; break;
+            case "origin": _originMode = value; break;
+            case "reverse-wrap": _reverseWrapMode = value; break;
+            case "reverse-wrap-extended": _reverseWrapExtendedMode = value; break;
+            case "sixel-cursor-to-right": _sixelCursorToRightMode = value; break;
+            case "sixel-scrolling": _sixelScrollingMode = value; break;
+            case "wraparound": _wraparoundMode = value; break;
+            default: throw new InvalidOperationException($"The state names an unknown mode '{name}'.");
+        }
+    }
+
+    // The inverse of ColorName: "default", "rgb:#rrggbb", or "<kind>:<index>:#rrggbb".
+    private static Hex1bColor? ParseColor(string? name)
+    {
+        if (name is null)
+            return null;
+        if (name == "default")
+            return Hex1bColor.Default;
+        var parts = name.Split(':');
+        var rgb = parts[^1];
+        if (rgb.Length != 7 || rgb[0] != '#')
+            throw new InvalidOperationException($"The state names an unknown colour '{name}'.");
+        var r = Convert.ToByte(rgb.Substring(1, 2), 16);
+        var g = Convert.ToByte(rgb.Substring(3, 2), 16);
+        var b = Convert.ToByte(rgb.Substring(5, 2), 16);
+        if (parts.Length == 2 && parts[0] == "rgb")
+            return Hex1bColor.FromRgb(r, g, b);
+        if (parts.Length != 3)
+            throw new InvalidOperationException($"The state names an unknown colour '{name}'.");
+        var index = byte.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture);
+        // The same index bounds the HMP1 row codec enforces for these kinds.
+        return ParseName<Hex1bColorKind>(parts[0]) switch
+        {
+            Hex1bColorKind.Standard when index < 8 => Hex1bColor.FromStandard(index, r, g, b),
+            Hex1bColorKind.Bright when index < 8 => Hex1bColor.FromBright(index, r, g, b),
+            Hex1bColorKind.Indexed => Hex1bColor.FromIndexed(index, r, g, b),
+            _ => throw new InvalidOperationException($"The state names an unknown colour '{name}'."),
+        };
+    }
+
+    // The inverse of AttributeName.
+    private static CellAttributes ParseAttributes(IReadOnlyList<string> names)
+    {
+        var attributes = CellAttributes.None;
+        foreach (var name in names)
+        {
+            attributes |= name switch
+            {
+                "bold" => CellAttributes.Bold,
+                "dim" => CellAttributes.Dim,
+                "italic" => CellAttributes.Italic,
+                "underline" => CellAttributes.Underline,
+                "blink" => CellAttributes.Blink,
+                "reverse" => CellAttributes.Reverse,
+                "hidden" => CellAttributes.Hidden,
+                "strikethrough" => CellAttributes.Strikethrough,
+                "overline" => CellAttributes.Overline,
+                "soft-wrap" => CellAttributes.SoftWrap,
+                "protected" => CellAttributes.Protected,
+                _ when name.StartsWith("bit-", StringComparison.Ordinal)
+                    && int.TryParse(name.AsSpan(4), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var bit)
+                    && bit is >= 0 and < 16 => (CellAttributes)(1 << bit),
+                _ => throw new InvalidOperationException($"The state names an unknown attribute '{name}'."),
+            };
+        }
+        return attributes;
+    }
+
+    // The inverse of ModelStateName: a kebab-case contract name back to a defined enum value (never a number),
+    // as the manifest reader parses configuration names.
+    private static T ParseName<T>(string name) where T : struct, Enum =>
+        Enum.TryParse<T>(name.Replace("-", "", StringComparison.Ordinal), ignoreCase: true, out var value) && Enum.IsDefined(value)
+            && !int.TryParse(name, out _)
+            ? value
+            : throw new InvalidOperationException($"The state names an unknown {typeof(T).Name} '{name}'.");
+}
