@@ -106,6 +106,7 @@ Use it to tell a wrong layout or a slow model from output that never reached the
 - Parameters: `sessionId`, optional `since` (a record sequence), `limit`, and `authorize` (`native-output` for the written bytes)
 - Returns `delivery.records`: each write's `outcome` (`accepted`, `refused` with a `reason`, `failed` with an `error`), `source`, `phase` (`before-model`/`after-model`), `bytesAccepted`, `modelSequenceAtStart`, and `outputSequence`
 - `accepted` means the host took the bytes, not that anything was displayed; local PTY sessions report `no-native-presentation`
+- To read incrementally, pass the last returned record's `sequence` as the next `since`; `totals.lastSequence` can skip a write still in progress
 
 ### Session Management
 

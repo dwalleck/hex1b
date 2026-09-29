@@ -243,7 +243,7 @@ hex1b capture delivery <id> [options]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--since` | long | | Only records after this sequence |
+| `--since` | long | | Only records after this sequence; to continue, pass the last returned record's sequence |
 | `--limit` | int | `4096` | Most records to return (1–4096) |
 | `--authorize` | string | | `native-output` adds each record's written bytes (base64) |
 

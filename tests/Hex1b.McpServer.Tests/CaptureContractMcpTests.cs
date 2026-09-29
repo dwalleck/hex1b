@@ -310,6 +310,10 @@ public class CaptureContractMcpTests : McpServerTestBase
                 .Single(l => l.GetProperty("layer").GetString() == "application-frame").GetProperty("available").GetBoolean(),
                 "a diagnostics-enabled app publishes application frames");
             StringAssert.Contains(FrameLayerReason(localCaps), "not a Hex1b application");
+            var delivery = attachedCaps.GetProperty("operations").EnumerateArray()
+                .Single(o => o.GetProperty("operation").GetString() == "delivery");
+            Assert.AreEqual("native-delivery", delivery.GetProperty("layer").GetString(), "the delivery operation names its layer");
+            CollectionAssert.Contains(delivery.GetProperty("authorizations").EnumerateArray().Select(a => a.GetString()).ToList(), "native-output");
             // The operations are the same; only milestone availability depends on the target.
             Assert.AreEqual(
                 WithoutMilestoneAvailability(attachedCaps.GetProperty("operations")),

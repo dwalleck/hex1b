@@ -569,8 +569,12 @@ internal sealed class FakeConsoleDriver : IConsoleDriver
             throw failure.Error;
         }
 
-        _written.AddRange(data.ToArray());
+        if (!DiscardWrites)
+            _written.AddRange(data.ToArray());
     }
+
+    /// <summary>Counts writes without keeping their bytes, so a test can measure the write path's own allocations.</summary>
+    public bool DiscardWrites { get; init; }
 
     /// <summary>Writes, reporting partial progress when a failure was injected.</summary>
     public void Write(ReadOnlySpan<byte> data, NativeWriteProgress progress)

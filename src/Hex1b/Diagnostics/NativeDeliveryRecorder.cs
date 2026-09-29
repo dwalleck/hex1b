@@ -103,13 +103,20 @@ internal sealed class NativeDeliveryRecorder
     /// </summary>
     internal Snapshot Read(long since, int limit, bool includeBytes)
     {
+        // Copied under the lock, encoded after it, so a capture never holds the pump's writes back
+        // while it base64-encodes up to 1 MiB.
+        var copies = new List<(DiagnosticDeliveryRecord Record, byte[]? Bytes)>();
+        int inProgress;
+        DiagnosticDeliveryTotals totals;
+        long evicted;
         lock (_sync)
         {
             var oldestRetained = Math.Max(1, _started - MaxRecords + 1);
-            var records = new List<DiagnosticDeliveryRecord>();
-            var inProgress = 0;
+            inProgress = 0;
             var blocked = false;
-            for (var sequence = Math.Max(since + 1, oldestRetained); sequence <= _started; sequence++)
+            // since >= _started returns nothing; comparing first keeps since + 1 from overflowing.
+            var first = since >= _started ? _started + 1 : Math.Max(since + 1, oldestRetained);
+            for (var sequence = first; sequence <= _started; sequence++)
             {
                 var entry = _ring[sequence % MaxRecords]!;
                 if (entry.Outcome is null)
@@ -119,12 +126,12 @@ internal sealed class NativeDeliveryRecorder
                     continue;
                 }
 
-                if (blocked || records.Count >= limit)
+                if (blocked || copies.Count >= limit)
                     continue;
-                records.Add(entry.ToRecord(includeBytes));
+                copies.Add((entry.ToRecord(), includeBytes ? entry.Bytes : null));
             }
 
-            return new Snapshot(records, new DiagnosticDeliveryTotals
+            totals = new DiagnosticDeliveryTotals
             {
                 Accepted = _accepted,
                 Refused = _refused,
@@ -132,8 +139,14 @@ internal sealed class NativeDeliveryRecorder
                 BytesAccepted = _bytesAccepted,
                 FirstSequence = _firstCompleted,
                 LastSequence = _lastCompleted,
-            }, Math.Max(0, _started - MaxRecords), inProgress);
+            };
+            evicted = Math.Max(0, _started - MaxRecords);
         }
+
+        var records = copies
+            .Select(c => c.Bytes is { } bytes ? c.Record with { Content = Convert.ToBase64String(bytes) } : c.Record)
+            .ToList();
+        return new Snapshot(records, totals, evicted, inProgress);
     }
 
     // Must hold _sync. Drops retained bytes from the oldest records until the budget holds, never
@@ -143,7 +156,8 @@ internal sealed class NativeDeliveryRecorder
         _byteCursor = Math.Max(_byteCursor, newest - MaxRecords + 1);
         while (_retainedBytes > MaxRetainedBytes && _byteCursor < newest)
         {
-            if (_ring[_byteCursor % MaxRecords] is { Bytes: { } bytes } entry && entry.Sequence == _byteCursor)
+            // A write that carried no bytes has nothing to evict.
+            if (_ring[_byteCursor % MaxRecords] is { Bytes: { Length: > 0 } bytes } entry && entry.Sequence == _byteCursor)
             {
                 _retainedBytes -= bytes.Length;
                 entry.Bytes = null;
@@ -176,7 +190,7 @@ internal sealed class NativeDeliveryRecorder
 
         public bool BytesEvicted { get; set; }
 
-        public DiagnosticDeliveryRecord ToRecord(bool includeBytes) => new()
+        public DiagnosticDeliveryRecord ToRecord() => new()
         {
             Sequence = Sequence,
             Source = source,
@@ -191,7 +205,6 @@ internal sealed class NativeDeliveryRecorder
             StartedAt = startedAt,
             ModelSequenceAtStart = modelSequence,
             OutputSequence = outputSequence,
-            Content = includeBytes && Bytes is { } retained ? Convert.ToBase64String(retained) : null,
             Truncated = truncated,
             BytesEvicted = BytesEvicted,
         };

@@ -54,7 +54,11 @@ internal interface IConsoleDriver : IDisposable
     /// bytes the host takes. A driver that cannot see partial progress reports none, so a failure's
     /// accepted bytes are unknown.
     /// </summary>
-    void Write(ReadOnlySpan<byte> data, NativeWriteProgress progress) => Write(data);
+    void Write(ReadOnlySpan<byte> data, NativeWriteProgress progress)
+    {
+        Write(data);
+        progress.Advance(data.Length);
+    }
     
     /// <summary>
     /// Flush stdout.

@@ -61,11 +61,16 @@ public sealed class TerminalDiagnostics
     private const string FailureObservabilityLimitation =
         "A failed write is observable only while the process survives it: closing a host terminal that is the process's controlling terminal ends the process (SIGHUP) before any write fails.";
     private const string InProgressLimitation =
-        "A write still in progress is reported once it completes; later records wait behind it so a since-continuation never skips one.";
+        "A write still in progress is reported once it completes, and later records wait behind it. Continue with since = the last returned record's sequence (not totals.lastSequence), so no record is skipped.";
+    private const string DisposalLimitation =
+        "Writes made while the terminal is disposed (its exit sequences) are readable only in-process: the diagnostics socket closes at session end.";
+    private const string PresentationQueriesLimitation =
+        "Writes a presentation makes on its own (cursor-position queries, capability probes, a WebSocket's held UTF-8 tail flushed later) are not terminal writes and are not recorded.";
     private const string DeliveryBoundsLimitation =
         "The session keeps the most recent 4,096 records and 1 MiB of written bytes (64 KiB per record); evictions and truncation are reported.";
     private static readonly IReadOnlyList<string> DeliveryLimitations =
-        [AcceptedIsNotPresentationLimitation, FailureObservabilityLimitation, InProgressLimitation, DeliveryBoundsLimitation, ObservationalLimitation];
+        [AcceptedIsNotPresentationLimitation, FailureObservabilityLimitation, InProgressLimitation, DeliveryBoundsLimitation,
+         DisposalLimitation, PresentationQueriesLimitation, ObservationalLimitation];
 
     private const string ModelCaptureIsNotAFrame =
         "A terminal-model capture is not an application frame; the application-frame operation returns frames, acquired separately.";
@@ -582,12 +587,16 @@ public sealed class TerminalDiagnostics
                 return DeliveryProblem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", $"Unsupported authorization '{authorization}'.");
         }
 
-        if (_terminal.IsDisposed)
-            return DeliveryProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
+        // A disposed terminal's record stays readable in-process: its last writes, the exit sequences,
+        // happen during disposal. The socket closes at session end, so remote clients cannot read them.
         if (_terminal.NativeDelivery is not { } recorder)
+        {
+            if (_terminal.IsDisposed)
+                return DeliveryProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
             return _terminal.PresentationAdapter is INonNativePresentation
                 ? DeliveryProblem(DiagnosticOutcome.Unavailable, "no-native-presentation", NoNativePresentation)
                 : DeliveryProblem(DiagnosticOutcome.Unavailable, "presentation-delivery-unobservable", DeliveryUnobservable);
+        }
 
         var includeBytes = request.Authorizations?.Contains(DiagnosticAuthorization.NativeOutput) == true;
         var startTimestamp = Stopwatch.GetTimestamp();
@@ -602,17 +611,27 @@ public sealed class TerminalDiagnostics
             new() { Field = "identity.applicationFrame", Reason = "Delivery records link to frames through outputSequence and frame output marks, never by timing." },
             new() { Field = "identity.applicationInstanceId", Reason = "Delivery records are per terminal session, not per application instance." },
         };
-        if (snapshot.Records.Any(r => r.Source == DiagnosticDeliverySource.TerminalControl))
+        // Every missing link is explained once, with the causes present in this result.
+        var outputCauses = new List<string>();
+        if (snapshot.Records.Any(r => r.OutputSequence is null && r.Source == DiagnosticDeliverySource.TerminalControl))
+            outputCauses.Add("terminal-control writes carry no workload output item");
+        if (snapshot.Records.Any(r => r.OutputSequence is null && r.Source != DiagnosticDeliverySource.TerminalControl))
+            outputCauses.Add(_terminal.InputMilestones is null or { AcceptanceOnly: true }
+                ? "the session does not track input milestones, so writes carry no output-item sequence"
+                : "state-sync replays of a remote (HMP1) workload carry no output item");
+        if (outputCauses.Count > 0)
+            unavailable.Add(new DiagnosticUnavailableField { Field = "records.outputSequence", Reason = string.Join("; ", outputCauses) + "." });
+        if (snapshot.Records.Any(r => r.Phase is null))
             unavailable.Add(new DiagnosticUnavailableField
             {
-                Field = "records.outputSequence",
-                Reason = "Terminal-control writes carry no workload output item and no phase.",
+                Field = "records.phase",
+                Reason = "Terminal-control writes are not workload output, so they have no phase relative to model application.",
             });
-        if (_terminal.InputMilestones is null or { AcceptanceOnly: true })
+        if (snapshot.Records.Any(r => r.BytesAccepted is null))
             unavailable.Add(new DiagnosticUnavailableField
             {
-                Field = "records.outputSequence",
-                Reason = "The session does not track input milestones, so writes carry no output-item sequence.",
+                Field = "records.bytesAccepted",
+                Reason = "For some failed writes the presentation cannot observe how many bytes the host took before the error.",
             });
 
         var identity = DescribeIdentity(DiagnosticLayer.NativeDelivery, modelSequence: null, applicationFrame: null,

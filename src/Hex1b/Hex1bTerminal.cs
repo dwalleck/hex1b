@@ -1822,7 +1822,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         var passthroughStarted = Stopwatch.GetTimestamp();
                         await WritePresentationAsync(_presentation ?? throw new InvalidOperationException(
                             "A model-gated delivery requires a presentation adapter."), data,
-                            Diagnostics.DiagnosticDeliverySource.WorkloadOutput, Diagnostics.DiagnosticDeliveryPhase.AfterModel, readItem.MilestoneSequence, ct);
+                            Diagnostics.DiagnosticDeliverySource.GatedDelivery, Diagnostics.DiagnosticDeliveryPhase.AfterModel, readItem.MilestoneSequence, ct);
                         _metrics.TerminalRawPassthroughDuration.Record(
                             Stopwatch.GetElapsedTime(passthroughStarted).TotalMilliseconds);
                         _metrics.TerminalOutputBytes.Record(data.Length);
@@ -1949,7 +1949,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                             VerifyObserversPreservedOutput(appliedTokens, filteredTokens);
 
                         var filteredBytes = Tokens.AnsiTokenUtf8Serializer.Serialize(filteredTokens);
-                        await WritePresentationAsync(_presentation, filteredBytes, Diagnostics.DiagnosticDeliverySource.WorkloadOutput,
+                        await WritePresentationAsync(_presentation, filteredBytes, acceptedDelivery is not null
+                            ? Diagnostics.DiagnosticDeliverySource.GatedDelivery : Diagnostics.DiagnosticDeliverySource.WorkloadOutput,
                             Diagnostics.DiagnosticDeliveryPhase.AfterModel, readItem.MilestoneSequence, ct);
                         _metrics.TerminalOutputBytes.Record(filteredBytes.Length);
                     }
@@ -1958,7 +1959,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         // Accepted model-gated raw output was intentionally held back before
                         // tokenization; forward the original bytes only after model application.
                         var passthroughStarted = Stopwatch.GetTimestamp();
-                        await WritePresentationAsync(_presentation, data, Diagnostics.DiagnosticDeliverySource.WorkloadOutput,
+                        await WritePresentationAsync(_presentation, data, Diagnostics.DiagnosticDeliverySource.GatedDelivery,
                             Diagnostics.DiagnosticDeliveryPhase.AfterModel, readItem.MilestoneSequence, ct);
                         _metrics.TerminalRawPassthroughDuration.Record(
                             Stopwatch.GetElapsedTime(passthroughStarted).TotalMilliseconds);

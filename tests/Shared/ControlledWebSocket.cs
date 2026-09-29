@@ -16,6 +16,9 @@ internal sealed class ControlledWebSocket : WebSocket
 
     public bool FailSends { get; set; }
 
+    /// <summary>Completes each send asynchronously, as a real socket under backpressure does, and records nothing.</summary>
+    public bool YieldSends { get; set; }
+
     public List<byte[]> Sent { get; } = [];
 
     public override WebSocketCloseStatus? CloseStatus => null;
@@ -51,10 +54,17 @@ internal sealed class ControlledWebSocket : WebSocket
 
     public override ValueTask SendAsync(System.ReadOnlyMemory<byte> buffer, WebSocketMessageType messageType, bool endOfMessage, CancellationToken cancellationToken = default)
     {
+        if (YieldSends)
+            return YieldThenSendAsync(buffer);
         lock (Sent)
             Sent.Add(buffer.ToArray());
         if (FailSends)
             throw new WebSocketException("The remote party closed the connection.");
         return ValueTask.CompletedTask;
+    }
+
+    private static async ValueTask YieldThenSendAsync(System.ReadOnlyMemory<byte> buffer)
+    {
+        await Task.Yield();
     }
 }

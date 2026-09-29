@@ -19,7 +19,7 @@ public class NativeDeliveryTests
     {
         await using var harness = await ConsoleHarness.StartAsync(milestones: true);
 
-        await harness.WriteAsync("ALPHA-OUTPUT");
+        var enqueued = await harness.WriteAsync("ALPHA-OUTPUT");
         var result = harness.Capture(authorizations: [DiagnosticAuthorization.NativeOutput]);
 
         Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome, result.Problem?.Message);
@@ -29,7 +29,9 @@ public class NativeDeliveryTests
         Assert.AreEqual(DiagnosticDeliverySource.WorkloadOutput, record.Source);
         Assert.AreEqual(record.Length, record.BytesAccepted, "an accepted write reported fewer bytes than it carried");
         Assert.IsGreaterThanOrEqualTo(record.StartTimestamp, record.EndTimestamp);
-        Assert.IsNotNull(record.OutputSequence, "a tracked session's write lost its output item");
+        // The workload's own enqueue counter is a different path from the pump's item.
+        Assert.AreEqual(enqueued, record.OutputSequence, "the write carried another output item's sequence");
+        Assert.AreNotEqual(record.ModelSequenceAtStart, record.OutputSequence, "fixture: the two sequences coincide, so a swap would pass");
         // The driver's own log is a different path from the recorder.
         StringAssert.Contains(harness.Driver.WrittenText, Decode(record));
         Assert.AreEqual(result.Records.Count, result.Totals!.Accepted + result.Totals.Refused + result.Totals.Failed,
@@ -79,7 +81,7 @@ public class NativeDeliveryTests
     [TestMethod]
     public async Task GatedRefusal_RecordsARefusedBatchThatNeverReachedTheHost()
     {
-        await using var harness = await ConsoleHarness.StartAsync();
+        await using var harness = await ConsoleHarness.StartAsync(milestones: true);
 
         // The host has left the geometry the batch was composed for.
         harness.Driver.TerminalSize = (41, 6);
@@ -95,6 +97,8 @@ public class NativeDeliveryTests
         Assert.AreEqual((DiagnosticDeliveryOutcome.Refused, "geometry-changed", 0),
             (records[0].Outcome, records[0].Reason, records[0].BytesAccepted));
         Assert.AreEqual(DiagnosticDeliveryPhase.BeforeModel, records[0].Phase);
+        Assert.IsNotNull(records[0].OutputSequence, "the refused batch lost its output item");
+        Assert.IsGreaterThan(records[0].OutputSequence!.Value, records[1].OutputSequence ?? 0, "the applied batch did not carry the later output item");
         Assert.AreEqual(DiagnosticDeliveryOutcome.Accepted, records[1].Outcome);
         Assert.IsFalse(harness.Driver.WrittenText.Contains("GATED-REFUSED", StringComparison.Ordinal), "a refused batch reached the host");
         StringAssert.Contains(harness.Driver.WrittenText, "GATED-APPLIED");
@@ -144,24 +148,44 @@ public class NativeDeliveryTests
     public async Task TerminalControl_ExitSequencesAreRecordedWithoutOutputLinks()
     {
         var harness = await ConsoleHarness.StartAsync(milestones: true);
-        var recorder = harness.Terminal.NativeDelivery!;
 
         await harness.DisposeAsync();
-        var records = recorder.Read(0, NativeDeliveryRecorder.MaxRecords, includeBytes: true).Records;
+        // Read through the engine, as every consumer does: disposal must not hide its own writes.
+        var result = harness.Capture(authorizations: [DiagnosticAuthorization.NativeOutput]);
 
-        var control = records.Where(r => r.Source == DiagnosticDeliverySource.TerminalControl).ToList();
+        Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome, result.Problem?.Message);
+        var control = result.Records.Where(r => r.Source == DiagnosticDeliverySource.TerminalControl).ToList();
         Assert.IsNotEmpty(control, "the terminal's exit sequences were not recorded");
         Assert.IsTrue(control.All(r => r.Phase is null && r.OutputSequence is null), "a terminal-control write carried output links");
         StringAssert.Contains(Decode(control[^1]), "\u001b[?1049l");
+        var fields = result.UnavailableFields.Select(f => f.Field).ToList();
+        CollectionAssert.Contains(fields, "records.phase", "a terminal-control record's missing phase was not explained");
+        CollectionAssert.Contains(fields, "records.outputSequence", "a terminal-control record's missing output item was not explained");
+        Assert.AreEqual(fields.Count, fields.Distinct().Count(), "a field was explained twice: " + string.Join(", ", fields));
     }
 
     [TestMethod]
-    public async Task Delivery_ZeroWritesSinceAndLimit()
+    public async Task Delivery_ZeroWritesIsAnEmptyObservation()
+    {
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(new Hex1bAppWorkloadAdapter())
+            .WithPresentation(new ConsolePresentationAdapter(new FakeConsoleDriver { TerminalSize = (40, 6) })).WithDimensions(40, 6).Build();
+        var result = new TerminalDiagnostics(terminal, "delivery").CaptureDelivery(new DiagnosticDeliveryRequest());
+
+        Assert.AreEqual(DiagnosticOutcome.Captured, result.Outcome, "zero writes must be an observation, not unavailable");
+        Assert.IsEmpty(result.Records);
+        Assert.AreEqual((0L, 0L, 0L, 0L, (long?)null, (long?)null, 0L, 0),
+            (result.Totals!.Accepted, result.Totals.Refused, result.Totals.Failed, result.Totals.BytesAccepted,
+             result.Totals.FirstSequence, result.Totals.LastSequence, result.EvictedRecords, result.WritesInProgress));
+        Assert.AreEqual("console", result.DeliveryLayer);
+        Assert.IsNotNull(result.Identity?.Acquisition, "the observation has no acquisition interval");
+    }
+
+    [TestMethod]
+    public async Task Delivery_SinceAndLimit()
     {
         await using var harness = await ConsoleHarness.StartAsync();
-        var empty = harness.Capture();
-        Assert.AreEqual(DiagnosticOutcome.Captured, empty.Outcome, "zero writes must be an observation, not unavailable");
-        var baseline = empty.Totals!.LastSequence ?? 0;
+        // Continue from the last returned record, never from totals.lastSequence.
+        var baseline = harness.Capture().Records.LastOrDefault()?.Sequence ?? 0;
 
         for (var i = 0; i < 5; i++)
             await harness.WriteAsync($"ROW{i}");
@@ -171,6 +195,8 @@ public class NativeDeliveryTests
         Assert.IsGreaterThanOrEqualTo(5, all.Records.Count);
         CollectionAssert.AreEqual(all.Records.Skip(2).Take(2).Select(r => r.Sequence).ToList(), page.Records.Select(r => r.Sequence).ToList());
         Assert.IsTrue(all.Records.Zip(all.Records.Skip(1)).All(p => p.Second.Sequence == p.First.Sequence + 1), "records are not oldest first and dense");
+        foreach (var since in new[] { all.Records[^1].Sequence, 1_000_000L, long.MaxValue - 1, long.MaxValue })
+            Assert.IsEmpty(harness.Capture(since: since).Records, $"since={since} returned records at or before it");
     }
 
     [TestMethod]
@@ -193,6 +219,10 @@ public class NativeDeliveryTests
         Assert.AreEqual(10_001, snapshot.Totals.Accepted);
         Assert.AreEqual(10_000L * 1024 + 100 * 1024, snapshot.Totals.BytesAccepted);
         Assert.IsLessThanOrEqualTo(NativeDeliveryRecorder.MaxRetainedBytes, retained, $"{retained} bytes retained");
+        // Eviction frees only what the budget needs: at most one record's bytes below it.
+        Assert.IsGreaterThanOrEqualTo(NativeDeliveryRecorder.MaxRetainedBytes - NativeDeliveryRecorder.MaxRecordBytes, retained, $"only {retained} bytes retained");
+        Assert.AreEqual(retained, snapshot.Records.Where(r => !r.BytesEvicted).Sum(r => Math.Min(r.Length, NativeDeliveryRecorder.MaxRecordBytes)),
+            "a record kept its bytes but was flagged evicted, or lost them unflagged");
         var last = snapshot.Records[^1];
         Assert.IsTrue(last.Truncated, "a 100 KiB write was not flagged truncated");
         Assert.AreEqual(NativeDeliveryRecorder.MaxRecordBytes, Convert.FromBase64String(last.Content!).Length);
@@ -307,24 +337,116 @@ public class NativeDeliveryTests
             snapshot.Records.Select(r => r.Sequence).ToList(), "sequences are not dense and unique");
         Assert.AreEqual(4000, snapshot.Totals.Accepted);
 
-        // Workload output racing the terminal's own exit sequences.
+        // Workload output racing the terminal's own exit sequences: the terminal is disposed while
+        // its pump is still running, not after the run was stopped.
+        var raced = 0;
         for (var round = 0; round < 20; round++)
         {
-            var harness = await ConsoleHarness.StartAsync();
-            var terminalRecorder = harness.Terminal.NativeDelivery!;
+            await using var harness = await ConsoleHarness.StartAsync();
+            using var started = new ManualResetEventSlim();
+            var written = 0;
             var writer = Task.Run(() =>
             {
-                for (var i = 0; i < 50; i++)
-                    harness.Workload.Write($"R{round}-{i}\r\n");
+                for (var i = 0; i < 200; i++)
+                {
+                    try { harness.Workload.Write($"R{round}-{i}\r\n"); }
+                    catch (ObjectDisposedException) { return; }
+                    Volatile.Write(ref written, i + 1);
+                    if (i == 10)
+                        started.Set();
+                }
             });
-            await harness.DisposeAsync();
+            started.Wait(TestContext.Current.CancellationToken);
+            var writtenAtDispose = Volatile.Read(ref written);
+            await harness.Terminal.DisposeAsync();
             await writer;
-            var read = terminalRecorder.Read(0, NativeDeliveryRecorder.MaxRecords, includeBytes: false);
+            var read = harness.Capture();
             var sequences = read.Records.Select(r => r.Sequence).ToList();
+
+            Assert.AreEqual(DiagnosticOutcome.Captured, read.Outcome, read.Problem?.Message);
+            Assert.AreEqual(0, read.WritesInProgress, $"round {round}: a write was never completed");
             Assert.IsTrue(sequences.Zip(sequences.Skip(1)).All(p => p.Second == p.First + 1), $"round {round}: sequences not dense");
-            Assert.AreEqual(read.Records.Count, read.Totals.Accepted + read.Totals.Refused + read.Totals.Failed,
+            Assert.AreEqual(read.Records.Count, read.Totals!.Accepted + read.Totals.Refused + read.Totals.Failed,
                 $"round {round}: a record was completed twice or not at all");
+            Assert.IsTrue(read.Records.Any(r => r.Source == DiagnosticDeliverySource.TerminalControl), $"round {round}: the exit sequences were not recorded");
+            if (writtenAtDispose < 200)
+                raced++;
         }
+
+        // Positive control: disposal began while the writer was still writing, or the rounds proved nothing.
+        Assert.IsGreaterThan(0, raced, "fixture: every writer finished before disposal began");
+    }
+
+    [TestMethod]
+    public void Recorder_InProgressWriteHoldsBackLaterRecordsUntilItCompletes()
+    {
+        var recorder = new NativeDeliveryRecorder("console");
+        var data = new byte[4];
+        var slow = recorder.Begin(DiagnosticDeliverySource.WorkloadOutput, DiagnosticDeliveryPhase.BeforeModel, data, null, 0);
+        recorder.Complete(recorder.Begin(DiagnosticDeliverySource.WorkloadOutput, DiagnosticDeliveryPhase.BeforeModel, data, null, 0),
+            DiagnosticDeliveryOutcome.Accepted, data.Length, null, null);
+
+        var during = recorder.Read(0, NativeDeliveryRecorder.MaxRecords, includeBytes: false);
+        recorder.Complete(slow, DiagnosticDeliveryOutcome.Accepted, data.Length, null, null);
+        var after = recorder.Read(during.Records.LastOrDefault()?.Sequence ?? 0, NativeDeliveryRecorder.MaxRecords, includeBytes: false);
+
+        Assert.IsEmpty(during.Records, "a record after an in-progress write was returned, so a continuation would skip the slow one");
+        Assert.AreEqual(1, during.WritesInProgress);
+        Assert.AreEqual(2L, during.Totals.LastSequence, "fixture: totals count the completed later write");
+        CollectionAssert.AreEqual(new[] { 1L, 2L }, after.Records.Select(r => r.Sequence).ToArray(), "continuing lost the slow write");
+        Assert.AreEqual(0, after.WritesInProgress);
+    }
+
+    [TestMethod]
+    public void Recorder_CompletesARecordOnlyOnce()
+    {
+        var recorder = new NativeDeliveryRecorder("console");
+        var entry = recorder.Begin(DiagnosticDeliverySource.WorkloadOutput, DiagnosticDeliveryPhase.BeforeModel, new byte[8], null, 0);
+
+        recorder.Complete(entry, DiagnosticDeliveryOutcome.Failed, 3, null, "first");
+        recorder.Complete(entry, DiagnosticDeliveryOutcome.Accepted, 8, null, null);
+        var snapshot = recorder.Read(0, NativeDeliveryRecorder.MaxRecords, includeBytes: false);
+
+        Assert.AreEqual((DiagnosticDeliveryOutcome.Failed, 3, "first"),
+            (snapshot.Records.Single().Outcome, snapshot.Records.Single().BytesAccepted, snapshot.Records.Single().Error));
+        Assert.AreEqual((0L, 1L, 3L), (snapshot.Totals.Accepted, snapshot.Totals.Failed, snapshot.Totals.BytesAccepted),
+            "a second completion was counted");
+    }
+
+    [TestMethod]
+    public void Recorder_AWriteWithoutBytesIsNeverFlaggedEvicted()
+    {
+        var recorder = new NativeDeliveryRecorder("websocket");
+        recorder.Complete(recorder.Begin(DiagnosticDeliverySource.WorkloadOutput, DiagnosticDeliveryPhase.BeforeModel, [], null, 0),
+            DiagnosticDeliveryOutcome.Accepted, 0, null, null);
+        var block = new byte[NativeDeliveryRecorder.MaxRecordBytes];
+        for (var i = 0; i < 17; i++)
+            recorder.Complete(recorder.Begin(DiagnosticDeliverySource.WorkloadOutput, DiagnosticDeliveryPhase.BeforeModel, block, null, 0),
+                DiagnosticDeliveryOutcome.Accepted, block.Length, null, null);
+
+        var records = recorder.Read(0, NativeDeliveryRecorder.MaxRecords, includeBytes: true).Records;
+
+        Assert.IsFalse(records[0].BytesEvicted, "an empty write was flagged as having lost bytes it never had");
+        Assert.IsTrue(records[1].BytesEvicted, "fixture: the budget did not evict the oldest real bytes");
+    }
+
+    [TestMethod]
+    public async Task DisposedPresentation_UngatedIsRefusedAndGatedFailsWithNoBytes()
+    {
+        await using var harness = await ConsoleHarness.StartAsync();
+        await harness.WriteAsync("SETTLE");
+        await harness.Presentation.DisposeAsync();
+
+        harness.Workload.Write("AFTER-DISPOSE");
+        var refused = await harness.WaitForRecordAsync(r => r.Outcome == DiagnosticDeliveryOutcome.Refused);
+        var gated = harness.Workload.WriteRequiredIfGeometry("GATED-AFTER-DISPOSE", 40, 6);
+        var failed = await harness.WaitForRecordAsync(r => r.Outcome == DiagnosticDeliveryOutcome.Failed);
+
+        Assert.AreEqual(("presentation-disposed", 0), (refused.Reason, refused.BytesAccepted));
+        Assert.AreEqual((DiagnosticDeliverySource.GatedDelivery, 0), (failed.Source, failed.BytesAccepted),
+            "a gated write to a disposed presentation took no bytes, and the record must say so");
+        StringAssert.Contains(failed.Error, nameof(ObjectDisposedException));
+        await Assert.ThrowsAsync<Exception>(() => gated.WaitAsync(TimeSpan.FromSeconds(5)), "fixture: the gated write did not fail");
     }
 
     [TestMethod]
@@ -398,10 +520,91 @@ public class NativeDeliveryTests
             (DiagnosticDeliveryOutcome.Failed, null),
         }, outcomes, string.Join(", ", outcomes));
         StringAssert.Contains(result.Records[2].Error, nameof(WebSocketException));
+        Assert.IsNull(result.Records[2].BytesAccepted, "a swallowed socket error cannot say how many bytes were sent");
+        CollectionAssert.Contains(result.UnavailableFields.Select(f => f.Field).ToList(), "records.bytesAccepted",
+            "the missing byte count was not explained");
         Assert.IsFalse(run.IsCompleted, "a swallowed socket error ended the run, which it never did before");
         Assert.HasCount(2, socket.Sent, "fixture: the open and failing writes both reached the socket; the closed one did not");
         await cts.CancelAsync();
         try { await run; } catch (Exception) { }
+    }
+
+    [TestMethod]
+    public async Task WebSocket_ModelGatedDeliveryIsGatedAndAfterModel()
+    {
+        // Both routes the terminal takes for a batch it gates against its own model: raw, and filtered.
+        foreach (var filtered in new[] { false, true })
+        {
+            var socket = new ControlledWebSocket();
+            var presentation = new WebSocketPresentationAdapter(socket, 40, 6);
+            var workload = new Hex1bAppWorkloadAdapter { GeometryGatedDeliveryEnforceable = true };
+            var builder = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithPresentation(presentation).WithDimensions(40, 6);
+            if (filtered)
+                builder.AddPresentationFilter(new ObservingFilter());
+            await using var terminal = builder.Build();
+            var diagnostics = new TerminalDiagnostics(terminal, "websocket");
+            using var cts = new CancellationTokenSource();
+            var run = terminal.RunAsync(cts.Token);
+
+            var outcome = await workload.WriteRequiredIfGeometry("MODEL-GATED", 40, 6).WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            var records = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Records;
+
+            Assert.AreEqual(NativeDeliveryOutcome.Applied, outcome, "fixture");
+            Assert.AreEqual((DiagnosticDeliverySource.GatedDelivery, DiagnosticDeliveryPhase.AfterModel, DiagnosticDeliveryOutcome.Accepted),
+                (records.Single().Source, records.Single().Phase, records.Single().Outcome),
+                $"filtered={filtered}: a model-gated batch was labelled as ordinary output or by the wrong order");
+            await cts.CancelAsync();
+            try { await run; } catch (Exception) { }
+        }
+    }
+
+    [TestMethod]
+    public async Task Unarmed_ObservableWritePathsAllocateNothingExtra()
+    {
+        // The console adapter can report its writes, so the helper's own recorder check is what is measured.
+        var driver = new FakeConsoleDriver { TerminalSize = (40, 6), DiscardWrites = true };
+        var console = new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25));
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(new Hex1bAppWorkloadAdapter())
+            .WithPresentation(console).WithDimensions(40, 6).Build();
+        Assert.IsNull(terminal.NativeDelivery, "fixture: no engine, so nothing is armed");
+        var helper = typeof(Hex1bTerminal).GetMethod("WritePresentationAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .CreateDelegate<Func<IHex1bTerminalPresentationAdapter, ReadOnlyMemory<byte>, DiagnosticDeliverySource, DiagnosticDeliveryPhase?, long, CancellationToken, ValueTask>>(terminal);
+        var bytes = new byte[64];
+        Assert.AreEqual(
+            Measure(() => console.WriteOutputAsync(bytes)),
+            Measure(() => helper(console, bytes, DiagnosticDeliverySource.WorkloadOutput, DiagnosticDeliveryPhase.BeforeModel, 1, default)),
+            "the unarmed helper allocates more than the console presentation's own write");
+
+        // The WebSocket adapter's public write must be exactly its one write path, even when a send completes asynchronously.
+        var socket = new ControlledWebSocket { YieldSends = true };
+        await using var websocket = new WebSocketPresentationAdapter(socket, 40, 6);
+        var core = typeof(WebSocketPresentationAdapter).GetMethod("WriteCoreAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .CreateDelegate<Func<ReadOnlyMemory<byte>, CancellationToken, StrongBox<NativeWriteResult>?, ValueTask>>(websocket);
+        var text = Encoding.UTF8.GetBytes("websocket output");
+        // Asynchronous completion leaves a few hundred bytes of thread-pool noise per thousand writes;
+        // one extra boxed state machine is over a hundred bytes on every write.
+        var coreBytes = Measure(() => core(text, default, null));
+        var publicBytes = Measure(() => websocket.WriteOutputAsync(text));
+        Assert.IsLessThan(8 * 1000, Math.Abs(publicBytes - coreBytes),
+            $"the unarmed WebSocket write allocates {publicBytes} bytes per 1,000 writes against its one write path's {coreBytes}");
+
+        static long Measure(Func<ValueTask> write)
+        {
+            static void Run(Func<ValueTask> write)
+            {
+                var pending = write();
+                while (!pending.IsCompleted)
+                    Thread.SpinWait(20);
+                pending.GetAwaiter().GetResult();
+            }
+
+            for (var i = 0; i < 100; i++)
+                Run(write);
+            var start = GC.GetAllocatedBytesForCurrentThread();
+            for (var i = 0; i < 1000; i++)
+                Run(write);
+            return GC.GetAllocatedBytesForCurrentThread() - start;
+        }
     }
 
     [TestMethod]
@@ -500,17 +703,33 @@ public class NativeDeliveryTests
             return harness;
         }
 
-        public async Task WriteAsync(string text)
+        // Returns the output item the workload enqueued the text as (0 without milestones).
+        public async Task<long> WriteAsync(string text)
         {
             Workload.Write(text);
+            var enqueued = Workload.MilestoneOutputSequence;
             for (var i = 0; i < 500 && !Driver.WrittenText.Contains(text, StringComparison.Ordinal); i++)
                 await Task.Delay(10, TestContext.Current.CancellationToken);
             Assert.Contains(text, Driver.WrittenText, "fixture: the output never reached the driver");
             // The record completes right after the driver write returns.
             await Task.Delay(20, TestContext.Current.CancellationToken);
+            return enqueued;
         }
 
         public long ModelSequence() => Terminal.CurrentModelSequence;
+
+        public async Task<DiagnosticDeliveryRecord> WaitForRecordAsync(Func<DiagnosticDeliveryRecord, bool> match)
+        {
+            for (var i = 0; i < 500; i++)
+            {
+                if (Capture().Records.FirstOrDefault(match) is { } record)
+                    return record;
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+            }
+
+            Assert.Fail("fixture: the expected record never appeared");
+            return null!;
+        }
 
         public DiagnosticDeliveryResult Capture(long? since = null, int? limit = null, IReadOnlyList<DiagnosticAuthorization>? authorizations = null) =>
             Diagnostics!.CaptureDelivery(new DiagnosticDeliveryRequest { Since = since, Limit = limit, Authorizations = authorizations });
@@ -528,7 +747,12 @@ public class NativeDeliveryTests
         }
     }
 
-    private sealed class PassFilter : IHex1bTerminalPresentationFilter
+    // An observer preserves the output, so a model-gated batch stays enforceable through it.
+    private sealed class ObservingFilter : PassFilter, IHex1bTerminalOutputObserver
+    {
+    }
+
+    private class PassFilter : IHex1bTerminalPresentationFilter
     {
         public ValueTask<IReadOnlyList<AnsiToken>> OnOutputAsync(IReadOnlyList<AppliedToken> appliedTokens, TimeSpan elapsed, CancellationToken ct = default) =>
             ValueTask.FromResult<IReadOnlyList<AnsiToken>>(appliedTokens.Select(t => t.Token).ToArray());

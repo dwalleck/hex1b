@@ -286,6 +286,27 @@ public class DiagnosticsSocketClientTests
     }
 
     [TestMethod]
+    public async Task Delivery_RecordsOnAnOutcomeOtherThanCaptured_IsProtocolError()
+    {
+        var record = new DiagnosticDeliveryRecord { Sequence = 1, Outcome = DiagnosticDeliveryOutcome.Accepted };
+        string Response(DiagnosticDeliveryResult result) =>
+            $$"""{"success":true,"delivery":{{System.Text.Json.JsonSerializer.Serialize(result, DiagnosticsJsonContext.Default.DiagnosticDeliveryResult)}}}""";
+        await using var withRecords = await FakeServer.StartAsync(_ => Response(
+            TerminalDiagnostics.DeliveryProblem(DiagnosticOutcome.Unavailable, "target-disposed", "gone") with { Records = [record] }));
+        await using var without = await FakeServer.StartAsync(_ => Response(
+            TerminalDiagnostics.DeliveryProblem(DiagnosticOutcome.Unavailable, "target-disposed", "gone")));
+
+        var rejected = await new DiagnosticsSocketClient().CaptureDeliveryAsync(withRecords.Path, new DiagnosticDeliveryRequest(),
+            TestContext.Current.CancellationToken);
+        var passed = await new DiagnosticsSocketClient().CaptureDeliveryAsync(without.Path, new DiagnosticDeliveryRequest(),
+            TestContext.Current.CancellationToken);
+
+        Assert.AreEqual((DiagnosticOutcome.Failed, "protocol-error"), (rejected.Outcome, rejected.Problem?.Code));
+        Assert.IsEmpty(rejected.Records);
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "target-disposed"), (passed.Outcome, passed.Problem?.Code), "fixture: the same outcome without records");
+    }
+
+    [TestMethod]
     public async Task ApplicationFrame_CapturedFrameWithMissingNestedLists_IsProtocolError()
     {
         var complete = new DiagnosticApplicationFrameResult

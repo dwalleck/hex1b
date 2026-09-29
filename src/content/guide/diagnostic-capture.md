@@ -222,7 +222,9 @@ what the host was sent, not what the model or the application holds.
   transport took the bytes. It is not an acknowledgment that anything was displayed.
 - `refused`: the presentation declined to write. For example, a geometry-gated batch composed for
   a geometry the host no longer reports (`geometry-changed`), a WebSocket that is not open
-  (`socket-not-open`), or a disposed presentation (`presentation-disposed`).
+  (`socket-not-open`), or a disposed presentation (`presentation-disposed`). A geometry-gated
+  write to a disposed console presentation is `failed` instead, with `bytesAccepted` 0, because
+  it throws.
 - `failed`: the write raised an error, which the record reports with its type and message. The
   error then propagates exactly as it does without diagnostics. A WebSocket presentation
   swallows socket errors, and still does.
@@ -236,17 +238,25 @@ The result carries:
 - `records`: oldest first;
 - `totals`: counts per outcome and bytes accepted since coverage started, never evicted;
 - `evictedRecords`;
-- `writesInProgress`.
+- `writesInProgress`: a write still in progress holds back every later record until it
+  completes. To read incrementally, pass the last returned record's `sequence` as the next
+  `since`. `totals.lastSequence` can be ahead of it and would skip the pending write.
 
 Each record carries:
 
 - its per-session `sequence`, assigned when the write started;
-- `source`: `workload-output`, `gated-delivery` or `terminal-control` (the terminal's own mode
-  and exit sequences);
-- `phase`: `before-model` for raw passthrough and gated writes, which reach the host before the
-  model applies the same bytes; `after-model` for filtered output;
+- `source`: `workload-output`, `gated-delivery` (a batch composed for a particular geometry) or
+  `terminal-control` (the terminal's own mode and exit sequences);
+- `phase`, labelled by the order in which the write actually happened:
+  - `before-model` for raw passthrough, and for a batch the console presentation gates on its
+    own geometry, which is written before the model applies it;
+  - `after-model` for filtered output and for a batch the terminal gates against its own model
+    (for example a WebSocket presentation). A diagnostics-enabled Hex1b application
+    (`WithDiagnostics()`) adds a presentation filter, so its ordinary output is `after-model`;
+  - absent for `terminal-control` writes, and listed in `unavailableFields`;
 - `length` and `bytesAccepted`: for a failed console write, the bytes the host took before the
-  error;
+  error. It is absent, and listed in `unavailableFields`, when the presentation cannot observe
+  it, as for a failed WebSocket send;
 - its interval in the `process-monotonic` clock domain of capture acquisitions;
 - `modelSequenceAtStart`;
 - `outputSequence`, when the session tracks input milestones. It links the write to the frame
@@ -267,6 +277,13 @@ Outcomes:
   terminal that is the process's controlling terminal delivers SIGHUP, which ends the process
   before any write fails. `failed` records come from hosts whose output terminal is not the
   controlling terminal, or from transports.
+- A terminal that has been disposed keeps its record readable in-process, including the exit
+  sequences written during disposal. The diagnostics socket closes at session end, so the CLI
+  and MCP cannot read those last records.
+- Writes a presentation makes on its own are not terminal writes and are not recorded: the
+  console presentation's cursor-position queries and capability probes, and a WebSocket's held
+  incomplete UTF-8 tail. That tail is counted in the `accepted` write that carried it, and is
+  sent later without a record of its own.
 - Socket clients read one JSON line per request. The reply begins with a UTF-8 byte-order mark,
   which a raw client must skip (it may arrive in its own read).
 

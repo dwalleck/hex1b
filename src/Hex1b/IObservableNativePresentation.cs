@@ -16,12 +16,4 @@ internal interface IObservableNativePresentation
     /// ordinary write throws, after <paramref name="progress"/> records the bytes taken so far.
     /// </summary>
     ValueTask<NativeWriteResult> WriteObservedAsync(ReadOnlyMemory<byte> data, NativeWriteProgress progress, CancellationToken ct);
-
-    /// <summary>
-    /// The observed form of <see cref="IGeometryGatedPresentationAdapter.WriteOutputIfGeometryAsync"/>,
-    /// for presentations that gate on geometry.
-    /// </summary>
-    ValueTask<NativeDeliveryOutcome> WriteObservedIfGeometryAsync(ReadOnlyMemory<byte> data, int expectedWidth, int expectedHeight,
-        NativeWriteProgress progress, CancellationToken ct) =>
-        throw new NotSupportedException("This presentation does not gate on geometry.");
 }

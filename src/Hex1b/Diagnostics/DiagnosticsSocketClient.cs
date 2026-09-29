@@ -218,6 +218,12 @@ internal sealed class DiagnosticsSocketClient
                 "The target reported a delivery record without its totals, identity, layer, or with a missing record.");
         }
 
+        if (result.Outcome != DiagnosticOutcome.Captured && result.Records.Count > 0)
+        {
+            return TerminalDiagnostics.DeliveryProblem(DiagnosticOutcome.Failed, "protocol-error",
+                $"The target reported outcome '{DiagnosticContractNames.Of(result.Outcome)}' with delivery records.");
+        }
+
         if (result.Outcome != DiagnosticOutcome.Captured && result.Problem is null)
         {
             return TerminalDiagnostics.DeliveryProblem(DiagnosticOutcome.Failed, "protocol-error",

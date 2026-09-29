@@ -35,7 +35,11 @@ internal sealed class UnixConsoleDriver : IConsoleDriver
     // Where Write sends output; standard output except in tests that write to a pipe.
     private readonly int _outputFd = STDOUT_FILENO;
 
-    /// <summary>A driver that writes to <paramref name="outputFd"/>; used by tests to observe partial writes.</summary>
+    /// <summary>
+    /// A write-only driver for tests: <see cref="Write(ReadOnlySpan{byte})"/> goes to
+    /// <paramref name="outputFd"/> so partial writes can be observed. Geometry, termios, input and
+    /// resize notifications still use the process's own standard streams, so it is not a console.
+    /// </summary>
     internal UnixConsoleDriver(int outputFd)
     {
         _outputFd = outputFd;

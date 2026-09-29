@@ -28,7 +28,9 @@ public sealed partial class Hex1bTerminal
     /// The session's native delivery recorder; present only when a diagnostics engine is attached and
     /// the presentation can report its writes.
     /// </summary>
-    internal Diagnostics.NativeDeliveryRecorder? NativeDelivery { get; private set; }
+    internal Diagnostics.NativeDeliveryRecorder? NativeDelivery => Volatile.Read(ref _nativeDelivery);
+
+    private Diagnostics.NativeDeliveryRecorder? _nativeDelivery;
 
     /// <summary>
     /// Arms native delivery recording when the presentation is observable; called when a diagnostics
@@ -36,8 +38,11 @@ public sealed partial class Hex1bTerminal
     /// </summary>
     internal void EnsureNativeDeliveryRecorder()
     {
-        if (NativeDelivery is null && _presentation is IObservableNativePresentation observable)
-            NativeDelivery = new Diagnostics.NativeDeliveryRecorder(observable.DeliveryLayer);
+        // An impact-aware presentation receives cell impacts rather than bytes through the helpers,
+        // so its writes would not be recorded; it is reported unobservable instead.
+        if (NativeDelivery is null && _presentation is IObservableNativePresentation observable
+            && _presentation is not ICellImpactAwarePresentationAdapter)
+            Interlocked.CompareExchange(ref _nativeDelivery, new Diagnostics.NativeDeliveryRecorder(observable.DeliveryLayer), null);
     }
 
     // Counts model events: output application batches, geometry changes, and synchronized-update

@@ -43,13 +43,13 @@ public sealed partial class Hex1bTerminal
     private ValueTask<NativeDeliveryOutcome> WritePresentationIfGeometryAsync(IGeometryGatedPresentationAdapter presentation,
         ReadOnlyMemory<byte> data, int expectedWidth, int expectedHeight, long outputSequence, CancellationToken ct)
     {
-        if (NativeDelivery is not { } recorder || presentation is not IObservableNativePresentation observable)
+        if (NativeDelivery is not { } recorder || presentation is not IObservableGatedPresentation observable)
             return presentation.WriteOutputIfGeometryAsync(data, expectedWidth, expectedHeight, ct);
         return WriteObservedIfGeometryAsync(recorder, observable, data, expectedWidth, expectedHeight, outputSequence, ct);
     }
 
     private async ValueTask<NativeDeliveryOutcome> WriteObservedIfGeometryAsync(NativeDeliveryRecorder recorder,
-        IObservableNativePresentation observable, ReadOnlyMemory<byte> data, int expectedWidth, int expectedHeight,
+        IObservableGatedPresentation observable, ReadOnlyMemory<byte> data, int expectedWidth, int expectedHeight,
         long outputSequence, CancellationToken ct)
     {
         // A gated batch is written before the model applies it: only a written batch is then described.

@@ -16,7 +16,7 @@ namespace Hex1b;
 public sealed class ConsolePresentationAdapter :
     IHex1bTerminalPresentationAdapter,
     IGeometryGatedPresentationAdapter,
-    IObservableNativePresentation,
+    IObservableGatedPresentation,
     ITerminalReflowProvider,
     IInternalTerminalReflowProvider,
     ICursorPositionSource,
@@ -396,13 +396,15 @@ public sealed class ConsolePresentationAdapter :
         CancellationToken ct) =>
         ValueTask.FromResult(WriteIfGeometryCore(data, expectedWidth, expectedHeight, progress: null));
 
-    ValueTask<NativeDeliveryOutcome> IObservableNativePresentation.WriteObservedIfGeometryAsync(
+    ValueTask<NativeDeliveryOutcome> IObservableGatedPresentation.WriteObservedIfGeometryAsync(
         ReadOnlyMemory<byte> data, int expectedWidth, int expectedHeight, NativeWriteProgress progress, CancellationToken ct) =>
         ValueTask.FromResult(WriteIfGeometryCore(data, expectedWidth, expectedHeight, progress));
 
     private NativeDeliveryOutcome WriteIfGeometryCore(ReadOnlyMemory<byte> data, int expectedWidth, int expectedHeight,
         NativeWriteProgress? progress)
     {
+        // Observed from the start: a disposed adapter throws before the host takes any byte.
+        progress?.Observe();
         if (_disposed)
         {
             throw new ObjectDisposedException(nameof(ConsolePresentationAdapter));

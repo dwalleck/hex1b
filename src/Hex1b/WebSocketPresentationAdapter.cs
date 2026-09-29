@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Net.WebSockets;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using Hex1b.Input;
@@ -205,29 +206,40 @@ public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAda
     }
 
     /// <inheritdoc />
-    public async ValueTask WriteOutputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default) =>
-        await WriteCoreAsync(data, ct).ConfigureAwait(false);
+    public ValueTask WriteOutputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default) =>
+        WriteCoreAsync(data, ct, outcome: null);
 
     /// <inheritdoc />
     string IObservableNativePresentation.DeliveryLayer => "websocket";
 
-    ValueTask<NativeWriteResult> IObservableNativePresentation.WriteObservedAsync(
-        ReadOnlyMemory<byte> data, NativeWriteProgress progress, CancellationToken ct) => WriteCoreAsync(data, ct);
+    async ValueTask<NativeWriteResult> IObservableNativePresentation.WriteObservedAsync(
+        ReadOnlyMemory<byte> data, NativeWriteProgress progress, CancellationToken ct)
+    {
+        var outcome = new StrongBox<NativeWriteResult>(NativeWriteResult.Accepted);
+        await WriteCoreAsync(data, ct, outcome).ConfigureAwait(false);
+        return outcome.Value;
+    }
 
-    // The one write path. The socket errors and cancellation it has always swallowed are reported as
-    // failures rather than thrown, so the terminal sees exactly what it saw before.
-    private async ValueTask<NativeWriteResult> WriteCoreAsync(ReadOnlyMemory<byte> data, CancellationToken ct)
+    // The one write path. The socket errors and cancellation it has always swallowed are reported to
+    // an observer (when there is one) rather than thrown, so the terminal sees exactly what it saw before.
+    private async ValueTask WriteCoreAsync(ReadOnlyMemory<byte> data, CancellationToken ct, StrongBox<NativeWriteResult>? outcome)
     {
         if (data.IsEmpty)
-            return NativeWriteResult.Accepted;
+            return;
         if (!TryBeginWriter())
-            return NativeWriteResult.Refuse("presentation-disposed");
+        {
+            if (outcome is not null) outcome.Value = NativeWriteResult.Refuse("presentation-disposed");
+            return;
+        }
 
         var lockTaken = false;
         try
         {
             if (_webSocket.State != WebSocketState.Open)
-                return NativeWriteResult.Refuse("socket-not-open");
+            {
+                if (outcome is not null) outcome.Value = NativeWriteResult.Refuse("socket-not-open");
+                return;
+            }
 
             TryTraceOutput(data);
             await _outputWriteLock.WaitAsync(ct).ConfigureAwait(false);
@@ -249,17 +261,16 @@ public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAda
             }
 
             CommitPendingUtf8(prepared.PendingBytes);
-            return NativeWriteResult.Accepted;
         }
         catch (WebSocketException error)
         {
             // Connection closed
-            return NativeWriteResult.Fail(error);
+            if (outcome is not null) outcome.Value = NativeWriteResult.Fail(error);
         }
         catch (OperationCanceledException error)
         {
             // Cancelled
-            return NativeWriteResult.Fail(error);
+            if (outcome is not null) outcome.Value = NativeWriteResult.Fail(error);
         }
         finally
         {
