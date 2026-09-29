@@ -515,8 +515,8 @@ public sealed class TerminalDiagnostics
 
         // The published frame keeps the focused editor's text; only an editor-text capture sees it.
         var editorTextAuthorized = authorizations.Contains(DiagnosticAuthorization.EditorText);
-        if (!editorTextAuthorized && frame.FocusedEditor is { Text: not null } editor)
-            frame = frame with { FocusedEditor = editor with { Text = null } };
+        if (!editorTextAuthorized)
+            frame = WithoutEditorText(frame);
         var editorTextCoverage = (editorTextAuthorized, frame.FocusedEditor) switch
         {
             (false, _) => new DiagnosticContentCoverage
@@ -749,7 +749,11 @@ public sealed class TerminalDiagnostics
                 WallClockEnd = startedAt,
             }, unavailable);
 
-        var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase((fresh, configuration) =>
+        var sources = new Diagnostics.Cases.CaseSources(
+            _terminal.InputMilestones,
+            _terminal.Workload is Hex1bAppWorkloadAdapter app ? app.ApplicationFrameSource : null,
+            _terminal.NativeDelivery);
+        var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase((fresh, unsupported, configuration) =>
             new Diagnostics.Cases.DiagnosticCaseRecorder(new DiagnosticCaseManifest
             {
                 FormatVersion = Diagnostics.Cases.CaseArtifactWriter.FormatVersion,
@@ -760,21 +764,12 @@ public sealed class TerminalDiagnostics
                 StartTimestamp = startTimestamp,
                 TimestampFrequency = Stopwatch.Frequency,
                 Fresh = fresh,
-                Checkpoint = Diagnostics.Cases.FreshModelCheckpoint.Describe(fresh, reapplication, configuration),
+                Checkpoint = Diagnostics.Cases.FreshModelCheckpoint.Describe(fresh, reapplication, unsupported, configuration),
                 Bounds = new DiagnosticCaseBounds { MaxBytes = maxBytes, MaxSeconds = maxSeconds },
                 Authorizations = granted,
                 Identity = identity,
-                Streams =
-                [
-                    new DiagnosticCaseStreamDeclaration
-                    {
-                        Stream = "model",
-                        Events = DiagnosticCoverageState.Included,
-                        Payloads = reapplication ? DiagnosticCoverageState.Included : DiagnosticCoverageState.Excluded,
-                        Reason = reapplication ? null : "Original model input requires the reapplication-data authorization.",
-                    },
-                ],
-            }, path, _terminal.TimeProvider, _terminal.ClearDiagnosticCase));
+                Streams = DeclareCaseStreams(granted, sources),
+            }, path, _terminal.TimeProvider, _terminal.ClearDiagnosticCase, sources));
 
         if (recorder is null)
         {
@@ -787,6 +782,26 @@ public sealed class TerminalDiagnostics
 
         recorder.Start();
         return recorder.Describe();
+    }
+
+    private static IReadOnlyList<DiagnosticCaseStreamDeclaration> DeclareCaseStreams(DiagnosticAuthorization[] granted,
+        Diagnostics.Cases.CaseSources sources)
+    {
+        DiagnosticCaseStreamDeclaration Declare(string stream, bool available, string unavailableReason, DiagnosticAuthorization payload, string payloadName) =>
+            !available
+                ? new DiagnosticCaseStreamDeclaration { Stream = stream, Events = DiagnosticCoverageState.Unavailable, Payloads = DiagnosticCoverageState.Unavailable, Reason = unavailableReason }
+                : granted.Contains(payload)
+                    ? new DiagnosticCaseStreamDeclaration { Stream = stream, Events = DiagnosticCoverageState.Included, Payloads = DiagnosticCoverageState.Included }
+                    : new DiagnosticCaseStreamDeclaration { Stream = stream, Events = DiagnosticCoverageState.Included, Payloads = DiagnosticCoverageState.Excluded, Reason = $"{payloadName} requires the {DiagnosticContractNames.Of(payload)} authorization." };
+
+        return
+        [
+            Declare("model", available: true, "", DiagnosticAuthorization.ReapplicationData, "Original model input"),
+            Declare("input", sources.Input is not null, "The terminal has no input milestone tracker.", DiagnosticAuthorization.RawInput, "Raw keyboard input"),
+            Declare("frames", sources.Frames is not null && sources.Input is { AcceptanceOnly: false },
+                "The workload is not a Hex1b application publishing diagnostic frames.", DiagnosticAuthorization.EditorText, "Focused-editor text"),
+            Declare("delivery", sources.Delivery is not null, "The presentation cannot report its native writes.", DiagnosticAuthorization.NativeOutput, "Written bytes"),
+        ];
     }
 
     /// <summary>Stops the active case, waiting for its artifact to be finished.</summary>
@@ -803,6 +818,10 @@ public sealed class TerminalDiagnostics
         _terminal.DiagnosticCase is { } recorder
             ? recorder.Describe()
             : CaseProblem(DiagnosticOutcome.Unavailable, "no-active-case", "No case is recording this terminal.");
+
+    /// <summary>The frame without its focused editor's text, which only editor-text authorizes.</summary>
+    internal static DiagnosticApplicationFrame WithoutEditorText(DiagnosticApplicationFrame frame) =>
+        frame.FocusedEditor is { Text: not null } editor ? frame with { FocusedEditor = editor with { Text = null } } : frame;
 
     internal static DiagnosticCaseResult CaseProblem(DiagnosticOutcome outcome, string code, string message) => new()
     {

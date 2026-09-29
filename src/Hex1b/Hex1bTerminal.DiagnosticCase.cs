@@ -41,10 +41,11 @@ public sealed partial class Hex1bTerminal
 
     /// <summary>
     /// Arms a diagnostic case under the model lock. The model is fresh when it has applied no model
-    /// event and its pump has read no output bytes. Returns the armed recorder, or why none was armed.
+    /// event and its pump has read no output bytes. A remote (HMP1) workload's model is driven by state
+    /// the case cannot hold, so its checkpoint is unsupported. Returns the armed recorder, or why none was armed.
     /// </summary>
     internal (DiagnosticCaseRecorder? Recorder, string? ProblemCode, string? ActiveCaseId) TryArmDiagnosticCase(
-        Func<bool, DiagnosticCaseModelConfiguration, DiagnosticCaseRecorder> create)
+        Func<bool, string?, DiagnosticCaseModelConfiguration, DiagnosticCaseRecorder> create)
     {
         lock (_bufferLock)
         {
@@ -52,7 +53,12 @@ public sealed partial class Hex1bTerminal
                 return (null, "target-disposed", null);
             if (_diagnosticCase is { } active)
                 return (null, "case-active", active.CaseId);
-            var recorder = create(_modelSequence == 0 && OutputBytesRead == 0, _caseConfiguration);
+            var unsupported = _workload is IHmp1TerminalOutputSource
+                ? "hmp1-workload: a remote workload's model is driven by state synchronization the case does not hold."
+                : null;
+            var recorder = create(_modelSequence == 0 && OutputBytesRead == 0, unsupported, _caseConfiguration);
+            // Registered with the arming, so the input and frame streams start with the model stream.
+            InputMilestones?.SetStreamObserver(recorder);
             Volatile.Write(ref _diagnosticCase, recorder);
             return (recorder, null, null);
         }
@@ -95,6 +101,14 @@ public sealed partial class Hex1bTerminal
         var ingress = _caseIngress;
         ClearCaseIngress();
         _diagnosticCase?.RecordApplication(_modelSequence, _width, _height, pending, ingress.Span);
+    }
+
+    // Must hold _bufferLock, at the end of an application: graphics resources or placements are state
+    // the text checkpoint cannot represent, so re-applicable coverage ends at this application.
+    private void NotifyCaseApplicationEndUnsafe()
+    {
+        if (_diagnosticCase is { } recorder && (_kgpGraphicsState.HasResidentState || _sixelGraphicsState.HasResidentState))
+            recorder.EndInterval(_modelSequence, "graphics");
     }
 
     // Must hold _bufferLock, right after the model sequence advanced for this event.

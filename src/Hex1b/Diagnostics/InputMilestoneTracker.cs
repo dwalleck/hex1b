@@ -143,6 +143,32 @@ internal sealed class InputMilestoneTracker
         return scope;
     }
 
+    private IDiagnosticStreamObserver? _streamObserver;
+
+    /// <summary>
+    /// Replaces the stream observer (a diagnostic case) and returns the previous one; it sees every
+    /// accept, processed input and frame publication from now on.
+    /// </summary>
+    internal IDiagnosticStreamObserver? SetStreamObserver(IDiagnosticStreamObserver? observer)
+    {
+        lock (_sync)
+        {
+            var previous = _streamObserver;
+            _streamObserver = observer;
+            return previous;
+        }
+    }
+
+    /// <summary>Removes <paramref name="observer"/> if it is still the stream observer.</summary>
+    internal void ClearStreamObserver(IDiagnosticStreamObserver observer)
+    {
+        lock (_sync)
+        {
+            if (ReferenceEquals(_streamObserver, observer))
+                _streamObserver = null;
+        }
+    }
+
     /// <summary>Numbers one completed write of <paramref name="kind"/> to an acceptance-only workload.</summary>
     internal long AcceptWrite(string kind)
     {
@@ -150,6 +176,7 @@ internal sealed class InputMilestoneTracker
         {
             var id = ++_accepted;
             _recent[id % RetainedRecords] = new Tracked(id, DateTimeOffset.UtcNow, Stopwatch.GetTimestamp(), kind, "diagnostic-send", null);
+            _streamObserver?.OnInputAccepted(id, kind, "diagnostic-send", null);
             WakeUnsafe();
             return id;
         }
@@ -200,6 +227,7 @@ internal sealed class InputMilestoneTracker
                 // Only a send still in progress claims the id; a write that outlives its send is native.
                 if (send is { Native: false } && send.TryInclude(id))
                     tracked.Source = "diagnostic-send";
+                _streamObserver?.OnInputAccepted(id, tracked.Kind, tracked.Source, evt);
                 WakeUnsafe();
                 return true;
             }
@@ -234,6 +262,7 @@ internal sealed class InputMilestoneTracker
                 _processedBy = applicationInstanceId;
             }
 
+            _streamObserver?.OnInputProcessed(tracked.Id, applicationInstanceId, _processed);
             WakeUnsafe();
         }
     }
@@ -327,6 +356,7 @@ internal sealed class InputMilestoneTracker
             }
 
             _latestFrame = frame;
+            _streamObserver?.OnFramePublished(applicationInstanceId, frameId, processedInput, wroteOutput, outputMark);
             WakeUnsafe();
         }
     }
@@ -532,7 +562,7 @@ internal sealed class InputMilestoneTracker
 
     // Described only when a raw-input capture asks. Paste content streams to the application after
     // acceptance, so paste events are not retained.
-    private static string? PayloadOf(Hex1bEvent evt) => evt switch
+    internal static string? PayloadOf(Hex1bEvent evt) => evt switch
     {
         Hex1bKeyEvent key => $"{key.Key}{(key.Modifiers == Hex1bModifiers.None ? "" : "+" + key.Modifiers)}{(key.Text is { Length: > 0 } t ? $" \"{t}\"" : "")}",
         Hex1bMouseEvent mouse => $"{mouse.Button} {mouse.Action} at {mouse.X},{mouse.Y}",

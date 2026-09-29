@@ -18,7 +18,7 @@ internal static class FreshModelCheckpoint
         "graphics-placements-and-resources",
     ];
 
-    internal static DiagnosticCaseCheckpoint Describe(bool fresh, bool authorized, DiagnosticCaseModelConfiguration configuration)
+    internal static DiagnosticCaseCheckpoint Describe(bool fresh, bool authorized, string? unsupported, DiagnosticCaseModelConfiguration configuration)
     {
         if (!authorized)
         {
@@ -26,6 +26,16 @@ internal static class FreshModelCheckpoint
             {
                 Status = DiagnosticCaseCheckpointStatus.Excluded,
                 Reason = "Requires the reapplication-data authorization.",
+            };
+        }
+
+        if (unsupported is not null)
+        {
+            return new DiagnosticCaseCheckpoint
+            {
+                Status = DiagnosticCaseCheckpointStatus.Unsupported,
+                Reason = unsupported,
+                Configuration = configuration,
             };
         }
 

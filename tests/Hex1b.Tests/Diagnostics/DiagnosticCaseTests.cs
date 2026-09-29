@@ -498,6 +498,342 @@ public class DiagnosticCaseTests
         StringAssert.Contains(armed.Model, "é", "fixture: the split scalar did not decode");
     }
 
+    [TestMethod]
+    public async Task Unsupported_EndsIntervalBeforeLaterEvents()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        var sixel = "\u001bP0;0;0q#0;2;100;0;0#0~~~~~~-\u001b\\"u8.ToArray();
+        DiagnosticCaseResult stopped;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "text ");
+            await workload.WriteAndWaitAsync(terminal, sixel);
+            Assert.IsTrue(terminal.TrackedSixelCount > 0 || terminal.KgpVirtualPlacementCount > 0, "fixture: the Sixel left no graphics state");
+            await workload.WriteAndWaitAsync(terminal, "after one ");
+            await workload.WriteAndWaitAsync(terminal, "after two");
+            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var artifact = Artifact.Read(stopped.Path!);
+        var graphicsEvent = artifact.ModelEvents().Single(e => e.TryGetProperty("data", out var d) && Convert.FromBase64String(d.GetString()!).SequenceEqual(sixel));
+        var graphicsSequence = graphicsEvent.GetProperty("modelSequence").GetInt64();
+        var endIndex = artifact.Events.FindIndex(e => e.GetProperty("stream").GetString() == "case" && e.GetProperty("kind").GetString() == "interval-end");
+        Assert.IsGreaterThanOrEqualTo(0, endIndex, "no interval end was recorded");
+        Assert.AreEqual((graphicsSequence, "graphics"), (artifact.Events[endIndex].GetProperty("modelSequence").GetInt64(),
+            artifact.Events[endIndex].GetProperty("record").GetProperty("reason").GetString()));
+        var laterModel = artifact.Events.Select((e, i) => (e, i)).Where(p => p.e.GetProperty("stream").GetString() == "model"
+            && p.e.GetProperty("modelSequence").GetInt64() > graphicsSequence).ToList();
+        Assert.HasCount(2, laterModel, "collection must continue after the interval ends");
+        Assert.IsTrue(laterModel.All(p => p.i > endIndex), "a later model event was written before the interval end");
+
+        var inspection = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! });
+        Assert.AreEqual((true, 0L, graphicsSequence - 1, "graphics"),
+            (inspection.Intervals.Single().Valid, inspection.Intervals.Single().FromModelSequence, inspection.Intervals.Single().ToModelSequence, inspection.Intervals.Single().EndReason));
+
+        // A model application the case holds no input for (the terminal's own API) also ends the interval.
+        var plain = new ScriptedWorkload();
+        await using var withoutIngress = Hex1bTerminal.CreateBuilder().WithWorkload(plain).WithHeadless().WithDimensions(40, 10)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        using (new Running(withoutIngress))
+        {
+            await plain.WriteAndWaitAsync(withoutIngress, "before");
+            withoutIngress.EnterAlternateScreen();
+            await plain.WriteAndWaitAsync(withoutIngress, "after");
+            stopped = await new TerminalDiagnostics(withoutIngress).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+        var interval = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! }).Intervals.Single();
+        Assert.AreEqual((1L, "application-without-ingress"), (interval.ToModelSequence, interval.EndReason));
+
+        // A remote (HMP1) workload's model is driven by state the case cannot hold: no valid interval at all.
+        await using var remote = Hex1bTerminal.CreateBuilder().WithWorkload(new FakeHmp1Workload()).WithHeadless().WithDimensions(40, 10).Build();
+        var remoteCase = new TerminalDiagnostics(remote).StartCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] });
+        await new TerminalDiagnostics(remote).StopCaseAsync(TestContext.Current.CancellationToken);
+        Assert.AreEqual(DiagnosticCaseCheckpointStatus.Unsupported, remoteCase.Checkpoint!.Status);
+        StringAssert.StartsWith(remoteCase.Checkpoint.Reason, "hmp1-workload");
+        Assert.IsFalse(DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = remoteCase.Path! }).Intervals.Single().Valid);
+    }
+
+    [TestMethod]
+    public async Task InputStream_RecordsAcceptsAndProcessingWithIds()
+    {
+        using var root = new CaseRoot();
+        foreach (var rawInput in new[] { false, true })
+        {
+            await using var app = await TrackedApp.StartAsync();
+            var started = app.Diagnostics.StartCase(new DiagnosticCaseStartRequest
+            {
+                Directory = root.Path,
+                Authorizations = rawInput ? [DiagnosticAuthorization.RawInput] : [],
+            });
+            var accepted = await app.Diagnostics.TrackSendAsync(() => app.Terminal.SendInputAsync(Encoding.UTF8.GetBytes("xyz")), "text");
+            Assert.IsNotNull(accepted, "fixture: the send was not tracked");
+            await WaitAsync(() => app.Terminal.InputMilestones!.ProcessedInput >= accepted.LastId);
+            await app.Diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+
+            var input = Artifact.Read(started.Path!).Events.Where(e => e.GetProperty("stream").GetString() == "input").ToList();
+            var acceptedIds = input.Where(e => e.GetProperty("kind").GetString() == "accepted").Select(e => e.GetProperty("input").GetProperty("id").GetInt64()).ToList();
+            var processedIds = input.Where(e => e.GetProperty("kind").GetString() == "processed").Select(e => e.GetProperty("input").GetProperty("id").GetInt64()).ToList();
+            var range = Enumerable.Range((int)accepted.FirstId, (int)(accepted.LastId - accepted.FirstId + 1)).Select(i => (long)i).ToList();
+            CollectionAssert.IsSubsetOf(range, acceptedIds, $"rawInput={rawInput}: accepted ids missing");
+            CollectionAssert.IsSubsetOf(range, processedIds, $"rawInput={rawInput}: processed ids missing");
+            var payloads = input.Where(e => e.GetProperty("input").TryGetProperty("payload", out _)).ToList();
+            Assert.AreEqual(rawInput, payloads.Count > 0, $"rawInput={rawInput}: key payloads");
+        }
+    }
+
+    [TestMethod]
+    public async Task FrameStream_RecordsEachPublishedFrame()
+    {
+        using var root = new CaseRoot();
+        foreach (var editorText in new[] { false, true })
+        {
+            await using var app = await TrackedApp.StartAsync();
+            var started = app.Diagnostics.StartCase(new DiagnosticCaseStartRequest
+            {
+                Directory = root.Path,
+                Authorizations = editorText ? [DiagnosticAuthorization.EditorText] : [],
+            });
+            var captured = new List<long>();
+            var before = app.Diagnostics.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest()).Frame!.FrameId;
+            for (var i = 0; i < 5; i++)
+            {
+                app.App.Invalidate();
+                await WaitAsync(() => app.Diagnostics.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest()).Frame?.FrameId > before);
+                before = app.Diagnostics.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest()).Frame!.FrameId;
+                captured.Add(before);
+            }
+            await app.Diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+
+            var frames = Artifact.Read(started.Path!).Events.Where(e => e.GetProperty("stream").GetString() == "frames").ToList();
+            var ids = frames.Select(e => e.GetProperty("frame").GetProperty("frameId").GetInt64()).ToList();
+            CollectionAssert.IsSubsetOf(captured, ids, $"editorText={editorText}: a published frame was not recorded");
+            CollectionAssert.AreEqual(ids.OrderBy(i => i).ToList(), ids, "frames out of order");
+            var texts = frames.Select(e => e.GetProperty("frame").GetProperty("projection").TryGetProperty("focusedEditor", out var fe)
+                && fe.TryGetProperty("text", out var t) ? t.GetString() : null).ToList();
+            Assert.AreEqual(editorText, texts.Any(t => t == TrackedApp.EditorSentinel), $"editorText={editorText}: focused editor text");
+        }
+
+        // A raw-byte workload publishes no frames: the stream is declared unavailable.
+        await using var raw = Hex1bTerminal.CreateBuilder().WithWorkload(new ScriptedWorkload()).WithHeadless().WithDimensions(20, 5).Build();
+        var rawCase = new TerminalDiagnostics(raw).StartCase(new DiagnosticCaseStartRequest { Directory = root.Path });
+        await new TerminalDiagnostics(raw).StopCaseAsync(TestContext.Current.CancellationToken);
+        var declaration = Artifact.Read(rawCase.Path!).Manifest.GetProperty("streams").EnumerateArray().Single(e => e.GetProperty("stream").GetString() == "frames");
+        Assert.AreEqual("unavailable", declaration.GetProperty("events").GetString());
+    }
+
+    [TestMethod]
+    public async Task DeliveryStream_RecordsNativeWritesAndEvictions()
+    {
+        using var root = new CaseRoot();
+        foreach (var nativeOutput in new[] { false, true })
+        {
+            var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+            var workload = new ScriptedWorkload();
+            await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+                .WithPresentation(new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25))).WithDimensions(40, 10).Build();
+            var diagnostics = new TerminalDiagnostics(terminal);
+            DiagnosticCaseResult started;
+            using (new Running(terminal))
+            {
+                var baseline = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0;
+                started = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = nativeOutput ? [DiagnosticAuthorization.NativeOutput] : [] });
+                for (var i = 0; i < 10; i++)
+                    await workload.WriteAndWaitAsync(terminal, $"DLV-{i} ");
+                await Task.Delay(100, TestContext.Current.CancellationToken);
+                await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+                var expected = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest { Since = baseline }).Records.Select(r => r.Sequence).ToList();
+                var delivery = Artifact.Read(started.Path!).Events.Where(e => e.GetProperty("stream").GetString() == "delivery").ToList();
+                var recorded = delivery.Select(e => e.GetProperty("ordinal").GetInt64()).ToList();
+                CollectionAssert.IsSubsetOf(recorded, expected, "a recorded delivery is not one the terminal made");
+                Assert.IsGreaterThanOrEqualTo(10, recorded.Count, "fixture: too few deliveries");
+                Assert.AreEqual(nativeOutput, delivery.Any(e => e.GetProperty("delivery").TryGetProperty("content", out _)), $"nativeOutput={nativeOutput}: bytes");
+            }
+        }
+
+        // Records evicted from the delivery ring while the writer is held become a missing range.
+        using var gate = new ManualResetEventSlim(false);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        try
+        {
+            var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+            var workload = new ScriptedWorkload();
+            await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+                .WithPresentation(new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25))).WithDimensions(40, 10).Build();
+            var diagnostics = new TerminalDiagnostics(terminal);
+            using (new Running(terminal))
+            {
+                var started = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path });
+                var before = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0;
+                for (var i = 0; i < 5000; i++)
+                    workload.Enqueue(Encoding.ASCII.GetBytes($"E{i} "));
+                await WaitAsync(() => (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0) >= before + 5000);
+                gate.Set();
+                await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+                var totalAfter = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence!.Value;
+                var artifact = Artifact.Read(started.Path!);
+                var missing = artifact.Events.Where(e => e.GetProperty("kind").GetString() == "missing"
+                    && e.GetProperty("record").GetProperty("stream").GetString() == "delivery").ToList();
+                Assert.HasCount(1, missing, "the eviction was not recorded once");
+                var record = missing[0].GetProperty("record");
+                var evicted = record.GetProperty("toOrdinal").GetInt64() - record.GetProperty("fromOrdinal").GetInt64() + 1;
+                var kept = artifact.Events.Count(e => e.GetProperty("stream").GetString() == "delivery");
+                Assert.AreEqual(totalAfter - before, evicted + kept, "missing plus recorded deliveries do not account for every write");
+                Assert.AreEqual("incomplete", DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = started.Path! })
+                    .Streams.Single(s => s.Stream == "delivery").State);
+            }
+        }
+        finally
+        {
+            gate.Set();
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+        }
+    }
+
+    [TestMethod]
+    public async Task Inspect_MatchesAnIndependentReadingOfTheFiles()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        DiagnosticCaseResult stopped;
+        using (new Running(terminal))
+        {
+            for (var i = 0; i < 12; i++)
+                await workload.WriteAndWaitAsync(terminal, $"line {i}\r\n");
+            terminal.Resize(30, 8);
+            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        // Oracle: the test's own reading of the raw files.
+        var artifact = Artifact.Read(stopped.Path!);
+        var model = artifact.ModelEvents();
+        var inspection = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path!, Since = 0, Limit = DiagnosticCaseInspector.MaxEvents });
+        Assert.AreEqual(DiagnosticOutcome.Captured, inspection.Outcome, inspection.Problem?.Message);
+        Assert.AreEqual(DiagnosticCaseCompletionState.Complete, inspection.CompletionState);
+        Assert.AreEqual(artifact.Events[^1].GetProperty("caseSequence").GetInt64(), inspection.LastCaseSequence);
+        var modelCoverage = inspection.Streams.Single(s => s.Stream == "model");
+        Assert.AreEqual(((long)model.Count, 1L, (long)model.Count, "complete"), (modelCoverage.Events, modelCoverage.FirstOrdinal, modelCoverage.LastOrdinal, modelCoverage.State));
+        var interval = inspection.Intervals.Single();
+        Assert.AreEqual((true, 0L, model[^1].GetProperty("modelSequence").GetInt64(), "case-stopped: requested"),
+            (interval.Valid, interval.FromModelSequence, interval.ToModelSequence, interval.EndReason));
+        CollectionAssert.AreEqual(artifact.Events.Select(e => e.GetProperty("caseSequence").GetInt64()).ToList(), inspection.Events.Select(e => e.CaseSequence).ToList());
+        CollectionAssert.AreEqual(model.Select(e => e.TryGetProperty("data", out var d) ? d.GetString() : null).ToList(),
+            inspection.Events.Where(e => e.Stream == "model").Select(e => e.Data).ToList(), "payloads differ from the file");
+
+        // Paging.
+        Assert.AreEqual(1L, DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path!, Limit = 1 }).Events.Single().CaseSequence);
+        Assert.IsEmpty(DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path!, Since = inspection.LastCaseSequence, Limit = 10 }).Events);
+        Assert.IsEmpty(DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! }).Events, "no limit returns no events");
+        foreach (var (request, code) in new (DiagnosticCaseInspectRequest, string)[]
+        {
+            (new() { Path = stopped.Path!, Limit = 0 }, "invalid-limit"),
+            (new() { Path = stopped.Path!, Limit = 4097 }, "invalid-limit"),
+            (new() { Path = stopped.Path!, Since = -1 }, "invalid-since"),
+            (new() { Path = "" }, "invalid-path"),
+        })
+            Assert.AreEqual((DiagnosticOutcome.InvalidRequest, code), (DiagnosticCaseInspector.Inspect(request).Outcome, DiagnosticCaseInspector.Inspect(request).Problem?.Code), code);
+        Assert.AreEqual("case-not-found", DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = Path.Combine(root.Path, "absent") }).Problem?.Code);
+
+        // An artifact whose completion record is missing was interrupted; its verified prefix remains valid.
+        var copy = Path.Combine(root.Path, "interrupted");
+        Directory.CreateDirectory(copy);
+        foreach (var file in new[] { "manifest.json", "events.jsonl" })
+            File.Copy(Path.Combine(stopped.Path!, file), Path.Combine(copy, file));
+        var interrupted = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = copy });
+        Assert.AreEqual((DiagnosticCaseCompletionState.Interrupted, "interrupted"), (interrupted.CompletionState, interrupted.Intervals.Single().EndReason));
+
+        // A case that did not start fresh has no valid interval.
+        var late = new ScriptedWorkload();
+        await using var nonFresh = Hex1bTerminal.CreateBuilder().WithWorkload(late).WithHeadless().WithDimensions(40, 10).Build();
+        using (new Running(nonFresh))
+        {
+            await late.WriteAndWaitAsync(nonFresh, "before");
+            var liveCase = new TerminalDiagnostics(nonFresh).StartCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] });
+            await late.WriteAndWaitAsync(nonFresh, "after");
+            await new TerminalDiagnostics(nonFresh).StopCaseAsync(TestContext.Current.CancellationToken);
+            var notFresh = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = liveCase.Path! }).Intervals.Single();
+            Assert.IsFalse(notFresh.Valid, "a case that did not start fresh reported a re-applicable interval");
+            StringAssert.StartsWith(notFresh.EndReason, "checkpoint unsupported");
+        }
+
+        // Unreadable and unknown-format manifests.
+        var broken = Path.Combine(root.Path, "broken");
+        Directory.CreateDirectory(broken);
+        Assert.AreEqual("invalid-artifact", DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = broken }).Problem?.Code);
+        File.WriteAllText(Path.Combine(broken, "manifest.json"), File.ReadAllText(Path.Combine(stopped.Path!, "manifest.json")).Replace("\"formatVersion\":1", "\"formatVersion\":2"));
+        Assert.AreEqual("unsupported-format", DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = broken }).Problem?.Code);
+    }
+
+    /// <summary>A diagnostics-enabled Hex1b application on a headless terminal, with a focused editor.</summary>
+    private sealed class TrackedApp : IAsyncDisposable
+    {
+        public const string EditorSentinel = "ZQX-EDITOR-SENTINEL";
+        private readonly CancellationTokenSource _cts = new();
+        private readonly Task _terminalRun;
+        private readonly Task _appRun;
+
+        private TrackedApp(Hex1bTerminal terminal, Hex1bApp app)
+        {
+            Terminal = terminal;
+            App = app;
+            Diagnostics = new TerminalDiagnostics(terminal);
+            _terminalRun = terminal.RunAsync(_cts.Token);
+            _appRun = app.RunAsync(_cts.Token);
+        }
+
+        public Hex1bTerminal Terminal { get; }
+        public Hex1bApp App { get; }
+        public TerminalDiagnostics Diagnostics { get; }
+
+        public static async Task<TrackedApp> StartAsync()
+        {
+            var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
+            var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 8).Build();
+            var app = new Hex1bApp(ctx => Task.FromResult<Hex1bWidget>(ctx.VStack(v => [v.Text("Editor:"), v.TextBox(EditorSentinel)])),
+                new Hex1bAppOptions { WorkloadAdapter = workload });
+            var tracked = new TrackedApp(terminal, app);
+            await WaitAsync(() => tracked.Diagnostics.CaptureApplicationFrame(new DiagnosticApplicationFrameRequest()).Frame is not null);
+            return tracked;
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await _cts.CancelAsync();
+            try { await _appRun; } catch (OperationCanceledException) { }
+            try { await _terminalRun; } catch (OperationCanceledException) { }
+            App.Dispose();
+            await Terminal.DisposeAsync();
+            _cts.Dispose();
+        }
+    }
+
+    /// <summary>A remote (HMP1-shaped) workload that never produces output; only its kind matters.</summary>
+    private sealed class FakeHmp1Workload : IHex1bTerminalWorkloadAdapter, IHmp1TerminalOutputSource
+    {
+        public Hmp1WorkloadAdapter? Hmp1Workload => null;
+        public async ValueTask<Hmp1WorkloadOutput> ReadTerminalOutputAsync(CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+            throw new OperationCanceledException();
+        }
+        public async ValueTask<ReadOnlyMemory<byte>> ReadOutputAsync(CancellationToken ct = default)
+        {
+            await Task.Delay(Timeout.Infinite, ct);
+            return ReadOnlyMemory<byte>.Empty;
+        }
+        public ValueTask WriteInputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask ResizeAsync(int width, int height, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public event Action? Disconnected { add { } remove { } }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
     // Measured with PumpAllocation.Measure on the base revision (5a4b0a6c, no case support) in this
     // configuration; the same routine runs in the base probe (…/scratchpad/t07s2/basealloc).
 #if DEBUG

@@ -208,6 +208,10 @@ public sealed partial class Hex1bTerminal
             terminal.NotifyCaseApplicationUnsafe();
         }
 
-        public void Dispose() => _terminal._captureApplicationDepth--;
+        public void Dispose()
+        {
+            _terminal._captureApplicationDepth--;
+            _terminal.NotifyCaseApplicationEndUnsafe();
+        }
     }
 }

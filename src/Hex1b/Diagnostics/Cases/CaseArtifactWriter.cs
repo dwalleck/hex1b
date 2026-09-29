@@ -6,7 +6,8 @@ namespace Hex1b.Diagnostics.Cases;
 /// <summary>
 /// Writes a case artifact: <c>manifest.json</c> first, then one line per event in <c>events.jsonl</c>,
 /// then <c>completion.json</c> (written to a temporary name and renamed, so it is either whole or absent).
-/// Each event line is <c>&lt;crc32 hex&gt;\t&lt;json&gt;\n</c>, the CRC covering the JSON bytes.
+/// Each event line is <c>&lt;crc32 hex&gt;\t&lt;json&gt;\n</c>, the CRC covering the JSON bytes, and the JSON
+/// is a <see cref="DiagnosticCaseEvent"/>.
 /// </summary>
 internal sealed class CaseArtifactWriter : IDisposable
 {
@@ -38,26 +39,11 @@ internal sealed class CaseArtifactWriter : IDisposable
     }
 
     /// <summary>Writes one event line; returns the bytes written.</summary>
-    internal int WriteEvent(in CaseEvent item)
+    internal int WriteEvent(DiagnosticCaseEvent item)
     {
         _json.Clear();
         using (var writer = new Utf8JsonWriter(_json))
-        {
-            writer.WriteStartObject();
-            writer.WriteNumber("caseSequence", item.CaseSequence);
-            writer.WriteString("stream", StreamName(item.Stream));
-            writer.WriteNumber("ordinal", item.Ordinal);
-            writer.WriteNumber("timestamp", item.Timestamp);
-            writer.WriteString("kind", item.Kind);
-            if (item.ModelSequence is { } modelSequence)
-                writer.WriteNumber("modelSequence", modelSequence);
-            writer.WriteNumber("width", item.Width);
-            writer.WriteNumber("height", item.Height);
-            writer.WriteNumber("length", item.Length);
-            if (item.Payload is { } payload)
-                writer.WriteBase64String("data", payload);
-            writer.WriteEndObject();
-        }
+            JsonSerializer.Serialize(writer, item, DiagnosticsJsonContext.Default.DiagnosticCaseEvent);
 
         var json = _json.WrittenSpan;
         Span<byte> prefix = stackalloc byte[9];
@@ -93,7 +79,8 @@ internal sealed class CaseArtifactWriter : IDisposable
         CaseStream.Model => "model",
         CaseStream.Input => "input",
         CaseStream.Frames => "frames",
-        _ => "delivery",
+        CaseStream.Delivery => "delivery",
+        _ => "case",
     };
 
     public void Dispose() => _events?.Dispose();
