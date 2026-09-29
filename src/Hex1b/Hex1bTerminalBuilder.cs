@@ -1160,6 +1160,20 @@ public sealed class Hex1bTerminalBuilder
     }
 
     /// <summary>
+    /// Starts recording a bounded diagnostic case when the terminal is built, before any output reaches
+    /// its model, so the case's checkpoint is the complete fresh model. <see cref="Build"/> throws when
+    /// the case cannot start (for example, refused storage or invalid bounds).
+    /// </summary>
+    /// <param name="request">Bounds, authorizations and storage for the case.</param>
+    public Hex1bTerminalBuilder WithDiagnosticCase(Diagnostics.DiagnosticCaseStartRequest request)
+    {
+        _diagnosticCase = request ?? throw new ArgumentNullException(nameof(request));
+        return this;
+    }
+
+    private Diagnostics.DiagnosticCaseStartRequest? _diagnosticCase;
+
+    /// <summary>
     /// Enables MCP diagnostics for this terminal, allowing external MCP tools to capture
     /// terminal state and inject input.
     /// </summary>
@@ -1553,7 +1567,18 @@ public sealed class Hex1bTerminalBuilder
             options.PresentationFilters.Add(filter);
         }
 
-        return new Hex1bTerminal(options);
+        var terminal = new Hex1bTerminal(options);
+        if (_diagnosticCase is { } caseRequest)
+        {
+            var started = new Diagnostics.TerminalDiagnostics(terminal).StartCase(caseRequest, Diagnostics.DiagnosticCaseStartPath.Construction);
+            if (started.Outcome != Diagnostics.DiagnosticOutcome.Captured)
+            {
+                terminal.Dispose();
+                throw new InvalidOperationException($"The diagnostic case could not start: {started.Problem?.Code}: {started.Problem?.Message}");
+            }
+        }
+
+        return terminal;
     }
 
     // === Internal for factory pattern ===

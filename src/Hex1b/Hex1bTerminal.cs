@@ -417,6 +417,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         _dcsByteStreamParser = new DcsByteStreamParser(sixelPolicy);
         _escapeTimeout = options.EscapeSequenceTimeout ?? TimeSpan.FromMilliseconds(50);
         ResetSixelModes();
+        CaptureCaseConfiguration(options);
 
         // Managed presentations apply and await resize through their lifecycle attachment.
         if (!_presentationOwnsResize)
@@ -3065,6 +3066,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         lock (_bufferLock)
         {
             AdvanceModelSequenceUnsafe();
+            NotifyCaseModelEventUnsafe("resize", newWidth, newHeight);
             // Check if the presentation adapter supports reflow and has it enabled
             if (_presentation is ITerminalReflowProvider { ReflowEnabled: true } reflowProvider)
             {
@@ -8201,6 +8203,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 return false;
 
             _disposed = true;
+            NotifyCaseDisposedUnsafe();
             EndCapturesUnsafe();
             SetSynchronizedOutputMode(false);
             _synchronizedOutputTimer?.Dispose();

@@ -679,6 +679,138 @@ public sealed class TerminalDiagnostics
     }
 
     /// <summary>
+    /// Starts recording a bounded diagnostic case on a running terminal. At most one case records a
+    /// terminal; its checkpoint is complete only when the model is still fresh.
+    /// </summary>
+    /// <param name="request">Bounds, authorizations and storage.</param>
+    public DiagnosticCaseResult StartCase(DiagnosticCaseStartRequest request) => StartCase(request, DiagnosticCaseStartPath.Live);
+
+    internal DiagnosticCaseResult StartCase(DiagnosticCaseStartRequest request, DiagnosticCaseStartPath startPath)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        // Every validation precedes any change to the filesystem or the terminal.
+        var maxBytes = request.MaxBytes ?? Diagnostics.Cases.DiagnosticCaseRecorder.DefaultMaxBytes;
+        if (maxBytes is < Diagnostics.Cases.DiagnosticCaseRecorder.MinMaxBytes or > Diagnostics.Cases.DiagnosticCaseRecorder.MaxMaxBytes)
+            return CaseProblem(DiagnosticOutcome.InvalidRequest, "invalid-bounds", "maxBytes must be 1 MiB to 1 GiB.");
+        var maxSeconds = request.MaxSeconds ?? Diagnostics.Cases.DiagnosticCaseRecorder.DefaultMaxSeconds;
+        if (maxSeconds is < Diagnostics.Cases.DiagnosticCaseRecorder.MinMaxSeconds or > Diagnostics.Cases.DiagnosticCaseRecorder.MaxMaxSeconds)
+            return CaseProblem(DiagnosticOutcome.InvalidRequest, "invalid-bounds", "maxSeconds must be 1 to 86,400.");
+        var authorizations = request.Authorizations ?? [];
+        foreach (var authorization in authorizations)
+        {
+            if (!Enum.IsDefined(authorization))
+                return CaseProblem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", $"Unsupported authorization '{authorization}'.");
+        }
+
+        string root;
+        try
+        {
+            root = request.Directory is { } directory
+                ? (string.IsNullOrWhiteSpace(directory) ? throw new ArgumentException("empty") : Path.GetFullPath(directory))
+                : Diagnostics.Cases.CaseStorage.DefaultRoot();
+        }
+        catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return CaseProblem(DiagnosticOutcome.InvalidRequest, "invalid-directory", "directory must be a valid path.");
+        }
+
+        if (_terminal.IsDisposed)
+            return CaseProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
+        if (_terminal.DiagnosticCase is { } active)
+            return CaseProblem(DiagnosticOutcome.Unavailable, "case-active", $"Case '{active.CaseId}' is already recording.") with { CaseId = active.CaseId };
+        if (Diagnostics.Cases.CaseStorage.CheckRoot(root) is { } refused)
+            return CaseProblem(DiagnosticOutcome.Failed, "storage-refused", refused);
+
+        var caseId = Guid.NewGuid().ToString("N");
+        string path;
+        try
+        {
+            path = Diagnostics.Cases.CaseStorage.CreateCaseDirectory(root, caseId);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return CaseProblem(DiagnosticOutcome.Failed, "storage-refused", error.Message);
+        }
+
+        var granted = authorizations.Distinct().OrderBy(a => a).ToArray();
+        var reapplication = granted.Contains(DiagnosticAuthorization.ReapplicationData);
+        var startedAt = _terminal.TimeProvider.GetUtcNow();
+        var startTimestamp = Stopwatch.GetTimestamp();
+        var unavailable = new List<DiagnosticUnavailableField>();
+        var identity = DescribeIdentity(DiagnosticLayer.TerminalModel, modelSequence: null, applicationFrame: null,
+            applicationInstanceId: null, _terminal.PresentationAdapter is Reflow.ITerminalReflowProvider { ReflowEnabled: true },
+            new DiagnosticAcquisition
+            {
+                ClockDomain = "process-monotonic",
+                Frequency = Stopwatch.Frequency,
+                StartTimestamp = startTimestamp,
+                EndTimestamp = startTimestamp,
+                WallClockStart = startedAt,
+                WallClockEnd = startedAt,
+            }, unavailable);
+
+        var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase((fresh, configuration) =>
+            new Diagnostics.Cases.DiagnosticCaseRecorder(new DiagnosticCaseManifest
+            {
+                FormatVersion = Diagnostics.Cases.CaseArtifactWriter.FormatVersion,
+                ContractVersion = ContractVersion,
+                CaseId = caseId,
+                StartPath = startPath,
+                StartedAt = startedAt,
+                StartTimestamp = startTimestamp,
+                TimestampFrequency = Stopwatch.Frequency,
+                Fresh = fresh,
+                Checkpoint = Diagnostics.Cases.FreshModelCheckpoint.Describe(fresh, reapplication, configuration),
+                Bounds = new DiagnosticCaseBounds { MaxBytes = maxBytes, MaxSeconds = maxSeconds },
+                Authorizations = granted,
+                Identity = identity,
+                Streams =
+                [
+                    new DiagnosticCaseStreamDeclaration
+                    {
+                        Stream = "model",
+                        Events = DiagnosticCoverageState.Included,
+                        Payloads = reapplication ? DiagnosticCoverageState.Included : DiagnosticCoverageState.Excluded,
+                        Reason = reapplication ? null : "Original model input requires the reapplication-data authorization.",
+                    },
+                ],
+            }, path, _terminal.TimeProvider, _terminal.ClearDiagnosticCase));
+
+        if (recorder is null)
+        {
+            // Lost a race with another start, or with disposal: nothing was recorded.
+            try { Directory.Delete(path, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            return problem == "case-active"
+                ? CaseProblem(DiagnosticOutcome.Unavailable, "case-active", $"Case '{activeId}' is already recording.") with { CaseId = activeId }
+                : CaseProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
+        }
+
+        recorder.Start();
+        return recorder.Describe();
+    }
+
+    /// <summary>Stops the active case, waiting for its artifact to be finished.</summary>
+    public async Task<DiagnosticCaseResult> StopCaseAsync(CancellationToken cancellationToken = default)
+    {
+        if (_terminal.DiagnosticCase is not { } recorder)
+            return CaseProblem(DiagnosticOutcome.Unavailable, "no-active-case", "No case is recording this terminal.");
+        await recorder.StopAsync(DiagnosticCaseStopReason.Requested).WaitAsync(cancellationToken).ConfigureAwait(false);
+        return recorder.Describe();
+    }
+
+    /// <summary>Reports the active case's state, bounds, progress and per-stream counts.</summary>
+    public DiagnosticCaseResult GetCaseStatus() =>
+        _terminal.DiagnosticCase is { } recorder
+            ? recorder.Describe()
+            : CaseProblem(DiagnosticOutcome.Unavailable, "no-active-case", "No case is recording this terminal.");
+
+    internal static DiagnosticCaseResult CaseProblem(DiagnosticOutcome outcome, string code, string message) => new()
+    {
+        Outcome = outcome,
+        Problem = new DiagnosticProblem { Code = code, Message = message },
+    };
+
+    /// <summary>
     /// Creates a delivery result for an operation that returned no records.
     /// </summary>
     internal static DiagnosticDeliveryResult DeliveryProblem(DiagnosticOutcome outcome, string code, string message) => new()

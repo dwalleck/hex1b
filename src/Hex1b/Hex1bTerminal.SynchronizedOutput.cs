@@ -61,6 +61,7 @@ public sealed partial class Hex1bTerminal
 
             // Releasing the update changes observed model state without model input.
             AdvanceModelSequenceUnsafe();
+            NotifyCaseModelEventUnsafe("synchronized-update-timeout", _width, _height);
             SetSynchronizedOutputMode(false);
         }
         NotifyPresentationInvalidated();

@@ -20,4 +20,11 @@ public enum DiagnosticAuthorization
 
     /// <summary>Bytes a terminal wrote to its native presentation (screen output).</summary>
     NativeOutput,
+
+    /// <summary>
+    /// Original terminal output and control data as it entered the model, its geometry ordering, and
+    /// checkpoint continuation, including non-screen metadata. It grants neither raw keyboard input nor
+    /// editor text.
+    /// </summary>
+    ReapplicationData,
 }
