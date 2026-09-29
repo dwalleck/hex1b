@@ -184,6 +184,71 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
+    public async Task Stop_ModelLockBusyWaitsForAnEventTheHolderIsRecording()
+    {
+        // F43: a slow (not wedged) lock holder records a model event while the busy stop runs; the stop checkpoint
+        // must not name an event before one the case records.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        using var paused = new ManualResetEventSlim();
+        using var resume = new ManualResetEventSlim();
+        var pauseArmed = 0;
+        DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = () =>
+        {
+            if (Interlocked.Exchange(ref pauseArmed, 0) == 1)
+            {
+                paused.Set();
+                resume.Wait(TimeSpan.FromSeconds(10));
+            }
+        };
+        Hex1bTerminal terminal;
+        string path;
+        try
+        {
+            (terminal, path) = Checkpointed(root, workload);
+        }
+        finally
+        {
+            DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            await workload.WriteAndWaitAsync(terminal, "before");
+            var diagnostics = new TerminalDiagnostics(terminal);
+            var modelLock = typeof(Hex1bTerminal).GetField("_bufferLock", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(terminal)!;
+            using var release = new ManualResetEventSlim();
+            var holder = new Thread(() =>
+            {
+                lock (modelLock)
+                {
+                    // The holder's resize is a model event, offered under the lock and paused past its check.
+                    Volatile.Write(ref pauseArmed, 1);
+                    terminal.Resize(30, 8);
+                    release.Wait(TimeSpan.FromSeconds(30));
+                }
+            });
+            holder.Start();
+            Assert.IsTrue(paused.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken), "fixture: the resize was never offered");
+            var stop = Task.Run(() => diagnostics.StopCaseAsync(TestContext.Current.CancellationToken));
+            await WaitAsync(() => diagnostics.GetCaseStatus().State == DiagnosticCaseState.Stopping, TimeSpan.FromSeconds(10));
+            resume.Set();
+            var finished = await Task.WhenAny(stop, Task.Delay(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken)) == stop;
+            release.Set();
+            holder.Join();
+            Assert.IsTrue(finished, "the stop did not finish");
+        }
+
+        var artifact = Artifact.Read(path);
+        var lastEvent = artifact.ModelEvents().Max(e => e.GetProperty("modelSequence").GetInt64());
+        Assert.AreEqual(2L, lastEvent, "fixture: the holder's resize was not recorded");
+        Assert.AreEqual(lastEvent, StopCheckpoint(artifact).GetProperty("modelSequence").GetInt64(),
+            "the stop checkpoint names an event before one the case recorded");
+        var counts = artifact.Completion!.Value.GetProperty("checkpoints");
+        Assert.AreEqual((1L, 1L), (counts.GetProperty("offered").GetInt64(), counts.GetProperty("written").GetInt64()));
+    }
+
+    [TestMethod]
     public async Task Stop_ModelLockBusyInALiveCaseNamesTheModelAtArming()
     {
         // F33: a case started mid-session whose first application wedges names the model's sequence at arming.

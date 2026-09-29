@@ -214,6 +214,33 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// </summary>
     internal long LastOfferedModelSequence => Volatile.Read(ref _lastOfferedModelSequence);
 
+    /// <summary>
+    /// Stops the case without the model lock (it was held too long), with a stop checkpoint that records the
+    /// boundary only. The stop is marked first and offers already past their check are waited for, so the
+    /// boundary read afterwards is the last model event the case records. The checkpoint counts as in
+    /// progress until recorded, so the closing sweep waits for it.
+    /// </summary>
+    internal void StopWithoutModelLock(DiagnosticCaseStopReason reason, string checkpointReason)
+    {
+        if (!IsRecording)
+        {
+            StopRecording(reason);
+            return;
+        }
+
+        Interlocked.Increment(ref _marksInProgress);
+        try
+        {
+            StopRecording(reason);
+            WaitForOffersInFlight();
+            RecordStopCheckpoint(LastOfferedModelSequence, new CheckpointCapture(null, null, "unavailable", checkpointReason, 0));
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _marksInProgress);
+        }
+    }
+
     /// <summary>Starts the last offered sequence at the model's sequence when armed (under the model lock).</summary>
     internal void SeedModelSequence(long modelSequence) => Volatile.Write(ref _lastOfferedModelSequence, modelSequence);
 
@@ -354,7 +381,6 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         try
         {
             Offer(CaseStream.Model, kind, modelSequence, width, height, length, payload, null);
-            Volatile.Write(ref _lastOfferedModelSequence, modelSequence);
         }
         catch (Exception error)
         {
@@ -474,6 +500,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 throw new InvalidOperationException("Injected stream failure.");
             _beforeEnqueue?.Invoke();
             Interlocked.Increment(ref _offered[index]);
+            // Published inside the in-flight window, so a stop that waits for offers in flight sees it.
+            if (stream == CaseStream.Model && modelSequence is { } offeredModelSequence)
+                Volatile.Write(ref _lastOfferedModelSequence, offeredModelSequence);
             var ordinal = Interlocked.Increment(ref _ordinals[index]);
             var item = new CaseEvent(stream, ordinal, Stopwatch.GetTimestamp(), kind, modelSequence, width, height, length, payload, detail, detailBytes);
             if (_queue.TryEnqueue(item))

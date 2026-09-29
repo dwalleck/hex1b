@@ -94,12 +94,8 @@ public sealed partial class Hex1bTerminal
             Monitor.TryEnter(_bufferLock, StopCheckpointLockTimeout, ref taken);
             if (!taken)
             {
-                if (recorder.IsRecording)
-                {
-                    recorder.RecordStopCheckpoint(recorder.LastOfferedModelSequence, new DiagnosticCaseRecorder.CheckpointCapture(null, null,
-                        "unavailable", $"model-lock-busy: the model lock was not free within {StopCheckpointLockTimeout.TotalSeconds:0} s", 0));
-                }
-                recorder.StopRecording(reason);
+                recorder.StopWithoutModelLock(reason,
+                    $"model-lock-busy: the model lock was not free within {StopCheckpointLockTimeout.TotalSeconds:0} s");
                 return;
             }
 
