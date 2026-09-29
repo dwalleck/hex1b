@@ -407,14 +407,15 @@ taken in one hold of the model lock, between two model events, at the model sequ
   decoded, but not yet applied, is not part of it.
 - A checkpoint taken inside an application (a mark or stop from one of its callbacks) would see it
   half applied. It records the boundary only (`unavailable: mid-application`). While the case has
-  not yet recorded the unfinished application, the boundary is the sequence before it (for a nested
-  application, the outer one, itself unfinished). Otherwise it is the model's current sequence: a
-  nested model event recorded the application early, the case started inside the callback, or its
-  model stream failed.
+  not yet recorded the unfinished application, the boundary is the model event just before it. For
+  a nested application, that event lies inside the unfinished outer one: the outer application
+  itself, or a model event raised in its callback. Otherwise the boundary is the model's current
+  sequence: a nested model event recorded the application early, the case started inside the
+  callback, or its model stream failed.
 - A stop that could not take the model lock names the last model event the case recorded, never an
   application the case has not yet recorded (or the model's sequence when the case started, if it
-  recorded none). That event can itself be unfinished: an outer application that a nested one
-  recorded early, or the application a case started inside.
+  recorded none). That event can lie inside an unfinished application, or be one: an outer
+  application that a nested one recorded early, or the application a case started inside.
 
 A mark (`case-mark`) takes an optional label of 1–64 printable ASCII characters. By default the
 label is `mark-` and the checkpoint's ordinal. Labels need not be unique: a re-application target
