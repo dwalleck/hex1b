@@ -547,8 +547,12 @@ state has nothing to change for (a history fault without history) makes the comp
 `unavailable` (`fault-not-applicable`).
 
 The result also names what was compared and with what:
-- `checkpoint`: the case's `fresh-model/1` checkpoint, with the configuration the model was rebuilt
-  from;
+- `checkpoint`: the case's initial checkpoint, with the configuration the model was rebuilt from. For
+  `fresh-model/1`, re-application starts from the fresh model. For a `text-state/1` start, it
+  restores the start's state and applies only the model events recorded after it; a target before
+  the start is `invalid-request` (`unknown-model-sequence`), and a start line that is missing or
+  holds a surface this build cannot restore is `unavailable` (`missing-start`,
+  `unsupported-start`);
 - `coverage`: the profile, the surfaces compared, and what it leaves out (clock stamps, write
   sequences, text identities, caller anchors, graphics);
 - `producer`: the recording build and process;

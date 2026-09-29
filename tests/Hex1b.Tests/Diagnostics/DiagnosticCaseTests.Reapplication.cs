@@ -179,23 +179,10 @@ public partial class DiagnosticCaseTests
                 Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), "a refused re-application wrote a run");
             }
 
-            // No valid interval at all: a case without reapplication-data, and one started after output.
+            // No valid interval at all: a case without reapplication-data. (A case started after output re-applies from
+            // its start since ticket 09: DiagnosticCaseTests.Reapply_LiveStartMatchesAtEveryCheckpoint.)
             var unauthorized = await RecordCaseAsync(root, [new("plain")], new HeadlessPresentationAdapter(20, 4), authorized: false);
             Assert.AreEqual("no-valid-interval", Reapply(unauthorized, modelSequence: 1).Problem?.Code);
-            var workload = new ScriptedWorkload();
-            await using var live = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 4).Build();
-            await workload.WriteAndWaitAsync(live, "before the case");
-            var started = new TerminalDiagnostics(live).StartCase(new DiagnosticCaseStartRequest
-            {
-                Directory = root.Path,
-                Authorizations = [DiagnosticAuthorization.ReapplicationData],
-            });
-            await workload.WriteAndWaitAsync(live, "after");
-            await new TerminalDiagnostics(live).StopCaseAsync(TestContext.Current.CancellationToken);
-            // A live start owns a text-state/1 start checkpoint (ticket 09); this build's reapplier does not restore it yet.
-            var notFresh = Reapply(started.Path!, label: "stop");
-            Assert.AreEqual("incompatible", notFresh.Problem?.Code);
-            StringAssert.Contains(notFresh.Problem!.Message, "checkpoint.profile");
             Assert.AreEqual(0, counter.Value);
         }
         finally

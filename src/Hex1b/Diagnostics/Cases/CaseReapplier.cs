@@ -105,8 +105,14 @@ internal static class CaseReapplier
         if (manifest.FormatVersion != CaseArtifactWriter.FormatVersion)
             return Refuse(DiagnosticOutcome.Unavailable, "incompatible",
                 $"formatVersion: format {manifest.FormatVersion} does not record its configuration structurally; re-application needs format {CaseArtifactWriter.FormatVersion}.");
-        if (manifest.Checkpoint.Profile != DiagnosticCaseCheckpointProfiles.FreshModel)
+        if (manifest.Checkpoint.Profile is not (DiagnosticCaseCheckpointProfiles.FreshModel or DiagnosticCaseCheckpointProfiles.TextState))
             return Refuse(DiagnosticOutcome.Unavailable, "incompatible", $"checkpoint.profile: unknown profile '{manifest.Checkpoint.Profile}'.");
+        // A fresh model starts at model sequence 0; a case started on a model that had applied output starts from its
+        // text-state/1 start checkpoint, restored, at the start's model sequence.
+        var restored = manifest.Checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState;
+        if (restored && manifest.Checkpoint.ModelSequence is not >= 0)
+            return Refuse(DiagnosticOutcome.Unavailable, "incompatible", "checkpoint.modelSequence: a text-state/1 start names no model sequence.");
+        var start = restored ? manifest.Checkpoint.ModelSequence!.Value : 0;
         var interval = inspection.Intervals.FirstOrDefault();
         if (manifest.Checkpoint.Status != DiagnosticCaseCheckpointStatus.Complete || manifest.Checkpoint.Configuration is not { } configuration
             || interval is not { Valid: true, ToModelSequence: { } intervalEnd })
@@ -125,13 +131,31 @@ internal static class CaseReapplier
 
         // The target, resolved from the verified events without applying any (and without reading any state).
         var eventsPath = System.IO.Path.Combine(path, CaseArtifactWriter.EventsFile);
-        var resolution = ResolveTarget(request, eventsPath);
+        var resolution = ResolveTarget(request, eventsPath, start);
         if (resolution.Problem is { } targetProblem)
             return described with { Outcome = targetProblem.Outcome, Problem = targetProblem.Problem };
         var target = resolution.ModelSequence;
         var chosen = resolution.Checkpoint;
         if (chosen is { Profile: var profile } && profile != DiagnosticCaseCheckpointProfiles.TextState)
             return Refuse(DiagnosticOutcome.Unavailable, "incompatible", $"checkpoint.profile: unknown projection profile '{profile}'.");
+        if (target < start)
+            return Refuse(DiagnosticOutcome.InvalidRequest, "unknown-model-sequence",
+                $"Model sequence {target} is before the case's start, at model sequence {start}: the case recorded nothing before it.");
+
+        // The start's state, read and checked before anything is built or written.
+        DiagnosticModelState? startState = null;
+        if (restored)
+        {
+            if (resolution.Start is not { } startLine || startLine.ModelSequence != start || startLine.Status != "recorded"
+                || ReadStartState(eventsPath, startLine.CaseSequence) is not { } state)
+                return Refuse(DiagnosticOutcome.Unavailable, "missing-start",
+                    $"The case's start checkpoint at model sequence {start} is missing from its verified events, or holds no state.");
+            if (StartCheckpoint.Unsupported(state) is { Count: > 0 } surfaces)
+                return Refuse(DiagnosticOutcome.Unavailable, "unsupported-start",
+                    $"The case's start holds {string.Join(", ", surfaces)}, which this build cannot restore.");
+            startState = state;
+        }
+
         var targetRecord = new DiagnosticCaseReapplyTarget
         {
             ModelSequence = target,
@@ -170,6 +194,18 @@ internal static class CaseReapplier
             return Refuse(DiagnosticOutcome.Unavailable, "incompatible", DiagnosticCaseRecorder.Bounded($"configuration: {error.Message}"));
         }
 
+        if (startState is not null)
+        {
+            try
+            {
+                replica.RestoreModelState(startState);
+            }
+            catch (Exception error) when (error is InvalidOperationException or ArgumentException or FormatException or OverflowException or IndexOutOfRangeException)
+            {
+                return Refuse(DiagnosticOutcome.Unavailable, "incompatible", DiagnosticCaseRecorder.Bounded($"start: {error.Message}"));
+            }
+        }
+
         string run;
         try
         {
@@ -184,7 +220,7 @@ internal static class CaseReapplier
         // presentation. It holds no process, file or real timer, so the collector releases it.
         var result = described with { Outcome = DiagnosticOutcome.Captured, RunPath = run, Target = targetRecord };
         DiagnosticCaseCheckpointEvent? recorded = null;
-        long applied = 0;
+        long applied = start;
         try
         {
             ReplicaForTesting.Value?.Invoke(replica);
@@ -192,7 +228,7 @@ internal static class CaseReapplier
             {
                 if (chosen is not null && item.CaseSequence == chosen.CaseSequence)
                     recorded = item.Checkpoint;
-                if (item.Stream == "model" && item.ModelSequence is { } sequence && sequence <= target)
+                if (item.Stream == "model" && item.ModelSequence is { } sequence && sequence > start && sequence <= target)
                 {
                     if (Apply(replica, clock, item, sequence) is { } divergence)
                         return Finish(result with { AppliedThrough = applied, Comparison = "different", ComparisonReason = divergence }, run);
@@ -344,27 +380,44 @@ internal static class CaseReapplier
         return null;
     }
 
-    private sealed record CheckpointLine(long CaseSequence, long ModelSequence, long Ordinal, string Label, string Status, string Profile);
+    private sealed record CheckpointLine(long CaseSequence, long ModelSequence, long Ordinal, string Label, string Status, string Profile, string Trigger);
 
-    private sealed record Resolution(long ModelSequence, CheckpointLine? Checkpoint, DiagnosticCaseReapplyResult? Problem, long LastModelSequence = 0);
+    private sealed record Resolution(long ModelSequence, CheckpointLine? Checkpoint, DiagnosticCaseReapplyResult? Problem, long LastModelSequence = 0)
+    {
+        /// <summary>The start checkpoint line (trigger <c>start</c>), when the case has one.</summary>
+        public CheckpointLine? Start { get; init; }
+    }
 
-    // One streaming pass over the verified events: the checkpoints (without their state) and, for a case-sequence
-    // target, the line it names.
-    private static Resolution ResolveTarget(DiagnosticCaseReapplyRequest request, string eventsPath)
+    // The start checkpoint's state: the first lines of the file, read until its line.
+    private static DiagnosticModelState? ReadStartState(string eventsPath, long caseSequence)
+    {
+        foreach (var item in CaseArtifactReader.ReadEvents(eventsPath, caseSequence))
+        {
+            if (item.CaseSequence == caseSequence)
+                return item.Checkpoint?.State;
+        }
+        return null;
+    }
+
+    // One streaming pass over the verified events: the checkpoints (without their state), the start line, and, for a
+    // case-sequence target, the line it names. Model sequences before `start` are not the case's.
+    private static Resolution ResolveTarget(DiagnosticCaseReapplyRequest request, string eventsPath, long start)
     {
         var checkpoints = new List<CheckpointLine>();
         DiagnosticCaseEvent? named = null;
-        long last = 0;
+        long last = start;
         foreach (var item in CaseArtifactReader.ReadEvents(eventsPath))
         {
             if (item.Stream == "model" && item.ModelSequence is { } modelEvent)
                 last = Math.Max(last, modelEvent);
             if (item.Checkpoint is { } checkpoint && item.ModelSequence is { } at)
-                checkpoints.Add(new CheckpointLine(item.CaseSequence, at, checkpoint.Ordinal, checkpoint.Label, checkpoint.Status, checkpoint.Profile));
+                checkpoints.Add(new CheckpointLine(item.CaseSequence, at, checkpoint.Ordinal, checkpoint.Label, checkpoint.Status, checkpoint.Profile, checkpoint.Trigger));
             if (item.CaseSequence == request.ToCaseSequence)
                 named = item with { Checkpoint = null, Data = null };
         }
 
+        // The start is the first checkpoint line, and only it has trigger start.
+        var startLine = checkpoints.FirstOrDefault() is { Trigger: "start" } first ? first : null;
         if (request.ToLabel is { } label)
         {
             var matches = checkpoints.Where(c => c.Label == label).ToList();
@@ -373,7 +426,7 @@ internal static class CaseReapplier
             if (matches.Count > 1)
                 return new Resolution(0, null, Problem(DiagnosticOutcome.InvalidRequest, "ambiguous-label",
                     $"{matches.Count} checkpoints are labelled '{label}', at case sequences {string.Join(", ", matches.Select(m => m.CaseSequence))}; name one by case sequence."));
-            return new Resolution(matches[0].ModelSequence, matches[0], null, last);
+            return new Resolution(matches[0].ModelSequence, matches[0], null, last) { Start = startLine };
         }
 
         if (request.ToCaseSequence is { } caseSequence)
@@ -381,15 +434,15 @@ internal static class CaseReapplier
             if (named is null)
                 return new Resolution(0, null, Problem(DiagnosticOutcome.InvalidRequest, "unknown-case-sequence", $"No verified event has case sequence {caseSequence}."));
             if (checkpoints.FirstOrDefault(c => c.CaseSequence == caseSequence) is { } line)
-                return new Resolution(line.ModelSequence, line, null, last);
+                return new Resolution(line.ModelSequence, line, null, last) { Start = startLine };
             if (named.Stream != "model" || named.ModelSequence is not { } modelSequence)
                 return new Resolution(0, null, Problem(DiagnosticOutcome.InvalidRequest, "not-a-boundary",
                     $"Case sequence {caseSequence} is a {named.Stream} {named.Kind} event, not a model event or a checkpoint."));
-            return new Resolution(modelSequence, AtSequence(checkpoints, modelSequence), null, last);
+            return new Resolution(modelSequence, AtSequence(checkpoints, modelSequence), null, last) { Start = startLine };
         }
 
         var target = request.ToModelSequence!.Value;
-        return new Resolution(target, AtSequence(checkpoints, target), null, last);
+        return new Resolution(target, AtSequence(checkpoints, target), null, last) { Start = startLine };
     }
 
     // The checkpoint compared at a model sequence: the first with state, else the first.

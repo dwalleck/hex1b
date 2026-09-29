@@ -2,6 +2,9 @@ using System.Text;
 using System.Text.Json;
 using Hex1b.Diagnostics;
 using Hex1b.Diagnostics.Cases;
+using System.Reflection;
+using System.Text.Json.Nodes;
+using Microsoft.Extensions.Time.Testing;
 
 namespace Hex1b.Tests.Diagnostics;
 
@@ -263,6 +266,240 @@ public partial class DiagnosticCaseTests
         var interval = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }).Intervals.Single();
         Assert.AreEqual((true, start, start + 2, "model-events-missing"),
             (interval.Valid, interval.FromModelSequence, interval.ToModelSequence, interval.EndReason));
+    }
+
+    // Continuation the start's viewport does not show, then input that uses it (evidence P2).
+    private const string LiveLeave = "\u001b[1;31mstyled\u001b[m \u001b]8;id=a;https://x.test/a\u001b\\link\u001b]8;;\u001b\\ " +
+        "\u001b[3g\u001b[1;7H\u001bH\u001b)0\u000e\u001b[3;9r\u001b[4;4H\u001b7\u001b[32m\u001b[1\"q\u001b[2;40HW";
+    private const string LiveReveal = "Z\u001b[3bq\u000fq\r\tT\u001b8S\u001b[9;1H\n\n\nend";
+
+    [TestMethod]
+    public async Task Reapply_LiveStartMatchesAtEveryCheckpoint()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10).Build();
+        string path;
+        long start;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, LiveLeave);
+            start = terminal.CurrentModelSequence;
+            path = StartLive(terminal, root);
+            await workload.WriteAndWaitAsync(terminal, LiveReveal);
+            Assert.AreEqual(DiagnosticOutcome.Captured, new TerminalDiagnostics(terminal).MarkCase("revealed").Outcome);
+            terminal.Resize(30, 8);
+            await workload.WriteAndWaitAsync(terminal, "resized\r\n");
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        foreach (var label in new[] { "start", "revealed", "stop" })
+        {
+            var result = Reapply(path, label: label);
+            AssertMatched(result, $"raw {label}");
+            Assert.AreEqual((DiagnosticCaseCheckpointProfiles.TextState, (long?)start), (result.Checkpoint!.Profile, result.Checkpoint.ModelSequence),
+                $"{label}: the result does not name the start it restored");
+        }
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Start_PartitionsInFlightApplicationAndResize(bool resizeFirst)
+    {
+        // With the model lock held, the pump reads and tokenizes a chunk (it uses the last printed cell: REP) and waits;
+        // a resize waits too. The case is armed in that window. Each is in the start or recorded after it, once.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10).Build();
+        string path;
+        long start;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "\u001b[1;33mbefore Q");
+            var modelLock = typeof(Hex1bTerminal).GetField("_bufferLock", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(terminal)!;
+            Task resize;
+            lock (modelLock)
+            {
+                resize = Task.CompletedTask;
+                if (resizeFirst)
+                {
+                    resize = Task.Run(() => terminal.Resize(36, 12));
+                    Thread.Sleep(50);
+                }
+                var read = terminal.OutputBytesRead;
+                workload.Enqueue(Encoding.UTF8.GetBytes(" in-flight\u001b[3b"));
+                Assert.IsTrue(SpinWait.SpinUntil(() => terminal.OutputBytesRead > read, TimeSpan.FromSeconds(5)), "fixture: the chunk was never read");
+                Thread.Sleep(20);
+                if (!resizeFirst)
+                    resize = Task.Run(() => terminal.Resize(36, 12));
+                Thread.Sleep(50);
+                start = terminal.CurrentModelSequence;
+                path = StartLive(terminal, root);
+            }
+            await resize;
+            await WaitAsync(() => terminal.CurrentModelSequence >= start + 2);
+            await workload.WriteAndWaitAsync(terminal, " after");
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var model = Artifact.Read(path).ModelEvents();
+        Assert.AreEqual(start + 1, model[0].GetProperty("modelSequence").GetInt64(), "the first recorded event is not the start's next");
+        var kinds = model.Take(2).Select(e => e.GetProperty("kind").GetString()).ToList();
+        CollectionAssert.AreEquivalent(new[] { "application", "resize" }, kinds, "the in-flight application and resize were not both recorded after the start");
+        AssertMatched(Reapply(path, label: "stop"), resizeFirst ? "resize first" : "application first");
+    }
+
+    [TestMethod]
+    public async Task Reapply_LiveStartAcrossSynchronizedUpdate()
+    {
+        // Armed inside an open synchronized update that times out after the start: the restored update times out on
+        // the replica's virtual clock at the recorded model sequence.
+        using var root = new CaseRoot();
+        var clock = new FakeTimeProvider();
+        var workload = new ScriptedWorkload();
+        await using var terminal = new Hex1bTerminal(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = new HeadlessPresentationAdapter(30, 5),
+            WorkloadAdapter = workload,
+            Width = 30,
+            Height = 5,
+            TimeProvider = clock,
+        });
+        await workload.WriteAndWaitAsync(terminal, "text\u001b[?2026hinside");
+        var path = StartLive(terminal, root);
+        await workload.WriteAndWaitAsync(terminal, " more");
+        var before = terminal.CurrentModelSequence;
+        clock.Advance(TimeSpan.FromSeconds(1));
+        await WaitAsync(() => terminal.CurrentModelSequence == before + 1);
+        await workload.WriteAndWaitAsync(terminal, " after");
+        await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+
+        Assert.AreEqual(1, Artifact.Read(path).ModelEvents().Count(e => e.GetProperty("kind").GetString() == "synchronized-update-timeout"),
+            "fixture: the timeout was not recorded after the start");
+        AssertMatched(Reapply(path, label: "stop"), "across the restored update");
+    }
+
+    [TestMethod]
+    public async Task Reapply_LiveStartWithoutStartStateUnavailable()
+    {
+        using var root = new CaseRoot();
+        var path = await RecordLiveAsync(root);
+        foreach (var (name, change) in new (string, Action<string>)[]
+        {
+            ("no state", copy => EditEventLine(copy, IsStart, node => node["checkpoint"]!.AsObject().Remove("state"))),
+            ("no line", copy => RemoveEventLine(copy, IsStart)),
+        })
+        {
+            var copy = CopyCase(root, path, name.Replace(' ', '-'));
+            change(copy);
+            var result = Reapply(copy, label: "stop");
+            Assert.AreEqual((DiagnosticOutcome.Unavailable, "missing-start"), (result.Outcome, result.Problem?.Code), $"{name}: {result.Problem?.Message}");
+            Assert.IsFalse(Directory.Exists(Path.Combine(copy, "reapplications")), $"{name}: a refused re-application wrote a run");
+        }
+    }
+
+    [TestMethod]
+    [DataRow("retained-history", "history")]
+    [DataRow("titles", "titles")]
+    [DataRow("pending-input", "pendingInput")]
+    public async Task Reapply_OutOfSurfaceStartRefused(string surface, string field)
+    {
+        // A start state the restore cannot represent, in a manifest that claims it complete: refused before anything.
+        using var root = new CaseRoot();
+        var copy = CopyCase(root, await RecordLiveAsync(root), surface);
+        EditEventLine(copy, IsStart, node =>
+        {
+            var state = node["checkpoint"]!["state"]!.AsObject();
+            switch (field)
+            {
+                case "history":
+                    state["history"] = JsonNode.Parse("""{"capacity":10,"nextRowId":2,"rows":[{"cells":[{"t":"x","s":0}],"id":1,"originalWidth":1}]}""");
+                    break;
+                case "titles":
+                    state["titles"]!["window"] = "T";
+                    break;
+                default:
+                    state["pendingInput"]!["escapePrefix"] = "[";
+                    break;
+            }
+        });
+        var result = Reapply(copy, label: "stop");
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "unsupported-start"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
+        StringAssert.Contains(result.Problem!.Message, surface);
+        Assert.IsFalse(Directory.Exists(Path.Combine(copy, "reapplications")), "a refused re-application wrote a run");
+    }
+
+    [TestMethod]
+    public async Task Reapply_TargetBeforeStartInvalid()
+    {
+        using var root = new CaseRoot();
+        var path = await RecordLiveAsync(root);
+        var start = Artifact.Read(path).Manifest.GetProperty("checkpoint").GetProperty("modelSequence").GetInt64();
+        var result = Reapply(path, modelSequence: start - 1);
+        Assert.AreEqual((DiagnosticOutcome.InvalidRequest, "unknown-model-sequence"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
+        AssertMatched(Reapply(path, modelSequence: start), "the start itself");
+    }
+
+    [TestMethod]
+    public async Task Start_InsideAnApplicationIsUnsupported()
+    {
+        // Armed from a callback inside an application: the model is half applied, so no start state is taken.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10).Build();
+        DiagnosticCaseResult? started = null;
+        terminal.WindowTitleChanged += _ => started ??= new TerminalDiagnostics(terminal).StartCase(new DiagnosticCaseStartRequest
+        {
+            Directory = root.Path,
+            Authorizations = [DiagnosticAuthorization.ReapplicationData],
+        });
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "before \u001b]2;armed here\u0007 rest");
+            await workload.WriteAndWaitAsync(terminal, " after");
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        Assert.IsNotNull(started?.Path, "fixture: the callback did not arm a case");
+        var checkpoint = Artifact.Read(started.Path).Manifest.GetProperty("checkpoint");
+        Assert.AreEqual("unsupported", checkpoint.GetProperty("status").GetString());
+        StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "mid-application:");
+    }
+
+    private static bool IsStart(JsonNode node) => node["checkpoint"]?["trigger"]?.GetValue<string>() == "start";
+
+    private static async Task<string> RecordLiveAsync(CaseRoot root)
+    {
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10).Build();
+        using var running = new Running(terminal);
+        await workload.WriteAndWaitAsync(terminal, LiveLeave);
+        var path = StartLive(terminal, root);
+        await workload.WriteAndWaitAsync(terminal, LiveReveal);
+        await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        return path;
+    }
+
+    private static string CopyCase(CaseRoot root, string path, string name)
+    {
+        var copy = Path.Combine(root.Path, "copy-" + name);
+        if (OperatingSystem.IsWindows())
+            Directory.CreateDirectory(copy);
+        else
+            Directory.CreateDirectory(copy, OwnerDirectory);
+        foreach (var file in Directory.GetFiles(path))
+            File.Copy(file, Path.Combine(copy, Path.GetFileName(file)));
+        return copy;
+    }
+
+    private static void RemoveEventLine(string path, Func<JsonNode, bool> select)
+    {
+        var file = Path.Combine(path, "events.jsonl");
+        var lines = File.ReadAllLines(file);
+        var kept = lines.Where(line => !select(JsonNode.Parse(line[9..])!)).ToList();
+        Assert.AreEqual(lines.Length - 1, kept.Count, "fixture: not exactly one line removed");
+        File.WriteAllText(file, string.Join("\n", kept) + "\n");
     }
 
     private static string StartLive(Hex1bTerminal terminal, CaseRoot root) =>
