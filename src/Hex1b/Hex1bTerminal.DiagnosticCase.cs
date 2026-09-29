@@ -100,12 +100,14 @@ public sealed partial class Hex1bTerminal
             }
 
             // Counted in progress from before the recording check until the checkpoint is kept, so a stop racing
-            // this one (a busy stop, or one that takes no checkpoint) never lets the writer close past it.
+            // this one (a busy stop, or one that takes no checkpoint) does not let the writer close past it, up to
+            // the closing sweep's 1 s bound.
             recorder.EnterStopCheckpoint();
             try
             {
                 if (recorder.IsRecording)
                 {
+                    recorder.LockedStopChecked();
                     var (sequence, capture) = TakeCaseCheckpointUnsafe(recorder, reason == DiagnosticCaseStopReason.SizeLimit);
                     recorder.RecordStopCheckpoint(sequence, capture);
                 }

@@ -406,6 +406,48 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
+    public async Task Stop_LockedStopIsCountedBeforeItsRecordingCheck()
+    {
+        // F51: between the locked stop's recording check and its claim, a stop that takes no checkpoint stops the
+        // case. The locked stop, counted before its check, must hold the writer's close and keep its checkpoint.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        DiagnosticCaseRecorder? recorder = null;
+        var closedEarly = true;
+        var first = 1;
+        DiagnosticCaseRecorder.AfterLockedStopCheckForTesting.Value = () =>
+        {
+            if (Interlocked.Exchange(ref first, 0) != 1)
+                return;
+            recorder!.StopRecording(DiagnosticCaseStopReason.CollectorFailed);
+            closedEarly = recorder.Completion.Wait(TimeSpan.FromMilliseconds(500));
+        };
+        Hex1bTerminal terminal;
+        string path;
+        try
+        {
+            (terminal, path) = Checkpointed(root, workload);
+        }
+        finally
+        {
+            DiagnosticCaseRecorder.AfterLockedStopCheckForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            await workload.WriteAndWaitAsync(terminal, "before");
+            recorder = terminal.DiagnosticCase!;
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        Assert.IsFalse(closedEarly, "the writer closed before the locked stop's checkpoint");
+        var artifact = Artifact.Read(path);
+        Assert.AreEqual("recorded", StopCheckpoint(artifact).GetProperty("checkpoint").GetProperty("status").GetString());
+        var counts = artifact.Completion!.Value.GetProperty("checkpoints");
+        Assert.AreEqual((1L, 1L), (counts.GetProperty("offered").GetInt64(), counts.GetProperty("written").GetInt64()));
+    }
+
+    [TestMethod]
     public async Task Stop_ModelLockBusyInALiveCaseNamesTheModelAtArming()
     {
         // F33: a case started mid-session whose first application wedges names the model's sequence at arming.
