@@ -216,6 +216,22 @@ internal static class CaseArtifactReader
         return result;
     }
 
+    /// <summary>
+    /// Streams the verified events of an events file, one line at a time, ending at the first line that fails
+    /// its checksum or JSON (the verified prefix). Memory is bounded by one line, not by the file.
+    /// </summary>
+    internal static IEnumerable<DiagnosticCaseEvent> ReadEvents(string eventsPath)
+    {
+        if (!File.Exists(eventsPath))
+            yield break;
+        foreach (var (bytes, terminated) in Lines(eventsPath))
+        {
+            if (!terminated || !TryParse(bytes, out var item))
+                yield break;
+            yield return item;
+        }
+    }
+
     // Delivery ordinals are the terminal's delivery sequences, which do not start at 1 for a case.
     private static long FirstDeliveryOrdinal(StreamScan stream, long ordinal) =>
         stream.Recorded.Count > 0 && stream.Recorded[0].FromOrdinal is { } from ? from : ordinal;

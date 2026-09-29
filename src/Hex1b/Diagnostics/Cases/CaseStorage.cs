@@ -87,6 +87,41 @@ internal static class CaseStorage
         return path;
     }
 
+    /// <summary>
+    /// Checks a case directory the way <see cref="CheckRoot"/> checks a root: not a link, owner-only and owned
+    /// by the current user. Returns why it is refused, or null.
+    /// </summary>
+    internal static string? CheckCaseDirectory(string path) =>
+        Directory.Exists(path) ? CheckRoot(path)?.Replace("case directory root", "case directory", StringComparison.Ordinal) : $"No case directory at '{path}'.";
+
+    /// <summary>
+    /// Creates a new owner-only run directory <c>reapplications/&lt;n&gt;</c> in a case. The number is claimed by
+    /// creating <c>&lt;n&gt;.claim</c> exclusively, so concurrent runs never share one.
+    /// </summary>
+    internal static string CreateRunDirectory(string casePath)
+    {
+        var runs = Path.Combine(casePath, "reapplications");
+        CreateOwnerOnlyDirectory(runs);
+        var next = Directory.EnumerateFileSystemEntries(runs)
+            .Select(entry => long.TryParse(Path.GetFileNameWithoutExtension(entry), out var n) ? n : 0).DefaultIfEmpty(0).Max() + 1;
+        for (var attempt = 0; attempt < 1000; attempt++, next++)
+        {
+            try
+            {
+                CreateFile(Path.Combine(runs, $"{next}.claim")).Dispose();
+            }
+            catch (IOException) when (File.Exists(Path.Combine(runs, $"{next}.claim")))
+            {
+                continue;
+            }
+
+            var run = Path.Combine(runs, next.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            CreateOwnerOnlyDirectory(run);
+            return run;
+        }
+        throw new IOException($"No run directory could be claimed in '{runs}'.");
+    }
+
     /// <summary>Creates a new owner-only file, failing if it exists.</summary>
     internal static FileStream CreateFile(string path)
     {

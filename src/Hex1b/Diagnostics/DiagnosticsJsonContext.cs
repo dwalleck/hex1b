@@ -29,6 +29,8 @@ namespace Hex1b.Diagnostics;
 [JsonSerializable(typeof(DiagnosticModelState))]
 [JsonSerializable(typeof(DiagnosticCaseMarkResult))]
 [JsonSerializable(typeof(DiagnosticModelStateComparison))]
+[JsonSerializable(typeof(DiagnosticCaseReapplyRequest))]
+[JsonSerializable(typeof(DiagnosticCaseReapplyResult))]
 [JsonSerializable(typeof(string))]
 [JsonSerializable(typeof(int))]
 [JsonSerializable(typeof(bool))]

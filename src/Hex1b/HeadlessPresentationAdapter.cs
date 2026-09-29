@@ -139,6 +139,17 @@ public sealed class HeadlessPresentationAdapter :
         return this;
     }
 
+    /// <summary>
+    /// Sets the strategy with reflow on or off: the strategy also decides whether absolute positioning clears
+    /// soft wraps, so a re-applied model keeps a recorded strategy even when reflow was off.
+    /// </summary>
+    internal HeadlessPresentationAdapter WithReflowStrategy(ITerminalReflowProvider strategy, bool enabled)
+    {
+        _reflowStrategy = strategy ?? throw new ArgumentNullException(nameof(strategy));
+        _reflowEnabled = enabled;
+        return this;
+    }
+
     /// <inheritdoc/>
     public bool ReflowEnabled => _reflowEnabled;
 
