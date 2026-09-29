@@ -46,10 +46,6 @@ public sealed record DiagnosticModelState
     [JsonPropertyName("styles")]
     public IReadOnlyList<DiagnosticModelStyle> Styles { get; init; } = [];
 
-    /// <summary>The write sequence the next written cell receives.</summary>
-    [JsonPropertyName("nextCellSequence")]
-    public long NextCellSequence { get; init; }
-
     /// <summary>The cursor.</summary>
     [JsonPropertyName("cursor")]
     public DiagnosticModelCursor Cursor { get; init; } = new();

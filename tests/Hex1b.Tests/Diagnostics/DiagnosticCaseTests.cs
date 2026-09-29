@@ -2010,7 +2010,9 @@ public partial class DiagnosticCaseTests
                     var before = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0;
                     for (var i = 0; i < 4000; i++)
                         workload.Enqueue(Encoding.ASCII.GetBytes($"M{i:D5} ".PadRight(600, 'x')));
-                    await WaitAsync(() => (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0) >= before + 4000);
+                    // 4,000 console writes: a fixture wait, generous for a loaded parallel run.
+                    await WaitAsync(() => (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0) >= before + 4000,
+                        TimeSpan.FromSeconds(30));
                     var last = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence!.Value;
                     gate.Set();
                     if (maxBytes is null)

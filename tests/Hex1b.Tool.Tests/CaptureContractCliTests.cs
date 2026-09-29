@@ -874,9 +874,10 @@ public class CaptureContractCliTests
         var engine = new TerminalDiagnostics(target, "CliMark");
 
         // Refusals equal the engine's own.
-        var (badExit, bad, _) = await RunCliAsync("capture", "case", "mark", Pid, "--label", "stop", "--json");
+        var tooLong = new string('x', 65);
+        var (badExit, bad, _) = await RunCliAsync("capture", "case", "mark", Pid, "--label", tooLong, "--json");
         Assert.AreEqual(1, badExit);
-        AssertJsonEquals(engine.MarkCase("stop"), bad, "invalid label");
+        AssertJsonEquals(engine.MarkCase(tooLong), bad, "invalid label");
 
         // A mark equals the checkpoint the target wrote.
         var (markExit, mark, markErr) = await RunCliAsync("capture", "case", "mark", Pid, "--label", "cli-mark", "--json");
@@ -930,10 +931,9 @@ public class CaptureContractCliTests
         var (faultExit, faulted, _) = await RunCliAsync("capture", "case", "reapply", path, "--to", "cli-mark", "--inject-fault", "cursor");
         Assert.AreEqual(2, faultExit);
         StringAssert.Contains(faulted, "Fault injected: cursor at cursor.x");
-        var (beyondExit, _, beyond) = await RunCliAsync("capture", "case", "reapply", path, "--to", "999999");
-        Assert.AreEqual(1, beyondExit);
-        StringAssert.Contains(beyond, "beyond-interval");
-        StringAssert.Contains(beyond, "Re-applicable through model sequence");
+        var (unknownExit, _, unknown) = await RunCliAsync("capture", "case", "reapply", path, "--to", "999999");
+        Assert.AreEqual(1, unknownExit);
+        StringAssert.Contains(unknown, "unknown-model-sequence");
         var (invalidExit, _, invalid) = await RunCliAsync("capture", "case", "reapply", path, "--to", "case:x");
         Assert.AreEqual((1, true), (invalidExit, invalid.Contains("invalid-target", StringComparison.Ordinal)), invalid);
     }

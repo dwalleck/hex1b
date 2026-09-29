@@ -17,6 +17,22 @@ public sealed record DiagnosticCaseReapplyResult
     [JsonPropertyName("problem")]
     public DiagnosticProblem? Problem { get; init; }
 
+    /// <summary>The case's starting checkpoint (<c>fresh-model/1</c>), with the recorded model configuration the replica was built from.</summary>
+    [JsonPropertyName("checkpoint")]
+    public DiagnosticCaseCheckpoint? Checkpoint { get; init; }
+
+    /// <summary>What the comparison covers and leaves out.</summary>
+    [JsonPropertyName("coverage")]
+    public DiagnosticModelStateCoverage? Coverage { get; init; }
+
+    /// <summary>The build and process that recorded the case (the manifest's identity).</summary>
+    [JsonPropertyName("producer")]
+    public DiagnosticObservationIdentity? Producer { get; init; }
+
+    /// <summary>The Hex1b build that re-applied it.</summary>
+    [JsonPropertyName("consumerHex1bVersion")]
+    public string? ConsumerHex1bVersion { get; init; }
+
     /// <summary>The case directory.</summary>
     [JsonPropertyName("path")]
     public string? Path { get; init; }

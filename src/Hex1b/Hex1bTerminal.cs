@@ -3694,6 +3694,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             if (_width != expectedWidth || _height != expectedHeight)
             {
                 appliedTokens = [];
+                NotifyCaseUnappliedOutputUnsafe();
                 return NativeDeliveryOutcome.GeometryChanged;
             }
 

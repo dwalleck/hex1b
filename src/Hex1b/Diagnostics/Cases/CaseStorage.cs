@@ -91,8 +91,26 @@ internal static class CaseStorage
     /// Checks a case directory the way <see cref="CheckRoot"/> checks a root: not a link, owner-only and owned
     /// by the current user. Returns why it is refused, or null.
     /// </summary>
-    internal static string? CheckCaseDirectory(string path) =>
-        Directory.Exists(path) ? CheckRoot(path)?.Replace("case directory root", "case directory", StringComparison.Ordinal) : $"No case directory at '{path}'.";
+    internal static string? CheckCaseDirectory(string path)
+    {
+        if (!Directory.Exists(path))
+            return $"No case directory at '{path}'.";
+        if (CheckRoot(path) is { } refused)
+            return refused.Replace("case directory root", "case directory", StringComparison.Ordinal);
+        return OperatingSystem.IsWindows() ? WindowsAccessProblem(path) : null;
+    }
+
+    // An existing directory passes only when its one access rule gives the current user full control, the rule
+    // CreateWindowsDirectory writes (not run: Windows is an approved untested risk).
+    [SupportedOSPlatform("windows")]
+    private static string? WindowsAccessProblem(string path)
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var rules = new DirectoryInfo(path).GetAccessControl().GetAccessRules(true, true, typeof(SecurityIdentifier));
+        return rules.Count == 1 && rules[0] is FileSystemAccessRule only && only.IdentityReference.Equals(identity.User)
+            ? null
+            : $"The case directory is accessible to others: '{path}'.";
+    }
 
     /// <summary>
     /// Creates a new owner-only run directory <c>reapplications/&lt;n&gt;</c> in a case. The number is claimed by

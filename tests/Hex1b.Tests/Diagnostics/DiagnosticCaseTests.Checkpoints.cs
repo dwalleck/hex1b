@@ -103,9 +103,10 @@ public partial class DiagnosticCaseTests
         var inLock = new List<(long Sequence, string State)>();
         await using (terminal)
         {
-            Assert.AreEqual("invalid-label", diagnostics.MarkCase("stop").Problem?.Code);
-            Assert.AreEqual("invalid-label", diagnostics.MarkCase("has space").Problem?.Code);
+            Assert.AreEqual("invalid-label", diagnostics.MarkCase("").Problem?.Code);
+            Assert.AreEqual("invalid-label", diagnostics.MarkCase("tab\there").Problem?.Code);
             Assert.AreEqual("invalid-label", diagnostics.MarkCase(new string('x', 65)).Problem?.Code);
+            Assert.AreEqual("invalid-label", diagnostics.MarkCase("caf\u00e9").Problem?.Code);
 
             await workload.WriteAndWaitAsync(terminal, "first ");
             between = diagnostics.MarkCase("between");
@@ -207,9 +208,10 @@ public partial class DiagnosticCaseTests
         {
             var diagnostics = new TerminalDiagnostics(terminal);
             await workload.WriteAndWaitAsync(terminal, "boundary only");
-            var mark = diagnostics.MarkCase("plain");
+            var mark = diagnostics.MarkCase("plain label with spaces");
             Assert.AreEqual(DiagnosticOutcome.Captured, mark.Outcome);
             Assert.IsFalse(mark.StateRecorded);
+            Assert.AreEqual("requires reapplication-data", mark.StateReason);
             await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
             Assert.AreEqual(0, terminal.ModelStateCapturesForTesting, "state was taken without reapplication-data");
         }
@@ -345,8 +347,8 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual("kitty", recorded.ReflowStrategy);
         Assert.IsTrue(recorded.ReflowEnabled);
         Assert.AreEqual((41, 7, (int?)null, 2), (recorded.Width, recorded.Height, recorded.ScrollbackCapacity, recorded.CommandMarkHistoryCapacity));
-        Assert.AreEqual(17, recorded.Graphics.MaximumImagesPerScreen);
-        Assert.AreEqual(TerminalCapabilities.Modern, CaseConfiguration.TerminalCapabilities(recorded.Capabilities, out var problem), problem);
+        Assert.AreEqual(17, recorded.Graphics!.MaximumImagesPerScreen);
+        Assert.AreEqual(TerminalCapabilities.Modern, CaseConfiguration.TerminalCapabilities(recorded.Capabilities!, out var problem), problem);
         Assert.AreSame(KittyReflowStrategy.Instance, CaseConfiguration.CreateReflowStrategy(recorded.ReflowStrategy));
 
         // Every capability and graphics option is recorded by name, and every capability value survives the trip.
@@ -370,7 +372,7 @@ public partial class DiagnosticCaseTests
         var unknownField = JsonSerializer.Deserialize("{\"supportsHolograms\":true,\"sixelSupport\":\"None\"}", DiagnosticsJsonContext.Default.DiagnosticCaseCapabilities)!;
         Assert.IsNull(CaseConfiguration.TerminalCapabilities(unknownField, out problem));
         Assert.AreEqual("capabilities.supportsHolograms: unknown field", problem);
-        Assert.IsNull(CaseConfiguration.TerminalCapabilities(recorded.Capabilities with { SixelSupport = "Hologram" }, out problem));
+        Assert.IsNull(CaseConfiguration.TerminalCapabilities(recorded.Capabilities! with { SixelSupport = "Hologram" }, out problem));
         StringAssert.StartsWith(problem, "capabilities.sixelSupport");
         Assert.IsNull(CaseConfiguration.CreateReflowStrategy("custom:Some.Strategy"));
 

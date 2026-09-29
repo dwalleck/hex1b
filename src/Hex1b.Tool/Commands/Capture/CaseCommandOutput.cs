@@ -74,7 +74,7 @@ internal static class CaseCommandOutput
 
         formatter.WriteLine($"Case {AppTreeCommand.Safe(result.CaseId)} marked '{AppTreeCommand.Safe(result.Label)}' " +
             $"(checkpoint {result.CheckpointOrdinal}) at model sequence {result.ModelSequence}" +
-            (result.StateRecorded == true ? "" : "; boundary only (state needs reapplication-data)"));
+            (result.StateRecorded == true ? "" : $"; boundary only ({AppTreeCommand.Safe(result.StateReason)})"));
         return 0;
     }
 

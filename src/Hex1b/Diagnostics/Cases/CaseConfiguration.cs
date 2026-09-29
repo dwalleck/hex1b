@@ -58,6 +58,65 @@ internal static class CaseConfiguration
         return null;
     }
 
+    // Format 2 fields a model cannot be rebuilt without. Absent nullable fields (scrollbackCapacity,
+    // customMarkerLimit, sixelCellMetrics) mean none, as they are written only when set.
+    private static readonly string[] RequiredFields =
+        ["width", "height", "commandMarkHistoryCapacity", "escapeSequenceTimeoutMs", "reflowEnabled", "reflowStrategy", "capabilities", "graphics"];
+
+    private static readonly string[] RequiredCapabilities =
+    [
+        "supportsDeltaProtocol", "supportsSixel", "sixelSupport", "supportsMouse", "supportsTrueColor", "supports256Colors",
+        "supportsAlternateScreen", "handlesAlternateScreenNatively", "supportsBracketedPaste", "supportsKgp",
+        "supportsRetroactiveVariationSelectors", "cellPixelWidth", "actualCellPixelWidth", "cellPixelHeight", "defaultForeground",
+        "defaultBackground", "supportsStyledUnderlines", "supportsUnderlineColor",
+    ];
+
+    private static readonly string[] RequiredGraphics =
+    [
+        "maximumRetainedInputBytesPerImage", "maximumRasterPixelsPerImage", "maximumRasterOperationsPerImage", "maximumImagesPerScreen",
+        "maximumPlacementsPerScreen", "maximumHistoryPlacements", "maximumRetainedLogicalPixelsPerScreen", "maximumRetainedBytesPerScreen",
+    ];
+
+    /// <summary>
+    /// Why a format 2 configuration cannot be rebuilt, naming the field: one missing from the raw manifest, one
+    /// this build does not know, or a value no model could be built with. Null when it can be.
+    /// </summary>
+    internal static string? Problem(System.Text.Json.Nodes.JsonObject raw, DiagnosticCaseModelConfiguration configuration)
+    {
+        foreach (var field in RequiredFields)
+        {
+            if (raw[field] is null)
+                return $"configuration.{field}: missing";
+        }
+        foreach (var field in RequiredCapabilities)
+        {
+            if (raw["capabilities"]?[field] is null)
+                return $"capabilities.{field}: missing";
+        }
+        foreach (var field in RequiredGraphics)
+        {
+            if (raw["graphics"]?[field] is null)
+                return $"graphics.{field}: missing";
+        }
+        if (configuration.Unknown is { Count: > 0 } unknown)
+            return $"configuration.{unknown.Keys.Order(StringComparer.Ordinal).First()}: unknown field";
+        if (configuration.Graphics?.Unknown is { Count: > 0 } unknownGraphics)
+            return $"graphics.{unknownGraphics.Keys.Order(StringComparer.Ordinal).First()}: unknown field";
+        if (configuration.Width is < 1 or > 10_000)
+            return $"configuration.width: {configuration.Width} is not 1 to 10,000";
+        if (configuration.Height is < 1 or > 10_000)
+            return $"configuration.height: {configuration.Height} is not 1 to 10,000";
+        if (configuration.ScrollbackCapacity is < 1)
+            return $"configuration.scrollbackCapacity: {configuration.ScrollbackCapacity} is not positive";
+        if (configuration.CommandMarkHistoryCapacity < 0)
+            return $"configuration.commandMarkHistoryCapacity: {configuration.CommandMarkHistoryCapacity} is negative";
+        if (configuration.CustomMarkerLimit is < 0)
+            return $"configuration.customMarkerLimit: {configuration.CustomMarkerLimit} is negative";
+        if (!double.IsFinite(configuration.EscapeSequenceTimeoutMs) || configuration.EscapeSequenceTimeoutMs is < 0 or > 86_400_000)
+            return $"configuration.escapeSequenceTimeoutMs: {configuration.EscapeSequenceTimeoutMs} is not 0 to 86,400,000";
+        return null;
+    }
+
     internal static DiagnosticCaseCapabilities Capabilities(TerminalCapabilities capabilities) => new()
     {
         SupportsDeltaProtocol = capabilities.SupportsDeltaProtocol,

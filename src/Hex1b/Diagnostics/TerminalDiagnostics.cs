@@ -137,7 +137,7 @@ public sealed class TerminalDiagnostics
     private static readonly IReadOnlyList<string> FrameLimitations =
         [LatestFrameLimitation, FrameLayerLimitation, ApplicationTextLimitation, ObservationalLimitation];
 
-    private static readonly string Hex1bVersion = ReadInformationalVersion(typeof(Hex1bTerminal).Assembly)
+    internal static readonly string Hex1bVersion = ReadInformationalVersion(typeof(Hex1bTerminal).Assembly)
         ?? typeof(Hex1bTerminal).Assembly.GetName().Version?.ToString() ?? "unknown";
 
     private static readonly Lazy<(DateTimeOffset? StartedAt, string? Reason)> ProcessStart = new(ReadProcessStart);
@@ -841,8 +841,9 @@ public sealed class TerminalDiagnostics
     /// otherwise the boundary only) at the current model sequence. It never waits for the case's writer.
     /// </summary>
     /// <param name="label">
-    /// A label a re-application can target: 1 to 64 letters, digits, <c>.</c>, <c>_</c>, <c>:</c> or <c>-</c>,
-    /// other than <c>stop</c>. Absent, the mark is labelled <c>mark-</c> and its ordinal.
+    /// A label a re-application can target: 1 to 64 printable ASCII characters. Labels need not be unique; a
+    /// target naming several checkpoints is refused, listing them. Absent, the mark is labelled <c>mark-</c> and
+    /// its ordinal.
     /// </param>
     public DiagnosticCaseMarkResult MarkCase(string? label = null)
     {
@@ -854,7 +855,7 @@ public sealed class TerminalDiagnostics
                 Problem = new DiagnosticProblem
                 {
                     Code = "invalid-label",
-                    Message = "label must be 1 to 64 letters, digits, '.', '_', ':' or '-', and not 'stop'.",
+                    Message = "label must be 1 to 64 printable ASCII characters.",
                 },
             };
         }
@@ -870,7 +871,7 @@ public sealed class TerminalDiagnostics
 
     /// <summary>Whether a mark label is valid; shared by the engine and its clients.</summary>
     internal static bool IsCaseLabel(string label) =>
-        label.Length is >= 1 and <= 64 && label != "stop" && label.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or ':' or '-');
+        label.Length is >= 1 and <= 64 && label.All(c => c is >= ' ' and <= '~');
 
     /// <summary>Reports the active case's state, bounds, progress and per-stream counts.</summary>
     public DiagnosticCaseResult GetCaseStatus() =>

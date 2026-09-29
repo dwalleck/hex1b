@@ -36,4 +36,11 @@ public sealed record DiagnosticCaseMarkResult
     /// <summary>Whether the model's state was taken (only with <c>reapplication-data</c>).</summary>
     [JsonPropertyName("stateRecorded")]
     public bool? StateRecorded { get; init; }
+
+    /// <summary>
+    /// Why no state was recorded: <c>requires reapplication-data</c>, <c>pending-state budget: …</c>, or
+    /// <c>capture-failed: …</c>; absent when state was recorded.
+    /// </summary>
+    [JsonPropertyName("stateReason")]
+    public string? StateReason { get; init; }
 }

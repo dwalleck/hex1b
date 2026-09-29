@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace Hex1b.Diagnostics;
@@ -55,9 +56,13 @@ public sealed record DiagnosticCaseModelConfiguration
 
     /// <summary>The presentation's terminal capabilities, which may come from the environment.</summary>
     [JsonPropertyName("capabilities")]
-    public DiagnosticCaseCapabilities Capabilities { get; init; } = new();
+    public DiagnosticCaseCapabilities? Capabilities { get; init; }
 
     /// <summary>Graphics policy and retained-resource limits.</summary>
     [JsonPropertyName("graphics")]
-    public DiagnosticCaseGraphicsLimits Graphics { get; init; } = new();
+    public DiagnosticCaseGraphicsLimits? Graphics { get; init; }
+
+    /// <summary>Recorded fields this build does not know; re-application refuses a configuration with any.</summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? Unknown { get; set; }
 }

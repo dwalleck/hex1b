@@ -85,16 +85,36 @@ public sealed partial class Hex1bTerminal
     /// </summary>
     internal void StopDiagnosticCaseWithCheckpoint(DiagnosticCaseRecorder recorder, DiagnosticCaseStopReason reason)
     {
-        lock (_bufferLock)
+        // A model lock held for long (a wedged callback: what a case is recorded to diagnose) must not hold up
+        // the stop, the time limit or the drain bound: past the wait the case stops without the state.
+        var taken = false;
+        try
         {
-            if (recorder.IsRecording)
+            Monitor.TryEnter(_bufferLock, StopCheckpointLockTimeout, ref taken);
+            if (!taken)
             {
-                var (state, milliseconds, problem) = TakeCaseCheckpointUnsafe(recorder);
-                recorder.RecordStopCheckpoint(_modelSequence, state, milliseconds, problem);
+                if (recorder.IsRecording)
+                {
+                    recorder.RecordStopCheckpoint(Interlocked.Read(ref _modelSequence), new DiagnosticCaseRecorder.CheckpointCapture(null, null,
+                        "unavailable", $"model-lock-busy: the model lock was not free within {StopCheckpointLockTimeout.TotalSeconds:0} s", 0));
+                }
+                recorder.StopRecording(reason);
+                return;
             }
+
+            if (recorder.IsRecording)
+                recorder.RecordStopCheckpoint(_modelSequence, TakeCaseCheckpointUnsafe(recorder, reason == DiagnosticCaseStopReason.SizeLimit));
             recorder.StopRecording(reason);
         }
+        finally
+        {
+            if (taken)
+                Monitor.Exit(_bufferLock);
+        }
     }
+
+    /// <summary>How long a stop waits for the model lock before it stops without its checkpoint's state.</summary>
+    internal static readonly TimeSpan StopCheckpointLockTimeout = TimeSpan.FromSeconds(2);
 
     /// <summary>
     /// Marks a boundary in a recording case: a checkpoint at the current model sequence, taken between two
@@ -111,14 +131,14 @@ public sealed partial class Hex1bTerminal
         {
             if (!recorder.IsRecording)
             {
-                recorder.ReleaseMark();
+                recorder.AbandonMark();
                 return MarkProblem("no-active-case", "No case is recording this terminal.");
             }
 
             DiagnosticCaseRecorder.BeforeMarkCaptureForTesting.Value?.Invoke();
-            var (state, milliseconds, problem) = TakeCaseCheckpointUnsafe(recorder);
+            var capture = TakeCaseCheckpointUnsafe(recorder, forSizeLimitStop: false);
             DiagnosticCaseRecorder.AfterMarkCaptureForTesting.Value?.Invoke();
-            var (ordinal, name) = recorder.RecordMark(label, _modelSequence, state, milliseconds, problem);
+            var (ordinal, name) = recorder.RecordMark(label, _modelSequence, capture);
             return new DiagnosticCaseMarkResult
             {
                 Outcome = DiagnosticOutcome.Captured,
@@ -126,7 +146,8 @@ public sealed partial class Hex1bTerminal
                 Label = name,
                 CheckpointOrdinal = ordinal,
                 ModelSequence = _modelSequence,
-                StateRecorded = state is not null,
+                StateRecorded = capture.State is not null,
+                StateReason = capture.State is null ? capture.Reason : null,
             };
         }
     }
@@ -137,33 +158,44 @@ public sealed partial class Hex1bTerminal
         Problem = new DiagnosticProblem { Code = code, Message = message },
     };
 
-    // Must hold _bufferLock. The state only with reapplication-data; a projection that fails leaves the
-    // boundary without state rather than failing the stop or the mark.
-    private (DiagnosticModelState? State, double? Milliseconds, string? Problem) TakeCaseCheckpointUnsafe(DiagnosticCaseRecorder recorder)
+    // Must hold _bufferLock. The state only with reapplication-data and within the pending-state budget,
+    // both judged from geometry before any state is read. A size-limit stop skips a state that could not fit
+    // what is left of the case. A projection that fails leaves the boundary without state rather than
+    // failing the stop or the mark.
+    private DiagnosticCaseRecorder.CheckpointCapture TakeCaseCheckpointUnsafe(DiagnosticCaseRecorder recorder, bool forSizeLimitStop)
     {
         if (!recorder.IncludeModelPayloads)
-            return (null, null, "requires reapplication-data");
+            return new(null, null, "unavailable", "requires reapplication-data", 0);
+        if (forSizeLimitStop && EstimateModelStateJsonBytesUnsafe() > recorder.StopCheckpointRoom)
+            return new(null, null, "missing", "size-limit", 0);
+        var estimate = EstimateModelStateBytesUnsafe();
+        if (!recorder.TryReserveStateBytes(estimate))
+            return new(null, null, "unavailable", "pending-state budget: the checkpoints awaiting the writer already hold their share of state", 0);
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
             var state = CaptureModelState();
-            return (state, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds, null);
+            return new(state, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds, "recorded", null, estimate);
         }
         catch (Exception error)
         {
-            return (null, null, DiagnosticCaseRecorder.Bounded($"capture-failed: {error.GetType().Name}: {error.Message}"));
+            recorder.ReleaseStateBytes(estimate);
+            return new(null, null, "unavailable", DiagnosticCaseRecorder.Bounded($"capture-failed: {error.GetType().Name}: {error.Message}"), 0);
         }
     }
 
-    /// <summary>Forgets a finished case so a new one can start.</summary>
-    internal void ClearDiagnosticCase(DiagnosticCaseRecorder recorder)
-    {
-        lock (_bufferLock)
-        {
-            if (ReferenceEquals(_diagnosticCase, recorder))
-                Volatile.Write(ref _diagnosticCase, null);
-        }
-    }
+    // Must hold _bufferLock: a batch was tokenized (moving the decoder, escape prefix and DCS framer) but
+    // refused without a model event, so no recorded application reproduces that state change; re-applicable
+    // coverage ends at the next model event.
+    private void NotifyCaseUnappliedOutputUnsafe() =>
+        _diagnosticCase?.EndInterval(_modelSequence + 1, "unapplied-output");
+
+    /// <summary>
+    /// Forgets a finished case so a new one can start. Atomic without the model lock, so a finishing writer
+    /// never waits on a held model lock (arming checks the field under the lock, and every hook reads it once).
+    /// </summary>
+    internal void ClearDiagnosticCase(DiagnosticCaseRecorder recorder) =>
+        Interlocked.CompareExchange(ref _diagnosticCase, null, recorder);
 
     // The pump item's original bytes, from its read until the model applies it (or the item ends
     // unapplied). Held whether or not a case is active, so a case started between an item's read and
@@ -193,6 +225,7 @@ public sealed partial class Hex1bTerminal
     // driven by the pump) is recorded as such.
     private void NotifyCaseApplicationUnsafe()
     {
+        CommitOutputContinuationUnsafe();
         var pump = ReferenceEquals(s_caseIngressPump.Value, this);
         var pending = pump && _caseIngressPending;
         var ingress = pump ? _caseIngress : default;

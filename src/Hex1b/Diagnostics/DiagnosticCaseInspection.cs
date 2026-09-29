@@ -52,6 +52,13 @@ public sealed record DiagnosticCaseInspection
     [JsonPropertyName("intervals")]
     public IReadOnlyList<DiagnosticCaseInterval> Intervals { get; init; } = [];
 
+    /// <summary>
+    /// Checkpoint coverage: checkpoint lines verified (ordinals are checkpoint ordinals), ranges declared missing,
+    /// and an <c>unaccounted</c> tail when the completion counts more taken than written or declared.
+    /// </summary>
+    [JsonPropertyName("checkpoints")]
+    public DiagnosticCaseStreamCoverage? Checkpoints { get; init; }
+
     /// <summary>Events after the requested case sequence, oldest first, at most the requested limit.</summary>
     [JsonPropertyName("events")]
     public IReadOnlyList<DiagnosticCaseEvent> Events { get; init; } = [];

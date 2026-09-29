@@ -20,7 +20,7 @@ internal sealed class CaptureCaseReapplyCommand : BaseCommand
     };
     private static readonly Option<string[]> s_faultOption = new("--inject-fault")
     {
-        Description = "Inject a declared fault into the reconstructed state before comparing (repeatable or comma-separated); the result is labelled"
+        Description = "Inject a declared fault into the reconstructed state before comparing, as kind or kind:target (cell-text:3/5, mode:wraparound, history-row:12; repeatable or comma-separated); the result is labelled"
     };
     private static readonly Option<int?> s_maxDifferencesOption = new("--max-differences")
     {

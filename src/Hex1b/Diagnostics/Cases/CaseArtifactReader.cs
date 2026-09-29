@@ -98,6 +98,7 @@ internal static class CaseArtifactReader
             LastCaseSequence = scan.LastCaseSequence,
             Streams = DescribeStreams(manifest, scan, completion),
             Intervals = DescribeIntervals(manifest, completion, state, scan),
+            Checkpoints = DescribeCheckpoints(scan, completion),
             Events = scan.Page,
         };
     }
@@ -155,6 +156,7 @@ internal static class CaseArtifactReader
         public long? TruncatedAtLine;
         public long? LastCaseSequence;
         public long? LastModelSequence;
+        public readonly StreamScan Checkpoints = new();
         public long? ModelGapAfter;
         public (long Sequence, string Reason)? IntervalEnd;
 
@@ -171,18 +173,27 @@ internal static class CaseArtifactReader
         foreach (var (bytes, terminated) in Lines(eventsPath))
         {
             line++;
-            if (!terminated || !TryParse(bytes, out var item))
+            // Checkpoint state is skipped, not deserialized: it can be large, and re-application reads it itself.
+            if (!terminated || !TryParse(bytes, out var item, includeState: false, out var stateOmitted))
             {
                 result.TruncatedAtLine = line;
                 break;
             }
 
             result.LastCaseSequence = item.CaseSequence;
-            // Pages carry checkpoints without their state, which can be large; re-application reads it.
             if (limit > 0 && item.CaseSequence > since && result.Page.Count < limit)
-                result.Page.Add(item.Checkpoint is { State: not null } checkpoint
-                    ? item with { Checkpoint = checkpoint with { State = null, StateOmitted = true } }
-                    : item);
+                result.Page.Add(stateOmitted ? item with { Checkpoint = item.Checkpoint! with { StateOmitted = true } } : item);
+
+            if (item.Checkpoint is { } written)
+            {
+                result.Checkpoints.Events++;
+                result.Checkpoints.First ??= written.Ordinal;
+                result.Checkpoints.Last = Math.Max(result.Checkpoints.Last ?? 0, written.Ordinal);
+            }
+            else if (item.Kind == "missing" && item.Record is { Stream: "checkpoint" } lostCheckpoints)
+            {
+                result.Checkpoints.Recorded.Add(lostCheckpoints);
+            }
 
             if (item.Stream == "case")
             {
@@ -220,14 +231,17 @@ internal static class CaseArtifactReader
     /// Streams the verified events of an events file, one line at a time, ending at the first line that fails
     /// its checksum or JSON (the verified prefix). Memory is bounded by one line, not by the file.
     /// </summary>
-    internal static IEnumerable<DiagnosticCaseEvent> ReadEvents(string eventsPath)
+    internal static IEnumerable<DiagnosticCaseEvent> ReadEvents(string eventsPath, long? includeStateAt = null)
     {
         if (!File.Exists(eventsPath))
             yield break;
         foreach (var (bytes, terminated) in Lines(eventsPath))
         {
-            if (!terminated || !TryParse(bytes, out var item))
+            if (!terminated || !TryParse(bytes, out var item, includeState: false, out var stateOmitted))
                 yield break;
+            // Only the one checkpoint whose state is wanted is deserialized whole.
+            if (stateOmitted && item.CaseSequence == includeStateAt && TryParse(bytes, out var whole, includeState: true, out _))
+                item = whole;
             yield return item;
         }
     }
@@ -236,18 +250,24 @@ internal static class CaseArtifactReader
     private static long FirstDeliveryOrdinal(StreamScan stream, long ordinal) =>
         stream.Recorded.Count > 0 && stream.Recorded[0].FromOrdinal is { } from ? from : ordinal;
 
-    private static bool TryParse(byte[] bytes, out DiagnosticCaseEvent item)
+    private static bool TryParse(byte[] bytes, out DiagnosticCaseEvent item, bool includeState, out bool stateOmitted)
     {
         item = null!;
+        stateOmitted = false;
         if (bytes.Length < 10 || bytes[8] != (byte)'\t')
             return false;
         if (!uint.TryParse(System.Text.Encoding.ASCII.GetString(bytes, 0, 8), System.Globalization.NumberStyles.HexNumber, null, out var crc))
             return false;
-        var json = bytes.AsSpan(9);
+        ReadOnlySpan<byte> json = bytes.AsSpan(9);
         if (CaseCrc32.Compute(json) != crc)
             return false;
         try
         {
+            if (!includeState && WithoutCheckpointState(json) is { } lighter)
+            {
+                json = lighter;
+                stateOmitted = true;
+            }
             item = JsonSerializer.Deserialize(json, DiagnosticsJsonContext.Default.DiagnosticCaseEvent)!;
             return item is not null;
         }
@@ -255,6 +275,47 @@ internal static class CaseArtifactReader
         {
             return false;
         }
+    }
+
+    // The line with its checkpoint's state replaced by null, found with a forward-only reader; null when the
+    // line holds no checkpoint state. The state's bytes are skipped, never materialized as objects.
+    private static byte[]? WithoutCheckpointState(ReadOnlySpan<byte> json)
+    {
+        var reader = new Utf8JsonReader(json);
+        if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+            return null;
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            var isCheckpoint = reader.ValueTextEquals("checkpoint"u8);
+            reader.Read();
+            if (!isCheckpoint || reader.TokenType != JsonTokenType.StartObject)
+            {
+                reader.Skip();
+                continue;
+            }
+
+            while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+            {
+                var isState = reader.ValueTextEquals("state"u8);
+                reader.Read();
+                if (!isState || reader.TokenType == JsonTokenType.Null)
+                {
+                    reader.Skip();
+                    continue;
+                }
+
+                var start = (int)reader.TokenStartIndex;
+                reader.Skip();
+                var end = (int)reader.BytesConsumed;
+                var lighter = new byte[start + 4 + json.Length - end];
+                json[..start].CopyTo(lighter);
+                "null"u8.CopyTo(lighter.AsSpan(start));
+                json[end..].CopyTo(lighter.AsSpan(start + 4));
+                return lighter;
+            }
+            return null;
+        }
+        return null;
     }
 
     // Yields each line's bytes (without the newline) and whether it was newline-terminated.
@@ -309,6 +370,28 @@ internal static class CaseArtifactReader
                 Missing = stream.Failure is { } failure ? [.. missing, failure] : missing,
             };
         }).ToList();
+
+    // Checkpoint coverage: written lines, declared missing ranges, and an unaccounted tail from the completion counts.
+    private static DiagnosticCaseStreamCoverage DescribeCheckpoints(ScanResult scan, DiagnosticCaseCompletion? completion)
+    {
+        var stream = scan.Checkpoints;
+        var missing = stream.Recorded.Select(m => m with { Stream = "checkpoint" }).ToList();
+        if (completion?.Checkpoints is { } counts && counts.Offered > counts.Written + counts.Dropped)
+        {
+            var after = Math.Max(stream.Last ?? 0, missing.Select(m => m.ToOrdinal ?? m.FromOrdinal ?? 0).DefaultIfEmpty(0).Max());
+            missing.Add(new DiagnosticCaseRecord { Stream = "checkpoint", FromOrdinal = after + 1, ToOrdinal = null, Reason = "unaccounted" });
+        }
+
+        return new DiagnosticCaseStreamCoverage
+        {
+            Stream = "checkpoint",
+            Events = stream.Events,
+            FirstOrdinal = stream.First,
+            LastOrdinal = stream.Last,
+            State = missing.Count == 0 ? "complete" : "incomplete",
+            Missing = missing,
+        };
+    }
 
     private static IReadOnlyList<DiagnosticCaseInterval> DescribeIntervals(DiagnosticCaseManifest manifest, DiagnosticCaseCompletion? completion,
         DiagnosticCaseCompletionState state, ScanResult scan)

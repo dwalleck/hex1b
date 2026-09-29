@@ -714,8 +714,9 @@ public class CaptureContractMcpTests : McpServerTestBase
 
         var unknown = await CallAsync(client, "mark_diagnostic_case", new() { ["sessionId"] = "no-such-session" });
         Assert.AreEqual("session-not-found", unknown.GetProperty("mark").GetProperty("problem").GetProperty("code").GetString());
-        var invalid = await CallAsync(client, "mark_diagnostic_case", new() { ["sessionId"] = sessionId, ["label"] = "stop" });
-        AssertJsonEquals(engine.MarkCase("stop"), invalid.GetProperty("mark"), "invalid label");
+        var tooLong = new string('x', 65);
+        var invalid = await CallAsync(client, "mark_diagnostic_case", new() { ["sessionId"] = sessionId, ["label"] = tooLong });
+        AssertJsonEquals(engine.MarkCase(tooLong), invalid.GetProperty("mark"), "invalid label");
         var mark = await CallAsync(client, "mark_diagnostic_case", new() { ["sessionId"] = sessionId, ["label"] = "mcp-mark" });
         Assert.IsTrue(mark.GetProperty("success").GetBoolean(), mark.ToString());
         var recorder = terminal.DiagnosticCase!;

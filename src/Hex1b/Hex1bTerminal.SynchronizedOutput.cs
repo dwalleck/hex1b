@@ -2,7 +2,7 @@ namespace Hex1b;
 
 public sealed partial class Hex1bTerminal
 {
-    private static readonly TimeSpan SynchronizedOutputTimeout = TimeSpan.FromSeconds(1);
+    internal static readonly TimeSpan SynchronizedOutputTimeout = TimeSpan.FromSeconds(1);
     private TaskCompletionSource? _synchronizedOutputCompletion;
     private ITimer? _synchronizedOutputTimer;
     private long _synchronizedOutputStarted;

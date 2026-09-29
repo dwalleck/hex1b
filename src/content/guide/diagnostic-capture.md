@@ -395,15 +395,25 @@ taken in one hold of the model lock, between two model events, at the model sequ
 - Without it, the checkpoint records the boundary only (`status: unavailable`,
   `reason: requires reapplication-data`).
 - A state too large for the case's size bound is written without it (`status: missing`,
-  `reason: size-limit`), and the case keeps recording. A checkpoint that cannot be written at all is
-  declared by a `missing` range of stream `checkpoint` (checkpoint ordinals).
+  `reason: size-limit`), and the case keeps recording. A size-limit stop estimates the state's size
+  first and does not take one that cannot fit. A checkpoint that cannot be written at all is declared
+  by a `missing` range of stream `checkpoint` (checkpoint ordinals).
+- State awaiting the writer is bounded at 256 MiB, estimated from the model's geometry before any
+  state is taken. A checkpoint past that budget records the boundary only (`unavailable`,
+  `pending-state budget`).
+- A stop waits at most 2 s for the model lock. When the lock is held longer, the case stops anyway,
+  and its stop checkpoint is `unavailable: model-lock-busy`.
+- A checkpoint records the model as of its model sequence. A chunk the output pump has read and
+  decoded, but not yet applied, is not part of it.
 
-A mark (`case-mark`) takes an optional label: 1–64 letters, digits, `.`, `_`, `:` or `-`, other
-than `stop` (the stop checkpoint's label). By default the label is `mark-` and the checkpoint's
-ordinal. It returns the label, the checkpoint ordinal and the model sequence. A mark never waits
-for the case writer. At most 64 marks can await it; a mark beyond that is refused `busy` before
-any state is taken. Problem codes: `invalid-label` (`invalid-request`); `no-active-case` and `busy`
-(`unavailable`).
+A mark (`case-mark`) takes an optional label of 1–64 printable ASCII characters. By default the
+label is `mark-` and the checkpoint's ordinal. Labels need not be unique: a re-application target
+naming several is refused, with their case sequences. The mark returns the label, the checkpoint
+ordinal, the model sequence, and `stateRecorded` (with `stateReason` when false). A mark never
+waits for the case writer, so it cannot return the checkpoint's case sequence; that sequence is in
+the artifact once the line is written. At most 64 marks can await the writer; a mark beyond that is
+refused `busy` before any state is taken. Problem codes: `invalid-label` (`invalid-request`);
+`no-active-case` and `busy` (`unavailable`).
 
 A checkpoint costs one pass over the model's cells under its lock: about 0.1–0.25 s and 60 MiB for
 250 columns with 10,000 history rows. A case takes none until a mark or its stop.
@@ -465,16 +475,20 @@ Problem codes: `invalid-path`, `invalid-limit` and `invalid-since` (`invalid-req
 checkpoint, bounds or streams), `unreadable-artifact` and `unsupported-format` (`failed`).
 
 Each inspection reads and verifies the whole artifact, because coverage and the verified prefix
-depend on every line. Paging with `since` does not skip that work. A page carries checkpoints
-without their state (`stateOmitted: true`); re-application reads it. A format 1 case (written before
+depend on every line. Paging with `since` does not skip that work. Checkpoint state is skipped
+while scanning, never deserialized: a page carries checkpoints without it (`stateOmitted: true`),
+and re-application reads only its target's. The inspection's `checkpoints` reports checkpoint
+coverage: lines written, ranges declared missing, and an `unaccounted` tail when the completion
+counts more taken than written or declared. A format 1 case (written before
 checkpoints) is still inspected, with its configuration strings left out.
 
 ### Re-apply
 
 Re-application reads a case offline and needs nothing from the process that wrote it. It checks
 everything first: the case directory must be owner-only, the artifact is verified as inspection
-does, the format must be 2, and its configuration and the target must be ones this build can
-rebuild. Then it builds a detached model from the recorded configuration, whose pumps never
+does, and the format must be 2. The configuration must hold every field (a missing or unknown one
+is refused, named), with values a model can be built with, and the target must be one this build
+can rebuild. Nothing is written until all of that holds. Then it builds a detached model from the recorded configuration, whose pumps never
 start and whose presentation is never written, on a virtual clock. It streams the verified
 events to that model one line at a time, up to the target:
 
@@ -495,26 +509,48 @@ the target, field by field:
 | `unavailable` | no checkpoint at the target, one without state, or one naming `graphics` or `dcs-continuation` (`comparisonReason` says which) |
 
 The target is a model sequence (`12`; `0` is the fresh model), a case sequence (`case:34`, of a
-checkpoint or a model event), or a checkpoint label (`label:name`, or the bare name). A label that
-names several checkpoints is refused with their case sequences. `--inject-fault` (`faults`) changes
-the reconstructed state at a declared path before comparing (`cell-text`, `cell-style`, `cursor`,
-`mode`, `title`, `charset`, `tab-stop`, `pending-input`, `history-row`, `history-rows`). Such a
-result is labelled `faultInjected`, and is never the recorded path's outcome.
+checkpoint or a model event), or a checkpoint label (`label:name`, or the bare name; a label that is
+all digits or starts with `case:` needs `label:`). A label that names several checkpoints is
+refused with their case sequences. In a complete case, a model sequence past its last recorded
+event is `unknown-model-sequence`. In an interrupted or truncated case, whose tail is unknown, it is
+`beyond-interval`.
+
+`--inject-fault` (`faults`) changes the compared state at a declared path, as `kind` or
+`kind:target`:
+- `cell-text` and `cell-style` take `:<row>/<column>`;
+- `mode` takes `:<name>`;
+- `history-row` takes `:<index>`, and changes that row's text;
+- `cursor`, `title`, `charset`, `tab-stop`, `pending-input` and `history-rows` take no target.
+
+Such a result is labelled `faultInjected`, and is never the recorded path's outcome. A fault the
+state has nothing to change for (a history fault without history) makes the comparison
+`unavailable` (`fault-not-applicable`).
+
+The result also names what was compared and with what:
+- `checkpoint`: the case's `fresh-model/1` checkpoint, with the configuration the model was rebuilt
+  from;
+- `coverage`: the profile, the surfaces compared, and what it leaves out (clock stamps, write
+  sequences, text identities, caller anchors, graphics);
+- `producer`: the recording build and process;
+- `consumerHex1bVersion`: the build that re-applied it.
 
 Each run writes a new owner-only directory, `reapplications/<n>` in the case, and never changes
 the case's own files. It holds `result.json`, the complete reconstructed state (`reapplied.json`),
-the recorded state (`recorded.json`), and any previews:
+the recorded state (`recorded.json`), the faulted state that was compared (`faulted.json`, with a
+fault), and any previews:
 
 - `reapplied.txt`, `.ansi`, `.svg` and `.html`: the reconstructed model through the capture exporters;
 - `recorded.txt`: the recorded checkpoint's screen text (with a `text` preview).
 
 Problem codes: `invalid-path`, `invalid-target`, `invalid-max-differences`, `invalid-fault`,
 `invalid-preview`, `unknown-label`, `ambiguous-label`, `unknown-case-sequence`, `not-a-boundary`
-and `fault-not-applicable` (`invalid-request`); `case-not-found`, `incompatible` (an old format,
-or an unknown reflow strategy, capability, graphics field or projection profile, named in the
-message), `no-valid-interval` and `beyond-interval` (with `lastValidModelSequence` and
-`intervalEndReason`) (`unavailable`); `storage-refused` and `reapplication-failed` (with
-`appliedThrough`) (`failed`).
+and `unknown-model-sequence` (`invalid-request`); `case-not-found`, `incompatible` (an old format;
+a missing or unknown configuration field; an impossible value; or an unknown reflow strategy,
+capability or projection profile; each named in the message), `no-valid-interval` and
+`beyond-interval` (with `lastValidModelSequence` and `intervalEndReason`) (`unavailable`);
+`storage-refused`, `storage-failed` (the run's files could not all be written) and
+`reapplication-failed` (with `appliedThrough`) (`failed`). The re-applicable interval also ends at
+a geometry-gated batch that was refused after its bytes were decoded (`unapplied-output`).
 
 Re-application streams the events file, so its memory is the model and one event, not the file: a
 119 MiB events file re-applies in about 133 MiB. It compares only at recorded checkpoints, and only

@@ -34,10 +34,10 @@ public class ModelStateComparerTests
             CollectionAssert.Contains(comparison.Differences.Select(d => d.Path).ToList(), path, $"{kind}: {string.Join("; ", comparison.Differences.Select(d => d.Path))}");
         }
         Assert.IsNull(ModelStateFault.Apply(same, "nope", out _, out var unknown));
-        StringAssert.StartsWith(unknown, "unknown fault 'nope'");
+        StringAssert.StartsWith(unknown, "Unknown fault 'nope'");
         var noHistory = await ProjectAsync("x", scrollback: null);
         Assert.IsNull(ModelStateFault.Apply(noHistory, "history-rows", out _, out var needsHistory));
-        StringAssert.Contains(needsHistory, "needs retained history");
+        StringAssert.Contains(needsHistory, "has no retained history");
 
         // Equal counts, different content: one cell's text, one cell's color, one history row's text.
         AssertOnly(await ProjectAsync("abc"), await ProjectAsync("abd"), "screen[0][2].text", "lastPrinted.cell.text");
@@ -47,6 +47,28 @@ public class ModelStateComparerTests
         var changed = await ProjectAsync(string.Concat(Enumerable.Range(1, 12).Select(i => i == 2 ? "rOw 2\r\n" : $"row {i}\r\n")));
         Assert.AreEqual(history.History!.Rows.Count, changed.History!.Rows.Count, "fixture: row counts differ");
         AssertOnly(history, changed, "history.rows[1][1].text");
+    }
+
+    [TestMethod]
+    public async Task Compare_StylesFieldByField()
+    {
+        // A separator inside a hyperlink, or null against empty, must not make two styles equal.
+        var state = await ProjectAsync("x");
+        DiagnosticModelState Styled(DiagnosticModelStyle style) => state with
+        {
+            Styles = [style],
+            Screen = [state.Screen[0] with { Cells = [state.Screen[0].Cells[0] with { Style = 0 }] }],
+        };
+        foreach (var (a, b) in new (DiagnosticModelStyle, DiagnosticModelStyle)[]
+        {
+            (new() { HyperlinkUri = "a|b", HyperlinkParameters = "c" }, new() { HyperlinkUri = "a", HyperlinkParameters = "b|c" }),
+            (new() { Foreground = null }, new() { Foreground = "" }),
+            (new() { Attributes = ["bold", "dim"] }, new() { Attributes = ["bold,dim"] }),
+        })
+        {
+            var comparison = ModelStateComparer.Compare(Styled(a), Styled(b), ModelStateComparer.DefaultMaxDifferences);
+            Assert.IsGreaterThan(0, comparison.Total, $"{a} and {b} compared equal");
+        }
     }
 
     [TestMethod]

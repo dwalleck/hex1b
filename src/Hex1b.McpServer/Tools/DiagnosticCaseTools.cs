@@ -83,10 +83,10 @@ public class DiagnosticCaseTools(TerminalSessionManager sessionManager)
     /// <summary>
     /// Marks a boundary in a target's active case.
     /// </summary>
-    [McpServerTool, Description("Marks a boundary in the terminal target's active diagnostic case: a checkpoint of the terminal model's full text state at its current model sequence (with the reapplication-data authorization; otherwise the boundary only), which reapply_diagnostic_case can target and compare. Never waits for the case's writer; at most 64 marks can await it, and a mark beyond is refused 'busy'.")]
+    [McpServerTool, Description("Marks a boundary in the terminal target's active diagnostic case: a checkpoint of the terminal model's full text state at its current model sequence (with the reapplication-data authorization; otherwise the boundary only), which reapply_diagnostic_case can target and compare. Never waits for the case's writer; at most 64 marks can await it, and a mark beyond is refused 'busy'; a mark whose state would pass the 256 MiB pending-state budget records the boundary only.")]
     public async Task<CaseMarkToolResult> MarkDiagnosticCase(
         [Description("Session ID of the terminal target")] string sessionId,
-        [Description("The checkpoint's label: 1-64 letters, digits, '.', '_', ':' or '-', not 'stop' (default mark-<ordinal>).")] string? label = null,
+        [Description("The checkpoint's label: 1-64 printable ASCII characters (default mark-<ordinal>); labels need not be unique.")] string? label = null,
         CancellationToken ct = default)
     {
         var target = sessionManager.GetTarget(sessionId);
@@ -103,7 +103,7 @@ public class DiagnosticCaseTools(TerminalSessionManager sessionManager)
             SessionId = sessionId,
             Message = result.Outcome == DiagnosticOutcome.Captured
                 ? $"Case {result.CaseId} marked '{result.Label}' at model sequence {result.ModelSequence}" +
-                  (result.StateRecorded == true ? "." : " (boundary only; the state needs reapplication-data).")
+                  (result.StateRecorded == true ? "." : $" (boundary only: {result.StateReason}).")
                 : $"Mark {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}",
             Mark = JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticCaseMarkResult),
         };
@@ -116,7 +116,7 @@ public class DiagnosticCaseTools(TerminalSessionManager sessionManager)
     public CaseReapplyToolResult ReapplyDiagnosticCase(
         [Description("The case directory (the 'path' a start or stop returned).")] string path,
         [Description("Target: a model sequence (12), a case sequence (case:34), or a checkpoint label (label:name, or the bare name; 'stop' is the stop checkpoint).")] string to,
-        [Description("Declared faults to inject into the reconstructed state before comparing (comma-separated): cell-text, cell-style, cursor, mode, title, charset, tab-stop, pending-input, history-row, history-rows. The result is labelled faultInjected.")] string? injectFault = null,
+        [Description("Declared faults to inject into the reconstructed state before comparing (comma-separated), as kind or kind:target: cell-text[:row/column], cell-style[:row/column], cursor, mode[:name], title, charset, tab-stop, pending-input, history-row[:index], history-rows. The result is labelled faultInjected.")] string? injectFault = null,
         [Description("Most differences listed (1-100000; default 1000). Every difference is counted.")] int? maxDifferences = null,
         [Description("Previews to write (comma-separated): text, ansi, svg, html.")] string? preview = null)
     {

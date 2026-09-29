@@ -14,6 +14,48 @@ public sealed partial class Hex1bTerminal
     /// </summary>
     internal static IReadOnlyDictionary<string, string> ModelStateFieldCoverage { get; } = BuildModelStateFieldCoverage();
 
+    // The output continuation as of the last application, committed inside its model-lock hold. The pump
+    // tokenizes the next chunk outside the lock before applying it, so the live decoder, escape prefix and
+    // DCS framer can already hold that chunk's state; a projection between the two must not see it.
+    private string _committedEscapePrefix = "";
+    private readonly byte[] _committedUtf8 = new byte[3];
+    private int _committedUtf8Length;
+    private bool _committedGroundEscape;
+    private int _committedFramerUtf8;
+    private bool _committedInDcs;
+
+    // Must hold _bufferLock, at an application's start: the chunk it applies has been tokenized, and no later
+    // chunk has (the pump tokenizes one chunk at a time). Copies without allocating.
+    private void CommitOutputContinuationUnsafe()
+    {
+        _committedEscapePrefix = _incompleteSequenceBuffer;
+        _pendingUtf8Output.AsSpan(0, _pendingUtf8OutputLength).CopyTo(_committedUtf8);
+        _committedUtf8Length = _pendingUtf8OutputLength;
+        _committedGroundEscape = _dcsByteStreamParser.HasPendingGroundEscape;
+        _committedFramerUtf8 = _dcsByteStreamParser.PendingUtf8ContinuationBytes;
+        _committedInDcs = _dcsByteStreamParser.IsInDcs;
+    }
+
+    /// <summary>
+    /// An upper estimate of a projection's size in memory, from geometry alone (no state is read cell by
+    /// cell), so a checkpoint can be refused before its state is taken. Must hold <c>_bufferLock</c>.
+    /// </summary>
+    internal long EstimateModelStateBytesUnsafe() => EstimateModelStateCellsUnsafe() * 40 + 64 * 1024;
+
+    /// <summary>
+    /// A rough estimate of a projection's JSON size (about 16–24 bytes a cell), from geometry alone, so a stop
+    /// at the size bound can skip a state that cannot fit. Must hold <c>_bufferLock</c>.
+    /// </summary>
+    internal long EstimateModelStateJsonBytesUnsafe() => EstimateModelStateCellsUnsafe() * 24 + 4 * 1024;
+
+    private long EstimateModelStateCellsUnsafe()
+    {
+        var cells = (long)_width * _height * (_savedMainScreenBuffer is null ? 1 : 2);
+        if (_scrollbackBuffer is { Count: > 0 } history)
+            cells += (long)history.Count * Math.Max(_width, 1);
+        return cells;
+    }
+
     // Projections taken, so a test can tell that a case takes one only at a mark or a stop.
     private long _modelStateCaptures;
 
@@ -85,7 +127,7 @@ public sealed partial class Hex1bTerminal
                 : null;
 
             var unsupported = new List<string>(2);
-            if (_dcsByteStreamParser.IsInDcs)
+            if (_committedInDcs)
                 unsupported.Add("dcs-continuation");
             if (HoldsGraphicsState())
                 unsupported.Add("graphics");
@@ -101,7 +143,6 @@ public sealed partial class Hex1bTerminal
                 Screen = screen,
                 SavedMainScreen = savedMain,
                 History = history,
-                NextCellSequence = _writeSequence,
                 Cursor = new DiagnosticModelCursor
                 {
                     X = _cursorX,
@@ -156,10 +197,10 @@ public sealed partial class Hex1bTerminal
                 PendingGraphemeCombine = _pendingGraphemeCombine,
                 PendingInput = new DiagnosticModelPendingInput
                 {
-                    EscapePrefix = _incompleteSequenceBuffer,
-                    Utf8 = Convert.ToBase64String(_pendingUtf8Output, 0, _pendingUtf8OutputLength),
-                    GroundEscape = _dcsByteStreamParser.HasPendingGroundEscape,
-                    FramerUtf8Remaining = _dcsByteStreamParser.PendingUtf8ContinuationBytes,
+                    EscapePrefix = _committedEscapePrefix,
+                    Utf8 = Convert.ToBase64String(_committedUtf8, 0, _committedUtf8Length),
+                    GroundEscape = _committedGroundEscape,
+                    FramerUtf8Remaining = _committedFramerUtf8,
                 },
                 SynchronizedUpdate = new DiagnosticSynchronizedUpdate
                 {
@@ -232,7 +273,6 @@ public sealed partial class Hex1bTerminal
     {
         Text = cell.Character,
         Style = styles.IndexOf(cell),
-        Sequence = cell.Sequence,
         WideWrapPadding = cell.IsWideWrapPadding,
     };
 
@@ -349,11 +389,11 @@ public sealed partial class Hex1bTerminal
         const string Clock = "clock: a wall-clock or timer reading";
         const string Identity = "identity: differs between otherwise identical models, or is assigned lazily when text is read";
         const string Configuration = "configuration: recorded in the case manifest, fixed after construction";
+        const string WriteOrder = "write-order: write sequences order cell writes and are not state (spec)";
         const string Infrastructure = "infrastructure: pumps, adapters, locks, callbacks, diagnostics or caches, not model state";
         const string InputPath = "input-path: state of the input direction, not of the output model";
         const string Anchors = "identity: caller-created text anchors and their views; command marks are projected";
         const string Graphics = "unsupported:graphics";
-        const string Dcs = "unsupported:dcs-continuation";
 
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
         void Set(string value, params string[] names)
@@ -364,7 +404,7 @@ public sealed partial class Hex1bTerminal
 
         Set(Projected,
             "_width", "_height", "_modelSequence", "_inAlternateScreen", "_screenBuffer", "_savedMainScreenBuffer",
-            "_scrollbackBuffer", "_writeSequence", "_cursorX", "_cursorY", "_pendingWrap", "_cursorVisible", "_cursorShape",
+            "_scrollbackBuffer", "_cursorX", "_cursorY", "_pendingWrap", "_cursorVisible", "_cursorShape",
             "_cursorProtected", "_cursorSaved", "_savedCursorX", "_savedCursorY", "_savedPendingWrap", "_savedCursorProtected",
             "_alternateScreenSavedCursorX", "_alternateScreenSavedCursorY", "_alternateScreenSavedPendingWrap",
             "_appCursorKeysMode", "_appKeypadMode", "_bracketedPasteMode", "_focusEventReporting", "_graphemeClusterMode",
@@ -376,21 +416,24 @@ public sealed partial class Hex1bTerminal
             "_currentForeground", "_currentBackground", "_currentUnderlineColor", "_currentUnderlineStyle", "_currentHyperlink",
             "_windowTitle", "_iconName", "_titleStack", "_activityState", "_commandMarks", "_nextCommandAnchorId",
             "_hasLastPrintedCell", "_lastPrintedCell", "_lastPrintedCellX", "_lastPrintedCellY", "_lastPrintedCellWidth",
-            "_pendingGraphemeCombine", "_incompleteSequenceBuffer", "_pendingUtf8Output", "_pendingUtf8OutputLength",
-            "_synchronizedOutputCompletion", "_synchronizedOutputStartedSequence");
-        // The decoder's held bytes are the ones _pendingUtf8Output tracks; the byte framer's pending
-        // escape and UTF-8 count are projected, and a DCS in progress is named unsupported.
-        Set(Projected, "_utf8Decoder");
-        Set(Dcs, "_dcsByteStreamParser");
+            "_pendingGraphemeCombine", "_synchronizedOutputCompletion", "_synchronizedOutputStartedSequence",
+            "_committedEscapePrefix", "_committedUtf8", "_committedUtf8Length", "_committedGroundEscape", "_committedFramerUtf8",
+            "_committedInDcs");
+        // The live continuation is projected through the copy each application commits (a DCS in progress is
+        // named unsupported); the decoder's held bytes are the ones _pendingUtf8Output tracks.
+        Set("committed: projected through the copy each application commits", "_incompleteSequenceBuffer", "_pendingUtf8Output",
+            "_pendingUtf8OutputLength", "_utf8Decoder", "_dcsByteStreamParser");
         Set(Graphics, "_sixelGraphicsState", "_kgpGraphicsState", "_sixelColorRegisters", "_sixelPlacementSequence");
+        // Sixel placement metrics set at run time: graphics only, which are never compared.
+        Set("graphics: Sixel placement metrics, set at run time; graphics are never compared", "_sixelCellMetricsOverride");
         Set(Clock, "_sessionStart", "_synchronizedOutputStarted", "_synchronizedOutputTimer", "_escapeFlushTimer",
             "_kgpAnimationTimer");
+        Set(WriteOrder, "_writeSequence", "TerminalCell.<Sequence>k__BackingField");
         Set(Identity, "<DiagnosticSessionId>k__BackingField", "_textGeneration", "_nextTextRowId", "_textScreenRowIds",
             "_textHistoryRowIds", "_savedMainTextRowIds", "_savedMainTextHistoryRowIds", "_commandAnchors",
             "_textAnchorReflowPending", "_textAnchorRetentionChanged", "_bufferGeometryVersion");
         Set(Anchors, "_textAnchors", "_historyTextAnchors", "_customAnchorViews", "_markerDetailsViews");
-        Set(Configuration, "_commandMarkHistoryCapacity", "_customMarkerLimit", "_escapeTimeout", "_caseConfiguration",
-            "_sixelCellMetricsOverride");
+        Set(Configuration, "_commandMarkHistoryCapacity", "_customMarkerLimit", "_escapeTimeout", "_caseConfiguration");
         Set(InputPath, "_activePasteContext", "_inBracketedPaste", "_incompleteInputSequenceBuffer", "_inputUtf8Decoder");
         Set(Infrastructure,
             "_bufferLock", "_captures", "_captureSequence", "_captureApplicationDepth", "_diagnosticCase", "_disposedCase",
@@ -408,7 +451,7 @@ public sealed partial class Hex1bTerminal
         // The model's value types.
         Set(Projected, "TerminalCell.<Character>k__BackingField", "TerminalCell.<Foreground>k__BackingField",
             "TerminalCell.<Background>k__BackingField", "TerminalCell.<Attributes>k__BackingField",
-            "TerminalCell.<Sequence>k__BackingField", "TerminalCell.<TrackedHyperlink>k__BackingField",
+            "TerminalCell.<TrackedHyperlink>k__BackingField",
             "TerminalCell.<UnderlineColor>k__BackingField", "TerminalCell.<UnderlineStyle>k__BackingField",
             "TerminalCell.<IsWideWrapPadding>k__BackingField",
             "ScrollbackRow.<Cells>k__BackingField", "ScrollbackRow.<OriginalWidth>k__BackingField",

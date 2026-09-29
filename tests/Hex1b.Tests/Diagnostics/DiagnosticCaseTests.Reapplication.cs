@@ -421,7 +421,8 @@ public partial class DiagnosticCaseTests
     public async Task Reapply_NoSideEffects()
     {
         using var root = new CaseRoot();
-        var path = await RecordCaseAsync(root, ReapplicationCorpus, new HeadlessPresentationAdapter(40, 10));
+        // Recorded protocol queries (DA1, DSR) must not make the replica write input anywhere.
+        var path = await RecordCaseAsync(root, [.. ReapplicationCorpus, new("\u001b[c\u001b[6nqueried")], new HeadlessPresentationAdapter(40, 10));
         var before = HashCaseFiles(path);
         Hex1bTerminal? replica = null;
         CaseReapplier.ReplicaForTesting.Value = t => replica = t;
@@ -439,6 +440,7 @@ public partial class DiagnosticCaseTests
             "the detached model's output pump ran");
         Assert.AreEqual(0, ((CaseReapplier.DetachedWorkload)replica!.Workload).Calls, "the detached model read or wrote its workload");
         Assert.AreEqual(0, replica.OutputBytesRead);
+        Assert.IsFalse(replica.IsDisposed, "the replica was disposed, which writes terminal-control sequences to its presentation");
 
         // A failure mid-interval is a failed result naming the last applied model sequence.
         CaseReapplier.AfterEventForTesting.Value = sequence =>
@@ -504,7 +506,12 @@ public partial class DiagnosticCaseTests
         AssertMatched(clean, "without a fault");
         Assert.AreNotEqual(clean.RunPath, faulted.RunPath, "a faulted run shared a directory");
         Assert.AreEqual((DiagnosticOutcome.Captured, "different", true), (faulted.Outcome, faulted.Comparison, faulted.FaultInjected));
-        CollectionAssert.AreEqual(new[] { "cell-text:screen[0][0].text", "mode:modes.wraparound" }, faulted.Faults.Select(f => $"{f.Kind}:{f.Path}").ToArray());
+        CollectionAssert.AreEqual(new[] { "cell-text=screen[0][0].text", "mode=modes.wraparound" }, faulted.Faults.Select(f => $"{f.Kind}={f.Path}").ToArray());
+        // reapplied.json is the reconstruction either way; faulted.json is what the faulted run compared.
+        Assert.AreEqual(File.ReadAllText(Path.Combine(clean.RunPath!, "reapplied.json")), File.ReadAllText(Path.Combine(faulted.RunPath!, "reapplied.json")));
+        var faultedState = JsonDocument.Parse(File.ReadAllText(Path.Combine(faulted.RunPath!, "faulted.json"))).RootElement;
+        Assert.AreNotEqual(File.ReadAllText(Path.Combine(clean.RunPath!, "reapplied.json")), faultedState.GetRawText());
+        CollectionAssert.DoesNotContain(clean.Files.ToArray(), "faulted.json");
         CollectionAssert.IsSubsetOf(new[] { "screen[0][0].text", "modes.wraparound" }, faulted.Differences!.Differences.Select(d => d.Path).ToArray());
 
         // Each run's own result file says the same.
@@ -518,14 +525,24 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual("invalid-fault", Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "stop", Faults = ["nope"] }).Problem?.Code);
         var bare = await RecordCaseAsync(root, [new("x")], new HeadlessPresentationAdapter(20, 4), o => o.ScrollbackCapacity = null);
         var inapplicable = Reapply(new DiagnosticCaseReapplyRequest { Path = bare, ToLabel = "stop", Faults = ["history-rows"] });
-        Assert.AreEqual((DiagnosticOutcome.InvalidRequest, "fault-not-applicable"), (inapplicable.Outcome, inapplicable.Problem?.Code));
+        Assert.AreEqual((DiagnosticOutcome.Captured, "unavailable"), (inapplicable.Outcome, inapplicable.Comparison));
+        StringAssert.StartsWith(inapplicable.ComparisonReason, "fault-not-applicable");
+        Assert.AreEqual("invalid-fault", Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "stop", Faults = ["cell-text:1,2"] }).Problem?.Code);
+        Assert.AreEqual("invalid-fault", Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "stop", Faults = ["title:x"] }).Problem?.Code);
+        var targeted = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "stop", Faults = ["cell-text:2/3", "mode:insert", "history-row:1"] });
+        CollectionAssert.AreEqual(new[] { "screen[2][3].text", "modes.insert", "history.rows[1][0].text" }, targeted.Faults.Select(f => f.Path).ToArray());
+        CollectionAssert.IsSubsetOf(new[] { "screen[2][3].text", "modes.insert", "history.rows[1][0].text" },
+            targeted.Differences!.Differences.Select(d => d.Path).ToArray());
+        var outside = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "stop", Faults = ["cell-text:99/0"] });
+        StringAssert.StartsWith(outside.ComparisonReason, "fault-not-applicable");
     }
 
     [TestMethod]
     public async Task Reapply_Previews()
     {
         using var root = new CaseRoot();
-        var path = await RecordCaseAsync(root, ReapplicationCorpus, new HeadlessPresentationAdapter(40, 10));
+        // U+E000 is a filler the text exporter renders as a space; the recorded preview must follow it.
+        var path = await RecordCaseAsync(root, [.. ReapplicationCorpus, new("pua\uE000end")], new HeadlessPresentationAdapter(40, 10));
         var expected = new Dictionary<string, string>();
         CaseReapplier.ReconstructedForTesting.Value = replica =>
         {
@@ -549,11 +566,13 @@ public partial class DiagnosticCaseTests
             Assert.AreEqual(content, File.ReadAllText(Path.Combine(result.RunPath!, name)), name);
         CollectionAssert.IsSubsetOf(expected.Keys.Append("recorded.txt").ToArray(), result.Files.ToArray());
 
-        // The recorded checkpoint's preview is its projection's text: rows of cell text.
+        // The recorded checkpoint's preview is its projection's text, with the text exporter's cell rules.
         var recorded = JsonDocument.Parse(File.ReadAllText(Path.Combine(result.RunPath!, "recorded.json"))).RootElement;
-        var rows = recorded.GetProperty("screen").EnumerateArray().Select(RowText);
-        Assert.AreEqual(string.Join("\n", rows), File.ReadAllText(Path.Combine(result.RunPath!, "recorded.txt")));
+        Assert.IsTrue(recorded.GetProperty("screen").EnumerateArray().Select(RowText).Any(row => row.Contains('\uE000')), "fixture: no U+E000 cell");
+        Assert.IsFalse(File.ReadAllText(Path.Combine(result.RunPath!, "recorded.txt")).Contains('\uE000'), "the filler was copied as text");
         StringAssert.Contains(File.ReadAllText(Path.Combine(result.RunPath!, "recorded.txt")), "colour");
+        // For a matched target the two text previews are the same text (wide glyphs, erased cells).
+        Assert.AreEqual(File.ReadAllText(Path.Combine(result.RunPath!, "reapplied.txt")), File.ReadAllText(Path.Combine(result.RunPath!, "recorded.txt")));
 
         // Without a checkpoint at the target, only the reconstructed model is previewed.
         var none = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToModelSequence = 1, Previews = ["text"] });

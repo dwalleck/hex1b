@@ -11,6 +11,24 @@ namespace Hex1b.Diagnostics.Cases;
 internal static class ModelStateComparer
 {
     internal const int DefaultMaxDifferences = 1_000;
+
+    /// <summary>The surfaces a comparison covers, in the order differences are listed.</summary>
+    internal static readonly IReadOnlyList<string> ComparedSurfaces =
+    [
+        "profile", "modelSequence", "width", "height", "activeBuffer", "screen", "savedMainScreen", "history", "cursor", "savedCursor",
+        "alternateSavedCursor", "modes", "protectedMode", "margins", "tabStops", "charsets", "rendition", "titles", "activity",
+        "commandMarks", "lastCommandAnchorId", "lastPrinted", "pendingGraphemeCombine", "pendingInput", "synchronizedUpdate", "unsupported",
+    ];
+
+    /// <summary>What the profile leaves out, and why (spec: state surface decision).</summary>
+    internal static readonly IReadOnlyList<string> Exclusions =
+    [
+        "clock stamps: each cell's write time and each history row's timestamp",
+        "write sequences: the order cells were written in",
+        "text identities: row ids, the text generation and anchor positions, assigned when text is read",
+        "caller-created text anchors and their views",
+        "graphics: images, placements and Sixel registers are named unsupported, never compared",
+    ];
     internal const int MaxMaxDifferences = 100_000;
 
     internal static DiagnosticModelStateComparison Compare(DiagnosticModelState recorded, DiagnosticModelState reapplied, int maxDifferences)
@@ -24,7 +42,6 @@ internal static class ModelStateComparer
         d.Rows("screen", "screen", recorded.Screen, reapplied.Screen, history: false);
         d.Rows("savedMainScreen", "savedMainScreen", recorded.SavedMainScreen, reapplied.SavedMainScreen, history: false);
         d.History(recorded.History, reapplied.History);
-        d.Number("nextCellSequence", "nextCellSequence", recorded.NextCellSequence, reapplied.NextCellSequence);
         d.Cursor(recorded.Cursor, reapplied.Cursor);
         d.SavedCursor("savedCursor", recorded.SavedCursor, reapplied.SavedCursor);
         d.SavedCursor("alternateSavedCursor", recorded.AlternateSavedCursor, reapplied.AlternateSavedCursor);
@@ -48,6 +65,10 @@ internal static class ModelStateComparer
     }
 
     private static string Join(IReadOnlyList<string> values) => string.Join(",", values);
+
+    // A list of names as its JSON array, so a name containing the separator stays distinct.
+    private static string Names(IReadOnlyList<string> values) =>
+        "[" + string.Join(",", values.Select(v => JsonSerializer.Serialize(v, DiagnosticsJsonContext.Default.String))) + "]";
 
     private static string? Json(string? value) =>
         value is null ? null : JsonSerializer.Serialize(value, DiagnosticsJsonContext.Default.String);
@@ -148,8 +169,6 @@ internal static class ModelStateComparer
         {
             if (!string.Equals(recorded.Text, reapplied.Text, StringComparison.Ordinal))
                 Add(surface, new Path(prefix, row, column, "text"), Json(recorded.Text), Json(reapplied.Text));
-            if (recorded.Sequence != reapplied.Sequence)
-                Add(surface, new Path(prefix, row, column, "sequence"), Text(recorded.Sequence), Text(reapplied.Sequence));
             if (recorded.WideWrapPadding != reapplied.WideWrapPadding)
                 Add(surface, new Path(prefix, row, column, "wideWrapPadding"), Flag(recorded.WideWrapPadding), Flag(reapplied.WideWrapPadding));
             if (SameStyle(recorded.Style, reapplied.Style))
@@ -169,19 +188,27 @@ internal static class ModelStateComparer
                 return same;
             var r = StyleAt(recordedStyles, recorded);
             var a = StyleAt(reappliedStyles, reapplied);
-            same = r is not null && a is not null && StyleKey(r) == StyleKey(a);
+            same = r is not null && a is not null && SameStyle(r, a);
             _sameStyle[(recorded, reapplied)] = same;
             return same;
         }
 
-        private static string StyleKey(DiagnosticModelStyle style) =>
-            $"{Join(style.Attributes)}|{style.Foreground}|{style.Background}|{style.UnderlineColor}|{style.UnderlineStyle}|{style.HyperlinkUri}|{style.HyperlinkParameters}";
+        // Field by field: no joined key, so no separator or null/empty collision can make two styles equal.
+        private static bool SameStyle(DiagnosticModelStyle recorded, DiagnosticModelStyle reapplied) =>
+            recorded.Attributes.SequenceEqual(reapplied.Attributes, StringComparer.Ordinal)
+            && string.Equals(recorded.Foreground, reapplied.Foreground, StringComparison.Ordinal)
+            && string.Equals(recorded.Background, reapplied.Background, StringComparison.Ordinal)
+            && string.Equals(recorded.UnderlineColor, reapplied.UnderlineColor, StringComparison.Ordinal)
+            && string.Equals(recorded.UnderlineStyle, reapplied.UnderlineStyle, StringComparison.Ordinal)
+            && string.Equals(recorded.HyperlinkUri, reapplied.HyperlinkUri, StringComparison.Ordinal)
+            && string.Equals(recorded.HyperlinkParameters, reapplied.HyperlinkParameters, StringComparison.Ordinal);
 
         public void Style(string surface, string prefix, DiagnosticModelStyle? recorded, DiagnosticModelStyle? reapplied)
         {
             if (!Presence(surface, prefix, recorded, reapplied))
                 return;
-            String(surface, $"{prefix}.attributes", Join(recorded!.Attributes), Join(reapplied!.Attributes));
+            if (!recorded!.Attributes.SequenceEqual(reapplied!.Attributes, StringComparer.Ordinal))
+                Add(surface, new Path($"{prefix}.attributes"), Names(recorded.Attributes), Names(reapplied.Attributes));
             String(surface, $"{prefix}.foreground", recorded.Foreground, reapplied.Foreground);
             String(surface, $"{prefix}.background", recorded.Background, reapplied.Background);
             String(surface, $"{prefix}.underlineColor", recorded.UnderlineColor, reapplied.UnderlineColor);

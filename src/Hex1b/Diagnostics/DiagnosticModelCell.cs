@@ -15,10 +15,6 @@ public readonly record struct DiagnosticModelCell
     [JsonPropertyName("s")]
     public int Style { get; init; }
 
-    /// <summary>The write sequence the cell was written at.</summary>
-    [JsonPropertyName("q")]
-    public long Sequence { get; init; }
-
     /// <summary>Whether the cell is the blank left where a wide glyph wrapped; omitted when false.</summary>
     [JsonPropertyName("w")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]

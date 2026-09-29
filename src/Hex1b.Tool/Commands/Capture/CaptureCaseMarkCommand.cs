@@ -17,7 +17,7 @@ internal sealed class CaptureCaseMarkCommand : BaseCommand
     private static readonly Argument<string> s_idArgument = new("id") { Description = "Terminal ID (or prefix)" };
     private static readonly Option<string?> s_labelOption = new("--label")
     {
-        Description = "The checkpoint's label (1-64 letters, digits, '.', '_', ':' or '-'; not 'stop'; default mark-<ordinal>)"
+        Description = "The checkpoint's label (1-64 printable ASCII characters; default mark-<ordinal>; labels need not be unique)"
     };
 
     public CaptureCaseMarkCommand(
