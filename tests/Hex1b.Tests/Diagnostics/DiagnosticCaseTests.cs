@@ -2065,6 +2065,168 @@ public class DiagnosticCaseTests
         }
     }
 
+    // === Review round 3 fences ===
+
+    [TestMethod]
+    public async Task Stop_UnpulledDeliveryIsDeclaredOnDrainTimeoutAndCollectorFailure()
+    {
+        using var root = new CaseRoot();
+        foreach (var failure in new[] { false, true })
+        {
+            using var gate = new ManualResetEventSlim(false);
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DrainTimeoutForTesting.Value = TimeSpan.FromMilliseconds(300);
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = failure ? new InvalidOperationException("injected") : null;
+            try
+            {
+                var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+                var workload = new ScriptedWorkload();
+                await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+                    .WithPresentation(new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25))).WithDimensions(40, 10).Build();
+                var diagnostics = new TerminalDiagnostics(terminal);
+                using (new Running(terminal))
+                {
+                    var started = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path });
+                    var before = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0;
+                    for (var i = 0; i < 100; i++)
+                        workload.Enqueue(Encoding.ASCII.GetBytes($"U{i} "));
+                    await WaitAsync(() => (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0) >= before + 100);
+                    var last = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence!.Value;
+                    if (!failure)
+                        await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+                    gate.Set();
+                    await WaitAsync(() => File.Exists(Path.Combine(started.Path!, "completion.json")));
+
+                    var reason = failure ? "collector-failed" : "drain-timeout";
+                    var artifact = Artifact.Read(started.Path!);
+                    CollectionAssert.IsSubsetOf(Enumerable.Range(0, (int)(last - before)).Select(i => before + 1 + i).ToList(), MissingOrdinals(artifact, "delivery"),
+                        $"{reason}: delivery records made before the stop were neither written nor declared");
+                    var delivery = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = started.Path! }).Streams.Single(s => s.Stream == "delivery");
+                    Assert.AreEqual("incomplete", delivery.State, reason);
+                    Assert.IsTrue(delivery.Missing.All(m => m.Reason == reason), $"{reason}: {string.Join(", ", delivery.Missing.Select(m => m.Reason))}");
+                }
+            }
+            finally
+            {
+                gate.Set();
+                Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+                Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DrainTimeoutForTesting.Value = null;
+                Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = null;
+            }
+        }
+    }
+
+    [TestMethod]
+    public async Task Reentrant_NestedApplicationKeepsEveryEvent()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        // A title handler that applies output runs an application inside the one that set the title.
+        terminal.WindowTitleChanged += _ => terminal.ApplyTokens(Hex1b.Tokens.AnsiTokenizer.Tokenize("nested"));
+        DiagnosticCaseResult stopped;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "before ");
+            await workload.WriteAndWaitAsync(terminal, "\u001b]0;renamed\u0007after");
+            await workload.WriteAndWaitAsync(terminal, " later");
+            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var model = Artifact.Read(stopped.Path!).ModelEvents();
+        CollectionAssert.AreEqual(Enumerable.Range(1, (int)terminal.CurrentModelSequence).Select(i => (long)i).ToList(),
+            model.Select(e => e.GetProperty("modelSequence").GetInt64()).ToList(), "a model event was lost or reordered by the nested application");
+        var titled = model.Single(e => e.TryGetProperty("data", out var d) && Encoding.UTF8.GetString(Convert.FromBase64String(d.GetString()!)).Contains("renamed", StringComparison.Ordinal));
+        var inspection = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! });
+        Assert.AreEqual("complete", inspection.Streams.Single(s => s.Stream == "model").State);
+        Assert.AreEqual((titled.GetProperty("modelSequence").GetInt64() - 1, "reentrant-application"),
+            (inspection.Intervals.Single().ToModelSequence, inspection.Intervals.Single().EndReason));
+    }
+
+    [TestMethod]
+    public async Task Stop_DrainTimeoutDeclaresAnOfferInFlight()
+    {
+        await AssertOfferInFlightDeclaredAsync(sizeLimit: false);
+    }
+
+    [TestMethod]
+    public async Task Limits_SizeStopDeclaresAnOfferInFlight()
+    {
+        await AssertOfferInFlightDeclaredAsync(sizeLimit: true);
+    }
+
+    // A resize passes its recording check and is held before its enqueue while the case discards its queue (a
+    // drain timeout, or the size bound); it must be declared with the queue, not left unaccounted.
+    private static async Task AssertOfferInFlightDeclaredAsync(bool sizeLimit)
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        using var gate = new ManualResetEventSlim(false);
+        using var held = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        var holding = 0;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DrainTimeoutForTesting.Value = TimeSpan.FromMilliseconds(300);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = () =>
+        {
+            if (Volatile.Read(ref holding) == 1 && Interlocked.Exchange(ref holding, 2) == 1)
+            {
+                held.Set();
+                release.Wait(TimeSpan.FromSeconds(10));
+            }
+        };
+        Hex1bTerminal terminal;
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(200, 50)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest
+                {
+                    Directory = root.Path,
+                    MaxBytes = 1024 * 1024,
+                    Authorizations = [DiagnosticAuthorization.ReapplicationData],
+                }).Build();
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DrainTimeoutForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            var diagnostics = new TerminalDiagnostics(terminal);
+            var path = diagnostics.GetCaseStatus().Path!;
+            using (new Running(terminal))
+            {
+                // Enough queued output to cross a 1 MiB bound when the writer is released, or a little to time out on.
+                var chunk = Enumerable.Repeat((byte)'s', sizeLimit ? 16 * 1024 : 16).ToArray();
+                for (var i = 0; i < 80; i++)
+                    await workload.WriteAndWaitAsync(terminal, chunk);
+                Volatile.Write(ref holding, 1);
+                var resize = Task.Run(() => terminal.Resize(150, 40));
+                Assert.IsTrue(held.Wait(TimeSpan.FromSeconds(10)), "fixture: the resize never reached the enqueue");
+                if (!sizeLimit)
+                    await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+                gate.Set();
+                await Task.Delay(300, TestContext.Current.CancellationToken);
+                release.Set();
+                await resize;
+                await WaitAsync(() => File.Exists(Path.Combine(path, "completion.json")));
+            }
+
+            var reason = sizeLimit ? "size-limit" : "drain-timeout";
+            var artifact = Artifact.Read(path);
+            Assert.AreEqual(sizeLimit ? "size-limit" : "requested", artifact.Completion!.Value.GetProperty("stopReason").GetString());
+            var model = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }).Streams.Single(s => s.Stream == "model");
+            Assert.IsTrue(model.Missing.All(m => m.Reason == reason),
+                $"{reason}: the held resize surfaced as {string.Join(", ", model.Missing.Select(m => m.Reason))} instead of a declared range");
+            Assert.IsTrue(MissingOrdinals(artifact, "model").Contains(81), $"{reason}: the held resize (ordinal 81) was not declared");
+        }
+    }
+
     private const int CaseEventQueueMax = Hex1b.Diagnostics.Cases.CaseEventQueue.MaxEvents;
 
     // Records the chunks with the writer held until the pump has applied them all, then stops.

@@ -32,7 +32,17 @@ internal static class CaseStorage
             return $"The case directory root is not a directory: '{root}'.";
         if (info.Exists && !OperatingSystem.IsWindows())
         {
-            var mode = File.GetUnixFileMode(root);
+            UnixFileMode mode;
+            try
+            {
+                mode = File.GetUnixFileMode(root);
+            }
+            catch (IOException error)
+            {
+                // Removed (or made unreadable) since it was found: nothing about it can be confirmed.
+                return $"The case directory root cannot be read: '{root}': {error.Message}";
+            }
+
             if ((mode & ~DirectoryMode) != 0)
                 return $"The case directory root is accessible to group or others: '{root}'.";
             if (OwnershipProblem(root, mode) is { } problem)

@@ -446,6 +446,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 if (Volatile.Read(ref _drainAbandoned) == 1)
                 {
                     WaitForOffersInFlight();
+                    DeclareUnpulledDelivery("drain-timeout");
                     DiscardQueued("drain-timeout");
                     break;
                 }
@@ -486,11 +487,13 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             // then reads as interrupted. The reader also marks any stream whose completion counts show
             // unaccounted events.
             Interlocked.Exchange(ref _stopReason, (int)DiagnosticCaseStopReason.CollectorFailed);
-            Volatile.Write(ref _state, Stopping);
+            // A full fence, as RequestStop's: an offer counts itself in flight before it reads the state.
+            Interlocked.Exchange(ref _state, Stopping);
             _stoppedAt ??= _timeProvider.GetUtcNow();
             try
             {
                 WaitForOffersInFlight();
+                DeclareUnpulledDelivery("collector-failed");
                 DiscardQueued("collector-failed");
             }
             catch (Exception)
@@ -544,9 +547,10 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         var last = delivery.Read(long.MaxValue - 1, 1, includeBytes: false).Totals.LastSequence ?? _deliverySince;
         if (last <= _deliverySince)
             return;
+        // Offered first (the terminal made them), dropped once declared, as for the queue.
         Interlocked.Add(ref _offered[(int)CaseStream.Delivery], last - _deliverySince);
-        Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], last - _deliverySince);
         WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = _deliverySince + 1, ToOrdinal = last, Reason = reason }, RangeLimit);
+        Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], last - _deliverySince);
         _deliverySince = last;
     }
 
@@ -600,7 +604,6 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 list[^1] = (list[^1].From, item.Ordinal);
             else
                 list.Add((item.Ordinal, item.Ordinal));
-            Interlocked.Increment(ref _dropped[(int)item.Stream]);
         }
 
         if (_pendingAfterLimit is { } pending)
@@ -608,9 +611,14 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         _pendingAfterLimit = null;
         while (_queue.TryDequeue(out var item))
             Add(item);
+        // Counted dropped only once declared: a range whose write fails leaves offered ahead of written plus
+        // dropped, which the reader reports as an unaccounted tail rather than a complete stream.
         foreach (var (stream, list) in ranges)
             foreach (var (from, to) in list)
+            {
                 WriteMissing(new DiagnosticCaseRecord { Stream = CaseArtifactWriter.StreamName(stream), FromOrdinal = from, ToOrdinal = to, Reason = reason }, RangeLimit);
+                Interlocked.Add(ref _dropped[(int)stream], to - from + 1);
+            }
         WriteClosingRecords();
     }
 
@@ -731,7 +739,6 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             if (record.Sequence > _deliverySince + 1)
             {
                 var missing = record.Sequence - _deliverySince - 1;
-                Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], missing);
                 Interlocked.Add(ref _offered[(int)CaseStream.Delivery], missing);
                 WriteMissing(new DiagnosticCaseRecord
                 {
@@ -740,6 +747,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                     ToOrdinal = record.Sequence - 1,
                     Reason = "evicted",
                 }, EventLimit);
+                Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], missing);
             }
 
             Interlocked.Increment(ref _offered[(int)CaseStream.Delivery]);
@@ -755,8 +763,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 // This record and the rest of the snapshot were pulled but never written.
                 var last = snapshot.Records[^1].Sequence;
                 Interlocked.Add(ref _offered[(int)CaseStream.Delivery], last - record.Sequence);
-                Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], last - record.Sequence + 1);
                 WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = record.Sequence, ToOrdinal = last, Reason = "size-limit" }, RangeLimit);
+                Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], last - record.Sequence + 1);
                 _deliverySince = last;
                 return false;
             }
