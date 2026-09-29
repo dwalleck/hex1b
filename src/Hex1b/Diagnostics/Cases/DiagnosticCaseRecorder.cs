@@ -38,6 +38,18 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// <summary>Runs just before a start arms its case, on the starting flow, while a test has set it.</summary>
     internal static readonly AsyncLocal<Action?> BeforeArmForTesting = new();
 
+    /// <summary>Runs after a start armed its case and before its writer starts, while a test has set it.</summary>
+    internal static readonly AsyncLocal<Action?> AfterArmForTesting = new();
+
+    /// <summary>
+    /// Runs on the producer's thread after an offer passed its recording check and before it enqueues,
+    /// taken from the arming flow while a test has set it (to hold a producer across a stop).
+    /// </summary>
+    internal static readonly AsyncLocal<Action?> BeforeEnqueueForTesting = new();
+
+    /// <summary>An exception the writer's disposal throws, taken from the arming flow while a test has set it.</summary>
+    internal static readonly AsyncLocal<Exception?> WriterDisposeFaultForTesting = new();
+
     /// <summary>A shorter drain bound for tests, taken from the arming flow while a test has set it.</summary>
     internal static readonly AsyncLocal<TimeSpan?> DrainTimeoutForTesting = new();
 
@@ -58,10 +70,20 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// <summary>How long a stop waits for queued events to reach the artifact (spec Q11).</summary>
     internal static readonly TimeSpan DrainTimeout = TimeSpan.FromSeconds(10);
 
-    // Artifact bytes kept free under the size bound for the closing records (loss, interval end, completion).
-    private const long ClosingReserve = 16 * 1024;
+    // The size bound is kept in tiers, so what must be written always has room:
+    //   events and running loss ranges                 below MaxBytes - 16 KiB (EventLimit);
+    //   ranges written as the case closes (discards)   below MaxBytes - 8 KiB  (RangeLimit);
+    //   closing records: the interval end, at most one failure and one overflow summary per stream,
+    //   each a bounded line                             below MaxBytes - 2 KiB  (ClosingLimit);
+    //   the completion record                          in the rest.
+    private const long EventReserve = 16 * 1024;
+    private const long RangeReserve = 8 * 1024;
+    private const long ClosingReserve = 2 * 1024;
+    private const int MaxFailureMessage = 256;
 
     private Exception? _writerFault = WriterFaultForTesting.Value;
+    private Exception? _writerDisposeFault = WriterDisposeFaultForTesting.Value;
+    private readonly Action? _beforeEnqueue = BeforeEnqueueForTesting.Value;
     private string? _streamFault = StreamFaultForTesting.Value;
     private readonly TimeSpan _drainTimeout = DrainTimeoutForTesting.Value ?? DrainTimeout;
 
@@ -90,7 +112,16 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     private long _lastWritten = -1;
     private int _stopReason = -1;
     private DateTimeOffset? _stoppedAt;
-    private Task? _writerTask;
+    // Completed when the writer has finished. It exists from construction, so a stop that finds the recorder
+    // armed but not yet started still waits for the artifact.
+    private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    // Producers between their recording check and their enqueue; the writer's last pass waits for them.
+    private int _offersInFlight;
+    // The application begun under the model lock and offered when it ends, after its graphics check.
+    private (long ModelSequence, int Width, int Height, int Length, bool HasIngress, byte[]? Payload)? _application;
+    // Per stream, the first ordinal of a missing range that did not fit under the size bound. From there the
+    // stream's coverage is summarized as one range of unknown extent when the case closes.
+    private readonly long?[] _undescribedFrom = new long?[StreamCount];
 
     // Where re-applicable model coverage ends. Held outside the queue so overload cannot drop it, and
     // written before any model event at or after it.
@@ -136,29 +167,34 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
 
     internal bool IsRecording => Volatile.Read(ref _state) == Recording;
 
+    /// <summary>The model sequence where re-applicable coverage ends, or <see cref="long.MaxValue"/>.</summary>
+    internal long IntervalEnd => Volatile.Read(ref _intervalEnd);
+
+    /// <summary>The loss ledger, for tests that need more loss ranges than a real overload produces.</summary>
+    internal CaseLossLedger LossForTesting => _loss;
+
     /// <summary>Completes when the writer has finished and the completion record is written (or failed).</summary>
-    internal Task Completion => _writerTask ?? Task.CompletedTask;
+    internal Task Completion => _completion.Task;
 
     /// <summary>Starts the writer and the time bound; called once, after the terminal armed this recorder.</summary>
     internal void Start()
     {
         _timeLimit = _timeProvider.CreateTimer(_ => RequestStop(DiagnosticCaseStopReason.TimeLimit), null,
             TimeSpan.FromSeconds(Manifest.Bounds.MaxSeconds), Timeout.InfiniteTimeSpan);
-        _writerTask = Task.Factory.StartNew(WriteLoopAsync, CancellationToken.None,
-            TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        _ = Task.Run(WriteLoopAsync);
     }
 
     /// <summary>
-    /// Records an output application with its original input bytes, copied only under
-    /// <c>reapplication-data</c>. The caller holds the model lock, which orders model events.
+    /// Begins an output application: copies its original input bytes (only under <c>reapplication-data</c>)
+    /// while they are valid. The event is offered by <see cref="EndApplication"/>, once the application's
+    /// effect on graphics state is known, so an interval end it causes precedes it in the artifact. The caller
+    /// holds the model lock for the whole application.
     /// </summary>
-    internal void RecordApplication(long modelSequence, int width, int height, bool hasIngress, ReadOnlySpan<byte> ingress)
+    internal void BeginApplication(long modelSequence, int width, int height, bool hasIngress, ReadOnlySpan<byte> ingress)
     {
+        _application = null;
         if (!IsRecording || Volatile.Read(ref _failed[(int)CaseStream.Model]))
             return;
-        // A model change the case holds no input for cannot be reproduced: coverage ends here.
-        if (!hasIngress)
-            EndInterval(modelSequence, "application-without-ingress");
         try
         {
             byte[]? payload = null;
@@ -169,22 +205,56 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                     Interlocked.Increment(ref copies.Value);
             }
 
-            Offer(CaseStream.Model, hasIngress ? "application" : "application-without-ingress", modelSequence, width, height,
-                ingress.Length, payload, null);
+            _application = (modelSequence, width, height, ingress.Length, hasIngress, payload);
         }
         catch (Exception error)
         {
-            // The event is lost with the stream: re-applicable coverage ends at it.
-            EndInterval(modelSequence, "stream-failed");
-            FailStream(CaseStream.Model, error);
+            FailModel(modelSequence, error);
         }
     }
 
-    /// <summary>Records a model event. The caller holds the terminal's model lock, which orders model events.</summary>
-    internal void RecordModelEvent(string kind, long modelSequence, int width, int height)
+    /// <summary>
+    /// Offers the application begun by <see cref="BeginApplication"/>. Graphics state the checkpoint cannot
+    /// hold, or an application without input bytes, ends re-applicable coverage at it.
+    /// </summary>
+    internal void EndApplication(bool graphics)
     {
-        if (IsRecording)
-            Offer(CaseStream.Model, kind, modelSequence, width, height, null, null, null);
+        if (_application is not { } application)
+            return;
+        _application = null;
+        // A model change the case holds no input for cannot be reproduced: coverage ends here.
+        if (!application.HasIngress)
+            EndInterval(application.ModelSequence, "application-without-ingress");
+        if (graphics)
+            EndInterval(application.ModelSequence, "graphics");
+        OfferModel(application.HasIngress ? "application" : "application-without-ingress", application.ModelSequence,
+            application.Width, application.Height, application.Length, application.Payload);
+    }
+
+    /// <summary>Records a model event. The caller holds the terminal's model lock, which orders model events.</summary>
+    internal void RecordModelEvent(string kind, long modelSequence, int width, int height) =>
+        OfferModel(kind, modelSequence, width, height, null, null);
+
+    // A model-stream failure must never reach the terminal, whose model sequence has already advanced: the
+    // stream ends, and re-applicable coverage with it.
+    private void OfferModel(string kind, long modelSequence, int width, int height, int? length, byte[]? payload)
+    {
+        if (!IsRecording || Volatile.Read(ref _failed[(int)CaseStream.Model]))
+            return;
+        try
+        {
+            Offer(CaseStream.Model, kind, modelSequence, width, height, length, payload, null);
+        }
+        catch (Exception error)
+        {
+            FailModel(modelSequence, error);
+        }
+    }
+
+    private void FailModel(long modelSequence, Exception error)
+    {
+        EndInterval(modelSequence, "stream-failed");
+        FailStream(CaseStream.Model, error);
     }
 
     /// <summary>
@@ -224,7 +294,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         // The application writes the frame before it reports the publication, on the same thread.
         var published = _sources.Frames?.LatestFrame is { } latest && latest.FrameId == frameId ? latest : null;
         var projection = published?.Frame is { } frame ? (_editorText ? frame : TerminalDiagnostics.WithoutEditorText(frame)) : null;
-        Offer(CaseStream.Frames, "published", null, null, null, null, null, new DiagnosticCaseFrameEvent
+        Offer(CaseStream.Frames, "published", null, null, null, null, null, detailBytes: CaseFrameSize.Estimate(projection), detail: new DiagnosticCaseFrameEvent
         {
             FrameId = frameId,
             ApplicationInstanceId = applicationInstanceId,
@@ -260,31 +330,46 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         {
             Stream = CaseArtifactWriter.StreamName(stream),
             FromOrdinal = Interlocked.Read(ref _ordinals[(int)stream]) + 1,
-            Reason = $"stream-failed: {error.GetType().Name}: {error.Message}",
+            Reason = Bounded($"stream-failed: {error.GetType().Name}: {error.Message}"),
         });
         if (_signal.CurrentCount == 0)
             _signal.Release();
     }
 
+    private static string Bounded(string text) => text.Length <= MaxFailureMessage ? text : text[..MaxFailureMessage] + "…";
+
     private void Offer(CaseStream stream, string kind, long? modelSequence, int? width, int? height, int? length, byte[]? payload,
-        object? detail)
+        object? detail = null, int detailBytes = 0)
     {
-        var index = (int)stream;
-        if (_streamFault is { } faulted && faulted == CaseArtifactWriter.StreamName(stream) && Interlocked.CompareExchange(ref _streamFault, null, faulted) == faulted)
-            throw new InvalidOperationException("Injected stream failure.");
-        Interlocked.Increment(ref _offered[index]);
-        var ordinal = Interlocked.Increment(ref _ordinals[index]);
-        var item = new CaseEvent(stream, ordinal, Stopwatch.GetTimestamp(), kind, modelSequence, width, height, length, payload, detail);
-        if (_queue.TryEnqueue(item))
+        // Counted in flight before the recording check (both full fences), so the writer's last pass, which
+        // runs after the stop and waits for no offer in flight, sees every event offered while recording.
+        Interlocked.Increment(ref _offersInFlight);
+        try
         {
-            if (_signal.CurrentCount == 0)
-                _signal.Release();
+            if (Volatile.Read(ref _state) != Recording)
+                return;
+            var index = (int)stream;
+            if (_streamFault is { } faulted && faulted == CaseArtifactWriter.StreamName(stream) && Interlocked.CompareExchange(ref _streamFault, null, faulted) == faulted)
+                throw new InvalidOperationException("Injected stream failure.");
+            _beforeEnqueue?.Invoke();
+            Interlocked.Increment(ref _offered[index]);
+            var ordinal = Interlocked.Increment(ref _ordinals[index]);
+            var item = new CaseEvent(stream, ordinal, Stopwatch.GetTimestamp(), kind, modelSequence, width, height, length, payload, detail, detailBytes);
+            if (_queue.TryEnqueue(item))
+            {
+                if (_signal.CurrentCount == 0)
+                    _signal.Release();
+            }
+            else
+            {
+                // Drop-newest; the loss is recorded outside the queue that could not take the event.
+                Interlocked.Increment(ref _dropped[index]);
+                _loss.Record(stream, ordinal);
+            }
         }
-        else
+        finally
         {
-            // Drop-newest; the loss is recorded outside the queue that could not take the event.
-            Interlocked.Increment(ref _dropped[index]);
-            _loss.Record(stream, ordinal);
+            Interlocked.Decrement(ref _offersInFlight);
         }
     }
 
@@ -342,9 +427,11 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 }
 
                 _writer.Flush();
-                if (stopping && _queue.Count == 0)
+                if (stopping && _queue.Count == 0 && Volatile.Read(ref _offersInFlight) == 0)
                     break;
-                if (!stopping)
+                if (stopping)
+                    await Task.Delay(1).ConfigureAwait(false);
+                else
                     await _signal.WaitAsync(50).ConfigureAwait(false);
             }
 
@@ -355,11 +442,21 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         }
         catch (Exception)
         {
-            // The writer or its storage failed: the case stops. The completion is attempted, but with
-            // storage failing it may not exist, and the artifact then reads as interrupted.
+            // The writer or its storage failed: the case stops. What was never written is declared missing
+            // and the completion is attempted; with storage failing either may not exist, and the artifact
+            // then reads as interrupted. The reader also marks any stream whose completion counts show
+            // unaccounted events.
             Interlocked.Exchange(ref _stopReason, (int)DiagnosticCaseStopReason.CollectorFailed);
             Volatile.Write(ref _state, Stopping);
             _stoppedAt ??= _timeProvider.GetUtcNow();
+            try
+            {
+                DiscardQueued("collector-failed");
+            }
+            catch (Exception)
+            {
+            }
+
             try
             {
                 _writer.WriteCompletion(DescribeCompletion());
@@ -371,10 +468,24 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         finally
         {
             Volatile.Write(ref _state, Stopped);
-            _timeLimit?.Dispose();
-            _sources.Input?.ClearStreamObserver(this);
-            _writer.Dispose();
-            _finished(this);
+            try
+            {
+                _timeLimit?.Dispose();
+                _sources.Input?.ClearStreamObserver(this);
+                if (Interlocked.Exchange(ref _writerDisposeFault, null) is { } fault)
+                    throw fault;
+                _writer.Dispose();
+            }
+            catch (Exception)
+            {
+                // Disposal re-flushes a buffer a failed write left behind; the case has ended either way.
+            }
+            finally
+            {
+                // Always forget the case, so the terminal can start another.
+                _finished(this);
+                _completion.TrySetResult();
+            }
         }
     }
 
@@ -383,6 +494,20 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         WriteIntervalEndIfPending(long.MaxValue);
         WriteLoss(final: true);
         WriteStreamFailures();
+        // Missing ranges that did not fit under the size bound: one range of unknown extent per stream.
+        for (var index = 0; index < StreamCount; index++)
+        {
+            if (_undescribedFrom[index] is not { } from)
+                continue;
+            _undescribedFrom[index] = null;
+            AppendCase("missing", null, new DiagnosticCaseRecord
+            {
+                Stream = CaseArtifactWriter.StreamName((CaseStream)index),
+                FromOrdinal = from,
+                ToOrdinal = null,
+                Reason = "size-limit-unknown-extent",
+            }, ClosingLimit);
+        }
     }
 
     // Writes queued events; false when the size bound stops the case.
@@ -390,11 +515,11 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     {
         while (Volatile.Read(ref _drainAbandoned) == 0 && _queue.TryDequeue(out var item))
         {
+            // Pending until written, so a size bound or a writer failure declares it missing with the queue.
+            _pendingAfterLimit = item;
             if (!Write(item))
-            {
-                _pendingAfterLimit = item;
                 return false;
-            }
+            _pendingAfterLimit = null;
         }
 
         return true;
@@ -422,19 +547,35 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         _pendingAfterLimit = null;
         while (_queue.TryDequeue(out var item))
             Add(item);
-        WriteClosingRecords();
         foreach (var (stream, list) in ranges)
             foreach (var (from, to) in list)
-                WriteCaseRecord("missing", null, new DiagnosticCaseRecord { Stream = CaseArtifactWriter.StreamName(stream), FromOrdinal = from, ToOrdinal = to, Reason = reason });
+                WriteMissing(new DiagnosticCaseRecord { Stream = CaseArtifactWriter.StreamName(stream), FromOrdinal = from, ToOrdinal = to, Reason = reason }, RangeLimit);
+        WriteClosingRecords();
     }
 
     private void WriteStreamFailures()
     {
         while (_streamFailures.TryDequeue(out var failure))
-            WriteCaseRecord("stream-failed", null, failure);
+            AppendCase("stream-failed", null, failure, ClosingLimit);
     }
 
-    private long EventLimit => Manifest.Bounds.MaxBytes - ClosingReserve;
+    private long EventLimit => Manifest.Bounds.MaxBytes - EventReserve;
+
+    private long RangeLimit => Manifest.Bounds.MaxBytes - RangeReserve;
+
+    private long ClosingLimit => Manifest.Bounds.MaxBytes - ClosingReserve;
+
+    // A missing range must fit below its tier. One that does not stops the case at its size bound, and its
+    // stream's loss from there is summarized as one range of unknown extent when the case closes.
+    private void WriteMissing(DiagnosticCaseRecord record, long limit)
+    {
+        var index = StreamIndex(record.Stream);
+        if (_undescribedFrom[index] is null && AppendCase("missing", null, record, limit))
+            return;
+        if (_undescribedFrom[index] is not { } from || record.FromOrdinal < from)
+            _undescribedFrom[index] = record.FromOrdinal;
+        RequestStop(DiagnosticCaseStopReason.SizeLimit);
+    }
 
     // Writes one queued event; false (nothing written) when it would cross the size bound.
     private bool Write(in CaseEvent item)
@@ -443,10 +584,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             throw fault;
         if (item.Stream == CaseStream.Model)
             WriteIntervalEndIfPending(item.ModelSequence ?? long.MaxValue);
-        var sequence = _caseSequence + 1;
-        if (!_writer.TryWriteEvent(new DiagnosticCaseEvent
+        return Append(item.Stream, new DiagnosticCaseEvent
         {
-            CaseSequence = sequence,
             Stream = CaseArtifactWriter.StreamName(item.Stream),
             Ordinal = item.Ordinal,
             Timestamp = item.Timestamp,
@@ -458,11 +597,36 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             Data = item.Payload is { } payload ? Convert.ToBase64String(payload) : null,
             Input = item.Detail as DiagnosticCaseInputEvent,
             Frame = item.Detail as DiagnosticCaseFrameEvent,
-        }, EventLimit))
+        }, EventLimit);
+    }
+
+    // The one append path: assigns the next case sequence and counts the line only when it was written.
+    private bool Append(CaseStream stream, DiagnosticCaseEvent item, long limit)
+    {
+        var sequence = _caseSequence + 1;
+        if (!_writer.TryWriteEvent(item with { CaseSequence = sequence }, limit))
             return false;
         _caseSequence = sequence;
-        Interlocked.Increment(ref _written[(int)item.Stream]);
+        Interlocked.Increment(ref _written[(int)stream]);
         Volatile.Write(ref _lastWritten, sequence);
+        return true;
+    }
+
+    // Case records are numbered by the writer alone, and only when written.
+    private bool AppendCase(string kind, long? modelSequence, DiagnosticCaseRecord record, long limit)
+    {
+        var ordinal = _ordinals[(int)CaseStream.Case] + 1;
+        if (!Append(CaseStream.Case, new DiagnosticCaseEvent
+        {
+            Stream = "case",
+            Ordinal = ordinal,
+            Timestamp = Stopwatch.GetTimestamp(),
+            Kind = kind,
+            ModelSequence = modelSequence,
+            Record = record,
+        }, limit))
+            return false;
+        _ordinals[(int)CaseStream.Case] = ordinal;
         return true;
     }
 
@@ -473,30 +637,13 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         if (_intervalEndWritten || end == long.MaxValue || nextModelSequence < end)
             return;
         _intervalEndWritten = true;
-        WriteCaseRecord("interval-end", end, new DiagnosticCaseRecord { Stream = "model", Reason = _intervalEndReason ?? "unsupported" });
+        AppendCase("interval-end", end, new DiagnosticCaseRecord { Stream = "model", Reason = _intervalEndReason ?? "unsupported" }, ClosingLimit);
     }
 
     private void WriteLoss(bool final)
     {
         foreach (var record in _loss.Take(final))
-            WriteCaseRecord("missing", null, record);
-    }
-
-    private void WriteCaseRecord(string kind, long? modelSequence, DiagnosticCaseRecord record)
-    {
-        var sequence = ++_caseSequence;
-        _writer.WriteEvent(new DiagnosticCaseEvent
-        {
-            CaseSequence = sequence,
-            Stream = "case",
-            Ordinal = Interlocked.Increment(ref _ordinals[(int)CaseStream.Case]),
-            Timestamp = Stopwatch.GetTimestamp(),
-            Kind = kind,
-            ModelSequence = modelSequence,
-            Record = record,
-        });
-        Interlocked.Increment(ref _written[(int)CaseStream.Case]);
-        Volatile.Write(ref _lastWritten, sequence);
+            WriteMissing(record, final ? RangeLimit : EventLimit);
     }
 
     // Native delivery records live in their own bounded ring; the writer pulls them instead of adding a
@@ -514,20 +661,18 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 var missing = record.Sequence - _deliverySince - 1;
                 Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], missing);
                 Interlocked.Add(ref _offered[(int)CaseStream.Delivery], missing);
-                WriteCaseRecord("missing", null, new DiagnosticCaseRecord
+                WriteMissing(new DiagnosticCaseRecord
                 {
                     Stream = "delivery",
                     FromOrdinal = _deliverySince + 1,
                     ToOrdinal = record.Sequence - 1,
                     Reason = "evicted",
-                });
+                }, EventLimit);
             }
 
-            var sequence = _caseSequence + 1;
             Interlocked.Increment(ref _offered[(int)CaseStream.Delivery]);
-            if (!_writer.TryWriteEvent(new DiagnosticCaseEvent
+            if (!Append(CaseStream.Delivery, new DiagnosticCaseEvent
             {
-                CaseSequence = sequence,
                 Stream = "delivery",
                 Ordinal = record.Sequence,
                 Timestamp = record.StartTimestamp,
@@ -539,13 +684,11 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 var last = snapshot.Records[^1].Sequence;
                 Interlocked.Add(ref _offered[(int)CaseStream.Delivery], last - record.Sequence);
                 Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], last - record.Sequence + 1);
-                WriteCaseRecord("missing", null, new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = record.Sequence, ToOrdinal = last, Reason = "size-limit" });
+                WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = record.Sequence, ToOrdinal = last, Reason = "size-limit" }, RangeLimit);
+                _deliverySince = last;
                 return false;
             }
 
-            _caseSequence = sequence;
-            Interlocked.Increment(ref _written[(int)CaseStream.Delivery]);
-            Volatile.Write(ref _lastWritten, sequence);
             _deliverySince = record.Sequence;
         }
 

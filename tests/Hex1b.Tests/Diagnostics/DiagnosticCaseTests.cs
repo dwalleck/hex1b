@@ -1361,6 +1361,422 @@ public class DiagnosticCaseTests
         Assert.HasCount(middle, flippedInspection.Events);
     }
 
+    // === Review round 1 fences ===
+
+    [TestMethod]
+    public async Task Failures_WriterDisposeFaultStillForgetsTheCase()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10).Build();
+        var diagnostics = new TerminalDiagnostics(terminal);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterDisposeFaultForTesting.Value = new IOException("injected flush failure on dispose");
+        try
+        {
+            Assert.AreEqual(DiagnosticOutcome.Captured, diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Outcome);
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterDisposeFaultForTesting.Value = null;
+        }
+
+        await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+        Assert.AreEqual("no-active-case", diagnostics.GetCaseStatus().Problem?.Code, "a failed disposal left the case armed");
+        var again = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path });
+        Assert.AreEqual(DiagnosticOutcome.Captured, again.Outcome, $"a new case could not start: {again.Problem?.Code}");
+        await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+    }
+
+    [TestMethod]
+    public async Task Dispose_WaitsForTheCaseArtifact()
+    {
+        using var root = new CaseRoot();
+        foreach (var asynchronous in new[] { true, false })
+        {
+            using var gate = new ManualResetEventSlim(false);
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+            Hex1bTerminal terminal;
+            ScriptedWorkload workload = new();
+            try
+            {
+                terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                    .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Build();
+            }
+            finally
+            {
+                Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            }
+
+            var path = new TerminalDiagnostics(terminal).GetCaseStatus().Path!;
+            using (new Running(terminal))
+                await workload.WriteAndWaitAsync(terminal, "before disposal");
+
+            var dispose = asynchronous ? terminal.DisposeAsync().AsTask() : Task.Run(terminal.Dispose);
+            await Task.Delay(300, TestContext.Current.CancellationToken);
+            Assert.IsFalse(dispose.IsCompleted, $"async={asynchronous}: disposal returned before the case's artifact was finished");
+            gate.Set();
+            await dispose.WaitAsync(TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+            // No polling: once disposal returns, the artifact is complete.
+            Assert.IsTrue(File.Exists(Path.Combine(path, "completion.json")), $"async={asynchronous}: no completion after disposal");
+            Assert.AreEqual("target-disposed", Artifact.Read(path).Completion!.Value.GetProperty("stopReason").GetString());
+        }
+    }
+
+    [TestMethod]
+    public async Task Failures_WriterFaultDeclaresTheUnwrittenMissing()
+    {
+        using var root = new CaseRoot();
+        using var gate = new ManualResetEventSlim(false);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = new InvalidOperationException("injected serializer failure");
+        Hex1bTerminal terminal;
+        var workload = new ScriptedWorkload();
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Build();
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            var diagnostics = new TerminalDiagnostics(terminal);
+            var path = diagnostics.GetCaseStatus().Path!;
+            using (new Running(terminal))
+            {
+                for (var i = 0; i < 50; i++)
+                    await workload.WriteAndWaitAsync(terminal, $"q{i} ");
+                gate.Set();
+                await WaitAsync(() => File.Exists(Path.Combine(path, "completion.json")));
+            }
+
+            var artifact = Artifact.Read(path);
+            Assert.AreEqual("collector-failed", artifact.Completion!.Value.GetProperty("stopReason").GetString());
+            CollectionAssert.AreEqual(Enumerable.Range(1, 50).Select(i => (long)i).ToList(), MissingOrdinals(artifact, "model"),
+                "the events the failed writer never wrote are not exactly the missing ranges");
+            Assert.IsTrue(artifact.Events.Where(e => e.GetProperty("kind").GetString() == "missing")
+                .All(e => e.GetProperty("record").GetProperty("reason").GetString() == "collector-failed"));
+            var model = artifact.Completion.Value.GetProperty("streams").EnumerateArray().Single(e => e.GetProperty("stream").GetString() == "model");
+            Assert.AreEqual(model.GetProperty("offered").GetInt64(), model.GetProperty("written").GetInt64() + model.GetProperty("dropped").GetInt64());
+        }
+    }
+
+    [TestMethod]
+    public async Task Reader_CompletionCountsBeyondTheFileAreAnUnknownTail()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Build();
+        DiagnosticCaseResult stopped;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "one ");
+            await workload.WriteAndWaitAsync(terminal, "two");
+            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        // The completion says five more model events were offered than the file holds or declares lost.
+        var completionPath = Path.Combine(stopped.Path!, "completion.json");
+        var completion = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(completionPath))!;
+        var model = completion["streams"]!.AsArray().Single(s => s!["stream"]!.GetValue<string>() == "model")!;
+        model["offered"] = model["offered"]!.GetValue<long>() + 5;
+        File.WriteAllText(completionPath, completion.ToJsonString());
+
+        var coverage = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! }).Streams.Single(s => s.Stream == "model");
+        Assert.AreEqual("incomplete", coverage.State);
+        var tail = coverage.Missing.Single();
+        Assert.AreEqual((coverage.LastOrdinal + 1, (long?)null, "unaccounted"), (tail.FromOrdinal, tail.ToOrdinal, tail.Reason));
+    }
+
+    [TestMethod]
+    public async Task StreamFailure_AModelEventFailureStaysInTheCase()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.StreamFaultForTesting.Value = "model";
+        Hex1bTerminal terminal;
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+                .Build();
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.StreamFaultForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            // The first model event is a resize: its failure must not reach Resize, which has advanced the sequence.
+            terminal.Resize(50, 12);
+            Assert.AreEqual((50, 12), (terminal.Width, terminal.Height), "the resize was not applied");
+            DiagnosticCaseResult stopped;
+            using (new Running(terminal))
+            {
+                await workload.WriteAndWaitAsync(terminal, "after the failure");
+                terminal.Resize(60, 12);
+                stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+            }
+
+            var inspection = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path!, Limit = 100 });
+            Assert.AreEqual("failed", inspection.Streams.Single(s => s.Stream == "model").State);
+            Assert.IsEmpty(inspection.Events.Where(e => e.Stream == "model").ToList(), "a failed model stream kept recording");
+            Assert.AreEqual((0L, "stream-failed"), (inspection.Intervals.Single().ToModelSequence, inspection.Intervals.Single().EndReason));
+        }
+    }
+
+    [TestMethod]
+    public async Task Limits_MissingRangesStayWithinTheBound()
+    {
+        const long bound = 1024 * 1024;
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(200, 50)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, MaxBytes = bound, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        var diagnostics = new TerminalDiagnostics(terminal);
+        var recorder = terminal.DiagnosticCase!;
+        var path = recorder.Path;
+        using (new Running(terminal))
+        {
+            // Fill the artifact to within ~150 KB of its bound with ordinary events.
+            var chunk = Enumerable.Repeat((byte)'f', 8 * 1024).ToArray();
+            while ((diagnostics.GetCaseStatus().BytesWritten ?? 0) < bound - 150 * 1024)
+                await workload.WriteAndWaitAsync(terminal, chunk);
+
+            // Then more loss than fits: 1,024 separate model ranges (about 170 KB of records), past any real ordinal.
+            for (var i = 0; i < Hex1b.Diagnostics.Cases.CaseLossLedger.MaxRangesPerStream; i++)
+                recorder.LossForTesting.Record(Hex1b.Diagnostics.Cases.CaseStream.Model, 1_000_000 + 2L * i);
+            await workload.WriteAndWaitAsync(terminal, "wake the writer");
+            await WaitAsync(() => File.Exists(Path.Combine(path, "completion.json")), TimeSpan.FromSeconds(30));
+        }
+
+        var bytes = Directory.GetFiles(path).Sum(f => new FileInfo(f).Length);
+        Assert.IsLessThanOrEqualTo(bound, bytes, $"the artifact holds {bytes} bytes against its {bound}-byte bound");
+        var artifact = Artifact.Read(path);
+        Assert.AreEqual("size-limit", artifact.Completion!.Value.GetProperty("stopReason").GetString());
+        var summary = artifact.Events.Where(e => e.GetProperty("kind").GetString() == "missing"
+            && e.GetProperty("record").GetProperty("reason").GetString() == "size-limit-unknown-extent").ToList();
+        Assert.HasCount(1, summary, "the loss that did not fit is not summarized once");
+        Assert.AreEqual(JsonValueKind.Null, summary[0].GetProperty("record").TryGetProperty("toOrdinal", out var to) ? to.ValueKind : JsonValueKind.Null);
+        Assert.AreEqual("incomplete", DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }).Streams.Single(s => s.Stream == "model").State);
+    }
+
+    [TestMethod]
+    public void Queue_ChargesAFrameItsRetainedSize()
+    {
+        var editor = new string('x', 1_000_000);
+        var frame = new DiagnosticApplicationFrame
+        {
+            FocusedEditor = new DiagnosticEditorState { Kind = "editor", Text = editor, Length = editor.Length },
+            Root = new DiagnosticFrameNode { Type = "Root", Children = [new DiagnosticFrameNode { Type = "Text", Text = new string('y', 10_000) }] },
+        };
+        var estimate = Hex1b.Diagnostics.Cases.CaseFrameSize.Estimate(frame);
+        Assert.IsGreaterThanOrEqualTo(2 * 1_000_000 + 2 * 10_000, estimate, "a frame's editor text and node text are not charged");
+
+        var queue = new Hex1b.Diagnostics.Cases.CaseEventQueue();
+        var accepted = 0;
+        for (var i = 0; i < 8; i++)
+        {
+            if (queue.TryEnqueue(new Hex1b.Diagnostics.Cases.CaseEvent(Hex1b.Diagnostics.Cases.CaseStream.Frames, i + 1, 0, "published",
+                    null, null, null, null, null, new DiagnosticCaseFrameEvent(), estimate)))
+                accepted++;
+        }
+
+        Assert.AreEqual(4, accepted, "the 8 MiB bound did not hold for 2 MB frames");
+    }
+
+    [TestMethod]
+    public async Task Graphics_IntervalEndIsSetBeforeItsApplicationIsOffered()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        Hex1bTerminal? terminal = null;
+        var offers = new List<(long Sequence, long IntervalEnd)>();
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = () =>
+        {
+            if (terminal?.DiagnosticCase is { } recorder)
+                lock (offers)
+                    offers.Add((terminal.CurrentModelSequence, recorder.IntervalEnd));
+        };
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+                .Build();
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            long graphicsSequence;
+            using (new Running(terminal))
+            {
+                await workload.WriteAndWaitAsync(terminal, "text ");
+                await workload.WriteAndWaitAsync(terminal, "\u001bP0;0;0q#0;2;100;0;0#0~~~~~~-\u001b\\"u8.ToArray());
+                graphicsSequence = terminal.CurrentModelSequence;
+                await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+            }
+
+            // The interval end is known when the graphics application is offered, so no reader (live, or of a
+            // case killed right after) can see that application inside the interval.
+            lock (offers)
+                Assert.AreEqual(graphicsSequence, offers.First(o => o.Sequence == graphicsSequence).IntervalEnd);
+        }
+    }
+
+    [TestMethod]
+    public async Task Stop_WaitsForAnOfferInFlight()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        using var held = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        var holding = 0;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = () =>
+        {
+            if (Volatile.Read(ref holding) == 1 && Interlocked.Exchange(ref holding, 2) == 1)
+            {
+                held.Set();
+                release.Wait(TimeSpan.FromSeconds(10));
+            }
+        };
+        Hex1bTerminal terminal;
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Build();
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            var diagnostics = new TerminalDiagnostics(terminal);
+            Volatile.Write(ref holding, 1);
+            // A resize passes the recording check, then is held before its enqueue while the case stops.
+            var resize = Task.Run(() => terminal.Resize(50, 12));
+            Assert.IsTrue(held.Wait(TimeSpan.FromSeconds(10)), "fixture: the resize never reached the enqueue");
+            var stop = diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+            await Task.Delay(300, TestContext.Current.CancellationToken);
+            release.Set();
+            var stopped = await stop;
+            await resize;
+
+            var artifact = Artifact.Read(stopped.Path!);
+            Assert.IsTrue(artifact.ModelEvents().Any(e => e.GetProperty("kind").GetString() == "resize"),
+                "an event offered while the case was recording was never written");
+            var model = artifact.Completion!.Value.GetProperty("streams").EnumerateArray().Single(e => e.GetProperty("stream").GetString() == "model");
+            Assert.AreEqual(model.GetProperty("offered").GetInt64(), model.GetProperty("written").GetInt64() + model.GetProperty("dropped").GetInt64());
+        }
+    }
+
+    [TestMethod]
+    public async Task Stop_BeforeTheWriterStartsStillWaits()
+    {
+        using var root = new CaseRoot();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(new ScriptedWorkload()).WithHeadless().WithDimensions(40, 10).Build();
+        var diagnostics = new TerminalDiagnostics(terminal);
+        Task<DiagnosticCaseResult>? stop = null;
+        var completedBeforeStart = false;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.AfterArmForTesting.Value = () =>
+        {
+            // Another client's stop arrives between the arming and the writer's start.
+            stop = Task.Run(() => diagnostics.StopCaseAsync());
+            Thread.Sleep(300);
+            completedBeforeStart = stop.IsCompleted;
+        };
+        DiagnosticCaseResult started;
+        try
+        {
+            started = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path });
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.AfterArmForTesting.Value = null;
+        }
+
+        Assert.IsFalse(completedBeforeStart, "the stop returned before the case's writer had even started");
+        var stopped = await stop!.WaitAsync(TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
+        Assert.AreEqual((DiagnosticCaseState.Stopped, true), (stopped.State, File.Exists(Path.Combine(started.Path!, "completion.json"))));
+    }
+
+    [TestMethod]
+    public async Task Ingress_OnlyThePumpTakesItsBytes()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        var filter = new HoldingFilter();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .AddWorkloadFilter(filter)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        DiagnosticCaseResult stopped;
+        using (new Running(terminal))
+        {
+            filter.Arm();
+            workload.Enqueue("PUMP-ITEM-BYTES"u8.ToArray());
+            Assert.IsTrue(filter.Held.Wait(TimeSpan.FromSeconds(10)), "fixture: the pump never held the item");
+            // Another thread applies to the model while the pump holds its item's bytes.
+            terminal.EnterAlternateScreen();
+            filter.Release.Set();
+            await WaitAsync(() => terminal.CurrentModelSequence >= 2);
+            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var model = Artifact.Read(stopped.Path!).ModelEvents();
+        Assert.AreEqual("application-without-ingress", model[0].GetProperty("kind").GetString(), "the other thread's application took the pump's bytes");
+        Assert.AreEqual("PUMP-ITEM-BYTES", Encoding.UTF8.GetString(Convert.FromBase64String(model[1].GetProperty("data").GetString()!)));
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void Storage_RefusesARootOwnedByAnotherUser()
+    {
+        if (!OperatingSystem.IsLinux() || Environment.UserName == "root")
+            Assert.Inconclusive("Needs a non-root Linux user.");
+        // /proc/1/fd is init's: owner-only (0500) and owned by root.
+        const string foreign = "/proc/1/fd";
+        Assert.AreEqual(UnixFileMode.None, File.GetUnixFileMode(foreign) & ~(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute),
+            "fixture: the foreign root is not owner-only, so the mode check would refuse it first");
+        StringAssert.Contains(Hex1b.Diagnostics.Cases.CaseStorage.CheckRoot(foreign), "not owned by the current user");
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Reader_UnreadableOrIncompleteManifestIsAStructuredFailure()
+    {
+        if (!OperatingSystem.IsLinux() || Environment.UserName == "root")
+            Assert.Inconclusive("Needs Unix permissions enforced for this user.");
+        using var root = new CaseRoot();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(new ScriptedWorkload()).WithHeadless().WithDimensions(40, 10)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Build();
+        var stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        var manifest = Path.Combine(stopped.Path!, "manifest.json");
+
+        var node = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(manifest))!;
+        node["checkpoint"] = null;
+        File.WriteAllText(manifest, node.ToJsonString());
+        var incomplete = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! });
+        Assert.AreEqual((DiagnosticOutcome.Failed, "invalid-artifact"), (incomplete.Outcome, incomplete.Problem?.Code));
+
+        File.SetUnixFileMode(manifest, UnixFileMode.None);
+        var unreadable = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! });
+        File.SetUnixFileMode(manifest, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        Assert.AreEqual((DiagnosticOutcome.Failed, "unreadable-artifact"), (unreadable.Outcome, unreadable.Problem?.Code));
+    }
+
     private const int CaseEventQueueMax = Hex1b.Diagnostics.Cases.CaseEventQueue.MaxEvents;
 
     // Records the chunks with the writer held until the pump has applied them all, then stops.

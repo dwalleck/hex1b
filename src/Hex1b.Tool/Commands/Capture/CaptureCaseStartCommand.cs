@@ -46,8 +46,7 @@ internal sealed class CaptureCaseStartCommand : BaseCommand
         DiagnosticContractNames.ParseCaseStartRequest(
             parseResult.GetValue(MaxBytesOption),
             parseResult.GetValue(MaxSecondsOption),
-            parseResult.GetValue(AuthorizeOption)?
-                .SelectMany(value => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)),
+            parseResult.GetValue(AuthorizeOption),
             parseResult.GetValue(DirOption));
 
     protected override async Task<int> ExecuteAsync(ParseResult parseResult, CancellationToken cancellationToken)

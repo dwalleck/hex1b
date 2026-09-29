@@ -848,6 +848,14 @@ public class CaptureContractCliTests
         var badLaunch = await RunCliAsync("terminal", "start", "--record-case", "--case-authorize", "bogus", "--", "/bin/true");
         Assert.AreEqual((1, true), (orphan.ExitCode, orphan.Stderr.Contains("require --record-case", StringComparison.Ordinal)), orphan.Stderr);
         Assert.AreEqual((1, true), (badLaunch.ExitCode, badLaunch.Stderr.Contains("unsupported-authorization", StringComparison.Ordinal)), badLaunch.Stderr);
+        var badBounds = await RunCliAsync("terminal", "start", "--record-case", "--case-max-bytes", "5", "--", "/bin/true");
+        Assert.AreEqual((1, true), (badBounds.ExitCode, badBounds.Stderr.Contains("invalid-bounds", StringComparison.Ordinal)), badBounds.Stderr);
+        Assert.IsFalse(badBounds.Stderr.Contains("Host process", StringComparison.Ordinal), "invalid bounds spawned a host before being refused");
+
+        // Every client splits comma-separated authorizations the same way, the internal host command included.
+        var hostList = await RunCliAsync("terminal", "host", "--record-case", "--case-authorize", "bogus,reapplication-data", "--", "/bin/true");
+        Assert.AreEqual(1, hostList.ExitCode, hostList.Stderr);
+        StringAssert.Contains(hostList.Stderr, "'bogus'");
     }
 
     [TestMethod]

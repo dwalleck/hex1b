@@ -30,9 +30,32 @@ internal static class CaseStorage
             return $"The case directory root is a link: '{root}'.";
         if (File.Exists(root))
             return $"The case directory root is not a directory: '{root}'.";
-        if (info.Exists && !OperatingSystem.IsWindows() && (File.GetUnixFileMode(root) & ~DirectoryMode) != 0)
-            return $"The case directory root is accessible to group or others: '{root}'.";
+        if (info.Exists && !OperatingSystem.IsWindows())
+        {
+            var mode = File.GetUnixFileMode(root);
+            if ((mode & ~DirectoryMode) != 0)
+                return $"The case directory root is accessible to group or others: '{root}'.";
+            if (!OwnedByCurrentUser(root, mode))
+                return $"The case directory root is not owned by the current user: '{root}'.";
+        }
+
         return null;
+    }
+
+    // Only a file's owner (or the superuser) may change its mode, so setting the mode it already has is an
+    // ownership check that changes nothing and needs no native call.
+    [UnsupportedOSPlatform("windows")]
+    private static bool OwnedByCurrentUser(string path, UnixFileMode mode)
+    {
+        try
+        {
+            File.SetUnixFileMode(path, mode);
+            return true;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     /// <summary>Creates the root if absent and the case's own directory, both owner-only and verified.</summary>

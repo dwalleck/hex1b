@@ -82,7 +82,7 @@ public class DiagnosticCaseTools(TerminalSessionManager sessionManager)
     internal static (DiagnosticCaseStartRequest? Request, DiagnosticCaseResult? Invalid) ParseStart(long? maxBytes, int? maxSeconds,
         string? authorize, string? directory) =>
         DiagnosticContractNames.ParseCaseStartRequest(maxBytes, maxSeconds,
-            authorize?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries), directory);
+            authorize is null ? null : [authorize], directory);
 
     internal static JsonElement ToJson(DiagnosticCaseResult result) =>
         JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticCaseResult);

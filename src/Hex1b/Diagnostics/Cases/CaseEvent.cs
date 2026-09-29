@@ -14,11 +14,12 @@ internal readonly record struct CaseEvent(
     int? Height,
     int? Length,
     byte[]? Payload,
-    object? Detail = null)
+    object? Detail = null,
+    int DetailBytes = 0)
 {
-    // A frame projection's size is unknown until serialized; it is charged a fixed estimate.
-    private const int FrameEstimate = 4096;
-
-    /// <summary>What the event costs the queue's byte bound: a fixed record overhead plus its payload.</summary>
-    public int QueuedBytes => 128 + (Payload?.Length ?? 0) + (Detail is DiagnosticCaseFrameEvent ? FrameEstimate : 0);
+    /// <summary>
+    /// What the event costs the queue's byte bound: a fixed record overhead, its payload, and the retained
+    /// size of its detail (a frame projection's estimate, <see cref="CaseFrameSize"/>).
+    /// </summary>
+    public int QueuedBytes => 128 + (Payload?.Length ?? 0) + DetailBytes;
 }

@@ -93,9 +93,14 @@ public sealed partial class Hex1bTerminal
 
     // The pump item's original bytes, from its read until the model applies it (or the item ends
     // unapplied). Held whether or not a case is active, so a case started between an item's read and
-    // its application still records it: field writes only, no copy.
+    // its application still records it: field writes only, no copy. Only an application on the output
+    // pump's own async flow takes them: any other application (another thread, or after the pump ended)
+    // is recorded without ingress and leaves them alone. The flow is marked once per pump run.
+    private static readonly AsyncLocal<Hex1bTerminal?> s_caseIngressPump = new();
     private ReadOnlyMemory<byte> _caseIngress;
     private bool _caseIngressPending;
+
+    private void EnterCaseIngressPump() => s_caseIngressPump.Value = this;
 
     private void StashCaseIngress(ReadOnlyMemory<byte> data)
     {
@@ -114,24 +119,34 @@ public sealed partial class Hex1bTerminal
     // driven by the pump) is recorded as such.
     private void NotifyCaseApplicationUnsafe()
     {
-        var pending = _caseIngressPending;
-        var ingress = _caseIngress;
-        ClearCaseIngress();
-        _diagnosticCase?.RecordApplication(_modelSequence, _width, _height, pending, ingress.Span);
+        var pump = ReferenceEquals(s_caseIngressPump.Value, this);
+        var pending = pump && _caseIngressPending;
+        var ingress = pump ? _caseIngress : default;
+        if (pump)
+            ClearCaseIngress();
+        _diagnosticCase?.BeginApplication(_modelSequence, _width, _height, pending, ingress.Span);
     }
 
     // Must hold _bufferLock, at the end of an application: graphics resources or placements are state
     // the text checkpoint cannot represent, so re-applicable coverage ends at this application.
-    private void NotifyCaseApplicationEndUnsafe()
-    {
-        if (_diagnosticCase is { } recorder && (_kgpGraphicsState.HasResidentState || _sixelGraphicsState.HasResidentState))
-            recorder.EndInterval(_modelSequence, "graphics");
-    }
+    private void NotifyCaseApplicationEndUnsafe() =>
+        _diagnosticCase?.EndApplication(_kgpGraphicsState.HasResidentState || _sixelGraphicsState.HasResidentState);
 
     // Must hold _bufferLock, right after the model sequence advanced for this event.
     private void NotifyCaseModelEventUnsafe(string kind, int width, int height) =>
         _diagnosticCase?.RecordModelEvent(kind, _modelSequence, width, height);
 
     // Must hold _bufferLock: disposal ends the case before it resets any model state.
-    private void NotifyCaseDisposedUnsafe() => _diagnosticCase?.RequestStop(DiagnosticCaseStopReason.TargetDisposed);
+    private void NotifyCaseDisposedUnsafe()
+    {
+        _disposedCase = _diagnosticCase;
+        _disposedCase?.RequestStop(DiagnosticCaseStopReason.TargetDisposed);
+    }
+
+    // The case disposal stopped. Disposal waits for it (at most the drain bound), so a process that exits
+    // right after disposing its terminal still leaves a finished artifact.
+    private DiagnosticCaseRecorder? _disposedCase;
+
+    private Task WaitForDisposedCaseAsync() =>
+        _disposedCase?.StopAsync(DiagnosticCaseStopReason.TargetDisposed) ?? Task.CompletedTask;
 }

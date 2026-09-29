@@ -706,12 +706,10 @@ public sealed class TerminalDiagnostics
     {
         ArgumentNullException.ThrowIfNull(request);
         // Every validation precedes any change to the filesystem or the terminal.
+        if (CaseBoundsProblem(request.MaxBytes, request.MaxSeconds) is { } invalidBounds)
+            return invalidBounds;
         var maxBytes = request.MaxBytes ?? Diagnostics.Cases.DiagnosticCaseRecorder.DefaultMaxBytes;
-        if (maxBytes is < Diagnostics.Cases.DiagnosticCaseRecorder.MinMaxBytes or > Diagnostics.Cases.DiagnosticCaseRecorder.MaxMaxBytes)
-            return CaseProblem(DiagnosticOutcome.InvalidRequest, "invalid-bounds", "maxBytes must be 1 MiB to 1 GiB.");
         var maxSeconds = request.MaxSeconds ?? Diagnostics.Cases.DiagnosticCaseRecorder.DefaultMaxSeconds;
-        if (maxSeconds is < Diagnostics.Cases.DiagnosticCaseRecorder.MinMaxSeconds or > Diagnostics.Cases.DiagnosticCaseRecorder.MaxMaxSeconds)
-            return CaseProblem(DiagnosticOutcome.InvalidRequest, "invalid-bounds", "maxSeconds must be 1 to 86,400.");
         var authorizations = request.Authorizations ?? [];
         foreach (var authorization in authorizations)
         {
@@ -798,6 +796,7 @@ public sealed class TerminalDiagnostics
                 : CaseProblem(DiagnosticOutcome.Unavailable, "target-disposed", "The terminal has been disposed.");
         }
 
+        Diagnostics.Cases.DiagnosticCaseRecorder.AfterArmForTesting.Value?.Invoke();
         recorder.Start();
         return recorder.Describe();
     }
@@ -840,6 +839,16 @@ public sealed class TerminalDiagnostics
     /// <summary>The frame without its focused editor's text, which only editor-text authorizes.</summary>
     internal static DiagnosticApplicationFrame WithoutEditorText(DiagnosticApplicationFrame frame) =>
         frame.FocusedEditor is { Text: not null } editor ? frame with { FocusedEditor = editor with { Text = null } } : frame;
+
+    /// <summary>Why a case's bounds are invalid, or null; shared by the engine and its clients.</summary>
+    internal static DiagnosticCaseResult? CaseBoundsProblem(long? maxBytes, int? maxSeconds)
+    {
+        if (maxBytes is < Diagnostics.Cases.DiagnosticCaseRecorder.MinMaxBytes or > Diagnostics.Cases.DiagnosticCaseRecorder.MaxMaxBytes)
+            return CaseProblem(DiagnosticOutcome.InvalidRequest, "invalid-bounds", "maxBytes must be 1 MiB to 1 GiB.");
+        if (maxSeconds is < Diagnostics.Cases.DiagnosticCaseRecorder.MinMaxSeconds or > Diagnostics.Cases.DiagnosticCaseRecorder.MaxMaxSeconds)
+            return CaseProblem(DiagnosticOutcome.InvalidRequest, "invalid-bounds", "maxSeconds must be 1 to 86,400.");
+        return null;
+    }
 
     internal static DiagnosticCaseResult CaseProblem(DiagnosticOutcome outcome, string code, string message) => new()
     {

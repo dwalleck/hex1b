@@ -40,34 +40,44 @@ internal static class CaseArtifactReader
             return Problem(DiagnosticOutcome.Failed, "invalid-artifact", "The case has no manifest.") with { Path = path };
 
         DiagnosticCaseManifest? manifest;
-        try
-        {
-            manifest = JsonSerializer.Deserialize(File.ReadAllBytes(manifestPath), DiagnosticsJsonContext.Default.DiagnosticCaseManifest);
-        }
-        catch (JsonException error)
-        {
-            return Problem(DiagnosticOutcome.Failed, "invalid-artifact", $"The manifest is not valid: {error.Message}") with { Path = path };
-        }
-
-        if (manifest is null)
-            return Problem(DiagnosticOutcome.Failed, "invalid-artifact", "The manifest is empty.") with { Path = path };
-        if (manifest.FormatVersion != CaseArtifactWriter.FormatVersion)
-            return Problem(DiagnosticOutcome.Failed, "unsupported-format", $"Artifact format {manifest.FormatVersion} is not supported (expected {CaseArtifactWriter.FormatVersion}).") with { Path = path };
-
-        var scan = Scan(System.IO.Path.Combine(path, CaseArtifactWriter.EventsFile), request.Since ?? 0, request.Limit ?? 0);
-
+        ScanResult scan;
         DiagnosticCaseCompletion? completion = null;
-        var completionPath = System.IO.Path.Combine(path, CaseArtifactWriter.CompletionFile);
-        if (File.Exists(completionPath))
+        try
         {
             try
             {
-                completion = JsonSerializer.Deserialize(File.ReadAllBytes(completionPath), DiagnosticsJsonContext.Default.DiagnosticCaseCompletion);
+                manifest = JsonSerializer.Deserialize(File.ReadAllBytes(manifestPath), DiagnosticsJsonContext.Default.DiagnosticCaseManifest);
             }
-            catch (JsonException)
+            catch (JsonException error)
             {
-                // A completion record that does not parse was never written whole: the case is interrupted.
+                return Problem(DiagnosticOutcome.Failed, "invalid-artifact", $"The manifest is not valid: {error.Message}") with { Path = path };
             }
+
+            // Fields the reader relies on; a hand-edited or damaged manifest may lack them.
+            if (manifest is null || manifest.Checkpoint is null || manifest.Streams is null || manifest.Bounds is null
+                || manifest.Streams.Any(s => s is null))
+                return Problem(DiagnosticOutcome.Failed, "invalid-artifact", "The manifest is empty or incomplete.") with { Path = path };
+            if (manifest.FormatVersion != CaseArtifactWriter.FormatVersion)
+                return Problem(DiagnosticOutcome.Failed, "unsupported-format", $"Artifact format {manifest.FormatVersion} is not supported (expected {CaseArtifactWriter.FormatVersion}).") with { Path = path };
+
+            scan = Scan(System.IO.Path.Combine(path, CaseArtifactWriter.EventsFile), request.Since ?? 0, request.Limit ?? 0);
+
+            var completionPath = System.IO.Path.Combine(path, CaseArtifactWriter.CompletionFile);
+            if (File.Exists(completionPath))
+            {
+                try
+                {
+                    completion = JsonSerializer.Deserialize(File.ReadAllBytes(completionPath), DiagnosticsJsonContext.Default.DiagnosticCaseCompletion);
+                }
+                catch (JsonException)
+                {
+                    // A completion record that does not parse was never written whole: the case is interrupted.
+                }
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return Problem(DiagnosticOutcome.Failed, "unreadable-artifact", $"The case files cannot be read: {error.Message}") with { Path = path };
         }
 
         var state = scan.TruncatedAtLine is not null ? DiagnosticCaseCompletionState.Truncated
@@ -83,7 +93,7 @@ internal static class CaseArtifactReader
             CompletionState = state,
             TruncatedAtLine = scan.TruncatedAtLine,
             LastCaseSequence = scan.LastCaseSequence,
-            Streams = DescribeStreams(manifest, scan),
+            Streams = DescribeStreams(manifest, scan, completion),
             Intervals = DescribeIntervals(manifest, completion, state, scan),
             Events = scan.Page,
         };
@@ -105,8 +115,10 @@ internal static class CaseArtifactReader
         public readonly List<DiagnosticCaseRecord> Recorded = [];
         public readonly List<(long From, long To)> Gaps = [];
         public DiagnosticCaseRecord? Failure;
+        private IReadOnlyList<DiagnosticCaseRecord>? _missing;
 
-        public IReadOnlyList<DiagnosticCaseRecord> Missing =>
+        // Computed once, after the scan.
+        public IReadOnlyList<DiagnosticCaseRecord> Missing => _missing ??=
             Recorded.Concat(Gaps.Where(g => !Recorded.Any(m => m.FromOrdinal <= g.From && (m.ToOrdinal is null || m.ToOrdinal >= g.To)))
                 .Select(g => new DiagnosticCaseRecord { FromOrdinal = g.From, ToOrdinal = g.To, Reason = "unknown" }))
                 .OrderBy(m => m.FromOrdinal).ToList();
@@ -229,11 +241,21 @@ internal static class CaseArtifactReader
             yield return (line.ToArray(), false);
     }
 
-    private static IReadOnlyList<DiagnosticCaseStreamCoverage> DescribeStreams(DiagnosticCaseManifest manifest, ScanResult scan) =>
+    private static IReadOnlyList<DiagnosticCaseStreamCoverage> DescribeStreams(DiagnosticCaseManifest manifest, ScanResult scan,
+        DiagnosticCaseCompletion? completion) =>
         manifest.Streams.Where(s => s.Events == DiagnosticCoverageState.Included).Select(declaration =>
         {
             var stream = scan.Streams.TryGetValue(declaration.Stream, out var found) ? found : new StreamScan();
             var missing = stream.Missing.Select(m => m with { Stream = declaration.Stream }).ToList();
+            // Events the completion counts as offered that were neither written nor declared lost (a collector
+            // that failed before it could say so): an unknown tail, never a complete stream.
+            if (completion?.Streams.FirstOrDefault(s => s?.Stream == declaration.Stream) is { } counts
+                && counts.Offered > counts.Written + counts.Dropped)
+            {
+                var after = Math.Max(stream.Last ?? 0, missing.Select(m => m.ToOrdinal ?? m.FromOrdinal ?? 0).DefaultIfEmpty(0).Max());
+                missing.Add(new DiagnosticCaseRecord { Stream = declaration.Stream, FromOrdinal = after + 1, ToOrdinal = null, Reason = "unaccounted" });
+            }
+
             return new DiagnosticCaseStreamCoverage
             {
                 Stream = declaration.Stream,

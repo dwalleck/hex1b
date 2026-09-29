@@ -83,10 +83,9 @@ internal sealed class TerminalStartCommand : BaseCommand
             return 1;
         }
 
-        // Case options are validated here, before a host is spawned; the host re-validates bounds and storage.
+        // Case options are parsed and their bounds checked here, before a host is spawned; the host checks storage.
         var recordCase = parseResult.GetValue(s_recordCaseOption);
-        var caseAuthorizations = parseResult.GetValue(s_caseAuthorizeOption)?
-            .SelectMany(value => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).ToArray() ?? [];
+        var caseAuthorizations = parseResult.GetValue(s_caseAuthorizeOption) ?? [];
         var caseDir = parseResult.GetValue(s_caseDirOption);
         var caseMaxBytes = parseResult.GetValue(s_caseMaxBytesOption);
         var caseMaxSeconds = parseResult.GetValue(s_caseMaxSecondsOption);

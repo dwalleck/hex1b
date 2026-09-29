@@ -326,9 +326,10 @@ a finished (or broken) artifact offline, without the process that wrote it, with
 | Storage root | `directory` | an owner-only directory | `~/.hex1b/cases` |
 
 The case directory is created under the root with mode 0700, and every file in it with 0600. Both
-modes are verified after creation. An existing root that is group- or world-accessible, a symbolic
-link, or not a directory is refused (`storage-refused`) before anything is written. Without
-`reapplication-data`, the checkpoint is `excluded` and no model bytes are copied.
+modes are verified after creation. An existing root is refused (`storage-refused`) before anything is
+written when it is group- or world-accessible, not owned by the current user, a symbolic link, or not
+a directory. Clients resolve a relative directory against their own working directory, not the
+target's. Without `reapplication-data`, the checkpoint is `excluded` and no model bytes are copied.
 
 ### Result
 
@@ -378,13 +379,21 @@ are unavailable for PTY workloads, and delivery for headless terminals.
   events and never blocks the terminal. Each drop is recorded as a `missing` range (`overload`)
   outside the queue.
 - **Size bound:** the case stops with `size-limit` before a line would cross it. The events it
-  could not write become `size-limit` missing ranges.
+  could not write become `size-limit` missing ranges. Missing ranges count toward the bound too.
+  When they no longer fit, a stream's loss from that point is summarized as one range of unknown
+  extent (`size-limit-unknown-extent`). The artifact, completion record included, never exceeds
+  `maxBytes`.
 - **Time bound:** the case stops with `time-limit`, on the terminal's `TimeProvider`.
 - **Stop drain:** a stop waits at most 10 s for queued events. Anything still unwritten becomes a
   `drain-timeout` missing range.
-- **Failures:** a storage or writer failure stops the case with `collector-failed`, and disposing
-  the terminal stops it with `target-disposed`. A failure inside one stream marks that stream
-  `failed` and the others keep recording.
+- **Failures:** a storage or writer failure stops the case with `collector-failed`. Whatever was
+  not written is declared missing (`collector-failed`) when storage still allows it.
+- **Disposal:** disposing the terminal stops the case with `target-disposed`. Disposal waits (at
+  most the 10 s drain bound) for the artifact to be finished, so a process that exits right after
+  disposing its terminal leaves a complete case.
+- **Stream failures:** a failure inside one stream marks that stream `failed`, and the others keep
+  recording. A model-stream failure also ends the re-applicable interval. It never reaches the
+  terminal operation (output, resize) that raised the event.
 - **Re-applicable interval:** the model interval ends at the first model event the case cannot
   reproduce. That is an application without recorded bytes, graphics state the case does not hold,
   a missing model event, a failed model stream, or the end of the verified file.
@@ -398,12 +407,17 @@ Inspection verifies every line's checksum before using it. It reports:
   verified prefix is every line before it);
 - each stream's event count, ordinal range, `state` (`complete`, `incomplete`, `failed`) and
   `missing` ranges. A gap in ordinals that no recorded range explains is reported with reason
-  `unknown`;
+  `unknown`. Events the completion record counts as offered, but that were neither written nor
+  declared lost, are an `unaccounted` range of unknown extent after the last ordinal;
 - the re-applicable model `intervals`;
 - a page of events: `since` (a case sequence) and `limit` (1–4,096; none by default).
 
 Problem codes: `invalid-path`, `invalid-limit` and `invalid-since` (`invalid-request`);
-`case-not-found` (`unavailable`); `invalid-artifact` and `unsupported-format` (`failed`).
+`case-not-found` (`unavailable`); `invalid-artifact` (a manifest that does not parse or lacks its
+checkpoint, bounds or streams), `unreadable-artifact` and `unsupported-format` (`failed`).
+
+Each inspection reads and verifies the whole artifact, because coverage and the verified prefix
+depend on every line. Paging with `since` does not skip that work.
 
 ## Capabilities
 

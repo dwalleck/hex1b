@@ -79,14 +79,19 @@ internal static class DiagnosticContractNames
     }
 
     /// <summary>
-    /// Builds a case start request from client text; the engine validates the bounds and storage. A relative
+    /// Builds a case start request from client text, the one parser every client uses: authorizations are
+    /// repeatable and comma-separated, bounds are checked as the engine checks them, and a relative
     /// directory is resolved here, in the client, rather than against an attached target's working directory.
+    /// The engine validates again, and alone checks storage.
     /// </summary>
     public static (DiagnosticCaseStartRequest? Request, DiagnosticCaseResult? Invalid) ParseCaseStartRequest(
         long? maxBytes, int? maxSeconds, IEnumerable<string>? authorizations, string? directory)
     {
-        if (!TryParseAuthorizations(authorizations, out var parsed, out var unsupported))
+        var names = authorizations?.SelectMany(value => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        if (!TryParseAuthorizations(names, out var parsed, out var unsupported))
             return (null, TerminalDiagnostics.CaseProblem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", unsupported));
+        if (TerminalDiagnostics.CaseBoundsProblem(maxBytes, maxSeconds) is { } invalidBounds)
+            return (null, invalidBounds);
 
         string? root = null;
         if (!string.IsNullOrWhiteSpace(directory))

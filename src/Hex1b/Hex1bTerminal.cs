@@ -1543,6 +1543,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     private async Task PumpWorkloadOutputAsync(CancellationToken ct)
     {
+        EnterCaseIngressPump();
         try
         {
             while (!ct.IsCancellationRequested)
@@ -8149,6 +8150,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
         _disposeCts.Cancel();
         _disposeCts.Dispose();
+        WaitForDisposedCaseAsync().GetAwaiter().GetResult();
     }
 
     /// <inheritdoc />
@@ -8197,6 +8199,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
         _disposeCts.Cancel();
         _disposeCts.Dispose();
+        await WaitForDisposedCaseAsync();
     }
 
     private bool TryBeginDisposalAndResetScreenOwnedState()
