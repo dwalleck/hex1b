@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Hex1b.Automation;
 using Hex1b.Diagnostics;
 using Hex1b.Diagnostics.Cases;
 using Hex1b.Reflow;
@@ -489,6 +490,75 @@ public partial class DiagnosticCaseTests
         var recorded = JsonDocument.Parse(File.ReadAllText(Path.Combine(result.RunPath!, "recorded.json"))).RootElement;
         Assert.AreEqual(recorded.GetProperty("history").GetProperty("rows").GetArrayLength(), reapplied.GetProperty("history").GetProperty("rows").GetArrayLength());
         Assert.IsGreaterThan(10, reapplied.GetProperty("history").GetProperty("rows").GetArrayLength(), "fixture: little history");
+    }
+
+    [TestMethod]
+    public async Task Reapply_FaultLabelled()
+    {
+        using var root = new CaseRoot();
+        var path = await RecordCaseAsync(root, ReapplicationCorpus, new HeadlessPresentationAdapter(40, 10));
+        var clean = Reapply(path, label: "history");
+        var faulted = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "history", Faults = ["cell-text", "mode"] });
+
+        AssertMatched(clean, "without a fault");
+        Assert.AreNotEqual(clean.RunPath, faulted.RunPath, "a faulted run shared a directory");
+        Assert.AreEqual((DiagnosticOutcome.Captured, "different", true), (faulted.Outcome, faulted.Comparison, faulted.FaultInjected));
+        CollectionAssert.AreEqual(new[] { "cell-text:screen[0][0].text", "mode:modes.wraparound" }, faulted.Faults.Select(f => $"{f.Kind}:{f.Path}").ToArray());
+        CollectionAssert.IsSubsetOf(new[] { "screen[0][0].text", "modes.wraparound" }, faulted.Differences!.Differences.Select(d => d.Path).ToArray());
+
+        // Each run's own result file says the same.
+        var cleanFile = JsonDocument.Parse(File.ReadAllText(Path.Combine(clean.RunPath!, "result.json"))).RootElement;
+        var faultedFile = JsonDocument.Parse(File.ReadAllText(Path.Combine(faulted.RunPath!, "result.json"))).RootElement;
+        Assert.IsFalse(cleanFile.GetProperty("faultInjected").GetBoolean());
+        Assert.AreEqual("matched", cleanFile.GetProperty("comparison").GetString());
+        Assert.IsTrue(faultedFile.GetProperty("faultInjected").GetBoolean());
+        Assert.AreEqual("different", faultedFile.GetProperty("comparison").GetString());
+
+        Assert.AreEqual("invalid-fault", Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "stop", Faults = ["nope"] }).Problem?.Code);
+        var bare = await RecordCaseAsync(root, [new("x")], new HeadlessPresentationAdapter(20, 4), o => o.ScrollbackCapacity = null);
+        var inapplicable = Reapply(new DiagnosticCaseReapplyRequest { Path = bare, ToLabel = "stop", Faults = ["history-rows"] });
+        Assert.AreEqual((DiagnosticOutcome.InvalidRequest, "fault-not-applicable"), (inapplicable.Outcome, inapplicable.Problem?.Code));
+    }
+
+    [TestMethod]
+    public async Task Reapply_Previews()
+    {
+        using var root = new CaseRoot();
+        var path = await RecordCaseAsync(root, ReapplicationCorpus, new HeadlessPresentationAdapter(40, 10));
+        var expected = new Dictionary<string, string>();
+        CaseReapplier.ReconstructedForTesting.Value = replica =>
+        {
+            using var snapshot = replica.CreateSnapshot();
+            expected["reapplied.txt"] = snapshot.GetScreenText();
+            expected["reapplied.ansi"] = snapshot.ToAnsi();
+            expected["reapplied.svg"] = snapshot.ToSvg();
+            expected["reapplied.html"] = snapshot.ToHtml();
+        };
+        DiagnosticCaseReapplyResult result;
+        try
+        {
+            result = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "stop", Previews = ["text", "ansi", "svg", "html"] });
+        }
+        finally
+        {
+            CaseReapplier.ReconstructedForTesting.Value = null;
+        }
+        AssertMatched(result, "previews");
+        foreach (var (name, content) in expected)
+            Assert.AreEqual(content, File.ReadAllText(Path.Combine(result.RunPath!, name)), name);
+        CollectionAssert.IsSubsetOf(expected.Keys.Append("recorded.txt").ToArray(), result.Files.ToArray());
+
+        // The recorded checkpoint's preview is its projection's text: rows of cell text.
+        var recorded = JsonDocument.Parse(File.ReadAllText(Path.Combine(result.RunPath!, "recorded.json"))).RootElement;
+        var rows = recorded.GetProperty("screen").EnumerateArray().Select(RowText);
+        Assert.AreEqual(string.Join("\n", rows), File.ReadAllText(Path.Combine(result.RunPath!, "recorded.txt")));
+        StringAssert.Contains(File.ReadAllText(Path.Combine(result.RunPath!, "recorded.txt")), "colour");
+
+        // Without a checkpoint at the target, only the reconstructed model is previewed.
+        var none = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToModelSequence = 1, Previews = ["text"] });
+        CollectionAssert.Contains(none.Files.ToArray(), "reapplied.txt");
+        CollectionAssert.DoesNotContain(none.Files.ToArray(), "recorded.txt");
+        Assert.AreEqual("invalid-preview", Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "stop", Previews = ["pdf"] }).Problem?.Code);
     }
 
     // --- fixtures ---

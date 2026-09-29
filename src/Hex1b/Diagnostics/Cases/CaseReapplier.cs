@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using Hex1b.Automation;
 
 namespace Hex1b.Diagnostics.Cases;
 
@@ -26,6 +27,12 @@ internal static class CaseReapplier
 
     /// <summary>Receives the detached model once built, while a test has set it.</summary>
     internal static readonly AsyncLocal<Action<Hex1bTerminal>?> ReplicaForTesting = new();
+
+    /// <summary>Receives the detached model once it reached the target, before previews, while a test has set it.</summary>
+    internal static readonly AsyncLocal<Action<Hex1bTerminal>?> ReconstructedForTesting = new();
+
+    /// <summary>The preview formats: the reconstructed model through the existing exporters.</summary>
+    internal static readonly IReadOnlyList<string> PreviewFormats = ["text", "ansi", "svg", "html"];
 
     private static readonly TimeSpan SynchronizedUpdateTimeout = TimeSpan.FromSeconds(1);
 
@@ -164,6 +171,8 @@ internal static class CaseReapplier
                 return Finish(result with { AppliedThrough = applied, Comparison = "different", ComparisonReason = $"The verified events end at model sequence {applied}, before the target {target}." }, run, null, null);
 
             var reconstructed = replica.CaptureModelState();
+            ReconstructedForTesting.Value?.Invoke(replica);
+            var previews = RenderPreviews(replica, request.Previews ?? []);
             var injected = new List<DiagnosticCaseInjectedFault>();
             foreach (var kind in faults)
             {
@@ -174,7 +183,7 @@ internal static class CaseReapplier
                         Outcome = DiagnosticOutcome.InvalidRequest,
                         Problem = new DiagnosticProblem { Code = "fault-not-applicable", Message = faultProblem! },
                         AppliedThrough = applied,
-                    }, run, reconstructed, null);
+                    }, run, reconstructed, null, previews);
                 }
                 reconstructed = faulted;
                 injected.Add(new DiagnosticCaseInjectedFault { Kind = kind, Path = faultPath! });
@@ -198,7 +207,10 @@ internal static class CaseReapplier
                 result = result with { Comparison = comparison.Total == 0 ? "matched" : "different", Differences = comparison };
             }
 
-            return Finish(result, run, reconstructed, recordedState);
+            // The recorded checkpoint's preview is its text, rendered from its projection (approval item 3).
+            if (recordedState is not null && previews.ContainsKey("reapplied.txt"))
+                previews["recorded.txt"] = ProjectionText(recordedState);
+            return Finish(result, run, reconstructed, recordedState, previews);
         }
         catch (Exception error)
         {
@@ -260,6 +272,11 @@ internal static class CaseReapplier
             return Problem(DiagnosticOutcome.InvalidRequest, "invalid-target", "A model sequence is 0 or more, a case sequence 1 or more, and a label is not empty.");
         if (request.MaxDifferences is < 1 or > ModelStateComparer.MaxMaxDifferences)
             return Problem(DiagnosticOutcome.InvalidRequest, "invalid-max-differences", $"maxDifferences must be 1 to {ModelStateComparer.MaxMaxDifferences:N0}.");
+        foreach (var preview in request.Previews ?? [])
+        {
+            if (!PreviewFormats.Contains(preview))
+                return Problem(DiagnosticOutcome.InvalidRequest, "invalid-preview", $"Unknown preview '{preview}'; previews are {string.Join(", ", PreviewFormats)}.");
+        }
         foreach (var fault in request.Faults ?? [])
         {
             if (!ModelStateFault.Kinds.Contains(fault))
@@ -330,8 +347,33 @@ internal static class CaseReapplier
     }
 
     // Writes the run's files: the complete reconstructed and recorded states (when there are any) and the result.
+    // Previews of the reconstructed model, through the existing exporters; a fault changes only the compared
+    // projection, never the model these render.
+    private static Dictionary<string, string> RenderPreviews(Hex1bTerminal replica, IReadOnlyList<string> formats)
+    {
+        var previews = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (formats.Count == 0)
+            return previews;
+        using var snapshot = replica.CreateSnapshot();
+        foreach (var format in formats.Distinct())
+        {
+            previews[$"reapplied.{(format == "text" ? "txt" : format)}"] = format switch
+            {
+                "text" => snapshot.GetScreenText(),
+                "ansi" => snapshot.ToAnsi(),
+                "svg" => snapshot.ToSvg(),
+                _ => snapshot.ToHtml(),
+            };
+        }
+        return previews;
+    }
+
+    // A projection's screen as text: each row's cells in order, rows separated by newlines.
+    internal static string ProjectionText(DiagnosticModelState state) =>
+        string.Join("\n", state.Screen.Select(row => string.Concat(row.Cells.Select(cell => cell.Text))));
+
     private static DiagnosticCaseReapplyResult Finish(DiagnosticCaseReapplyResult result, string run, DiagnosticModelState? reconstructed,
-        DiagnosticModelState? recorded)
+        DiagnosticModelState? recorded, IReadOnlyDictionary<string, string>? previews = null)
     {
         var files = new List<string>();
         void Write(string name, byte[] bytes)
@@ -346,6 +388,8 @@ internal static class CaseReapplier
             Write("reapplied.json", JsonSerializer.SerializeToUtf8Bytes(reconstructed, DiagnosticsJsonContext.Default.DiagnosticModelState));
         if (recorded is not null)
             Write("recorded.json", JsonSerializer.SerializeToUtf8Bytes(recorded, DiagnosticsJsonContext.Default.DiagnosticModelState));
+        foreach (var (name, content) in previews ?? new Dictionary<string, string>())
+            Write(name, System.Text.Encoding.UTF8.GetBytes(content));
         files.Add("result.json");
         var final = result with { Files = files };
         Write("result.json", JsonSerializer.SerializeToUtf8Bytes(final, DiagnosticsJsonContext.Default.DiagnosticCaseReapplyResult));
