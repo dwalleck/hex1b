@@ -99,12 +99,22 @@ public sealed partial class Hex1bTerminal
                 return;
             }
 
-            if (recorder.IsRecording)
+            // Counted in progress from before the recording check until the checkpoint is kept, so a stop racing
+            // this one (a busy stop, or one that takes no checkpoint) never lets the writer close past it.
+            recorder.EnterStopCheckpoint();
+            try
             {
-                var (sequence, capture) = TakeCaseCheckpointUnsafe(recorder, reason == DiagnosticCaseStopReason.SizeLimit);
-                recorder.RecordStopCheckpoint(sequence, capture);
+                if (recorder.IsRecording)
+                {
+                    var (sequence, capture) = TakeCaseCheckpointUnsafe(recorder, reason == DiagnosticCaseStopReason.SizeLimit);
+                    recorder.RecordStopCheckpoint(sequence, capture);
+                }
+                recorder.StopRecording(reason);
             }
-            recorder.StopRecording(reason);
+            finally
+            {
+                recorder.ExitStopCheckpoint();
+            }
         }
         finally
         {

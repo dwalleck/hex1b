@@ -202,13 +202,14 @@ public partial class DiagnosticCaseTests
         var workload = new ScriptedWorkload();
         using var paused = new ManualResetEventSlim();
         var pauseArmed = 0;
+        var resumedOnCondition = false;
         Func<bool>? resumeWhen = null;
         Action pause = () =>
         {
             if (Interlocked.Exchange(ref pauseArmed, 0) == 1)
             {
                 paused.Set();
-                SpinWait.SpinUntil(() => Volatile.Read(ref resumeWhen) is { } resume && resume(), TimeSpan.FromSeconds(10));
+                resumedOnCondition = SpinWait.SpinUntil(() => Volatile.Read(ref resumeWhen) is { } resume && resume(), TimeSpan.FromSeconds(10));
             }
         };
         var hook = afterOffer ? DiagnosticCaseRecorder.AfterModelOfferForTesting : DiagnosticCaseRecorder.BeforeEnqueueForTesting;
@@ -252,6 +253,7 @@ public partial class DiagnosticCaseTests
             release.Set();
             holder.Join();
             Assert.IsTrue(finished, "the stop did not finish");
+            Assert.IsTrue(resumedOnCondition, "fixture: the holder resumed on its time bound, not on the stop");
         }
 
         var artifact = Artifact.Read(path);
@@ -313,6 +315,94 @@ public partial class DiagnosticCaseTests
             stop.GetProperty("modelSequence").GetInt64(), stop.GetProperty("checkpoint").GetProperty("reason").GetString()),
             "the stop checkpoint is not the first claim's alone");
         Assert.AreEqual(0L, (long)pendingField.GetValue(recorder)!, "a losing stop checkpoint's state bytes were not returned");
+    }
+
+    [TestMethod]
+    public async Task Stop_ALockedStopsClaimedCheckpointIsWrittenWhenABusyStopLoses()
+    {
+        // F47: a stop holding the model lock has claimed the stop checkpoint but not yet kept it when a second stop,
+        // busy on that lock, stops the case and loses the claim. The writer must wait for the first to be kept.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        Hex1bTerminal? target = null;
+        var closedEarly = true;
+        var first = 1;
+        DiagnosticCaseRecorder.AfterStopCheckpointClaimForTesting.Value = () =>
+        {
+            if (Interlocked.Exchange(ref first, 0) != 1)
+                return;
+            var recorder = target!.DiagnosticCase!;
+            var busy = Task.Run(() => target.StopDiagnosticCaseWithCheckpoint(recorder, DiagnosticCaseStopReason.TimeLimit));
+            // The busy stop waits out its lock timeout, stops the case and loses; the writer then drains.
+            busy.Wait(TimeSpan.FromSeconds(10));
+            closedEarly = !busy.IsCompleted || recorder.Completion.Wait(TimeSpan.FromMilliseconds(300));
+        };
+        Hex1bTerminal terminal;
+        string path;
+        try
+        {
+            (terminal, path) = Checkpointed(root, workload);
+        }
+        finally
+        {
+            DiagnosticCaseRecorder.AfterStopCheckpointClaimForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            target = terminal;
+            await workload.WriteAndWaitAsync(terminal, "before");
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        Assert.IsFalse(closedEarly, "the writer closed while the claimed stop checkpoint was not yet kept (or the busy stop never finished)");
+        var artifact = Artifact.Read(path);
+        Assert.AreEqual("recorded", StopCheckpoint(artifact).GetProperty("checkpoint").GetProperty("status").GetString());
+        var counts = artifact.Completion!.Value.GetProperty("checkpoints");
+        Assert.AreEqual((1L, 1L), (counts.GetProperty("offered").GetInt64(), counts.GetProperty("written").GetInt64()));
+    }
+
+    [TestMethod]
+    public async Task Stop_BusyStopIsCountedBeforeItsRecordingCheck()
+    {
+        // F48: between a busy stop's recording check and its checkpoint, a stop that takes none (a collector
+        // failure) stops the case. The busy stop, counted before its check, must hold the writer's close.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        DiagnosticCaseRecorder? recorder = null;
+        var closedEarly = true;
+        var first = 1;
+        DiagnosticCaseRecorder.AfterBusyStopCheckForTesting.Value = () =>
+        {
+            if (Interlocked.Exchange(ref first, 0) != 1)
+                return;
+            recorder!.StopRecording(DiagnosticCaseStopReason.CollectorFailed);
+            closedEarly = recorder.Completion.Wait(TimeSpan.FromMilliseconds(500));
+        };
+        Hex1bTerminal terminal;
+        string path;
+        try
+        {
+            (terminal, path) = Checkpointed(root, workload);
+        }
+        finally
+        {
+            DiagnosticCaseRecorder.AfterBusyStopCheckForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            await workload.WriteAndWaitAsync(terminal, "before");
+            recorder = terminal.DiagnosticCase!;
+            await Task.Run(() => recorder.StopWithoutModelLock(DiagnosticCaseStopReason.TimeLimit, "model-lock-busy: fixture"));
+            Assert.IsTrue(recorder.Completion.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken), "the case never completed");
+        }
+
+        Assert.IsFalse(closedEarly, "the writer closed before the busy stop's checkpoint");
+        var artifact = Artifact.Read(path);
+        Assert.AreEqual("model-lock-busy: fixture", StopCheckpoint(artifact).GetProperty("checkpoint").GetProperty("reason").GetString());
+        var counts = artifact.Completion!.Value.GetProperty("checkpoints");
+        Assert.AreEqual((1L, 1L), (counts.GetProperty("offered").GetInt64(), counts.GetProperty("written").GetInt64()));
     }
 
     [TestMethod]

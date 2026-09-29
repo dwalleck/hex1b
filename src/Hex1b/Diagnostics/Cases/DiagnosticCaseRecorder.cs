@@ -84,7 +84,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     internal static readonly AsyncLocal<Action?> BeforeMarkCaptureForTesting = new();
 
     /// <summary>
-    /// Runs on the producer's thread after a model event's offer has returned (its in-flight count released),
+    /// Runs on the producer's thread as a model event's offer ends, just after its in-flight count is released,
     /// taken from the arming flow while a test has set it.
     /// </summary>
     internal static readonly AsyncLocal<Action?> AfterModelOfferForTesting = new();
@@ -231,11 +231,13 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     internal void StopWithoutModelLock(DiagnosticCaseStopReason reason, string checkpointReason)
     {
         // Counted in progress before the recording check (both full fences), as a mark is: either this sees the
-        // case already stopped, or every closing sweep sees this checkpoint in progress and waits for it.
-        Interlocked.Increment(ref _marksInProgress);
+        // case already stopped, or every closing sweep sees this checkpoint in progress and waits for it (up to
+        // its bound).
+        EnterStopCheckpoint();
         try
         {
             var recording = IsRecording;
+            _afterBusyStopCheck?.Invoke();
             StopRecording(reason);
             if (!recording)
                 return;
@@ -244,9 +246,17 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         }
         finally
         {
-            Interlocked.Decrement(ref _marksInProgress);
+            ExitStopCheckpoint();
         }
     }
+
+    /// <summary>
+    /// Runs in <see cref="StopWithoutModelLock"/> after its recording check, taken from the arming flow while a
+    /// test has set it.
+    /// </summary>
+    internal static readonly AsyncLocal<Action?> AfterBusyStopCheckForTesting = new();
+
+    private readonly Action? _afterBusyStopCheck = AfterBusyStopCheckForTesting.Value;
 
     /// <summary>Starts the last offered sequence at the model's sequence when armed (under the model lock).</summary>
     internal void SeedModelSequence(long modelSequence) => Volatile.Write(ref _lastOfferedModelSequence, modelSequence);
@@ -388,7 +398,6 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         try
         {
             Offer(CaseStream.Model, kind, modelSequence, width, height, length, payload, null);
-            _afterModelOffer?.Invoke();
         }
         catch (Exception error)
         {
@@ -531,6 +540,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         finally
         {
             Interlocked.Decrement(ref _offersInFlight);
+            if (stream == CaseStream.Model)
+                _afterModelOffer?.Invoke();
         }
     }
 
@@ -600,7 +611,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// <summary>
     /// Records the stop checkpoint: from a stop holding the model lock (which stops the case in the same hold),
     /// or from a stop that could not take it (<see cref="StopWithoutModelLock"/>). The first claim wins
-    /// atomically, as the two can race; a later one returns its reserved state bytes.
+    /// atomically, as the two can race; a later one returns its reserved state bytes. The caller is counted in
+    /// progress (<see cref="EnterStopCheckpoint"/>) from before its recording check until this returns, so a
+    /// closing sweep never finds a checkpoint claimed but not yet kept.
     /// </summary>
     internal void RecordStopCheckpoint(long modelSequence, CheckpointCapture capture)
     {
@@ -615,6 +628,15 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     }
 
     private int _stopCheckpointClaimed;
+
+    /// <summary>
+    /// Counts a stop's checkpoint in progress, as a mark is, until <see cref="ExitStopCheckpoint"/>: the closing
+    /// sweep waits for it (bounded, as the stop holds the model lock only while it takes its state).
+    /// </summary>
+    internal void EnterStopCheckpoint() => Interlocked.Increment(ref _marksInProgress);
+
+    /// <summary>Ends <see cref="EnterStopCheckpoint"/>.</summary>
+    internal void ExitStopCheckpoint() => Interlocked.Decrement(ref _marksInProgress);
 
     /// <summary>
     /// Runs after a stop checkpoint's claim, before it is kept, taken from the arming flow while a test has
