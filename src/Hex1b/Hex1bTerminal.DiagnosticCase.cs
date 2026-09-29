@@ -173,7 +173,8 @@ public sealed partial class Hex1bTerminal
     {
         // Inside any application (a callback's mark or stop, the lock being re-entrant) the model is half
         // applied. The boundary is the last completed sequence while the case still holds the application
-        // unoffered, and the current one once it was offered early (a nested event flushed it).
+        // unoffered, and the current one otherwise: a nested event offered it early, the case was armed
+        // inside the callback, or its model stream failed.
         if (_captureApplicationDepth > 0)
             return (recorder.ApplicationInProgress ? _modelSequence - 1 : _modelSequence,
                 new(null, null, "unavailable", "mid-application: taken inside an application that had not finished", 0));
