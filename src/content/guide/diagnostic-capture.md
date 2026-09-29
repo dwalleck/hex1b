@@ -312,10 +312,11 @@ Start a case in one of two ways:
   output is projected at the arming, in the same hold of the model lock. The case owns a
   `text-state/1` start checkpoint (a `checkpoint` line labelled `start`, at the arming model
   sequence), and every later model event is recorded after it. The start is `complete` when the
-  model holds only what its restore can represent. Otherwise it is `unsupported`, and
-  `unsupportedSurfaces` names each surface found: `retained-history`, `saved-screen` (the
-  alternate screen is active), `titles`, `command-marks`, `pending-input`, `dcs-continuation`
-  and `graphics`. A start larger than the 256 MiB pending-state budget, or one taken inside an
+  model holds only what its restore can represent: the active screen and its continuation and,
+  on the alternate screen (a Hex1b application, a full-screen program), the saved main screen.
+  Otherwise it is `unsupported`, and `unsupportedSurfaces` names each surface found:
+  `retained-history`, `titles`, `command-marks`, `pending-input`, `dcs-continuation` and
+  `graphics`. A start larger than the 256 MiB pending-state budget, or one taken inside an
   application, is `unsupported` with that reason. The case records either way.
 
 Stop the case with `hex1b capture case stop`, `stop_diagnostic_case`, or `case-stop`. Mark a

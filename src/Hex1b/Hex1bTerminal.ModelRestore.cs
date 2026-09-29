@@ -7,15 +7,18 @@ public sealed partial class Hex1bTerminal
 {
     /// <summary>
     /// Restores a <c>text-state/1</c> projection into this model: the inverse of the model-state projection
-    /// for the active text buffer. Only the case reapplier calls this, on a terminal whose pumps never started.
-    /// The geometry is set through the model's own resize (an empty model, so nothing reflows), then every
-    /// projected field is written in one hold of the model lock. Restored hyperlinks are this model's own
+    /// for the active text buffer and, on the alternate screen, the saved main screen. Only the case reapplier calls
+    /// this, on a terminal whose pumps never started. The geometry is set through the model's own resize (an empty
+    /// model, so nothing reflows). A state on the alternate screen is entered through the model's own entry: the main
+    /// screen's cells are written at the saved screen's geometry, the model enters the alternate screen (which saves
+    /// them, and selects the alternate screen for its graphics and text coordinates), then resizes to the active
+    /// geometry. Every other projected field is then written in one hold of the model lock. Restored hyperlinks are this model's own
     /// tracked objects, and an open synchronized update is re-entered on this model's clock. Identity, clock and
     /// write-order fields keep this model's values, as the census classifies them.
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// The state holds something this restore cannot represent (retained rows, a saved screen, titles, command
-    /// marks, pending input, or an unsupported surface), or the model has already applied output.
+    /// The state holds something this restore cannot represent (retained rows, titles, command marks, pending
+    /// input, or an unsupported surface), or the model has already applied output.
     /// </exception>
     internal void RestoreModelState(DiagnosticModelState state)
     {
@@ -27,21 +30,29 @@ public sealed partial class Hex1bTerminal
                 throw new InvalidOperationException("Only a model that has applied nothing can be restored.");
         }
 
+        var cells = new TerminalCell[state.Styles.Count];
+        var built = new bool[state.Styles.Count];
+        if (state.SavedMainScreen is { } savedMain)
+        {
+            var savedHeight = savedMain.Count;
+            var savedWidth = savedHeight == 0 ? 0 : savedMain[0].Cells.Count;
+            if (savedWidth != _width || savedHeight != _height)
+                Resize(savedWidth, savedHeight);
+            lock (_bufferLock)
+            {
+                RestoreScreenUnsafe(savedMain, state.Styles, cells, built);
+                DoEnterAlternateScreen();
+            }
+        }
+
         if (state.Width != _width || state.Height != _height)
             Resize(state.Width, state.Height);
 
         lock (_bufferLock)
         {
-            // The resize of an empty model moves no text into history; the model is still otherwise fresh.
+            // The resizes of an empty model move no text into history; the model is still otherwise fresh.
             _scrollbackBuffer?.Clear();
-            var cells = new TerminalCell[state.Styles.Count];
-            var built = new bool[state.Styles.Count];
-            for (var row = 0; row < state.Height; row++)
-            {
-                var projected = state.Screen[row].Cells;
-                for (var column = 0; column < state.Width; column++)
-                    SetCell(row, column, RestoreCell(projected[column], state.Styles, cells, built), damageSixel: false);
-            }
+            RestoreScreenUnsafe(state.Screen, state.Styles, cells, built);
 
             _cursorX = state.Cursor.X;
             _cursorY = state.Cursor.Y;
@@ -120,6 +131,18 @@ public sealed partial class Hex1bTerminal
         }
     }
 
+    // Writes projected rows into the active screen buffer, which has their geometry.
+    private void RestoreScreenUnsafe(IReadOnlyList<DiagnosticModelRow> rows, IReadOnlyList<DiagnosticModelStyle> styles,
+        TerminalCell[] cells, bool[] built)
+    {
+        for (var row = 0; row < rows.Count; row++)
+        {
+            var projected = rows[row].Cells;
+            for (var column = 0; column < projected.Count; column++)
+                SetCell(row, column, RestoreCell(projected[column], styles, cells, built), damageSixel: false);
+        }
+    }
+
     // The first field of a state this restore cannot represent, or null. The case's start policy
     // decides what a start checkpoint may hold; this is the restore's own precondition.
     private static string? UnrestorableField(DiagnosticModelState state)
@@ -128,8 +151,10 @@ public sealed partial class Hex1bTerminal
             return $"profile '{state.Profile}'";
         if (state.History is { Rows.Count: > 0 })
             return "retained history rows";
-        if (state.SavedMainScreen is not null || state.ActiveBuffer != "main")
-            return "a saved main screen";
+        if ((state.SavedMainScreen is not null) != (state.ActiveBuffer == "alternate") || state.ActiveBuffer is not ("main" or "alternate"))
+            return $"an active buffer '{state.ActiveBuffer}' that does not match its saved main screen";
+        if (state.SavedMainScreen is { Count: > 0 } saved && saved.Any(row => row.Cells.Count != saved[0].Cells.Count))
+            return "a saved main screen whose rows do not share one width";
         if (state.Titles.Window.Length > 0 || state.Titles.Icon.Length > 0 || state.Titles.Stack.Count > 0)
             return "titles";
         if (state.CommandMarks.Count > 0)

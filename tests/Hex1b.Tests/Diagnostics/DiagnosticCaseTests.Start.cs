@@ -303,6 +303,33 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
+    public async Task Reapply_LiveStartHex1bApplication()
+    {
+        // A Hex1b application runs on the alternate screen; started without a case, its start restores both screens.
+        using var root = new CaseRoot();
+        await using var app = await TrackedApp.StartAsync();
+        await app.Terminal.SendInputAsync(Encoding.UTF8.GetBytes("before the case"));
+        await Settle(app.Terminal);
+        var appStarted = app.Diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] });
+        Assert.AreEqual("complete", appStarted.Checkpoint?.Status is { } status ? DiagnosticContractNames.Of(status) : null,
+            $"fixture: the application's start is not restorable: {appStarted.Checkpoint?.Reason}");
+        await app.Terminal.SendInputAsync(Encoding.UTF8.GetBytes(" typed after"));
+        await Settle(app.Terminal);
+        Assert.AreEqual(DiagnosticOutcome.Captured, app.Diagnostics.MarkCase("typed").Outcome);
+        // A resize on the alternate screen re-renders the application.
+        app.Terminal.Resize(30, 6);
+        await Settle(app.Terminal);
+        Assert.AreEqual(DiagnosticOutcome.Captured, app.Diagnostics.MarkCase("resized").Outcome);
+        await app.Diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+        var artifact = Artifact.Read(appStarted.Path!);
+        Assert.IsNotEmpty(artifact.ModelEvents(), "fixture: the application wrote nothing after the start");
+        var startState = artifact.Events.First(e => e.GetProperty("stream").GetString() == "case").GetProperty("checkpoint").GetProperty("state");
+        Assert.AreEqual("alternate", startState.GetProperty("activeBuffer").GetString(), "fixture: the application's start is not on the alternate screen");
+        foreach (var label in new[] { "start", "typed", "resized", "stop" })
+            AssertMatched(Reapply(appStarted.Path!, label: label), $"app {label}");
+    }
+
+    [TestMethod]
     [DataRow(false)]
     [DataRow(true)]
     public async Task Start_PartitionsInFlightApplicationAndResize(bool resizeFirst)

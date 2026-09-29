@@ -2,9 +2,9 @@ namespace Hex1b.Diagnostics.Cases;
 
 /// <summary>
 /// The <c>text-state/1</c> start checkpoint of a case started on a terminal that has already applied output:
-/// which state surfaces a start may hold. The active text buffer and its continuation are restored; retained
-/// history, a saved screen, titles, command marks, pending input and graphics are refused while present, until
-/// their tickets extend the surface (10, 11, 12; graphics are outside the text profile).
+/// which state surfaces a start may hold. The active text buffer, its continuation and, on the alternate screen, the
+/// saved main screen are restored; retained history, titles, command marks, pending input and graphics are refused
+/// while present, until their tickets extend the surface (10, 11, 12; graphics are outside the text profile).
 /// </summary>
 internal static class StartCheckpoint
 {
@@ -44,8 +44,6 @@ internal static class StartCheckpoint
         var surfaces = new List<string>();
         if (state.History is { Rows.Count: > 0 })
             surfaces.Add("retained-history");
-        if (state.SavedMainScreen is not null || state.ActiveBuffer != "main")
-            surfaces.Add("saved-screen");
         if (state.Titles.Window.Length > 0 || state.Titles.Icon.Length > 0 || state.Titles.Stack.Count > 0)
             surfaces.Add("titles");
         if (state.CommandMarks.Count > 0)

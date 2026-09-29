@@ -102,6 +102,44 @@ public class DiagnosticModelRestoreTests
         Assert.AreEqual(Digest(original), Digest(replica), $"{field}: the public views differ after the revealing input");
     }
 
+    // A start on the alternate screen (evidence P9): both screens restored, entered through the model's own entry, so
+    // leaving it, resizing while on it and writing on it agree with the original.
+    [TestMethod]
+    [DataRow("leave", false, 0, 0, "\u001b[?1049lmain after")]
+    [DataRow("resize then leave", false, 30, 8, "\u001b[?1049l after")]
+    [DataRow("grow then leave", false, 50, 12, "\u001b[?1049l after")]
+    [DataRow("write on it", false, 0, 0, "alt more\r\nnext")]
+    [DataRow("resized before the start, grow then leave", true, 50, 12, "\u001b[?1049l after")]
+    public void ModelRestore_AlternateScreenReproducesLeaving(string name, bool resizedBeforeStart, int width, int height, string reveal)
+    {
+        var original = Detached(new FakeTimeProvider());
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(
+            "\u001b[1;32mmain text\u001b[m\r\n\u001b]8;;https://x.test/m\u001b\\linked\u001b]8;;\u001b\\\u001b[5;5Hcur\u001b[?1049h\u001b[Halt text"));
+        if (resizedBeforeStart)
+            original.Resize(30, 8);
+        var state = original.CaptureModelState();
+        Assert.IsNotNull(state.SavedMainScreen, "fixture: the start is not on the alternate screen");
+        Assert.IsEmpty(StartCheckpoint.Unsupported(state), "fixture: the start is not restorable");
+
+        var replica = Detached(new FakeTimeProvider());
+        replica.RestoreModelState(state);
+        var start = JsonDifferences(Json(state), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(start, $"{name}: the restored start differs: " + string.Join("; ", start.Take(5)));
+        // Oracle: the model's own alternate-screen bookkeeping, read directly.
+        Assert.AreEqual(AlternateBookkeeping(original), AlternateBookkeeping(replica), $"{name}: the replica did not enter the alternate screen as the model does");
+
+        if (width > 0)
+        {
+            original.Resize(width, height);
+            replica.Resize(width, height);
+        }
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(reveal));
+        replica.ApplyRecordedOutput(Encoding.UTF8.GetBytes(reveal));
+        var after = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(after, $"{name}: after the revealing input the restored model differs: " + string.Join("; ", after.Take(5)));
+        Assert.AreEqual(Digest(original), Digest(replica), $"{name}: the public views differ after the revealing input");
+    }
+
     [TestMethod]
     public void ModelRestore_HyperlinksLiveInReplicaStore()
     {
@@ -151,7 +189,7 @@ public class DiagnosticModelRestoreTests
     [TestMethod]
     [DataRow("", "plain\r\n", "")]
     [DataRow("retained-history", "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9\r\n10\r\n11\r\n12\r\n", "_scrollbackBuffer")]
-    [DataRow("saved-screen", "main\u001b[?1049halt", "_savedMainScreenBuffer")]
+    [DataRow("", "main\u001b[?1049halt", "_savedMainScreenBuffer")]
     [DataRow("titles", "\u001b]2;T\u0007", "_windowTitle")]
     [DataRow("titles", "\u001b]1;I\u0007", "_iconName")]
     [DataRow("titles", "\u001b]22;\u0007", "_titleStack")]
@@ -217,6 +255,17 @@ public class DiagnosticModelRestoreTests
         TimeProvider = clock,
         DeferStart = true,
     });
+
+    // Where the model records that the alternate screen is selected: both graphics states and the saved main text
+    // coordinates (evidence P9).
+    private static string AlternateBookkeeping(Hex1bTerminal terminal)
+    {
+        object? Field(object target, string name) =>
+            target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(target);
+        var kgp = Field(terminal, "_kgpGraphicsState")!;
+        var sixel = Field(terminal, "_sixelGraphicsState")!;
+        return $"kgp={Field(kgp, "_alternateActive")} sixel={Field(sixel, "_alternateActive")} savedRows={Field(terminal, "_savedMainTextRowIds") is not null}";
+    }
 
     private static TrackedObjectStore Store(Hex1bTerminal terminal) =>
         (TrackedObjectStore)typeof(Hex1bTerminal).GetField("_trackedObjects", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(terminal)!;
