@@ -59,6 +59,12 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// </summary>
     internal static readonly AsyncLocal<Exception?> PersistentLossFaultForTesting = new();
 
+    /// <summary>
+    /// Runs on the writer after a failure marked the stop and before it declares what was not written (a static
+    /// hook, read at that moment, since the writer does not run on the test's flow).
+    /// </summary>
+    internal static readonly StrongBox<Action<DiagnosticCaseRecorder>?> AfterStopMarkForTesting = new();
+
     /// <summary>An exception the writer's disposal throws, taken from the arming flow while a test has set it.</summary>
     internal static readonly AsyncLocal<Exception?> WriterDisposeFaultForTesting = new();
 
@@ -422,11 +428,11 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     internal void RequestStop(DiagnosticCaseStopReason reason)
     {
         Interlocked.CompareExchange(ref _stopReason, (int)reason, -1);
-        if (Interlocked.CompareExchange(ref _state, Stopping, Recording) == Recording)
-        {
+        // Marked before the state changes, so a writer that sees the stop always sees the mark (first mark wins).
+        if (Volatile.Read(ref _state) == Recording)
             MarkDeliveryAtStop();
+        if (Interlocked.CompareExchange(ref _state, Stopping, Recording) == Recording)
             _signal.Release();
-        }
     }
 
     // The last delivery record the terminal made before the case stopped; later records are not the case's.
@@ -482,8 +488,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                     // the terminal made before the stop included.
                     RequestStop(DiagnosticCaseStopReason.SizeLimit);
                     WaitForOffersInFlight();
-                    if (!drained)
-                        DeclareUnpulledDelivery("size-limit");
+                    DeclareUnpulledDelivery("size-limit");
                     DiscardQueued("size-limit");
                     break;
                 }
@@ -512,10 +517,11 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             // unaccounted events.
             Interlocked.Exchange(ref _stopReason, (int)DiagnosticCaseStopReason.CollectorFailed);
             // A full fence, as RequestStop's: an offer counts itself in flight before it reads the state.
-            if (Interlocked.Exchange(ref _state, Stopping) == Recording)
-                MarkDeliveryAtStop();
+            MarkDeliveryAtStop();
+            Interlocked.Exchange(ref _state, Stopping);
             _stoppedAt ??= _timeProvider.GetUtcNow();
             WaitForOffersInFlight();
+            AfterStopMarkForTesting.Value?.Invoke(this);
             // Separately, so a failure declaring one leaves the other to be declared (or reported unaccounted).
             try
             {
@@ -582,30 +588,39 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         if (last <= _deliverySince)
             return;
         // Offered first (the terminal made them), dropped once declared, as for the queue.
-        Interlocked.Add(ref _offered[(int)CaseStream.Delivery], last - _deliverySince);
-        WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = _deliverySince + 1, ToOrdinal = last, Reason = reason }, RangeLimit);
-        Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], last - _deliverySince);
+        var count = last - _deliverySince;
+        Interlocked.Add(ref _offered[(int)CaseStream.Delivery], count);
+        WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = _deliverySince + 1, ToOrdinal = last, Reason = reason }, RangeLimit,
+            () => Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], count));
         _deliverySince = last;
     }
 
     private void WriteClosingRecords()
     {
+        // Whatever delivery the terminal made before the stop and the writer did not settle (evicted from the
+        // ring, or behind a write still in progress at the last pull) is declared, on every stop path.
+        DeclareUnpulledDelivery("not-pulled");
         WriteIntervalEndIfPending(long.MaxValue);
         WriteLoss(final: true);
         WriteStreamFailures();
-        // Missing ranges that did not fit under the size bound: one range of unknown extent per stream.
+        // Missing ranges that did not fit under the size bound: one range of unknown extent per stream. Their
+        // counts are declared only once the summary is written; a summary that fails leaves them unaccounted.
         for (var index = 0; index < StreamCount; index++)
         {
             if (_undescribedFrom[index] is not { } from)
                 continue;
-            _undescribedFrom[index] = null;
-            AppendCase("missing", null, new DiagnosticCaseRecord
+            if (!AppendCase("missing", null, new DiagnosticCaseRecord
             {
                 Stream = CaseArtifactWriter.StreamName((CaseStream)index),
                 FromOrdinal = from,
                 ToOrdinal = null,
                 Reason = "size-limit-unknown-extent",
-            }, ClosingLimit);
+            }, ClosingLimit))
+                continue;
+            _undescribedFrom[index] = null;
+            foreach (var declared in _deferredDeclarations[index] ?? [])
+                declared();
+            _deferredDeclarations[index] = null;
         }
     }
 
@@ -650,8 +665,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         foreach (var (stream, list) in ranges)
             foreach (var (from, to) in list)
             {
-                WriteMissing(new DiagnosticCaseRecord { Stream = CaseArtifactWriter.StreamName(stream), FromOrdinal = from, ToOrdinal = to, Reason = reason }, RangeLimit);
-                Interlocked.Add(ref _dropped[(int)stream], to - from + 1);
+                var index = (int)stream;
+                WriteMissing(new DiagnosticCaseRecord { Stream = CaseArtifactWriter.StreamName(stream), FromOrdinal = from, ToOrdinal = to, Reason = reason }, RangeLimit,
+                    () => Interlocked.Add(ref _dropped[index], to - from + 1));
             }
         WriteClosingRecords();
     }
@@ -670,15 +686,25 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
 
     // A missing range must fit below its tier. One that does not stops the case at its size bound, and its
     // stream's loss from there is summarized as one range of unknown extent when the case closes.
-    private void WriteMissing(DiagnosticCaseRecord record, long limit)
+    // `declared` counts the range; it runs once the range is in the artifact: at once, or when the summary
+    // that covers it is written.
+    private void WriteMissing(DiagnosticCaseRecord record, long limit, Action declared)
     {
         var index = StreamIndex(record.Stream);
         if (_undescribedFrom[index] is null && AppendCase("missing", null, record, limit))
+        {
+            declared();
             return;
+        }
+
         if (_undescribedFrom[index] is not { } from || record.FromOrdinal < from)
             _undescribedFrom[index] = record.FromOrdinal;
+        (_deferredDeclarations[index] ??= []).Add(declared);
         RequestStop(DiagnosticCaseStopReason.SizeLimit);
     }
+
+    // Per stream, the counts of ranges waiting for their summary line.
+    private readonly List<Action>?[] _deferredDeclarations = new List<Action>?[StreamCount];
 
     // Writes one queued event; false (nothing written) when it would cross the size bound.
     private bool Write(in CaseEvent item)
@@ -763,18 +789,19 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 throw fault;
             if (_persistentLossFault is { } persistent)
                 throw persistent;
-            WriteMissing(record, final ? RangeLimit : EventLimit);
             var index = StreamIndex(record.Stream);
-            if (record.ToOrdinal is { } to)
+            WriteMissing(record, final ? RangeLimit : EventLimit, () =>
             {
-                Interlocked.Add(ref _undeclaredOverload[index], -(to - (record.FromOrdinal ?? to) + 1));
-            }
-            else
-            {
-                Volatile.Write(ref _overloadUnknownDeclared[index], true);
-                Interlocked.Exchange(ref _undeclaredOverload[index], 0);
-            }
-
+                if (record.ToOrdinal is { } to)
+                {
+                    Interlocked.Add(ref _undeclaredOverload[index], -(to - (record.FromOrdinal ?? to) + 1));
+                }
+                else
+                {
+                    Volatile.Write(ref _overloadUnknownDeclared[index], true);
+                    Interlocked.Exchange(ref _undeclaredOverload[index], 0);
+                }
+            });
             _pendingLoss.Dequeue();
         }
     }
@@ -790,48 +817,65 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         var stop = Volatile.Read(ref _deliveryAtStop);
         foreach (var record in snapshot.Records)
         {
+            // Records evicted before this pull: declared up to the stop, and settled, before anything else.
+            // Counts follow what was declared or written, and _deliverySince only what is settled, so a write
+            // that throws leaves nothing counted twice when the failure path declares the rest.
+            if (record.Sequence > _deliverySince + 1 && _deliverySince < stop)
+            {
+                var to = Math.Min(record.Sequence - 1, stop);
+                var missing = to - _deliverySince;
+                WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = _deliverySince + 1, ToOrdinal = to, Reason = "evicted" },
+                    EventLimit, () =>
+                    {
+                        Interlocked.Add(ref _offered[(int)CaseStream.Delivery], missing);
+                        Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], missing);
+                    });
+                _deliverySince = to;
+            }
+
             // Records the terminal made after the case stopped are not the case's, like any other late offer.
             if (record.Sequence > stop)
                 break;
 
-            // Counts follow what was declared or written, and _deliverySince only what is settled, so a write
-            // that throws leaves nothing counted twice when the failure path declares the rest.
-            if (record.Sequence > _deliverySince + 1)
+            // Offered before the write, so status never shows more written than offered; withdrawn when the
+            // record is not written after all.
+            Interlocked.Increment(ref _offered[(int)CaseStream.Delivery]);
+            bool appended;
+            try
             {
-                var missing = record.Sequence - _deliverySince - 1;
-                WriteMissing(new DiagnosticCaseRecord
+                if (Interlocked.Exchange(ref _deliveryFault, null) is { } fault)
+                    throw fault;
+                appended = Append(CaseStream.Delivery, new DiagnosticCaseEvent
                 {
                     Stream = "delivery",
-                    FromOrdinal = _deliverySince + 1,
-                    ToOrdinal = record.Sequence - 1,
-                    Reason = "evicted",
+                    Ordinal = record.Sequence,
+                    Timestamp = record.StartTimestamp,
+                    Kind = "delivery",
+                    Delivery = record,
                 }, EventLimit);
-                Interlocked.Add(ref _offered[(int)CaseStream.Delivery], missing);
-                Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], missing);
-                _deliverySince = record.Sequence - 1;
+            }
+            catch
+            {
+                Interlocked.Decrement(ref _offered[(int)CaseStream.Delivery]);
+                throw;
             }
 
-            if (Interlocked.Exchange(ref _deliveryFault, null) is { } fault)
-                throw fault;
-            if (!Append(CaseStream.Delivery, new DiagnosticCaseEvent
+            if (!appended)
             {
-                Stream = "delivery",
-                Ordinal = record.Sequence,
-                Timestamp = record.StartTimestamp,
-                Kind = "delivery",
-                Delivery = record,
-            }, EventLimit))
-            {
-                // This record and the rest of the snapshot were pulled but never written.
+                // This record and the rest of the snapshot, up to the stop, were pulled but never written.
+                Interlocked.Decrement(ref _offered[(int)CaseStream.Delivery]);
                 var last = Math.Min(snapshot.Records[^1].Sequence, stop);
-                WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = record.Sequence, ToOrdinal = last, Reason = "size-limit" }, RangeLimit);
-                Interlocked.Add(ref _offered[(int)CaseStream.Delivery], last - record.Sequence + 1);
-                Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], last - record.Sequence + 1);
+                var count = last - record.Sequence + 1;
+                WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = record.Sequence, ToOrdinal = last, Reason = "size-limit" },
+                    RangeLimit, () =>
+                    {
+                        Interlocked.Add(ref _offered[(int)CaseStream.Delivery], count);
+                        Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], count);
+                    });
                 _deliverySince = last;
                 return false;
             }
 
-            Interlocked.Increment(ref _offered[(int)CaseStream.Delivery]);
             _deliverySince = record.Sequence;
         }
 
@@ -856,7 +900,10 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 Stream = s.Declaration.Stream,
                 Offered = Interlocked.Read(ref _offered[s.Index]),
                 Written = Interlocked.Read(ref _written[s.Index]),
-                Dropped = Interlocked.Read(ref _dropped[s.Index]) - (declaredOnly ? Math.Max(0, Interlocked.Read(ref _undeclaredOverload[s.Index])) : 0),
+                // Once a stream's loss of unknown extent is declared it covers every later drop, including one that
+                // counted itself undeclared while the writer was declaring it.
+                Dropped = Interlocked.Read(ref _dropped[s.Index]) - (declaredOnly && !Volatile.Read(ref _overloadUnknownDeclared[s.Index])
+                    ? Math.Max(0, Interlocked.Read(ref _undeclaredOverload[s.Index])) : 0),
             }).ToList();
 
     private static int StreamIndex(string name) => name switch

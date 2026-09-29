@@ -388,6 +388,10 @@ are unavailable for PTY workloads, and delivery for headless terminals.
 - **Time bound:** the case stops with `time-limit`, on the terminal's `TimeProvider`.
 - **Stop drain:** a stop waits at most 10 s for queued events. Anything still unwritten becomes a
   `drain-timeout` missing range.
+- **Delivery at the stop:** delivery records are the case's up to the last one the terminal made when
+  the case stopped; later records are neither written nor counted. Records made before the stop that
+  the writer could not pull are declared: `evicted` when the ring overwrote them, `not-pulled`
+  otherwise (for example, behind a write still in progress).
 - **Failures:** a storage or writer failure stops the case with `collector-failed`. Whatever was
   not written is declared missing (`collector-failed`) when storage still allows it.
 - **Disposal:** disposing the terminal stops the case with `target-disposed`. Disposal waits (at

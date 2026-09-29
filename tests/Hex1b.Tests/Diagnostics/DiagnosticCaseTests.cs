@@ -2361,6 +2361,166 @@ public class DiagnosticCaseTests
         }
     }
 
+    // === Review round 5 fences ===
+
+    // A delivery-capable terminal with a live case and a held writer; `during` runs with the writer held.
+    private static async Task<(string Path, long Before, long AtStop, JsonElement Completion, Artifact Artifact)> RecordDeliveryAroundAStopAsync(
+        CaseRoot root, int beforeStop, int afterStop, long? maxBytes = null, int chunkBytes = 0)
+    {
+        using var gate = new ManualResetEventSlim(false);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DrainTimeoutForTesting.Value = TimeSpan.FromSeconds(60);
+        try
+        {
+            var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+            var workload = new ScriptedWorkload();
+            await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+                .WithPresentation(new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25))).WithDimensions(40, 10).Build();
+            var diagnostics = new TerminalDiagnostics(terminal);
+            using (new Running(terminal))
+            {
+                var started = diagnostics.StartCase(new DiagnosticCaseStartRequest
+                {
+                    Directory = root.Path,
+                    MaxBytes = maxBytes,
+                    Authorizations = chunkBytes > 0 ? [DiagnosticAuthorization.ReapplicationData, DiagnosticAuthorization.NativeOutput] : [],
+                });
+                long Last() => diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0;
+                var before = Last();
+                for (var i = 0; i < beforeStop; i++)
+                    workload.Enqueue(Encoding.ASCII.GetBytes(chunkBytes > 0 ? $"S{i:D5} ".PadRight(chunkBytes, 'x') : $"S{i} "));
+                await WaitAsync(() => Last() >= before + beforeStop, TimeSpan.FromSeconds(60));
+                var atStop = Last();
+                var stop = diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+                await WaitAsync(() => diagnostics.GetCaseStatus().State == DiagnosticCaseState.Stopping);
+                // The terminal keeps writing after the case stopped, while the writer is still held.
+                for (var i = 0; i < afterStop; i++)
+                    workload.Enqueue(Encoding.ASCII.GetBytes($"A{i} "));
+                await WaitAsync(() => Last() >= atStop + afterStop, TimeSpan.FromSeconds(60));
+                gate.Set();
+                var stopped = await stop;
+                await WaitAsync(() => File.Exists(Path.Combine(stopped.Path!, "completion.json")));
+                var artifact = Artifact.Read(stopped.Path!);
+                var counts = artifact.Completion!.Value.GetProperty("streams").EnumerateArray().Single(e => e.GetProperty("stream").GetString() == "delivery");
+                return (stopped.Path!, before, atStop, counts.Clone(), artifact);
+            }
+        }
+        finally
+        {
+            gate.Set();
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DrainTimeoutForTesting.Value = null;
+        }
+    }
+
+    private static List<long> DeliveryOrdinals(Artifact artifact) =>
+        artifact.Events.Where(e => e.GetProperty("stream").GetString() == "delivery").Select(e => e.GetProperty("ordinal").GetInt64()).ToList();
+
+    [TestMethod]
+    public async Task Stop_DeliveryAfterARequestedStopIsNotPulled()
+    {
+        using var root = new CaseRoot();
+        var (_, before, atStop, counts, artifact) = await RecordDeliveryAroundAStopAsync(root, beforeStop: 10, afterStop: 50);
+        var written = DeliveryOrdinals(artifact);
+        Assert.IsTrue(written.All(o => o <= atStop), $"records made after the stop were written: up to {written.DefaultIfEmpty().Max()} against {atStop}");
+        Assert.AreEqual((atStop - before, atStop - before), (counts.GetProperty("offered").GetInt64(), counts.GetProperty("written").GetInt64()));
+    }
+
+    [TestMethod]
+    public async Task Stop_DeliveryEvictedBeforeTheFinalPullIsDeclared()
+    {
+        using var root = new CaseRoot();
+        // More records after the stop than the delivery ring holds, so the records before it are evicted.
+        var (path, before, atStop, counts, artifact) = await RecordDeliveryAroundAStopAsync(root, beforeStop: 10,
+            afterStop: Hex1b.Diagnostics.NativeDeliveryRecorder.MaxRecords + 200);
+        CollectionAssert.AreEquivalent(Enumerable.Range(0, (int)(atStop - before)).Select(i => before + 1 + i).ToList(),
+            DeliveryOrdinals(artifact).Concat(MissingOrdinals(artifact, "delivery")).ToList(),
+            "records made before the stop were neither written nor declared (or records after it were)");
+        Assert.AreEqual(counts.GetProperty("offered").GetInt64(), counts.GetProperty("written").GetInt64() + counts.GetProperty("dropped").GetInt64());
+        var delivery = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }).Streams.Single(s => s.Stream == "delivery");
+        Assert.AreEqual("incomplete", delivery.State);
+        Assert.IsTrue(delivery.Missing.All(m => m.Reason == "evicted"), string.Join(", ", delivery.Missing.Select(m => m.Reason)));
+    }
+
+    [TestMethod]
+    public async Task Limits_SizeStopAfterARequestedStopDeclaresOnlyUpToTheStop()
+    {
+        using var root = new CaseRoot();
+        long LineBytes(string path, string stream) => File.ReadAllLines(Path.Combine(path, "events.jsonl"))
+            .Where(l => l.Contains($"\"stream\":\"{stream}\"", StringComparison.Ordinal)).Sum(l => (long)Encoding.UTF8.GetByteCount(l) + 1);
+
+        // Measure, then bound the case so the final pass (after a requested stop) crosses it inside the delivery pull,
+        // while the ring also holds records made after the stop.
+        var measured = await RecordDeliveryAroundAStopAsync(root, beforeStop: 3000, afterStop: 0, chunkBytes: 100);
+        var bound = new FileInfo(Path.Combine(measured.Path, "manifest.json")).Length + LineBytes(measured.Path, "model")
+            + LineBytes(measured.Path, "delivery") / 2 + 16 * 1024;
+        Assert.IsGreaterThanOrEqualTo(Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.MinMaxBytes, bound, "fixture: too few bytes for a legal bound");
+
+        var (_, before, atStop, counts, artifact) = await RecordDeliveryAroundAStopAsync(root, beforeStop: 3000, afterStop: 500, maxBytes: bound, chunkBytes: 100);
+        var written = DeliveryOrdinals(artifact);
+        var missing = MissingOrdinals(artifact, "delivery");
+        Assert.IsGreaterThan(0, written.Count, "fixture: no delivery was written before the bound");
+        Assert.IsGreaterThan(0, missing.Count, "fixture: the bound was not crossed inside the delivery pull");
+        Assert.IsTrue(missing.All(o => o <= atStop), $"records made after the stop were declared: up to {missing.Max()} against {atStop}");
+        CollectionAssert.AreEquivalent(Enumerable.Range(0, (int)(atStop - before)).Select(i => before + 1 + i).ToList(), written.Concat(missing).ToList());
+        Assert.AreEqual(counts.GetProperty("offered").GetInt64(), counts.GetProperty("written").GetInt64() + counts.GetProperty("dropped").GetInt64());
+    }
+
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task Failures_DeliveryAfterACollectorFailureIsNotTheCases()
+    {
+        using var root = new CaseRoot();
+        using var gate = new ManualResetEventSlim(false);
+        var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+        var workload = new ScriptedWorkload();
+        Hex1bTerminal? terminal = null;
+        long atMark = -1;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = new InvalidOperationException("injected");
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.AfterStopMarkForTesting.Value = recorder =>
+        {
+            if (terminal is null || !ReferenceEquals(recorder, terminal.DiagnosticCase))
+                return;
+            // The terminal keeps writing after the case failed and marked its stop.
+            var diagnostics = new TerminalDiagnostics(terminal);
+            long Last() => diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0;
+            atMark = Last();
+            for (var i = 0; i < 30; i++)
+                workload.Enqueue(Encoding.ASCII.GetBytes($"F{i} "));
+            SpinWait.SpinUntil(() => Last() >= atMark + 30, TimeSpan.FromSeconds(10));
+        };
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+                .WithPresentation(new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25))).WithDimensions(40, 10).Build();
+            await using (terminal)
+            {
+                var diagnostics = new TerminalDiagnostics(terminal);
+                using (new Running(terminal))
+                {
+                    var started = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path });
+                    for (var i = 0; i < 10; i++)
+                        workload.Enqueue(Encoding.ASCII.GetBytes($"B{i} "));
+                    await WaitAsync(() => (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0) >= 10);
+                    gate.Set();
+                    await WaitAsync(() => File.Exists(Path.Combine(started.Path!, "completion.json")), TimeSpan.FromSeconds(30));
+
+                    Assert.IsGreaterThan(0L, atMark, "fixture: the failure path never ran the hook");
+                    var missing = MissingOrdinals(Artifact.Read(started.Path!), "delivery");
+                    Assert.IsTrue(missing.All(o => o <= atMark), $"records made after the failure were declared: up to {missing.DefaultIfEmpty().Max()} against {atMark}");
+                }
+            }
+        }
+        finally
+        {
+            gate.Set();
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.AfterStopMarkForTesting.Value = null;
+        }
+    }
+
     private const int CaseEventQueueMax = Hex1b.Diagnostics.Cases.CaseEventQueue.MaxEvents;
 
     // Records the chunks with the writer held until the pump has applied them all, then stops.
