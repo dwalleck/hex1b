@@ -100,8 +100,9 @@ public sealed partial class Hex1bTerminal
             }
 
             // Counted in progress from before the recording check until the checkpoint is kept, so a stop racing
-            // this one (a busy stop, or one that takes no checkpoint, which nothing produces today) does not let the
-            // writer close past it, up to the closing sweep's 1 s bound.
+            // this one (a busy stop, or one that takes no checkpoint, which no caller requests today; the writer's own
+            // failure abandons the case rather than closing through the sweep) does not let the writer close past
+            // it, up to the closing sweep's 1 s bound.
             recorder.EnterStopCheckpoint();
             try
             {

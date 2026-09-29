@@ -209,9 +209,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     private bool _stopCheckpointSettled;
     // Marks reserved or awaiting the writer; bounded, and reserved before any state is taken.
     private int _pendingMarks;
-    // Marks between their reservation and their enqueue (or abandonment), and stops between their recording check
-    // and keeping their checkpoint; every closing sweep waits (up to its 1 s bound) for none, so a mark or stop
-    // checkpoint finished within the bound is written or declared.
+    // Marks between their reservation and their enqueue (or abandonment), and stops from before their recording
+    // check until they exit (after keeping their checkpoint); every closing sweep waits (up to its 1 s bound) for
+    // none, so a mark or stop checkpoint finished within the bound is written or declared.
     private int _marksInProgress;
     // Estimated bytes of checkpoint state taken and not yet written.
     private long _pendingStateBytes;

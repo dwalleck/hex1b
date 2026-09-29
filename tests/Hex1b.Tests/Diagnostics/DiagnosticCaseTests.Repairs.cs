@@ -366,8 +366,9 @@ public partial class DiagnosticCaseTests
     public async Task Stop_BusyStopIsCountedBeforeItsRecordingCheck()
     {
         // F48: between a busy stop's recording check and its checkpoint, a stop that takes none (a collector
-        // failure; nothing produces one today) stops the case. The busy stop, counted before its check, must hold
-        // the writer's close.
+        // failure; no caller requests one today, and the writer's own failure abandons the case rather than
+        // closing through the sweep) stops the case. The busy stop, counted before its check, must hold the
+        // writer's close.
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
         DiagnosticCaseRecorder? recorder = null;
@@ -410,7 +411,7 @@ public partial class DiagnosticCaseTests
     public async Task Stop_LockedStopIsCountedBeforeItsRecordingCheck()
     {
         // F51: between the locked stop's recording check and its claim, a stop that takes no checkpoint stops the
-        // case. Nothing produces such a stop today; the ordering is defensive. The locked stop, counted before its
+        // case. No caller requests such a stop today; the ordering is defensive. The locked stop, counted before its
         // check, must hold the writer's close and keep its checkpoint.
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
