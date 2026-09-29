@@ -100,7 +100,15 @@ internal static class CaseArtifactReader
         public long Events;
         public long? First;
         public long? Last;
-        public readonly List<DiagnosticCaseRecord> Missing = [];
+        // Recorded missing ranges (anywhere in the file) and ordinal gaps seen while scanning; a gap no
+        // recorded range explains is loss of unknown cause.
+        public readonly List<DiagnosticCaseRecord> Recorded = [];
+        public readonly List<(long From, long To)> Gaps = [];
+
+        public IReadOnlyList<DiagnosticCaseRecord> Missing =>
+            Recorded.Concat(Gaps.Where(g => !Recorded.Any(m => m.FromOrdinal <= g.From && (m.ToOrdinal is null || m.ToOrdinal >= g.To)))
+                .Select(g => new DiagnosticCaseRecord { FromOrdinal = g.From, ToOrdinal = g.To, Reason = "unknown" }))
+                .OrderBy(m => m.FromOrdinal).ToList();
     }
 
     private sealed class ScanResult
@@ -141,15 +149,15 @@ internal static class CaseArtifactReader
                 if (item.Kind == "interval-end" && item.ModelSequence is { } end && result.IntervalEnd is null)
                     result.IntervalEnd = (end, item.Record?.Reason ?? "unsupported");
                 else if (item.Kind == "missing" && item.Record is { } missing && result.Streams.TryGetValue(missing.Stream, out var target))
-                    target.Missing.Add(missing);
+                    target.Recorded.Add(missing);
                 continue;
             }
 
             if (!result.Streams.TryGetValue(item.Stream, out var stream))
                 continue;
             var expected = stream.Last is { } last ? last + 1 : (item.Stream == "delivery" ? FirstDeliveryOrdinal(stream, item.Ordinal) : 1);
-            if (item.Ordinal > expected && !Covered(stream, expected, item.Ordinal - 1))
-                stream.Missing.Add(new DiagnosticCaseRecord { Stream = item.Stream, FromOrdinal = expected, ToOrdinal = item.Ordinal - 1, Reason = "unknown" });
+            if (item.Ordinal > expected)
+                stream.Gaps.Add((expected, item.Ordinal - 1));
             stream.Events++;
             stream.First ??= item.Ordinal;
             stream.Last = item.Ordinal;
@@ -168,10 +176,7 @@ internal static class CaseArtifactReader
 
     // Delivery ordinals are the terminal's delivery sequences, which do not start at 1 for a case.
     private static long FirstDeliveryOrdinal(StreamScan stream, long ordinal) =>
-        stream.Missing.Count > 0 && stream.Missing[0].FromOrdinal is { } from ? from : ordinal;
-
-    private static bool Covered(StreamScan stream, long from, long to) =>
-        stream.Missing.Any(m => m.FromOrdinal <= from && (m.ToOrdinal is null || m.ToOrdinal >= to));
+        stream.Recorded.Count > 0 && stream.Recorded[0].FromOrdinal is { } from ? from : ordinal;
 
     private static bool TryParse(byte[] bytes, out DiagnosticCaseEvent item)
     {
@@ -225,14 +230,15 @@ internal static class CaseArtifactReader
         manifest.Streams.Where(s => s.Events == DiagnosticCoverageState.Included).Select(declaration =>
         {
             var stream = scan.Streams.TryGetValue(declaration.Stream, out var found) ? found : new StreamScan();
+            var missing = stream.Missing.Select(m => m with { Stream = declaration.Stream }).ToList();
             return new DiagnosticCaseStreamCoverage
             {
                 Stream = declaration.Stream,
                 Events = stream.Events,
                 FirstOrdinal = stream.First,
                 LastOrdinal = stream.Last,
-                State = stream.Missing.Count == 0 ? "complete" : "incomplete",
-                Missing = stream.Missing,
+                State = missing.Count == 0 ? "complete" : "incomplete",
+                Missing = missing,
             };
         }).ToList();
 
@@ -261,12 +267,13 @@ internal static class CaseArtifactReader
                 end = (to, reason);
         }
 
+        // On a tie the first reason considered is reported: a recorded cause before an inferred gap.
         if (scan.IntervalEnd is { } intervalEnd)
             Consider(intervalEnd.Sequence - 1, intervalEnd.Reason);
-        if (scan.ModelGapAfter is { } gap)
-            Consider(gap, "model-events-missing");
         foreach (var missing in model.Missing)
             Consider(Math.Max(0, (missing.FromOrdinal ?? 1) - 1), missing.Reason == "unknown" ? "model-events-missing" : missing.Reason);
+        if (scan.ModelGapAfter is { } gap)
+            Consider(gap, "model-events-missing");
         if (state == DiagnosticCaseCompletionState.Truncated)
             Consider(last, "truncated");
         else if (state == DiagnosticCaseCompletionState.Interrupted)

@@ -834,6 +834,252 @@ public class DiagnosticCaseTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
+    [TestMethod]
+    public async Task Overload_PumpNeverWaits()
+    {
+        using var root = new CaseRoot();
+        var chunks = Enumerable.Range(0, 20_000).Select(i => Encoding.ASCII.GetBytes($"{i % 97} ")).ToArray();
+        async Task<(string Presentation, string Model)> RunAsync(bool armed, ManualResetEventSlim? gate)
+        {
+            var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+            var workload = new ScriptedWorkload();
+            var builder = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+                .WithPresentation(new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25))).WithDimensions(40, 10);
+            if (armed)
+                builder.WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] });
+            await using var terminal = builder.Build();
+            using (new Running(terminal))
+            {
+                try
+                {
+                    var total = chunks.Sum(c => (long)c.Length);
+                    foreach (var chunk in chunks)
+                        workload.Enqueue(chunk);
+                    // The writer is held for the whole run: the pump must still read and apply everything.
+                    await WaitAsync(() => terminal.OutputBytesRead == total);
+                    await Settle(terminal);
+                    var result = (driver.WrittenText, Corpus.Digest(terminal));
+                    if (armed)
+                    {
+                        var status = new TerminalDiagnostics(terminal).GetCaseStatus();
+                        Assert.AreEqual(0L, status.Streams.Single(s => s.Stream == "model").Written, "fixture: the writer was not held");
+                    }
+                    return result;
+                }
+                finally
+                {
+                    // Released before disposal, so a pump that did wait on the writer can finish and report.
+                    gate?.Set();
+                }
+            }
+        }
+
+        var unarmed = await RunAsync(armed: false, gate: null);
+        using var gate = new ManualResetEventSlim(false);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        try
+        {
+            var armed = await RunAsync(armed: true, gate);
+            Assert.AreEqual(unarmed.Model, armed.Model, "overload changed the model");
+            Assert.AreEqual(unarmed.Presentation, armed.Presentation, "overload changed the presentation output");
+        }
+        finally
+        {
+            gate.Set();
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+        }
+    }
+
+    [TestMethod]
+    public async Task Overload_DropNewestAccounted()
+    {
+        using var root = new CaseRoot();
+        var artifact = await RecordHeldAsync(root, Enumerable.Range(0, 5000).Select(i => Encoding.ASCII.GetBytes($"c{i} ")).ToArray(), payloads: false);
+        var ordinals = artifact.ModelEvents().Select(e => e.GetProperty("ordinal").GetInt64()).ToList();
+        var missing = MissingOrdinals(artifact, "model");
+
+        CollectionAssert.AreEqual(Enumerable.Range(1, CaseEventQueueMax).Select(i => (long)i).ToList(), ordinals.Take(CaseEventQueueMax).ToList(),
+            "the queue did not keep the oldest events (drop-newest)");
+        var dropped = Enumerable.Range(CaseEventQueueMax + 1, 5000 - CaseEventQueueMax).Select(i => (long)i).ToList();
+        CollectionAssert.AreEqual(dropped, missing, "the recorded missing ranges are not exactly the dropped events");
+        CollectionAssert.AreEquivalent(ordinals.Concat(missing).ToList(), Enumerable.Range(1, 5000).Select(i => (long)i).ToList(), "an event is neither recorded nor missing");
+
+    }
+
+    [TestMethod]
+    public void Queue_RefusesPastTheByteBound()
+    {
+        // The model cannot apply 8 MiB of input quickly enough for an end-to-end test, so the byte
+        // bound is exercised on the queue itself; the event bound is exercised end to end above.
+        static Hex1b.Diagnostics.Cases.CaseEvent Event(long ordinal, int payload) =>
+            new(Hex1b.Diagnostics.Cases.CaseStream.Model, ordinal, 0, "application", ordinal, 40, 10, payload, new byte[payload]);
+
+        var queue = new Hex1b.Diagnostics.Cases.CaseEventQueue();
+        Assert.IsFalse(queue.TryEnqueue(Event(1, 9 * 1024 * 1024)), "an event over the byte bound was queued into an empty queue");
+        var accepted = 0;
+        for (var i = 0; i < 10; i++)
+            accepted += queue.TryEnqueue(Event(i + 2, 1024 * 1024)) ? 1 : 0;
+        Assert.AreEqual(7, accepted, "eight 1 MiB events plus their overhead exceed 8 MiB; seven fit");
+        Assert.IsLessThanOrEqualTo(Hex1b.Diagnostics.Cases.CaseEventQueue.MaxBytes, queue.Bytes);
+        Assert.IsTrue(queue.TryDequeue(out var oldest));
+        Assert.AreEqual(2L, oldest.Ordinal, "the oldest event was not kept");
+        Assert.IsTrue(queue.TryEnqueue(Event(99, 1024 * 1024)), "space freed by the writer was not reusable");
+    }
+
+    [TestMethod]
+    public async Task Loss_PersistsOutsideQueue()
+    {
+        using var root = new CaseRoot();
+        // The queue is full from the first dropped event on, so no queued notice could have carried the loss.
+        var artifact = await RecordHeldAsync(root, Enumerable.Range(0, CaseEventQueueMax + 700).Select(i => Encoding.ASCII.GetBytes($"q{i} ")).ToArray(), payloads: true);
+        var records = artifact.Events.Where(e => e.GetProperty("kind").GetString() == "missing").ToList();
+        Assert.IsNotEmpty(records, "the loss was not persisted");
+        Assert.IsTrue(records.All(e => e.GetProperty("record").GetProperty("reason").GetString() == "overload"));
+        Assert.HasCount(700, MissingOrdinals(artifact, "model"));
+
+        var inspection = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = artifact.Path });
+        Assert.AreEqual("incomplete", inspection.Streams.Single(s => s.Stream == "model").State);
+        Assert.AreEqual(((long)CaseEventQueueMax, "overload"), (inspection.Intervals.Single().ToModelSequence!.Value, inspection.Intervals.Single().EndReason),
+            "re-application crossed the lost events");
+    }
+
+    [TestMethod]
+    public async Task Reader_DetectsOrdinalGap()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        DiagnosticCaseResult stopped;
+        using (new Running(terminal))
+        {
+            for (var i = 0; i < 6; i++)
+                await workload.WriteAndWaitAsync(terminal, $"g{i} ");
+            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        // Remove the third model event's line, keeping every remaining line intact and verified.
+        var events = Path.Combine(stopped.Path!, "events.jsonl");
+        var lines = File.ReadAllLines(events).ToList();
+        var third = lines.FindIndex(l => l.Contains("\"stream\":\"model\"", StringComparison.Ordinal) && l.Contains("\"ordinal\":3,", StringComparison.Ordinal));
+        Assert.IsGreaterThanOrEqualTo(0, third, "fixture: no third model event");
+        lines.RemoveAt(third);
+        File.WriteAllLines(events, lines);
+
+        var inspection = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! });
+        var model = inspection.Streams.Single(s => s.Stream == "model");
+        Assert.AreEqual("incomplete", model.State, "a missing line went unnoticed");
+        Assert.AreEqual((3L, 3L, "unknown"), (model.Missing.Single().FromOrdinal!.Value, model.Missing.Single().ToOrdinal!.Value, model.Missing.Single().Reason));
+        Assert.AreEqual((2L, "model-events-missing"), (inspection.Intervals.Single().ToModelSequence!.Value, inspection.Intervals.Single().EndReason));
+    }
+
+    [TestMethod]
+    public void Loss_CapBecomesUnknownExtent()
+    {
+        var ledger = new Hex1b.Diagnostics.Cases.CaseLossLedger();
+        const int Ranges = Hex1b.Diagnostics.Cases.CaseLossLedger.MaxRangesPerStream + 76;
+        // Every other ordinal lost: each loss is its own range.
+        for (var i = 0; i < Ranges; i++)
+            ledger.Record(Hex1b.Diagnostics.Cases.CaseStream.Model, 2L * i + 1);
+
+        var records = ledger.Take(final: true);
+        var closed = records.Where(r => r.ToOrdinal is not null).ToList();
+        var unknown = records.Where(r => r.ToOrdinal is null).ToList();
+        Assert.HasCount(Hex1b.Diagnostics.Cases.CaseLossLedger.MaxRangesPerStream, closed, "the ledger grew past its cap");
+        Assert.AreEqual((2L * Hex1b.Diagnostics.Cases.CaseLossLedger.MaxRangesPerStream + 1, "overload-unknown-extent"),
+            (unknown.Single().FromOrdinal!.Value, unknown.Single().Reason), "loss past the cap was not reported as unknown extent");
+        Assert.IsEmpty(ledger.Take(final: true), "a range was reported twice");
+    }
+
+    [TestMethod]
+    public async Task Status_ReportsProgressAndLoss()
+    {
+        using var root = new CaseRoot();
+        using var gate = new ManualResetEventSlim(false);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        try
+        {
+            var workload = new ScriptedWorkload();
+            await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Build();
+            var diagnostics = new TerminalDiagnostics(terminal);
+            using (new Running(terminal))
+            {
+                const int Chunks = 4500;
+                var total = 0L;
+                for (var i = 0; i < Chunks; i++)
+                {
+                    var chunk = Encoding.ASCII.GetBytes($"s{i} ");
+                    total += chunk.Length;
+                    workload.Enqueue(chunk);
+                }
+                await WaitAsync(() => terminal.OutputBytesRead == total);
+                await Settle(terminal);
+
+                var held = diagnostics.GetCaseStatus();
+                var model = held.Streams.Single(s => s.Stream == "model");
+                Assert.AreEqual((DiagnosticCaseState.Recording, (long)Chunks, 0L, (long)(Chunks - CaseEventQueueMax)),
+                    (held.State!.Value, model.Offered, model.Written, model.Dropped), "status while the writer is held");
+                Assert.AreEqual(new FileInfo(Path.Combine(held.Path!, "manifest.json")).Length, held.BytesWritten,
+                    "only the manifest may be written while the writer is held");
+                Assert.IsGreaterThanOrEqualTo(0.0, held.ElapsedSeconds!.Value);
+
+                gate.Set();
+                await WaitAsync(() => diagnostics.GetCaseStatus().Streams.Single(s => s.Stream == "model").Written == CaseEventQueueMax);
+                Assert.IsGreaterThan(0L, diagnostics.GetCaseStatus().BytesWritten!.Value);
+                await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+            }
+        }
+        finally
+        {
+            gate.Set();
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+        }
+    }
+
+    private const int CaseEventQueueMax = Hex1b.Diagnostics.Cases.CaseEventQueue.MaxEvents;
+
+    // Records the chunks with the writer held until the pump has applied them all, then stops.
+    private static async Task<Artifact> RecordHeldAsync(CaseRoot root, byte[][] chunks, bool payloads)
+    {
+        using var gate = new ManualResetEventSlim(false);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        try
+        {
+            var workload = new ScriptedWorkload();
+            await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = payloads ? [DiagnosticAuthorization.ReapplicationData] : [] })
+                .Build();
+            using (new Running(terminal))
+            {
+                var total = chunks.Sum(c => (long)c.Length);
+                foreach (var chunk in chunks)
+                    workload.Enqueue(chunk);
+                await WaitAsync(() => terminal.OutputBytesRead == total, TimeSpan.FromSeconds(60));
+                await Settle(terminal);
+                gate.Set();
+                var stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+                return Artifact.Read(stopped.Path!);
+            }
+        }
+        finally
+        {
+            gate.Set();
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+        }
+    }
+
+    private static List<long> MissingOrdinals(Artifact artifact, string stream) =>
+        artifact.Events.Where(e => e.GetProperty("kind").GetString() == "missing" && e.GetProperty("record").GetProperty("stream").GetString() == stream)
+            .SelectMany(e =>
+            {
+                var record = e.GetProperty("record");
+                var from = record.GetProperty("fromOrdinal").GetInt64();
+                var to = record.GetProperty("toOrdinal").GetInt64();
+                return Enumerable.Range(0, (int)(to - from + 1)).Select(i => from + i);
+            }).OrderBy(o => o).ToList();
+
     // Measured with PumpAllocation.Measure on the base revision (5a4b0a6c, no case support) in this
     // configuration; the same routine runs in the base probe (…/scratchpad/t07s2/basealloc).
 #if DEBUG
@@ -910,9 +1156,10 @@ public class DiagnosticCaseTests
         }
     }
 
-    private static async Task WaitAsync(Func<bool> condition)
+    private static async Task WaitAsync(Func<bool> condition, TimeSpan? limit = null)
     {
-        for (var i = 0; i < 500 && !condition(); i++)
+        var deadline = DateTime.UtcNow + (limit ?? TimeSpan.FromSeconds(5));
+        while (!condition() && DateTime.UtcNow < deadline)
             await Task.Delay(10, TestContext.Current.CancellationToken);
         Assert.IsTrue(condition(), "fixture: condition never held");
     }
@@ -1024,7 +1271,7 @@ public class DiagnosticCaseTests
     }
 
     /// <summary>The artifact read independently of the production reader: plain JSON over the raw files.</summary>
-    private sealed record Artifact(JsonElement Manifest, List<JsonElement> Events, JsonElement? Completion)
+    private sealed record Artifact(JsonElement Manifest, List<JsonElement> Events, JsonElement? Completion, string Path)
     {
         public static Artifact Read(string path)
         {
@@ -1039,7 +1286,7 @@ public class DiagnosticCaseTests
 
             var completionPath = System.IO.Path.Combine(path, "completion.json");
             JsonElement? completion = File.Exists(completionPath) ? JsonDocument.Parse(File.ReadAllText(completionPath)).RootElement : null;
-            return new Artifact(manifest, events, completion);
+            return new Artifact(manifest, events, completion, path);
         }
 
         public List<JsonElement> ModelEvents() => Events.Where(e => e.GetProperty("stream").GetString() == "model").ToList();

@@ -35,6 +35,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     private const int StreamCount = 5;
 
     private readonly CaseEventQueue _queue = new();
+    private readonly CaseLossLedger _loss = new();
     private readonly CaseArtifactWriter _writer;
     private readonly SemaphoreSlim _signal = new(0);
     private readonly TimeProvider _timeProvider;
@@ -188,8 +189,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     {
         var index = (int)stream;
         Interlocked.Increment(ref _offered[index]);
-        var item = new CaseEvent(stream, Interlocked.Increment(ref _ordinals[index]), Stopwatch.GetTimestamp(), kind, modelSequence,
-            width, height, length, payload, detail);
+        var ordinal = Interlocked.Increment(ref _ordinals[index]);
+        var item = new CaseEvent(stream, ordinal, Stopwatch.GetTimestamp(), kind, modelSequence, width, height, length, payload, detail);
         if (_queue.TryEnqueue(item))
         {
             if (_signal.CurrentCount == 0)
@@ -197,7 +198,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         }
         else
         {
+            // Drop-newest; the loss is recorded outside the queue that could not take the event.
             Interlocked.Increment(ref _dropped[index]);
+            _loss.Record(stream, ordinal);
         }
     }
 
@@ -226,6 +229,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             {
                 _writerGate?.Wait();
                 var stopping = Volatile.Read(ref _state) != Recording;
+                // Loss first: it does not depend on the queue draining.
+                WriteLoss(final: false);
                 while (_queue.TryDequeue(out var item))
                     Write(item);
                 PullDelivery();
@@ -237,6 +242,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             }
 
             WriteIntervalEndIfPending(long.MaxValue);
+            WriteLoss(final: true);
             _stoppedAt = _timeProvider.GetUtcNow();
             _writer.Flush();
             _writer.WriteCompletion(DescribeCompletion());
@@ -287,6 +293,12 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             return;
         _intervalEndWritten = true;
         WriteCaseRecord("interval-end", end, new DiagnosticCaseRecord { Stream = "model", Reason = _intervalEndReason ?? "unsupported" });
+    }
+
+    private void WriteLoss(bool final)
+    {
+        foreach (var record in _loss.Take(final))
+            WriteCaseRecord("missing", null, record);
     }
 
     private void WriteCaseRecord(string kind, long? modelSequence, DiagnosticCaseRecord record)
