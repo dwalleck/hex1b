@@ -2557,6 +2557,9 @@ public class DiagnosticCaseTests
                     $"a retried declaration counted twice: {counts}");
                 var delivery = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = started.Path! }).Streams.Single(s => s.Stream == "delivery");
                 Assert.IsFalse(delivery.Missing.Any(m => m.Reason == "unaccounted"), string.Join(", ", delivery.Missing.Select(m => $"{m.FromOrdinal}-{m.ToOrdinal} {m.Reason}")));
+                // The later declaration landed: every record is declared, not merely balanced.
+                CollectionAssert.IsSubsetOf(Enumerable.Range(0, 100).Select(i => before + 1 + i).ToList(), MissingOrdinals(artifact, "delivery"),
+                    "no later declaration landed for the unpulled delivery");
             }
         }
         finally
@@ -2565,6 +2568,48 @@ public class DiagnosticCaseTests
             Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
             Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = null;
             Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.UnpulledFaultForTesting.Value = null;
+        }
+    }
+
+    // === Review round 7 fences ===
+
+    [TestMethod]
+    public async Task Failures_DeliveryNeverDeclaredIsUnaccounted()
+    {
+        using var root = new CaseRoot();
+        var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+            .WithPresentation(new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25))).WithDimensions(40, 10).Build();
+        var diagnostics = new TerminalDiagnostics(terminal);
+        using (new Running(terminal))
+        {
+            // Between arming and the writer's start: the events file cannot be created (a directory holds its
+            // name), so every line fails while the manifest and completion still land, and the terminal makes
+            // 100 delivery records the case owns.
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.AfterArmForTesting.Value = () =>
+            {
+                Directory.CreateDirectory(Path.Combine(terminal.DiagnosticCase!.Path, "events.jsonl"));
+                var before = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0;
+                for (var i = 0; i < 100; i++)
+                    workload.Enqueue(Encoding.ASCII.GetBytes($"N{i} "));
+                SpinWait.SpinUntil(() => (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0) >= before + 100,
+                    TimeSpan.FromSeconds(10));
+            };
+            DiagnosticCaseResult started;
+            try
+            {
+                started = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path });
+            }
+            finally
+            {
+                Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.AfterArmForTesting.Value = null;
+            }
+
+            await WaitAsync(() => File.Exists(Path.Combine(started.Path!, "completion.json")));
+            var delivery = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = started.Path! }).Streams.Single(s => s.Stream == "delivery");
+            Assert.AreEqual("incomplete", delivery.State, "delivery that was neither written nor declared read complete");
+            Assert.IsTrue(delivery.Missing.Any(m => m.Reason == "unaccounted"), string.Join(", ", delivery.Missing.Select(m => m.Reason)));
         }
     }
 
