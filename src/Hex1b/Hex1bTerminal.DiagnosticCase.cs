@@ -173,9 +173,10 @@ public sealed partial class Hex1bTerminal
         bool forSizeLimitStop)
     {
         // Inside any application (a callback's mark or stop, the lock being re-entrant) the model is half
-        // applied. The boundary is the model event just before the application while the case has not yet
-        // recorded it (for a nested application, one inside the unfinished outer one), and the current one otherwise: a
-        // nested event recorded it early, the case was armed inside the callback, or its model stream failed.
+        // applied. While the case has not yet recorded the application, the boundary is the model sequence
+        // just before it (0 before the model's first; for a nested application, an event inside the
+        // unfinished outer one). Otherwise it is the current one: a nested event recorded the application
+        // early, the case was armed inside the callback, or its model stream failed.
         if (_captureApplicationDepth > 0)
             return (recorder.ApplicationInProgress ? _modelSequence - 1 : _modelSequence,
                 new(null, null, "unavailable", "mid-application: taken inside an application that had not finished", 0));
