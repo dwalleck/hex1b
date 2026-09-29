@@ -37,7 +37,7 @@ internal static class CaseStorage
             {
                 mode = File.GetUnixFileMode(root);
             }
-            catch (IOException error)
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             {
                 // Removed (or made unreadable) since it was found: nothing about it can be confirmed.
                 return $"The case directory root cannot be read: '{root}': {error.Message}";

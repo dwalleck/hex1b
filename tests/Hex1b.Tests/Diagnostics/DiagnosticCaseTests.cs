@@ -2227,6 +2227,140 @@ public class DiagnosticCaseTests
         }
     }
 
+    // === Review round 4 fences ===
+
+    [TestMethod]
+    public async Task Failures_DeliveryFaultCountsEachRecordOnce()
+    {
+        using var root = new CaseRoot();
+        using var gate = new ManualResetEventSlim(false);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DeliveryFaultForTesting.Value = new IOException("injected delivery write failure");
+        try
+        {
+            var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+            var workload = new ScriptedWorkload();
+            await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+                .WithPresentation(new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25))).WithDimensions(40, 10).Build();
+            var diagnostics = new TerminalDiagnostics(terminal);
+            using (new Running(terminal))
+            {
+                var started = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path });
+                var before = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0;
+                for (var i = 0; i < 20; i++)
+                    workload.Enqueue(Encoding.ASCII.GetBytes($"D{i} "));
+                await WaitAsync(() => (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0) >= before + 20);
+                gate.Set();
+                await WaitAsync(() => File.Exists(Path.Combine(started.Path!, "completion.json")));
+
+                var artifact = Artifact.Read(started.Path!);
+                Assert.AreEqual("collector-failed", artifact.Completion!.Value.GetProperty("stopReason").GetString());
+                var counts = artifact.Completion.Value.GetProperty("streams").EnumerateArray().Single(e => e.GetProperty("stream").GetString() == "delivery");
+                Assert.AreEqual(counts.GetProperty("offered").GetInt64(), counts.GetProperty("written").GetInt64() + counts.GetProperty("dropped").GetInt64(),
+                    $"delivery counts do not balance: {counts}");
+                var delivery = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = started.Path! }).Streams.Single(s => s.Stream == "delivery");
+                Assert.IsTrue(delivery.Missing.All(m => m.Reason == "collector-failed"), string.Join(", ", delivery.Missing.Select(m => m.Reason)));
+            }
+        }
+        finally
+        {
+            gate.Set();
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DeliveryFaultForTesting.Value = null;
+        }
+    }
+
+    [TestMethod]
+    public async Task Stop_DeliveryMadeAfterTheStopIsNotTheCases()
+    {
+        using var root = new CaseRoot();
+        using var gate = new ManualResetEventSlim(false);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DrainTimeoutForTesting.Value = TimeSpan.FromMilliseconds(300);
+        try
+        {
+            var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+            var workload = new ScriptedWorkload();
+            await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+                .WithPresentation(new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25))).WithDimensions(40, 10).Build();
+            var diagnostics = new TerminalDiagnostics(terminal);
+            using (new Running(terminal))
+            {
+                var started = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path });
+                var before = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0;
+                for (var i = 0; i < 10; i++)
+                    workload.Enqueue(Encoding.ASCII.GetBytes($"B{i} "));
+                await WaitAsync(() => (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0) >= before + 10);
+                var atStop = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence!.Value;
+                await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+                // The terminal keeps writing after the case stopped, before the stalled writer resumes.
+                for (var i = 0; i < 50; i++)
+                    workload.Enqueue(Encoding.ASCII.GetBytes($"A{i} "));
+                await WaitAsync(() => (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0) >= atStop + 50);
+                gate.Set();
+                await WaitAsync(() => File.Exists(Path.Combine(started.Path!, "completion.json")));
+
+                var artifact = Artifact.Read(started.Path!);
+                var missing = MissingOrdinals(artifact, "delivery");
+                Assert.IsTrue(missing.All(o => o <= atStop), $"records made after the stop were declared: up to {missing.DefaultIfEmpty().Max()} against {atStop}");
+                var counts = artifact.Completion!.Value.GetProperty("streams").EnumerateArray().Single(e => e.GetProperty("stream").GetString() == "delivery");
+                Assert.AreEqual(atStop - before, counts.GetProperty("offered").GetInt64(), "delivery records after the stop were counted as offered");
+            }
+        }
+        finally
+        {
+            gate.Set();
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DrainTimeoutForTesting.Value = null;
+        }
+    }
+
+    [TestMethod]
+    public async Task Failures_OverloadRangesThatNeverReachStorageAreUnaccounted()
+    {
+        using var root = new CaseRoot();
+        using var gate = new ManualResetEventSlim(false);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.PersistentLossFaultForTesting.Value = new IOException("injected: loss ranges never fit the file");
+        Hex1bTerminal terminal;
+        var workload = new ScriptedWorkload();
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Build();
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.PersistentLossFaultForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            var path = new TerminalDiagnostics(terminal).GetCaseStatus().Path!;
+            using (new Running(terminal))
+            {
+                var total = 0L;
+                for (var i = 0; i < CaseEventQueueMax + 500; i++)
+                {
+                    var chunk = Encoding.ASCII.GetBytes($"o{i} ");
+                    total += chunk.Length;
+                    workload.Enqueue(chunk);
+                }
+
+                await WaitAsync(() => terminal.OutputBytesRead >= total, TimeSpan.FromSeconds(60));
+                gate.Set();
+                // The drops are one open range, taken only at the final pass, where its write fails.
+                await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+                await WaitAsync(() => File.Exists(Path.Combine(path, "completion.json")));
+            }
+
+            var model = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }).Streams.Single(s => s.Stream == "model");
+            Assert.AreEqual("incomplete", model.State, "overload that was never declared left the stream complete");
+            Assert.IsTrue(model.Missing.Any(m => m.Reason == "unaccounted"), string.Join(", ", model.Missing.Select(m => $"{m.FromOrdinal}-{m.ToOrdinal} {m.Reason}")));
+        }
+    }
+
     private const int CaseEventQueueMax = Hex1b.Diagnostics.Cases.CaseEventQueue.MaxEvents;
 
     // Records the chunks with the writer held until the pump has applied them all, then stops.
