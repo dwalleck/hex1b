@@ -55,7 +55,7 @@ internal static class CaseArtifactReader
 
             // Fields the reader relies on; a hand-edited or damaged manifest may lack them.
             if (manifest is null || manifest.Checkpoint is null || manifest.Streams is null || manifest.Bounds is null
-                || manifest.Streams.Any(s => s is null))
+                || manifest.Streams.Any(s => s?.Stream is null))
                 return Problem(DiagnosticOutcome.Failed, "invalid-artifact", "The manifest is empty or incomplete.") with { Path = path };
             if (manifest.FormatVersion != CaseArtifactWriter.FormatVersion)
                 return Problem(DiagnosticOutcome.Failed, "unsupported-format", $"Artifact format {manifest.FormatVersion} is not supported (expected {CaseArtifactWriter.FormatVersion}).") with { Path = path };
@@ -68,6 +68,9 @@ internal static class CaseArtifactReader
                 try
                 {
                     completion = JsonSerializer.Deserialize(File.ReadAllBytes(completionPath), DiagnosticsJsonContext.Default.DiagnosticCaseCompletion);
+                    // A completion without its stream counts was not written whole either.
+                    if (completion?.Streams is null || completion.Streams.Any(s => s?.Stream is null))
+                        completion = null;
                 }
                 catch (JsonException)
                 {

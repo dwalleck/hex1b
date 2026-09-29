@@ -147,6 +147,10 @@ public sealed partial class Hex1bTerminal
     // right after disposing its terminal still leaves a finished artifact.
     private DiagnosticCaseRecorder? _disposedCase;
 
+    // A disposal re-entered under the model lock (a scrollback or title callback that disposes) cannot wait:
+    // the writer needs that lock to finish, so it would stall for the whole drain bound. The case still stops.
     private Task WaitForDisposedCaseAsync() =>
-        _disposedCase?.StopAsync(DiagnosticCaseStopReason.TargetDisposed) ?? Task.CompletedTask;
+        _disposedCase is { } recorder && !Monitor.IsEntered(_bufferLock)
+            ? recorder.StopAsync(DiagnosticCaseStopReason.TargetDisposed)
+            : Task.CompletedTask;
 }

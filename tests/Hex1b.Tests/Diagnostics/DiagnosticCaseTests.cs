@@ -1750,6 +1750,15 @@ public class DiagnosticCaseTests
         const string foreign = "/proc/1/fd";
         Assert.AreEqual(UnixFileMode.None, File.GetUnixFileMode(foreign) & ~(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute),
             "fixture: the foreign root is not owner-only, so the mode check would refuse it first");
+        try
+        {
+            File.SetUnixFileMode(foreign, File.GetUnixFileMode(foreign));
+            Assert.Inconclusive("fixture: /proc/1/fd is this user's (a container whose init runs as the test user).");
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+
         StringAssert.Contains(Hex1b.Diagnostics.Cases.CaseStorage.CheckRoot(foreign), "not owned by the current user");
     }
 
@@ -1775,6 +1784,285 @@ public class DiagnosticCaseTests
         var unreadable = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! });
         File.SetUnixFileMode(manifest, UnixFileMode.UserRead | UnixFileMode.UserWrite);
         Assert.AreEqual((DiagnosticOutcome.Failed, "unreadable-artifact"), (unreadable.Outcome, unreadable.Problem?.Code));
+    }
+
+    // === Review round 2 fences ===
+
+    [TestMethod]
+    public async Task Dispose_ReenteredUnderTheModelLockDoesNotStall()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        Hex1bTerminal? terminal = null;
+        TimeSpan? disposal = null;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DrainTimeoutForTesting.Value = TimeSpan.FromSeconds(3);
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(10, 2)
+                .WithScrollback(10, _ =>
+                {
+                    // A scrollback callback runs under the model lock; disposing from it must not wait for the writer.
+                    if (disposal is not null)
+                        return;
+                    var watch = System.Diagnostics.Stopwatch.StartNew();
+                    terminal!.Dispose();
+                    disposal = watch.Elapsed;
+                })
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Build();
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.DrainTimeoutForTesting.Value = null;
+        }
+
+        var path = new TerminalDiagnostics(terminal).GetCaseStatus().Path!;
+        using (new Running(terminal))
+        {
+            workload.Enqueue("one\r\ntwo\r\nthree\r\nfour\r\n"u8.ToArray());
+            await WaitAsync(() => disposal is not null);
+        }
+
+        Assert.IsLessThan(TimeSpan.FromSeconds(1.5), disposal!.Value, "a disposal under the model lock waited for the case writer");
+        await WaitAsync(() => File.Exists(Path.Combine(path, "completion.json")));
+        Assert.AreEqual("target-disposed", Artifact.Read(path).Completion!.Value.GetProperty("stopReason").GetString());
+    }
+
+    [TestMethod]
+    public async Task Reentrant_ModelEventDuringAnApplicationKeepsSequenceOrder()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        // A title handler that resizes runs in the middle of the application that set the title.
+        terminal.WindowTitleChanged += _ => terminal.Resize(50, 12);
+        DiagnosticCaseResult stopped;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "before ");
+            await workload.WriteAndWaitAsync(terminal, "\u001b]0;renamed\u0007after");
+            await workload.WriteAndWaitAsync(terminal, " later");
+            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var model = Artifact.Read(stopped.Path!).ModelEvents();
+        var sequences = model.Select(e => e.GetProperty("modelSequence").GetInt64()).ToList();
+        CollectionAssert.AreEqual(sequences.Order().ToList(), sequences, "model events are not in model-sequence order");
+        CollectionAssert.AreEqual(Enumerable.Range(1, model.Count).Select(i => (long)i).ToList(), sequences);
+        var titled = model.Single(e => e.TryGetProperty("data", out var d) && Encoding.UTF8.GetString(Convert.FromBase64String(d.GetString()!)).Contains("renamed", StringComparison.Ordinal));
+        var interval = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! }).Intervals.Single();
+        Assert.AreEqual((titled.GetProperty("modelSequence").GetInt64() - 1, "reentrant-model-event"), (interval.ToModelSequence, interval.EndReason));
+    }
+
+    [TestMethod]
+    public async Task Reader_DamagedCompletionOrStreamDeclarationIsStructured()
+    {
+        using var root = new CaseRoot();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(new ScriptedWorkload()).WithHeadless().WithDimensions(40, 10)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Build();
+        var stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+
+        var completionPath = Path.Combine(stopped.Path!, "completion.json");
+        var completion = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(completionPath))!;
+        completion["streams"] = null;
+        File.WriteAllText(completionPath, completion.ToJsonString());
+        var withoutCounts = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! });
+        Assert.AreEqual((DiagnosticOutcome.Captured, DiagnosticCaseCompletionState.Interrupted), (withoutCounts.Outcome, withoutCounts.CompletionState),
+            "a completion without its counts was trusted");
+
+        var manifestPath = Path.Combine(stopped.Path!, "manifest.json");
+        var manifest = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(manifestPath))!;
+        manifest["streams"]![0]!["stream"] = null;
+        File.WriteAllText(manifestPath, manifest.ToJsonString());
+        var nameless = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! });
+        Assert.AreEqual((DiagnosticOutcome.Failed, "invalid-artifact"), (nameless.Outcome, nameless.Problem?.Code));
+    }
+
+    [TestMethod]
+    public async Task Failures_AnOfferInFlightAtAWriterFaultIsDeclared()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        using var gate = new ManualResetEventSlim(false);
+        using var held = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        var holding = 0;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = new InvalidOperationException("injected");
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = () =>
+        {
+            if (Volatile.Read(ref holding) == 1 && Interlocked.Exchange(ref holding, 2) == 1)
+            {
+                held.Set();
+                release.Wait(TimeSpan.FromSeconds(10));
+            }
+        };
+        Hex1bTerminal terminal;
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Build();
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            var path = new TerminalDiagnostics(terminal).GetCaseStatus().Path!;
+            using (new Running(terminal))
+            {
+                await workload.WriteAndWaitAsync(terminal, "queued");
+                Volatile.Write(ref holding, 1);
+                // A resize passes its check, then is held before its enqueue while the writer fails.
+                var resize = Task.Run(() => terminal.Resize(50, 12));
+                Assert.IsTrue(held.Wait(TimeSpan.FromSeconds(10)), "fixture: the resize never reached the enqueue");
+                gate.Set();
+                await Task.Delay(300, TestContext.Current.CancellationToken);
+                release.Set();
+                await resize;
+                await WaitAsync(() => File.Exists(Path.Combine(path, "completion.json")));
+            }
+
+            var artifact = Artifact.Read(path);
+            Assert.AreEqual("collector-failed", artifact.Completion!.Value.GetProperty("stopReason").GetString());
+            CollectionAssert.AreEqual(new List<long> { 1, 2 }, MissingOrdinals(artifact, "model"), "the in-flight resize was not declared with the queue");
+            var missing = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }).Streams.Single(s => s.Stream == "model").Missing;
+            Assert.IsTrue(missing.All(m => m.Reason == "collector-failed"), "the in-flight event surfaced as an unaccounted tail instead of a declared range");
+        }
+    }
+
+    [TestMethod]
+    public void Limits_ClosingRecordsFitTheirReserves()
+    {
+        // The worst case each closing tier must hold, serialized as the writer serializes it (CRC, tab, newline).
+        static long Line(DiagnosticCaseEvent item) =>
+            10 + JsonSerializer.SerializeToUtf8Bytes(item, DiagnosticsJsonContext.Default.DiagnosticCaseEvent).Length;
+        DiagnosticCaseEvent Case(string kind, DiagnosticCaseRecord record) => new()
+        {
+            CaseSequence = long.MaxValue, Stream = "case", Ordinal = long.MaxValue, Timestamp = long.MaxValue, Kind = kind,
+            ModelSequence = long.MaxValue, Record = record,
+        };
+
+        string[] streams = ["model", "input", "frames", "delivery"];
+        var message = Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.Bounded("stream-failed: " + new string('\u00e9', 1000));
+        Assert.IsTrue(message.All(c => c is >= ' ' and <= '~') && message.Length <= Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.MaxFailureMessage,
+            "a failure message is not bounded printable ASCII");
+        var closing = Line(Case("interval-end", new DiagnosticCaseRecord { Stream = "model", Reason = "reentrant-model-event" }))
+            + streams.Sum(s => Line(Case("stream-failed", new DiagnosticCaseRecord { Stream = s, FromOrdinal = long.MaxValue, Reason = message })))
+            + streams.Sum(s => Line(Case("missing", new DiagnosticCaseRecord { Stream = s, FromOrdinal = long.MaxValue, Reason = "size-limit-unknown-extent" })));
+        Assert.IsLessThanOrEqualTo(Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.RangeReserve - Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.ClosingReserve,
+            closing, "the closing records can overflow their tier");
+
+        var completion = JsonSerializer.SerializeToUtf8Bytes(new DiagnosticCaseCompletion
+        {
+            CaseId = new string('f', 32),
+            StopReason = DiagnosticCaseStopReason.CollectorFailed,
+            StoppedAt = DateTimeOffset.MaxValue,
+            LastCaseSequence = long.MaxValue,
+            BytesWritten = long.MaxValue,
+            Streams = streams.Select(s => new DiagnosticCaseStreamStatus { Stream = s, Offered = long.MaxValue, Written = long.MaxValue, Dropped = long.MaxValue }).ToList(),
+        }, DiagnosticsJsonContext.Default.DiagnosticCaseCompletion).Length;
+        Assert.IsLessThanOrEqualTo(Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.ClosingReserve, (long)completion, "the completion can overflow its reserve");
+    }
+
+    [TestMethod]
+    public async Task Limits_SizeCrossedInTheModelDrainDeclaresTheDelivery()
+    {
+        using var root = new CaseRoot();
+        async Task<(string Path, long First, long Last)> RecordAsync(long? maxBytes)
+        {
+            using var gate = new ManualResetEventSlim(false);
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+            try
+            {
+                var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+                var workload = new ScriptedWorkload();
+                await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+                    .WithPresentation(new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25))).WithDimensions(40, 10).Build();
+                var diagnostics = new TerminalDiagnostics(terminal);
+                using (new Running(terminal))
+                {
+                    var started = diagnostics.StartCase(new DiagnosticCaseStartRequest
+                    {
+                        Directory = root.Path,
+                        MaxBytes = maxBytes,
+                        Authorizations = [DiagnosticAuthorization.ReapplicationData, DiagnosticAuthorization.NativeOutput],
+                    });
+                    var before = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0;
+                    for (var i = 0; i < 4000; i++)
+                        workload.Enqueue(Encoding.ASCII.GetBytes($"M{i:D5} ".PadRight(600, 'x')));
+                    await WaitAsync(() => (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0) >= before + 4000);
+                    var last = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence!.Value;
+                    gate.Set();
+                    if (maxBytes is null)
+                        await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+                    await WaitAsync(() => File.Exists(Path.Combine(started.Path!, "completion.json")));
+                    return (started.Path!, before + 1, last);
+                }
+            }
+            finally
+            {
+                gate.Set();
+                Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            }
+        }
+
+        long LineBytes(string path, string stream) => File.ReadAllLines(Path.Combine(path, "events.jsonl"))
+            .Where(l => l.Contains($"\"stream\":\"{stream}\"", StringComparison.Ordinal)).Sum(l => (long)Encoding.UTF8.GetByteCount(l) + 1);
+
+        // The bound falls inside the model drain, before any delivery record is pulled.
+        var measured = await RecordAsync(null);
+        var bound = new FileInfo(Path.Combine(measured.Path, "manifest.json")).Length + LineBytes(measured.Path, "model") / 2 + 16 * 1024;
+        Assert.IsGreaterThanOrEqualTo(Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.MinMaxBytes, bound, "fixture: too few bytes for a legal bound");
+
+        var (path, first, last) = await RecordAsync(bound);
+        var artifact = Artifact.Read(path);
+        Assert.AreEqual("size-limit", artifact.Completion!.Value.GetProperty("stopReason").GetString());
+        var kept = artifact.Events.Where(e => e.GetProperty("stream").GetString() == "delivery").Select(e => e.GetProperty("ordinal").GetInt64()).ToList();
+        Assert.IsEmpty(kept, "fixture: a delivery record was written before the bound");
+        var missing = MissingOrdinals(artifact, "delivery");
+        CollectionAssert.IsSubsetOf(Enumerable.Range(0, (int)(last - first + 1)).Select(i => first + i).ToList(), missing,
+            "delivery records made before the stop were neither written nor declared missing");
+    }
+
+    [TestMethod]
+    public async Task Failures_LossRangesTakenBeforeAFaultAreStillDeclared()
+    {
+        using var root = new CaseRoot();
+        using var gate = new ManualResetEventSlim(false);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.LossFaultForTesting.Value = new InvalidOperationException("injected loss write failure");
+        Hex1bTerminal terminal;
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(new ScriptedWorkload()).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path }).Build();
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.LossFaultForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            var recorder = terminal.DiagnosticCase!;
+            // Three separate losses: the first two are closed ranges the writer takes before it fails.
+            foreach (var ordinal in new long[] { 100, 102, 104 })
+                recorder.LossForTesting.Record(Hex1b.Diagnostics.Cases.CaseStream.Model, ordinal);
+            gate.Set();
+            await WaitAsync(() => File.Exists(Path.Combine(recorder.Path, "completion.json")));
+
+            var artifact = Artifact.Read(recorder.Path);
+            Assert.AreEqual("collector-failed", artifact.Completion!.Value.GetProperty("stopReason").GetString());
+            CollectionAssert.IsSubsetOf(new List<long> { 100, 102, 104 }, MissingOrdinals(artifact, "model"),
+                "loss ranges taken before the failure were never declared");
+        }
     }
 
     private const int CaseEventQueueMax = Hex1b.Diagnostics.Cases.CaseEventQueue.MaxEvents;

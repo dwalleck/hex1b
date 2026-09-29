@@ -328,8 +328,10 @@ a finished (or broken) artifact offline, without the process that wrote it, with
 The case directory is created under the root with mode 0700, and every file in it with 0600. Both
 modes are verified after creation. An existing root is refused (`storage-refused`) before anything is
 written when it is group- or world-accessible, not owned by the current user, a symbolic link, or not
-a directory. Clients resolve a relative directory against their own working directory, not the
-target's. Without `reapplication-data`, the checkpoint is `excluded` and no model bytes are copied.
+a directory. A root whose mode cannot be set (a read-only mount) is refused as unconfirmed. Ownership
+is checked by setting the root's existing mode, which only its owner may do. A superuser therefore
+passes for any owner: run cases as an ordinary user when the root may be shared. Clients resolve a
+relative directory against their own working directory, not the target's. Without `reapplication-data`, the checkpoint is `excluded` and no model bytes are copied.
 
 ### Result
 
@@ -395,8 +397,17 @@ are unavailable for PTY workloads, and delivery for headless terminals.
   recording. A model-stream failure also ends the re-applicable interval. It never reaches the
   terminal operation (output, resize) that raised the event.
 - **Re-applicable interval:** the model interval ends at the first model event the case cannot
-  reproduce. That is an application without recorded bytes, graphics state the case does not hold,
-  a missing model event, a failed model stream, or the end of the verified file.
+  reproduce:
+  - an application without recorded bytes;
+  - graphics state the case does not hold;
+  - a model event raised in the middle of an application (`reentrant-model-event`, for example a
+    title handler that resizes), or a nested application (`reentrant-application`);
+  - a missing model event;
+  - a failed model stream;
+  - the end of the verified file.
+- **Re-entrant disposal:** a terminal disposed from inside one of its own callbacks (scrollback,
+  title) cannot wait for the case writer. It stops the case and returns; the artifact is finished
+  moments later.
 
 ### Inspect
 

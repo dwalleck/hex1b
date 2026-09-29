@@ -47,6 +47,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// </summary>
     internal static readonly AsyncLocal<Action?> BeforeEnqueueForTesting = new();
 
+    /// <summary>An exception the writer throws before its next loss range, taken from the arming flow while a test has set it.</summary>
+    internal static readonly AsyncLocal<Exception?> LossFaultForTesting = new();
+
     /// <summary>An exception the writer's disposal throws, taken from the arming flow while a test has set it.</summary>
     internal static readonly AsyncLocal<Exception?> WriterDisposeFaultForTesting = new();
 
@@ -76,13 +79,14 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     //   closing records: the interval end, at most one failure and one overflow summary per stream,
     //   each a bounded line                             below MaxBytes - 2 KiB  (ClosingLimit);
     //   the completion record                          in the rest.
-    private const long EventReserve = 16 * 1024;
-    private const long RangeReserve = 8 * 1024;
-    private const long ClosingReserve = 2 * 1024;
-    private const int MaxFailureMessage = 256;
+    internal const long EventReserve = 16 * 1024;
+    internal const long RangeReserve = 8 * 1024;
+    internal const long ClosingReserve = 2 * 1024;
+    internal const int MaxFailureMessage = 256;
 
     private Exception? _writerFault = WriterFaultForTesting.Value;
     private Exception? _writerDisposeFault = WriterDisposeFaultForTesting.Value;
+    private Exception? _lossFault = LossFaultForTesting.Value;
     private readonly Action? _beforeEnqueue = BeforeEnqueueForTesting.Value;
     private string? _streamFault = StreamFaultForTesting.Value;
     private readonly TimeSpan _drainTimeout = DrainTimeoutForTesting.Value ?? DrainTimeout;
@@ -192,7 +196,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// </summary>
     internal void BeginApplication(long modelSequence, int width, int height, bool hasIngress, ReadOnlySpan<byte> ingress)
     {
-        _application = null;
+        FlushReentered("reentrant-application");
         if (!IsRecording || Volatile.Read(ref _failed[(int)CaseStream.Model]))
             return;
         try
@@ -232,8 +236,25 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     }
 
     /// <summary>Records a model event. The caller holds the terminal's model lock, which orders model events.</summary>
-    internal void RecordModelEvent(string kind, long modelSequence, int width, int height) =>
+    internal void RecordModelEvent(string kind, long modelSequence, int width, int height)
+    {
+        FlushReentered("reentrant-model-event");
         OfferModel(kind, modelSequence, width, height, null, null);
+    }
+
+    // A model event raised while an application is still in progress (a handler that resizes, or a nested
+    // application) happened in the middle of it: re-applying the application's bytes and then the event cannot
+    // reproduce that. The open application is offered now, so model events stay in sequence order, and
+    // re-applicable coverage ends at it.
+    private void FlushReentered(string reason)
+    {
+        if (_application is not { } application)
+            return;
+        _application = null;
+        EndInterval(application.ModelSequence, reason);
+        OfferModel(application.HasIngress ? "application" : "application-without-ingress", application.ModelSequence,
+            application.Width, application.Height, application.Length, application.Payload);
+    }
 
     // A model-stream failure must never reach the terminal, whose model sequence has already advanced: the
     // stream ends, and re-applicable coverage with it.
@@ -336,7 +357,17 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             _signal.Release();
     }
 
-    private static string Bounded(string text) => text.Length <= MaxFailureMessage ? text : text[..MaxFailureMessage] + "…";
+    // A failure message is bounded in bytes, not just characters, so the closing tier's budget holds: at most
+    // MaxFailureMessage printable ASCII characters (anything else becomes '?', which JSON never escapes).
+    internal static string Bounded(string text)
+    {
+        var length = Math.Min(text.Length, MaxFailureMessage);
+        return string.Create(length, text, static (span, source) =>
+        {
+            for (var i = 0; i < span.Length; i++)
+                span[i] = source[i] is >= ' ' and <= '~' and not '"' and not '\\' and not '<' and not '>' and not '&' and not '\'' and not '+' and not '`' ? source[i] : '?';
+        });
+    }
 
     private void Offer(CaseStream stream, string kind, long? modelSequence, int? width, int? height, int? length, byte[]? payload,
         object? detail = null, int detailBytes = 0)
@@ -414,20 +445,28 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 WriteStreamFailures();
                 if (Volatile.Read(ref _drainAbandoned) == 1)
                 {
+                    WaitForOffersInFlight();
                     DiscardQueued("drain-timeout");
                     break;
                 }
 
-                if (!DrainQueue() || !PullDelivery())
+                var drained = DrainQueue();
+                if (!drained || !PullDelivery())
                 {
-                    // The size bound: the case ends, and what it could not write is missing.
+                    // The size bound: the case ends, and what it could not write is missing, delivery records
+                    // the terminal made before the stop included.
                     RequestStop(DiagnosticCaseStopReason.SizeLimit);
+                    WaitForOffersInFlight();
+                    if (!drained)
+                        DeclareUnpulledDelivery("size-limit");
                     DiscardQueued("size-limit");
                     break;
                 }
 
                 _writer.Flush();
-                if (stopping && _queue.Count == 0 && Volatile.Read(ref _offersInFlight) == 0)
+                // In flight first: an offer enqueues before it leaves, so a queue read after seeing none in
+                // flight sees its event.
+                if (stopping && Volatile.Read(ref _offersInFlight) == 0 && _queue.Count == 0)
                     break;
                 if (stopping)
                     await Task.Delay(1).ConfigureAwait(false);
@@ -451,6 +490,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             _stoppedAt ??= _timeProvider.GetUtcNow();
             try
             {
+                WaitForOffersInFlight();
                 DiscardQueued("collector-failed");
             }
             catch (Exception)
@@ -487,6 +527,27 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 _completion.TrySetResult();
             }
         }
+    }
+
+    // A stop changes the state before a discard; offers that passed their check before it finish first, so
+    // their events are discarded (and declared) with the queue rather than left unaccounted. Bounded, as a
+    // producer is never held for long.
+    private void WaitForOffersInFlight() =>
+        SpinWait.SpinUntil(() => Volatile.Read(ref _offersInFlight) == 0, TimeSpan.FromSeconds(1));
+
+    // Delivery records the terminal made but the writer never pulled, declared missing when the case ends
+    // before it could write them.
+    private void DeclareUnpulledDelivery(string reason)
+    {
+        if (_sources.Delivery is not { } delivery)
+            return;
+        var last = delivery.Read(long.MaxValue - 1, 1, includeBytes: false).Totals.LastSequence ?? _deliverySince;
+        if (last <= _deliverySince)
+            return;
+        Interlocked.Add(ref _offered[(int)CaseStream.Delivery], last - _deliverySince);
+        Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], last - _deliverySince);
+        WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = _deliverySince + 1, ToOrdinal = last, Reason = reason }, RangeLimit);
+        _deliverySince = last;
     }
 
     private void WriteClosingRecords()
@@ -640,10 +701,21 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         AppendCase("interval-end", end, new DiagnosticCaseRecord { Stream = "model", Reason = _intervalEndReason ?? "unsupported" }, ClosingLimit);
     }
 
+    // Ranges taken from the ledger stay pending until written, so a writer failure partway through keeps the
+    // rest for the failure path to declare.
+    private readonly Queue<DiagnosticCaseRecord> _pendingLoss = new();
+
     private void WriteLoss(bool final)
     {
         foreach (var record in _loss.Take(final))
+            _pendingLoss.Enqueue(record);
+        while (_pendingLoss.TryPeek(out var record))
+        {
+            if (Interlocked.Exchange(ref _lossFault, null) is { } fault)
+                throw fault;
             WriteMissing(record, final ? RangeLimit : EventLimit);
+            _pendingLoss.Dequeue();
+        }
     }
 
     // Native delivery records live in their own bounded ring; the writer pulls them instead of adding a

@@ -35,26 +35,32 @@ internal static class CaseStorage
             var mode = File.GetUnixFileMode(root);
             if ((mode & ~DirectoryMode) != 0)
                 return $"The case directory root is accessible to group or others: '{root}'.";
-            if (!OwnedByCurrentUser(root, mode))
-                return $"The case directory root is not owned by the current user: '{root}'.";
+            if (OwnershipProblem(root, mode) is { } problem)
+                return problem;
         }
 
         return null;
     }
 
     // Only a file's owner (or the superuser) may change its mode, so setting the mode it already has is an
-    // ownership check that changes nothing and needs no native call.
+    // ownership check that changes nothing and needs no native call. A root whose mode cannot be set (a
+    // read-only mount, or one removed meanwhile) cannot be confirmed either, and is refused the same way.
+    // A superuser passes for any owner: the check cannot tell (a documented limitation).
     [UnsupportedOSPlatform("windows")]
-    private static bool OwnedByCurrentUser(string path, UnixFileMode mode)
+    private static string? OwnershipProblem(string path, UnixFileMode mode)
     {
         try
         {
             File.SetUnixFileMode(path, mode);
-            return true;
+            return null;
         }
         catch (UnauthorizedAccessException)
         {
-            return false;
+            return $"The case directory root is not owned by the current user: '{path}'.";
+        }
+        catch (IOException error)
+        {
+            return $"The case directory root's ownership cannot be confirmed: '{path}': {error.Message}";
         }
     }
 
