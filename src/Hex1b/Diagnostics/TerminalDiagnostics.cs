@@ -751,7 +751,7 @@ public sealed class TerminalDiagnostics
 
         var sources = new Diagnostics.Cases.CaseSources(
             _terminal.InputMilestones,
-            _terminal.Workload is Hex1bAppWorkloadAdapter app ? app.ApplicationFrameSource : null,
+            _terminal.Workload as Hex1bAppWorkloadAdapter,
             _terminal.NativeDelivery);
         var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase((fresh, unsupported, configuration) =>
             new Diagnostics.Cases.DiagnosticCaseRecorder(new DiagnosticCaseManifest
@@ -798,7 +798,7 @@ public sealed class TerminalDiagnostics
         [
             Declare("model", available: true, "", DiagnosticAuthorization.ReapplicationData, "Original model input"),
             Declare("input", sources.Input is not null, "The terminal has no input milestone tracker.", DiagnosticAuthorization.RawInput, "Raw keyboard input"),
-            Declare("frames", sources.Frames is not null && sources.Input is { AcceptanceOnly: false },
+            Declare("frames", sources.FramesAvailable,
                 "The workload is not a Hex1b application publishing diagnostic frames.", DiagnosticAuthorization.EditorText, "Focused-editor text"),
             Declare("delivery", sources.Delivery is not null, "The presentation cannot report its native writes.", DiagnosticAuthorization.NativeOutput, "Written bytes"),
         ];

@@ -104,6 +104,7 @@ internal static class CaseArtifactReader
         // recorded range explains is loss of unknown cause.
         public readonly List<DiagnosticCaseRecord> Recorded = [];
         public readonly List<(long From, long To)> Gaps = [];
+        public DiagnosticCaseRecord? Failure;
 
         public IReadOnlyList<DiagnosticCaseRecord> Missing =>
             Recorded.Concat(Gaps.Where(g => !Recorded.Any(m => m.FromOrdinal <= g.From && (m.ToOrdinal is null || m.ToOrdinal >= g.To)))
@@ -150,6 +151,8 @@ internal static class CaseArtifactReader
                     result.IntervalEnd = (end, item.Record?.Reason ?? "unsupported");
                 else if (item.Kind == "missing" && item.Record is { } missing && result.Streams.TryGetValue(missing.Stream, out var target))
                     target.Recorded.Add(missing);
+                else if (item.Kind == "stream-failed" && item.Record is { } failure && result.Streams.TryGetValue(failure.Stream, out var failed))
+                    failed.Failure ??= failure;
                 continue;
             }
 
@@ -237,8 +240,8 @@ internal static class CaseArtifactReader
                 Events = stream.Events,
                 FirstOrdinal = stream.First,
                 LastOrdinal = stream.Last,
-                State = missing.Count == 0 ? "complete" : "incomplete",
-                Missing = missing,
+                State = stream.Failure is not null ? "failed" : missing.Count == 0 ? "complete" : "incomplete",
+                Missing = stream.Failure is { } failure ? [.. missing, failure] : missing,
             };
         }).ToList();
 
