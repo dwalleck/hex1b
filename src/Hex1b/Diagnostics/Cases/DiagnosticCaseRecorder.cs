@@ -214,6 +214,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// </summary>
     internal long LastOfferedModelSequence => Volatile.Read(ref _lastOfferedModelSequence);
 
+    /// <summary>Starts the last offered sequence at the model's sequence when armed (under the model lock).</summary>
+    internal void SeedModelSequence(long modelSequence) => Volatile.Write(ref _lastOfferedModelSequence, modelSequence);
+
     /// <summary>
     /// Whether an application has begun and not yet been offered. The caller holds the model lock: a checkpoint
     /// taken then (re-entered from inside the application) would see it half applied.

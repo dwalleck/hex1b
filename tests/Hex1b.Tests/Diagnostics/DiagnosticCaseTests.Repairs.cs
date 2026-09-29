@@ -164,6 +164,107 @@ public partial class DiagnosticCaseTests
                 estimate = terminal.EstimateModelStateBytesUnsafe();
             Assert.IsGreaterThanOrEqualTo(cells * 40, estimate, $"the estimate {estimate} undercounts {cells} cells");
         }
+
+        // F32: a main screen saved at 300 × 100 when the alternate screen was entered keeps that size after a resize.
+        workload = new ScriptedWorkload();
+        var (alternate, _) = Checkpointed(root, workload, width: 300, height: 100, scrollback: null);
+        await using (alternate)
+        {
+            await workload.WriteAndWaitAsync(alternate, "main\u001b[?1049halternate");
+            alternate.Resize(20, 5);
+            var state = alternate.CaptureModelState();
+            var cells = state.Screen.Sum(r => (long)r.Cells.Count) + state.SavedMainScreen!.Sum(r => (long)r.Cells.Count);
+            Assert.IsGreaterThan(29_000L, cells, "fixture: the saved screen was resized");
+            var modelLock = typeof(Hex1bTerminal).GetField("_bufferLock", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(alternate)!;
+            long estimate;
+            lock (modelLock)
+                estimate = alternate.EstimateModelStateBytesUnsafe();
+            Assert.IsGreaterThanOrEqualTo(cells * 40, estimate, $"the estimate {estimate} undercounts the saved screen's {cells} cells");
+        }
+    }
+
+    [TestMethod]
+    public async Task Stop_ModelLockBusyInALiveCaseNamesTheModelAtArming()
+    {
+        // F33: a case started mid-session whose first application wedges names the model's sequence at arming.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10).Build();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var wedge = false;
+        terminal.WindowTitleChanged += _ =>
+        {
+            if (!wedge)
+                return;
+            entered.Set();
+            release.Wait(TimeSpan.FromSeconds(30));
+        };
+        string path;
+        long armedAt;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "one ");
+            await workload.WriteAndWaitAsync(terminal, "two ");
+            var diagnostics = new TerminalDiagnostics(terminal);
+            armedAt = terminal.CurrentModelSequence;
+            path = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] }).Path!;
+            wedge = true;
+            workload.Enqueue("\u001b]0;wedged\u0007"u8.ToArray());
+            Assert.IsTrue(entered.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken), "fixture: the callback never ran");
+            await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+            release.Set();
+        }
+
+        Assert.AreEqual(armedAt, StopCheckpoint(Artifact.Read(path)).GetProperty("modelSequence").GetInt64());
+    }
+
+    [TestMethod]
+    public async Task Mark_AfterANestedEventInsideAnApplicationRecordsTheBoundary()
+    {
+        // F34: after a callback raises a model event (a resize), the application is still unfinished; a mark there
+        // must not record its half-applied state.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        var (terminal, _) = Checkpointed(root, workload);
+        var diagnostics = new TerminalDiagnostics(terminal);
+        DiagnosticCaseMarkResult? inside = null;
+        terminal.WindowTitleChanged += _ =>
+        {
+            if (inside is not null)
+                return;
+            terminal.Resize(30, 8);
+            inside = diagnostics.MarkCase("after-nested");
+        };
+        await using (terminal)
+        {
+            await workload.WriteAndWaitAsync(terminal, "before ");
+            await workload.WriteAndWaitAsync(terminal, "\u001b]0;titled\u0007after");
+            await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        Assert.IsNotNull(inside, "fixture: the callback never marked");
+        Assert.IsFalse(inside.StateRecorded, "a mark inside an unfinished application recorded its state");
+        StringAssert.StartsWith(inside.StateReason, "mid-application");
+    }
+
+    [TestMethod]
+    public async Task Reapply_ReplicaThatCannotBeAllocatedIsIncompatible()
+    {
+        // F35: an allocation failure building the detached model is a refusal of the configuration, with nothing written.
+        using var root = new CaseRoot();
+        var path = await RecordCaseAsync(root, [new("oom")], new HeadlessPresentationAdapter(20, 4));
+        CaseReapplier.BuildReplicaForTesting.Value = () => throw new OutOfMemoryException("injected allocation failure");
+        try
+        {
+            var result = Reapply(path, label: "stop");
+            Assert.AreEqual((DiagnosticOutcome.Unavailable, "incompatible"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
+            Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), "a refused replica wrote a run");
+        }
+        finally
+        {
+            CaseReapplier.BuildReplicaForTesting.Value = null;
+        }
     }
 
     [TestMethod]

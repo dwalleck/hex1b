@@ -31,6 +31,9 @@ internal static class CaseReapplier
     /// <summary>Receives the detached model once it reached the target, before previews, while a test has set it.</summary>
     internal static readonly AsyncLocal<Action<Hex1bTerminal>?> ReconstructedForTesting = new();
 
+    /// <summary>Runs as the detached model is built, while a test has set it (to fail allocation there).</summary>
+    internal static readonly AsyncLocal<Action?> BuildReplicaForTesting = new();
+
     /// <summary>Runs before a run's files are written, while a test has set it (to fail storage there).</summary>
     internal static readonly AsyncLocal<Action?> FinishWritingForTesting = new();
 
@@ -266,6 +269,7 @@ internal static class CaseReapplier
     private static Hex1bTerminal BuildReplica(DiagnosticCaseModelConfiguration configuration, Reflow.ITerminalReflowProvider strategy,
         TerminalCapabilities capabilities, ReapplicationClock clock)
     {
+        BuildReplicaForTesting.Value?.Invoke();
         var presentation = new HeadlessPresentationAdapter(configuration.Width, configuration.Height, capabilities)
             .WithReflowStrategy(strategy, configuration.ReflowEnabled);
         var options = new Hex1bTerminalOptions

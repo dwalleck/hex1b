@@ -72,6 +72,7 @@ public sealed partial class Hex1bTerminal
                 ? "hmp1-workload: a remote workload's model is driven by state synchronization the case does not hold."
                 : null;
             var recorder = create(_modelSequence == 0 && OutputBytesRead == 0, unsupported, _caseConfiguration);
+            recorder.SeedModelSequence(_modelSequence);
             // Registered with the arming, so the input and frame streams start with the model stream.
             InputMilestones?.SetStreamObserver(recorder);
             Volatile.Write(ref _diagnosticCase, recorder);
@@ -170,8 +171,12 @@ public sealed partial class Hex1bTerminal
     private (long Sequence, DiagnosticCaseRecorder.CheckpointCapture Capture) TakeCaseCheckpointUnsafe(DiagnosticCaseRecorder recorder,
         bool forSizeLimitStop)
     {
-        if (recorder.ApplicationInProgress)
-            return (_modelSequence - 1, new(null, null, "unavailable", "mid-application: taken inside an application that had not finished", 0));
+        // Inside any application (a callback's mark or stop, the lock being re-entrant) the model is half
+        // applied. The boundary is the last completed sequence while the case still holds the application
+        // unoffered, and the current one once it was offered early (a nested event flushed it).
+        if (_captureApplicationDepth > 0)
+            return (recorder.ApplicationInProgress ? _modelSequence - 1 : _modelSequence,
+                new(null, null, "unavailable", "mid-application: taken inside an application that had not finished", 0));
         if (!recorder.IncludeModelPayloads)
             return (_modelSequence, new(null, null, "unavailable", "requires reapplication-data", 0));
         if (forSizeLimitStop && EstimateModelStateJsonBytesUnsafe() > recorder.StopCheckpointRoom)

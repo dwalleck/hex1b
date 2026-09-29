@@ -406,9 +406,10 @@ taken in one hold of the model lock, between two model events, at the model sequ
 - A checkpoint records the model as of its model sequence. A chunk the output pump has read and
   decoded, but not yet applied, is not part of it.
 - A checkpoint taken inside an application (a mark or stop from one of its callbacks) would see it
-  half applied. It records the boundary only (`unavailable: mid-application`) at the last completed
-  model sequence. A stop that could not take the model lock names the last model event the case
-  holds.
+  half applied. It records the boundary only (`unavailable: mid-application`), at the last completed
+  model sequence (or, once a nested model event inside the callback has been recorded, at that
+  event). A stop that could not take the model lock names the last model event the case holds (the
+  model's sequence when the case started, if it holds none).
 
 A mark (`case-mark`) takes an optional label of 1–64 printable ASCII characters. By default the
 label is `mark-` and the checkpoint's ordinal. Labels need not be unique: a re-application target

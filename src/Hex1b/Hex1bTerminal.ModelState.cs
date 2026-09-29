@@ -52,7 +52,8 @@ public sealed partial class Hex1bTerminal
     // counted row by row: O(rows), no cell read.
     private long EstimateModelStateCellsUnsafe()
     {
-        var cells = (long)_width * _height * (_savedMainScreenBuffer is null ? 1 : 2);
+        // The saved main screen keeps the size it had when the alternate screen was entered.
+        var cells = (long)_width * _height + (_savedMainScreenBuffer?.Length ?? 0);
         if (_scrollbackBuffer is { Count: > 0 } history)
         {
             for (var row = 0; row < history.Count; row++)
