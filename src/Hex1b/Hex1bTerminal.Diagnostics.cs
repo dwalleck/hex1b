@@ -34,13 +34,14 @@ public sealed partial class Hex1bTerminal
 
     /// <summary>
     /// Arms native delivery recording when the presentation is observable; called when a diagnostics
-    /// engine attaches. Writes made before this are not covered.
+    /// engine attaches. Writes made before this are not covered, and a terminal already disposed is
+    /// not armed: an empty record would claim coverage of a session that has ended.
     /// </summary>
     internal void EnsureNativeDeliveryRecorder()
     {
         // An impact-aware presentation receives cell impacts rather than bytes through the helpers,
         // so its writes would not be recorded; it is reported unobservable instead.
-        if (NativeDelivery is null && _presentation is IObservableNativePresentation observable
+        if (NativeDelivery is null && !_disposed && _presentation is IObservableNativePresentation observable
             && _presentation is not ICellImpactAwarePresentationAdapter)
             Interlocked.CompareExchange(ref _nativeDelivery, new Diagnostics.NativeDeliveryRecorder(observable.DeliveryLayer), null);
     }

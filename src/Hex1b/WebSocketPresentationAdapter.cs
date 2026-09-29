@@ -1,6 +1,5 @@
 using System.Buffers;
 using System.Net.WebSockets;
-using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using Hex1b.Input;
@@ -207,7 +206,7 @@ public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAda
 
     /// <inheritdoc />
     public ValueTask WriteOutputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default) =>
-        WriteCoreAsync(data, ct, outcome: null);
+        TryStartWrite(data) is null ? SendAsync(data, ct, observe: false) : default;
 
     /// <inheritdoc />
     string IObservableNativePresentation.DeliveryLayer => "websocket";
@@ -215,32 +214,55 @@ public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAda
     async ValueTask<NativeWriteResult> IObservableNativePresentation.WriteObservedAsync(
         ReadOnlyMemory<byte> data, NativeWriteProgress progress, CancellationToken ct)
     {
-        var outcome = new StrongBox<NativeWriteResult>(NativeWriteResult.Accepted);
-        await WriteCoreAsync(data, ct, outcome).ConfigureAwait(false);
-        return outcome.Value;
-    }
-
-    // The one write path. The socket errors and cancellation it has always swallowed are reported to
-    // an observer (when there is one) rather than thrown, so the terminal sees exactly what it saw before.
-    private async ValueTask WriteCoreAsync(ReadOnlyMemory<byte> data, CancellationToken ct, StrongBox<NativeWriteResult>? outcome)
-    {
-        if (data.IsEmpty)
-            return;
-        if (!TryBeginWriter())
+        switch (TryStartWrite(data))
         {
-            if (outcome is not null) outcome.Value = NativeWriteResult.Refuse("presentation-disposed");
-            return;
+            case "":
+                return NativeWriteResult.Accepted;
+            case { } refusal:
+                return NativeWriteResult.Refuse(refusal);
         }
 
+        try
+        {
+            await SendAsync(data, ct, observe: true).ConfigureAwait(false);
+            return NativeWriteResult.Accepted;
+        }
+        catch (WebSocketException error)
+        {
+            return NativeWriteResult.Fail(error);
+        }
+        catch (OperationCanceledException error)
+        {
+            return NativeWriteResult.Fail(error);
+        }
+    }
+
+    // Decides whether a write goes ahead: null when it does, and the writer is then begun; "" for an
+    // empty write; otherwise why it is declined. Synchronous and allocation-free, so the unarmed write
+    // carries nothing the write before delivery recording did not.
+    private string? TryStartWrite(ReadOnlyMemory<byte> data)
+    {
+        if (data.IsEmpty)
+            return "";
+        if (!TryBeginWriter())
+            return "presentation-disposed";
+        if (_webSocket.State != WebSocketState.Open)
+        {
+            CompleteWriter();
+            return "socket-not-open";
+        }
+
+        return null;
+    }
+
+    // The one send path, for a write TryStartWrite began. The socket errors and cancellation it has
+    // always swallowed reach an observer instead, which reports them rather than throwing, so the
+    // terminal sees exactly what it saw before.
+    private async ValueTask SendAsync(ReadOnlyMemory<byte> data, CancellationToken ct, bool observe)
+    {
         var lockTaken = false;
         try
         {
-            if (_webSocket.State != WebSocketState.Open)
-            {
-                if (outcome is not null) outcome.Value = NativeWriteResult.Refuse("socket-not-open");
-                return;
-            }
-
             TryTraceOutput(data);
             await _outputWriteLock.WaitAsync(ct).ConfigureAwait(false);
             lockTaken = true;
@@ -262,15 +284,13 @@ public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAda
 
             CommitPendingUtf8(prepared.PendingBytes);
         }
-        catch (WebSocketException error)
+        catch (WebSocketException) when (!observe)
         {
             // Connection closed
-            if (outcome is not null) outcome.Value = NativeWriteResult.Fail(error);
         }
-        catch (OperationCanceledException error)
+        catch (OperationCanceledException) when (!observe)
         {
             // Cancelled
-            if (outcome is not null) outcome.Value = NativeWriteResult.Fail(error);
         }
         finally
         {

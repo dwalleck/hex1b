@@ -281,9 +281,11 @@ Outcomes:
   sequences written during disposal. The diagnostics socket closes at session end, so the CLI
   and MCP cannot read those last records.
 - Writes a presentation makes on its own are not terminal writes and are not recorded: the
-  console presentation's cursor-position queries and capability probes, and a WebSocket's held
-  incomplete UTF-8 tail. That tail is counted in the `accepted` write that carried it, and is
-  sent later without a record of its own.
+  console presentation's cursor-position queries and capability probes. A WebSocket presentation
+  holds back an incomplete UTF-8 sequence at the end of a write. The held bytes count in the
+  `length` and `content` of the write that carried them, which is `accepted`. They are sent at the
+  start of the next write's message, outside that record's `length` and `content`, or, if no write
+  completes them, as U+FFFD when the presentation is disposed, with no record.
 - Socket clients read one JSON line per request. The reply begins with a UTF-8 byte-order mark,
   which a raw client must skip (it may arrive in its own read).
 

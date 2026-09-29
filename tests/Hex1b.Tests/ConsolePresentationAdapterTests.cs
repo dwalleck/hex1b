@@ -562,6 +562,12 @@ internal sealed class FakeConsoleDriver : IConsoleDriver
     public void Write(ReadOnlySpan<byte> data)
     {
         Interlocked.Increment(ref _writeCount);
+        if (HoldMarker is { } marker && Encoding.ASCII.GetString(data).Contains(marker, StringComparison.Ordinal))
+        {
+            WriteHeld.Set();
+            ReleaseHeld.Wait(TimeSpan.FromSeconds(10));
+        }
+
         if (_failure is { } failure)
         {
             _failure = null;
@@ -576,9 +582,27 @@ internal sealed class FakeConsoleDriver : IConsoleDriver
     /// <summary>Counts writes without keeping their bytes, so a test can measure the write path's own allocations.</summary>
     public bool DiscardWrites { get; init; }
 
+    /// <summary>Reports write progress as a driver without its own progress reporting does.</summary>
+    public bool UsesDefaultProgress { get; set; }
+
+    /// <summary>A write containing this text blocks, after setting <see cref="WriteHeld"/>, until <see cref="ReleaseHeld"/> is set.</summary>
+    public string? HoldMarker { get; set; }
+
+    public ManualResetEventSlim WriteHeld { get; } = new();
+
+    public ManualResetEventSlim ReleaseHeld { get; } = new();
+
     /// <summary>Writes, reporting partial progress when a failure was injected.</summary>
     public void Write(ReadOnlySpan<byte> data, NativeWriteProgress progress)
     {
+        if (UsesDefaultProgress)
+        {
+            // As the IConsoleDriver default: nothing is known until the whole write returns.
+            Write(data);
+            progress.Advance(data.Length);
+            return;
+        }
+
         if (_failure is { } failure)
             progress.Advance(failure.AcceptedBytes);
         Write(data);

@@ -403,10 +403,10 @@ public sealed class ConsolePresentationAdapter :
     private NativeDeliveryOutcome WriteIfGeometryCore(ReadOnlyMemory<byte> data, int expectedWidth, int expectedHeight,
         NativeWriteProgress? progress)
     {
-        // Observed from the start: a disposed adapter throws before the host takes any byte.
-        progress?.Observe();
         if (_disposed)
         {
+            // Known exactly: a disposed adapter throws before the host takes any byte.
+            progress?.Observe();
             throw new ObjectDisposedException(nameof(ConsolePresentationAdapter));
         }
 
