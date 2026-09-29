@@ -116,7 +116,7 @@ public class DiagnosticCaseTools(TerminalSessionManager sessionManager)
     public CaseReapplyToolResult ReapplyDiagnosticCase(
         [Description("The case directory (the 'path' a start or stop returned).")] string path,
         [Description("Target: a model sequence (12), a case sequence (case:34), or a checkpoint label (label:name, or the bare name; 'stop' is the stop checkpoint).")] string to,
-        [Description("Declared faults to inject into the reconstructed state before comparing (comma-separated), as kind or kind:target: cell-text[:row/column], cell-style[:row/column], cursor, mode[:name], title, charset, tab-stop, pending-input, history-row[:index], history-rows. The result is labelled faultInjected.")] string? injectFault = null,
+        [Description("Declared faults to inject into the reconstructed state before comparing (comma-separated), as kind or kind:target: cell-text[:row/column], cell-style[:row/column], cursor, mode[:name], title, charset, tab-stop, pending-input, history-row[:index], history-rows, pending-wrap, last-printed, rendition, margins, saved-cursor, pending-grapheme, activity, synchronized-update. The result is labelled faultInjected.")] string? injectFault = null,
         [Description("Most differences listed (1-100000; default 1000). Every difference is counted.")] int? maxDifferences = null,
         [Description("Previews to write (comma-separated): text, ansi, svg, html.")] string? preview = null)
     {

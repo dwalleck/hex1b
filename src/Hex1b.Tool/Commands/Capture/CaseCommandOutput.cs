@@ -23,8 +23,8 @@ internal static class CaseCommandOutput
         formatter.WriteLine($"Case {AppTreeCommand.Safe(result.CaseId)} {verb}: {DiagnosticContractNames.Of(result.State!.Value)}" +
             (result.StopReason is { } reason ? $" ({DiagnosticContractNames.Of(reason)})" : ""));
         formatter.WriteLine($"Path: {AppTreeCommand.Safe(result.Path)}");
-        formatter.WriteLine($"Checkpoint: {AppTreeCommand.Safe(result.Checkpoint!.Profile)} {DiagnosticContractNames.Of(result.Checkpoint.Status)}" +
-            (result.Checkpoint.Reason is { } why ? $" ({AppTreeCommand.Safe(why)})" : ""));
+        var checkpoint = result.Checkpoint!;
+        formatter.WriteLine($"Checkpoint: {Checkpoint(checkpoint)}" + (checkpoint.Reason is { } why ? $" ({AppTreeCommand.Safe(why)})" : ""));
         formatter.WriteLine($"Bounds: {result.Bounds!.MaxBytes} bytes, {result.Bounds.MaxSeconds} s; " +
             $"written {result.BytesWritten ?? 0} bytes in {result.ElapsedSeconds ?? 0:0.###} s");
         foreach (var stream in result.Streams)
@@ -46,7 +46,7 @@ internal static class CaseCommandOutput
             (inspection.Completion is { } completion ? $" ({DiagnosticContractNames.Of(completion.StopReason)})" : "") +
             (inspection.TruncatedAtLine is { } line ? $", verified through line {line - 1}" : ""));
         formatter.WriteLine($"Started: {manifest.StartedAt:O} ({DiagnosticContractNames.Of(manifest.StartPath)}); " +
-            $"checkpoint {AppTreeCommand.Safe(manifest.Checkpoint.Profile)} {DiagnosticContractNames.Of(manifest.Checkpoint.Status)}");
+            $"checkpoint {Checkpoint(manifest.Checkpoint)}");
         foreach (var stream in inspection.Streams)
         {
             formatter.WriteLine($"  {AppTreeCommand.Safe(stream.Stream)}: {AppTreeCommand.Safe(stream.State)}, {stream.Events} events" +
@@ -93,6 +93,8 @@ internal static class CaseCommandOutput
             return result.Comparison == "matched" ? 0 : 2;
 
         var target = result.Target!;
+        if (result.Checkpoint is { ModelSequence: { } start } restored)
+            formatter.WriteLine($"Restored from the {AppTreeCommand.Safe(restored.Profile)} start at model sequence {start}");
         formatter.WriteLine($"Re-applied to model sequence {target.ModelSequence}" +
             (target.Label is { } label ? $" ('{AppTreeCommand.Safe(label)}')" : "") + $": {AppTreeCommand.Safe(result.Comparison)}" +
             (result.ComparisonReason is { } reason ? $" ({AppTreeCommand.Safe(reason)})" : ""));
@@ -109,6 +111,13 @@ internal static class CaseCommandOutput
         formatter.WriteLine($"Run: {AppTreeCommand.Safe(result.RunPath)} ({string.Join(", ", result.Files.Select(AppTreeCommand.Safe))})");
         return result.Comparison == "matched" ? 0 : 2;
     }
+
+    // A case's initial checkpoint: its profile and status, and for a start on a model that had applied output, its
+    // model sequence and any surfaces it could not restore.
+    private static string Checkpoint(DiagnosticCaseCheckpoint checkpoint) =>
+        $"{AppTreeCommand.Safe(checkpoint.Profile)} {DiagnosticContractNames.Of(checkpoint.Status)}" +
+        (checkpoint.ModelSequence is { } start ? $" at model sequence {start}" : "") +
+        (checkpoint.UnsupportedSurfaces is { Count: > 0 } surfaces ? $"; unsupported surfaces: {string.Join(", ", surfaces.Select(AppTreeCommand.Safe))}" : "");
 
     private static int Failure(OutputFormatter formatter, DiagnosticOutcome outcome, DiagnosticProblem? problem)
     {

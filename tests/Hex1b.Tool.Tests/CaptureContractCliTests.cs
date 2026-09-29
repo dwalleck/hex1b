@@ -945,6 +945,68 @@ public class CaptureContractCliTests
         StringAssert.Contains(beyond, "Re-applicable through model sequence");
     }
 
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task CaseLiveStart_InspectAndReapplyFromTheStart()
+    {
+        // Ticket 09: a case started through the CLI on a running application owns a text-state/1 start (the
+        // application is on the alternate screen), and re-applies from it to matched.
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        await using var target = await StartAttachedAppAsync();
+        var (startExit, start, startErr) = await RunCliAsync("capture", "case", "start", Pid, "--dir", root.Path,
+            "--authorize", "reapplication-data", "--json");
+        Assert.AreEqual(0, startExit, startErr);
+        var checkpoint = JsonDocument.Parse(start).RootElement.GetProperty("checkpoint");
+        Assert.AreEqual(("text-state/1", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()),
+            checkpoint.ToString());
+        var startSequence = checkpoint.GetProperty("modelSequence").GetInt64();
+        target.Resize(30, 6);
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.Width == 30 && s.ContainsText("STYLED"), TimeSpan.FromSeconds(10), "re-rendered")
+            .Build().ApplyAsync(target, TestContext.Current.CancellationToken);
+        var (markExit, _, markErr) = await RunCliAsync("capture", "case", "mark", Pid, "--label", "resized", "--json");
+        Assert.AreEqual(0, markExit, markErr);
+        var (stopExit, stop, stopErr) = await RunCliAsync("capture", "case", "stop", Pid, "--json");
+        Assert.AreEqual(0, stopExit, stopErr);
+        var path = JsonDocument.Parse(stop).RootElement.GetProperty("path").GetString()!;
+
+        var (inspectExit, inspect, inspectErr) = await RunCliAsync("capture", "case", "inspect", path, "--json");
+        Assert.AreEqual(0, inspectExit, inspectErr);
+        var expected = JsonSerializer.SerializeToElement(DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }),
+            DiagnosticsJsonContext.Default.DiagnosticCaseInspection);
+        Assert.IsTrue(JsonElement.DeepEquals(expected, JsonDocument.Parse(inspect).RootElement), "CLI inspect differs from the inspector");
+        var (_, inspectText, _) = await RunCliAsync("capture", "case", "inspect", path);
+        StringAssert.Contains(inspectText, $"checkpoint text-state/1 complete at model sequence {startSequence}");
+        StringAssert.Contains(inspectText, $"Re-applicable: model {startSequence}..");
+
+        foreach (var label in new[] { "start", "resized", "stop" })
+        {
+            var (exit, json, err) = await RunCliAsync("capture", "case", "reapply", path, "--to", label, "--json");
+            var reapplied = DiagnosticCaseReapplier.Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = label });
+            Assert.AreEqual("matched", reapplied.Comparison, $"{label}: {reapplied.ComparisonReason} {reapplied.Problem?.Message}");
+            Assert.AreEqual(0, exit, err);
+            AssertJsonEquals(reapplied, json, label, "runPath");
+        }
+        var (textExit, text, _) = await RunCliAsync("capture", "case", "reapply", path, "--to", "stop");
+        Assert.AreEqual(0, textExit);
+        StringAssert.Contains(text, $"Restored from the text-state/1 start at model sequence {startSequence}");
+
+        // A start that held refused surfaces: the text names them.
+        var refused = Path.Combine(root.Path, "refused");
+        Directory.CreateDirectory(refused, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        foreach (var file in Directory.GetFiles(path))
+            File.Copy(file, Path.Combine(refused, Path.GetFileName(file)));
+        var manifest = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Path.Combine(refused, "manifest.json")))!;
+        manifest["checkpoint"]!["status"] = "unsupported";
+        manifest["checkpoint"]!["reason"] = "unsupported-surfaces: the start held retained-history, titles.";
+        manifest["checkpoint"]!["unsupportedSurfaces"] = new System.Text.Json.Nodes.JsonArray("retained-history", "titles");
+        File.WriteAllText(Path.Combine(refused, "manifest.json"), manifest.ToJsonString());
+        var (_, refusedText, _) = await RunCliAsync("capture", "case", "inspect", refused);
+        StringAssert.Contains(refusedText, "unsupported surfaces: retained-history, titles");
+    }
+
     // The client's JSON equals the contract object's, apart from fields that differ per run.
     private static void AssertJsonEquals<T>(T expected, string actualJson, string what, params string[] ignored)
     {

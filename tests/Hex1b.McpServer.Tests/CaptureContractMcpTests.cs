@@ -696,6 +696,52 @@ public class CaptureContractMcpTests : McpServerTestBase
 
     [TestMethod]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task CaseLiveStart_ReapplyFromTheStartMatchesTheReapplier()
+    {
+        // Ticket 09: a case started over MCP on a running application owns a text-state/1 start, and re-applies from
+        // it to matched through reapply_diagnostic_case, equal to the reapplier's own result.
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        await using var terminal = await StartAttachedAppAsync();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var sessionId = await ConnectAttachedAsync(client);
+        var start = await CallAsync(client, "start_diagnostic_case", new()
+        {
+            ["sessionId"] = sessionId,
+            ["directory"] = root.Path,
+            ["authorize"] = "reapplication-data",
+        });
+        Assert.IsTrue(start.GetProperty("success").GetBoolean(), start.ToString());
+        var checkpoint = start.GetProperty("case").GetProperty("checkpoint");
+        Assert.AreEqual(("text-state/1", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()),
+            checkpoint.ToString());
+        terminal.Resize(30, 6);
+        await new Hex1bTerminalInputSequenceBuilder()
+            .WaitUntil(s => s.Width == 30 && s.ContainsText("STYLED"), TimeSpan.FromSeconds(10), "re-rendered")
+            .Build().ApplyAsync(terminal, TestContext.Current.CancellationToken);
+        var mark = await CallAsync(client, "mark_diagnostic_case", new() { ["sessionId"] = sessionId, ["label"] = "resized" });
+        Assert.IsTrue(mark.GetProperty("success").GetBoolean(), mark.ToString());
+        var stop = await CallAsync(client, "stop_diagnostic_case", new() { ["sessionId"] = sessionId });
+        var path = stop.GetProperty("case").GetProperty("path").GetString()!;
+
+        var inspect = await CallAsync(client, "inspect_diagnostic_case", new() { ["path"] = path });
+        var expected = JsonSerializer.SerializeToElement(DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }),
+            DiagnosticsJsonContext.Default.DiagnosticCaseInspection);
+        Assert.IsTrue(JsonElement.DeepEquals(expected, inspect.GetProperty("inspection")), "MCP inspect differs from the inspector");
+        foreach (var label in new[] { "start", "resized", "stop" })
+        {
+            var result = await CallAsync(client, "reapply_diagnostic_case", new() { ["path"] = path, ["to"] = label });
+            var reapplied = DiagnosticCaseReapplier.Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = label });
+            Assert.AreEqual("matched", reapplied.Comparison, $"{label}: {reapplied.ComparisonReason} {reapplied.Problem?.Message}");
+            Assert.IsTrue(result.GetProperty("success").GetBoolean(), result.ToString());
+            AssertJsonEquals(reapplied, result.GetProperty("reapplication"), label, "runPath");
+        }
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task Case_MarkAndReapplyMatchTheEngineAndTheReapplier()
     {
         if (!OperatingSystem.IsLinux())
