@@ -26,6 +26,7 @@ namespace Hex1b.Diagnostics;
 [JsonSerializable(typeof(DiagnosticCaseEvent))]
 [JsonSerializable(typeof(DiagnosticCaseInspectRequest))]
 [JsonSerializable(typeof(DiagnosticCaseInspection))]
+[JsonSerializable(typeof(DiagnosticModelState))]
 [JsonSerializable(typeof(string))]
 [JsonSerializable(typeof(int))]
 [JsonSerializable(typeof(bool))]

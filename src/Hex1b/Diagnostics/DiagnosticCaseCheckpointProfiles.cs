@@ -8,4 +8,9 @@ public static class DiagnosticCaseCheckpointProfiles
     /// bytes, since construction. Its state is fully determined by its configuration.
     /// </summary>
     public const string FreshModel = "fresh-model/1";
+
+    /// <summary>
+    /// A typed projection of the model's full text state (<see cref="DiagnosticModelState"/>).
+    /// </summary>
+    public const string TextState = "text-state/1";
 }

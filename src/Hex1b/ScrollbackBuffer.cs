@@ -55,6 +55,9 @@ internal sealed class ScrollbackBuffer
     /// </summary>
     public int Count => _count;
 
+    /// <summary>The identity the next pushed row receives.</summary>
+    internal long NextRowId => _nextRowId;
+
     /// <summary>
     /// Adds a row to the buffer. If the buffer is full, the oldest row is evicted
     /// and its tracked object references are released.

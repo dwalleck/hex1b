@@ -75,6 +75,8 @@ internal sealed class DcsByteStreamParser
 
     internal bool HasPendingGroundEscape => _state == ParserState.GroundEscape;
 
+    internal int PendingUtf8ContinuationBytes => _utf8ContinuationBytesRemaining;
+
     public int RetentionLimit => _retentionLimit;
 
     public DcsByteStreamBatch Process(ReadOnlySpan<byte> data)
