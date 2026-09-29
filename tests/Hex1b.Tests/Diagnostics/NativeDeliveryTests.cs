@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Net.WebSockets;
 using System.Text.Json;
 using Hex1b.Diagnostics;
 using Hex1b.Tokens;
@@ -360,6 +361,137 @@ public class NativeDeliveryTests
         var layer = none.Layers.Single(l => l.Layer == DiagnosticLayer.NativeDelivery);
         Assert.IsFalse(layer.Available);
         StringAssert.Contains(layer.Reason, "no native presentation");
+    }
+
+    [TestMethod]
+    public async Task WebSocket_RefusedWhenNotOpenAndFailedWhenTheSendIsSwallowed()
+    {
+        var socket = new StateWebSocket();
+        var presentation = new WebSocketPresentationAdapter(socket, 40, 6);
+        var workload = new Hex1bAppWorkloadAdapter();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithPresentation(presentation).WithDimensions(40, 6).Build();
+        var diagnostics = new TerminalDiagnostics(terminal, "websocket");
+        using var cts = new CancellationTokenSource();
+        var run = terminal.RunAsync(cts.Token);
+
+        async Task WriteAndSettleAsync(string text, int records)
+        {
+            workload.Write(text);
+            for (var i = 0; i < 300 && (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals?.LastSequence ?? 0) < records; i++)
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+        }
+
+        await WriteAndSettleAsync("OPEN", 1);
+        socket.CurrentState = WebSocketState.Closed;
+        await WriteAndSettleAsync("CLOSED", 2);
+        socket.CurrentState = WebSocketState.Open;
+        socket.FailSends = true;
+        await WriteAndSettleAsync("BROKEN", 3);
+        var result = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest());
+
+        Assert.AreEqual("websocket", result.DeliveryLayer);
+        var outcomes = result.Records.Select(r => (r.Outcome, r.Reason)).ToList();
+        CollectionAssert.AreEqual(new List<(DiagnosticDeliveryOutcome, string?)>
+        {
+            (DiagnosticDeliveryOutcome.Accepted, null),
+            (DiagnosticDeliveryOutcome.Refused, "socket-not-open"),
+            (DiagnosticDeliveryOutcome.Failed, null),
+        }, outcomes, string.Join(", ", outcomes));
+        StringAssert.Contains(result.Records[2].Error, nameof(WebSocketException));
+        Assert.IsFalse(run.IsCompleted, "a swallowed socket error ended the run, which it never did before");
+        Assert.HasCount(2, socket.Sent, "fixture: the open and failing writes both reached the socket; the closed one did not");
+        await cts.CancelAsync();
+        try { await run; } catch (Exception) { }
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public void PartialWrite_ReportsTheBytesTheKernelTook()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Linux pipe semantics.");
+        var fds = new int[2];
+        Assert.AreEqual(0, Pipe(fds), "fixture: pipe()");
+        var (readFd, writeFd) = (fds[0], fds[1]);
+        var driver = new UnixConsoleDriver(writeFd);
+        var readerCount = 0;
+        var unread = 0;
+        var reader = new Thread(() =>
+        {
+            var buffer = new byte[4096];
+            while (readerCount < 10_000)
+            {
+                var n = (int)Read(readFd, buffer, Math.Min(buffer.Length, 10_000 - readerCount));
+                if (n <= 0)
+                    break;
+                readerCount += n;
+            }
+
+            // Let the writer fill the pipe and block, then count what the kernel holds unread.
+            Thread.Sleep(300);
+            _ = Ioctl(readFd, 0x541B /* FIONREAD */, out unread);
+            Close(readFd);
+        });
+        reader.Start();
+
+        var progress = new NativeWriteProgress();
+        var failure = Assert.ThrowsExactly<InvalidOperationException>(() => driver.Write(new byte[1024 * 1024], progress));
+        reader.Join();
+        Close(writeFd);
+
+        Assert.AreEqual("write() failed with errno 32", failure.Message, "the driver's failure changed");
+        Assert.IsTrue(progress.Observed);
+        Assert.AreEqual(readerCount + unread, progress.BytesAccepted,
+            $"reader took {readerCount}, {unread} were left unread in the pipe, driver reported {progress.BytesAccepted}");
+        Assert.IsGreaterThan(10_000, progress.BytesAccepted, "fixture: the write did not accept anything beyond what was read");
+    }
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "pipe", SetLastError = true)]
+    private static extern int Pipe(int[] fds);
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "read", SetLastError = true)]
+    private static extern nint Read(int fd, byte[] buffer, nint count);
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "close", SetLastError = true)]
+    private static extern int Close(int fd);
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "ioctl", SetLastError = true)]
+    private static extern int Ioctl(int fd, ulong request, out int value);
+
+    // A WebSocket whose state and send failures the test controls.
+    private sealed class StateWebSocket : System.Net.WebSockets.WebSocket
+    {
+        public System.Net.WebSockets.WebSocketState CurrentState { get; set; } = System.Net.WebSockets.WebSocketState.Open;
+        public bool FailSends { get; set; }
+        public List<byte[]> Sent { get; } = [];
+        public override System.Net.WebSockets.WebSocketCloseStatus? CloseStatus => null;
+        public override string? CloseStatusDescription => null;
+        public override System.Net.WebSockets.WebSocketState State => CurrentState;
+        public override string? SubProtocol => null;
+        public override void Abort() { }
+        public override Task CloseAsync(System.Net.WebSockets.WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) => Task.CompletedTask;
+        public override Task CloseOutputAsync(System.Net.WebSockets.WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) => Task.CompletedTask;
+        public override void Dispose() { }
+        public override async Task<System.Net.WebSockets.WebSocketReceiveResult> ReceiveAsync(ArraySegment<byte> buffer, CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+            throw new OperationCanceledException();
+        }
+        public override async ValueTask<System.Net.WebSockets.ValueWebSocketReceiveResult> ReceiveAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+            throw new OperationCanceledException();
+        }
+        public override Task SendAsync(ArraySegment<byte> buffer, System.Net.WebSockets.WebSocketMessageType messageType, bool endOfMessage, CancellationToken cancellationToken) =>
+            SendAsync(buffer.AsMemory(), messageType, endOfMessage, cancellationToken).AsTask();
+        public override ValueTask SendAsync(ReadOnlyMemory<byte> buffer, System.Net.WebSockets.WebSocketMessageType messageType, bool endOfMessage, CancellationToken cancellationToken = default)
+        {
+            lock (Sent)
+                Sent.Add(buffer.ToArray());
+            if (FailSends)
+                throw new System.Net.WebSockets.WebSocketException("The remote party closed the connection.");
+            return ValueTask.CompletedTask;
+        }
     }
 
     private static string Decode(DiagnosticDeliveryRecord record) =>

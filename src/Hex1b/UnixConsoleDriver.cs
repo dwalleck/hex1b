@@ -32,6 +32,15 @@ internal sealed class UnixConsoleDriver : IConsoleDriver
     // negligible next to the latency a full 100ms slice would add per observation.
     private const int ReadPollSliceMilliseconds = 25;
     
+    // Where Write sends output; standard output except in tests that write to a pipe.
+    private readonly int _outputFd = STDOUT_FILENO;
+
+    /// <summary>A driver that writes to <paramref name="outputFd"/>; used by tests to observe partial writes.</summary>
+    internal UnixConsoleDriver(int outputFd)
+    {
+        _outputFd = outputFd;
+    }
+
     public UnixConsoleDriver()
     {
         if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS())
@@ -217,8 +226,15 @@ internal sealed class UnixConsoleDriver : IConsoleDriver
         }, ct);
     }
     
-    public void Write(ReadOnlySpan<byte> data)
+    public void Write(ReadOnlySpan<byte> data) => WriteCore(data, progress: null);
+
+    /// <inheritdoc />
+    public void Write(ReadOnlySpan<byte> data, NativeWriteProgress progress) => WriteCore(data, progress);
+
+    // Loops over partial writes; progress (when observed) advances by each write the kernel took.
+    private void WriteCore(ReadOnlySpan<byte> data, NativeWriteProgress? progress)
     {
+        progress?.Observe();
         unsafe
         {
             fixed (byte* ptr = data)
@@ -227,7 +243,7 @@ internal sealed class UnixConsoleDriver : IConsoleDriver
                 var offset = 0;
                 while (remaining > 0)
                 {
-                    var written = write(STDOUT_FILENO, ptr + offset, (nuint)remaining);
+                    var written = write(_outputFd, ptr + offset, (nuint)remaining);
                     if (written < 0)
                     {
                         var errno = Marshal.GetLastPInvokeError();
@@ -237,6 +253,7 @@ internal sealed class UnixConsoleDriver : IConsoleDriver
                     }
                     offset += (int)written;
                     remaining -= (int)written;
+                    progress?.Advance((int)written);
                 }
             }
         }

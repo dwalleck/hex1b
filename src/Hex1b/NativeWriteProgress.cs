@@ -10,6 +10,9 @@ internal sealed class NativeWriteProgress
 
     public bool Observed { get; private set; }
 
+    /// <summary>Declares that this write's progress is observed, so zero accepted bytes means zero, not unknown.</summary>
+    public void Observe() => Observed = true;
+
     public void Advance(int bytes)
     {
         Observed = true;

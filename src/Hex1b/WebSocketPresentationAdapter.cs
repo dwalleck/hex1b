@@ -14,7 +14,7 @@ namespace Hex1b;
 /// WebSocket connections, allowing Hex1b applications to run in web browsers
 /// through xterm.js or similar terminal emulators.
 /// </remarks>
-public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAdapter
+public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAdapter, IObservableNativePresentation
 {
     private readonly record struct PreparedUtf8Output(
         byte[] CompleteBytes,
@@ -205,16 +205,29 @@ public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAda
     }
 
     /// <inheritdoc />
-    public async ValueTask WriteOutputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
+    public async ValueTask WriteOutputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default) =>
+        await WriteCoreAsync(data, ct).ConfigureAwait(false);
+
+    /// <inheritdoc />
+    string IObservableNativePresentation.DeliveryLayer => "websocket";
+
+    ValueTask<NativeWriteResult> IObservableNativePresentation.WriteObservedAsync(
+        ReadOnlyMemory<byte> data, NativeWriteProgress progress, CancellationToken ct) => WriteCoreAsync(data, ct);
+
+    // The one write path. The socket errors and cancellation it has always swallowed are reported as
+    // failures rather than thrown, so the terminal sees exactly what it saw before.
+    private async ValueTask<NativeWriteResult> WriteCoreAsync(ReadOnlyMemory<byte> data, CancellationToken ct)
     {
-        if (data.IsEmpty || !TryBeginWriter())
-            return;
+        if (data.IsEmpty)
+            return NativeWriteResult.Accepted;
+        if (!TryBeginWriter())
+            return NativeWriteResult.Refuse("presentation-disposed");
 
         var lockTaken = false;
         try
         {
             if (_webSocket.State != WebSocketState.Open)
-                return;
+                return NativeWriteResult.Refuse("socket-not-open");
 
             TryTraceOutput(data);
             await _outputWriteLock.WaitAsync(ct).ConfigureAwait(false);
@@ -236,14 +249,17 @@ public sealed class WebSocketPresentationAdapter : IHex1bTerminalPresentationAda
             }
 
             CommitPendingUtf8(prepared.PendingBytes);
+            return NativeWriteResult.Accepted;
         }
-        catch (WebSocketException)
+        catch (WebSocketException error)
         {
             // Connection closed
+            return NativeWriteResult.Fail(error);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException error)
         {
             // Cancelled
+            return NativeWriteResult.Fail(error);
         }
         finally
         {

@@ -879,8 +879,15 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         }
     }
     
-    public void Write(ReadOnlySpan<byte> data)
+    public void Write(ReadOnlySpan<byte> data) => WriteCore(data, progress: null);
+
+    /// <inheritdoc />
+    public void Write(ReadOnlySpan<byte> data, NativeWriteProgress progress) => WriteCore(data, progress);
+
+    // Loops over partial writes; progress (when observed) advances by each write the console took.
+    private void WriteCore(ReadOnlySpan<byte> data, NativeWriteProgress? progress)
     {
+        progress?.Observe();
         unsafe
         {
             fixed (byte* ptr = data)
@@ -898,6 +905,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
                     
                     offset += (int)bytesWritten;
                     remaining -= bytesWritten;
+                    progress?.Advance((int)bytesWritten);
                 }
             }
         }

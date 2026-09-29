@@ -25,8 +25,12 @@ public sealed partial class Hex1bTerminal
         try
         {
             var result = await observable.WriteObservedAsync(data, progress, ct).ConfigureAwait(false);
-            recorder.Complete(entry, result.Refused ? DiagnosticDeliveryOutcome.Refused : DiagnosticDeliveryOutcome.Accepted,
-                result.Refused ? 0 : data.Length, result.Reason, error: null);
+            if (result.Failed)
+                recorder.Complete(entry, DiagnosticDeliveryOutcome.Failed, progress.Observed ? progress.BytesAccepted : null,
+                    reason: null, result.Error);
+            else
+                recorder.Complete(entry, result.Refused ? DiagnosticDeliveryOutcome.Refused : DiagnosticDeliveryOutcome.Accepted,
+                    result.Refused ? 0 : data.Length, result.Reason, error: null);
         }
         catch (Exception error)
         {
