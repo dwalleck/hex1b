@@ -209,8 +209,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     private bool _stopCheckpointSettled;
     // Marks reserved or awaiting the writer; bounded, and reserved before any state is taken.
     private int _pendingMarks;
-    // Marks between their reservation and their enqueue (or abandonment); every closing sweep waits for none,
-    // so a mark that passed its in-lock check is written or declared, never lost.
+    // Marks between their reservation and their enqueue (or abandonment), and stops between their recording check
+    // and keeping their checkpoint; every closing sweep waits (up to its 1 s bound) for none, so a mark or stop
+    // checkpoint finished within the bound is written or declared.
     private int _marksInProgress;
     // Estimated bytes of checkpoint state taken and not yet written.
     private long _pendingStateBytes;
@@ -236,8 +237,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         EnterStopCheckpoint();
         try
         {
-            var recording = IsRecording;
-            _afterBusyStopCheck?.Invoke();
+            var recording = BusyStopCheck();
             StopRecording(reason);
             if (!recording)
                 return;
@@ -257,6 +257,14 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     internal static readonly AsyncLocal<Action?> AfterBusyStopCheckForTesting = new();
 
     private readonly Action? _afterBusyStopCheck = AfterBusyStopCheckForTesting.Value;
+
+    // The busy stop's recording check, with its test hook bound to the read itself.
+    private bool BusyStopCheck()
+    {
+        var recording = IsRecording;
+        _afterBusyStopCheck?.Invoke();
+        return recording;
+    }
 
     /// <summary>Starts the last offered sequence at the model's sequence when armed (under the model lock).</summary>
     internal void SeedModelSequence(long modelSequence) => Volatile.Write(ref _lastOfferedModelSequence, modelSequence);
@@ -635,8 +643,17 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// </summary>
     internal void EnterStopCheckpoint() => Interlocked.Increment(ref _marksInProgress);
 
-    /// <summary>Called by the stop holding the model lock once its recording check has found the case recording.</summary>
-    internal void LockedStopChecked() => _afterLockedStopCheck?.Invoke();
+    /// <summary>
+    /// The recording check of the stop holding the model lock, with its test hook bound to the read itself (run
+    /// when the case is recording).
+    /// </summary>
+    internal bool LockedStopCheck()
+    {
+        if (!IsRecording)
+            return false;
+        _afterLockedStopCheck?.Invoke();
+        return true;
+    }
 
     /// <summary>
     /// Runs in the stop holding the model lock after its recording check, taken from the arming flow while a
@@ -1084,8 +1101,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     // all are declared missing as ranges of checkpoint ordinals; a range that fails leaves them unaccounted.
     private void WriteRemainingCheckpoints()
     {
-        // A mark that passed its in-lock check before the stop enqueues shortly; bounded, as a mark holds the
-        // model lock only while it takes its state.
+        // Marks and stop checkpoints in progress (see _marksInProgress) finish shortly; the wait is bounded at 1 s,
+        // as a mark is counted while it waits for the model lock.
         SpinWait.SpinUntil(() => Volatile.Read(ref _marksInProgress) == 0, TimeSpan.FromSeconds(1));
         var unwritten = new List<long>();
         while (_checkpoints.TryDequeue(out var pending))
