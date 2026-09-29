@@ -2028,6 +2028,8 @@ public class DiagnosticCaseTests
         var missing = MissingOrdinals(artifact, "delivery");
         CollectionAssert.IsSubsetOf(Enumerable.Range(0, (int)(last - first + 1)).Select(i => first + i).ToList(), missing,
             "delivery records made before the stop were neither written nor declared missing");
+        Assert.IsTrue(artifact.Events.Where(e => e.GetProperty("kind").GetString() == "missing" && e.GetProperty("record").GetProperty("stream").GetString() == "delivery")
+            .All(e => e.GetProperty("record").GetProperty("reason").GetString() == "size-limit"), "the unpulled delivery was not declared by the size stop");
     }
 
     [TestMethod]
@@ -2518,6 +2520,51 @@ public class DiagnosticCaseTests
             Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
             Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = null;
             Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.AfterStopMarkForTesting.Value = null;
+        }
+    }
+
+    // === Review round 6 fences ===
+
+    [TestMethod]
+    public async Task Failures_ARetriedDeliveryDeclarationCountsOnce()
+    {
+        using var root = new CaseRoot();
+        using var gate = new ManualResetEventSlim(false);
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = new InvalidOperationException("injected writer failure");
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.UnpulledFaultForTesting.Value = new IOException("injected transient declaration failure");
+        try
+        {
+            var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+            var workload = new ScriptedWorkload();
+            await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+                .WithPresentation(new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25))).WithDimensions(40, 10).Build();
+            var diagnostics = new TerminalDiagnostics(terminal);
+            using (new Running(terminal))
+            {
+                var started = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path });
+                var before = diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0;
+                for (var i = 0; i < 100; i++)
+                    workload.Enqueue(Encoding.ASCII.GetBytes($"R{i} "));
+                await WaitAsync(() => (diagnostics.CaptureDelivery(new DiagnosticDeliveryRequest()).Totals!.LastSequence ?? 0) >= before + 100);
+                // The writer fails; its first declaration of the unpulled delivery fails too, and a later one lands.
+                gate.Set();
+                await WaitAsync(() => File.Exists(Path.Combine(started.Path!, "completion.json")));
+
+                var artifact = Artifact.Read(started.Path!);
+                var counts = artifact.Completion!.Value.GetProperty("streams").EnumerateArray().Single(e => e.GetProperty("stream").GetString() == "delivery");
+                Assert.AreEqual(counts.GetProperty("offered").GetInt64(), counts.GetProperty("written").GetInt64() + counts.GetProperty("dropped").GetInt64(),
+                    $"a retried declaration counted twice: {counts}");
+                var delivery = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = started.Path! }).Streams.Single(s => s.Stream == "delivery");
+                Assert.IsFalse(delivery.Missing.Any(m => m.Reason == "unaccounted"), string.Join(", ", delivery.Missing.Select(m => $"{m.FromOrdinal}-{m.ToOrdinal} {m.Reason}")));
+            }
+        }
+        finally
+        {
+            gate.Set();
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.WriterFaultForTesting.Value = null;
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.UnpulledFaultForTesting.Value = null;
         }
     }
 

@@ -18,8 +18,11 @@ public sealed record DiagnosticCaseRecord
     public long? ToOrdinal { get; init; }
 
     /// <summary>
-    /// Why: for an interval end, <c>graphics</c>, <c>application-without-ingress</c> or
-    /// <c>stream-failed</c>; for a missing range, <c>overload</c>, <c>evicted</c> or <c>drain-timeout</c>.
+    /// Why. For an interval end: <c>graphics</c>, <c>application-without-ingress</c>, <c>reentrant-model-event</c>,
+    /// <c>reentrant-application</c> or <c>stream-failed</c>. For a missing range: <c>overload</c>,
+    /// <c>overload-unknown-extent</c>, <c>evicted</c>, <c>not-pulled</c>, <c>drain-timeout</c>, <c>size-limit</c>,
+    /// <c>size-limit-unknown-extent</c> or <c>collector-failed</c> (and, from the reader, <c>unknown</c> or
+    /// <c>unaccounted</c>). For a failed stream: <c>stream-failed: </c> and the error.
     /// </summary>
     [JsonPropertyName("reason")]
     public string Reason { get; init; } = "";

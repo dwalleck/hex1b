@@ -65,6 +65,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// </summary>
     internal static readonly StrongBox<Action<DiagnosticCaseRecorder>?> AfterStopMarkForTesting = new();
 
+    /// <summary>An exception the writer throws once, declaring unpulled delivery, taken from the arming flow while a test has set it.</summary>
+    internal static readonly AsyncLocal<Exception?> UnpulledFaultForTesting = new();
+
     /// <summary>An exception the writer's disposal throws, taken from the arming flow while a test has set it.</summary>
     internal static readonly AsyncLocal<Exception?> WriterDisposeFaultForTesting = new();
 
@@ -103,6 +106,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     private Exception? _writerDisposeFault = WriterDisposeFaultForTesting.Value;
     private Exception? _lossFault = LossFaultForTesting.Value;
     private Exception? _deliveryFault = DeliveryFaultForTesting.Value;
+    private Exception? _unpulledFault = UnpulledFaultForTesting.Value;
     private readonly Exception? _persistentLossFault = PersistentLossFaultForTesting.Value;
     private readonly Action? _beforeEnqueue = BeforeEnqueueForTesting.Value;
     private string? _streamFault = StreamFaultForTesting.Value;
@@ -590,8 +594,20 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         // Offered first (the terminal made them), dropped once declared, as for the queue.
         var count = last - _deliverySince;
         Interlocked.Add(ref _offered[(int)CaseStream.Delivery], count);
-        WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = _deliverySince + 1, ToOrdinal = last, Reason = reason }, RangeLimit,
-            () => Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], count));
+        try
+        {
+            if (Interlocked.Exchange(ref _unpulledFault, null) is { } fault)
+                throw fault;
+            WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = _deliverySince + 1, ToOrdinal = last, Reason = reason }, RangeLimit,
+                () => Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], count));
+        }
+        catch
+        {
+            // Not settled: a later declaration (the closing sweep, or the failure path) counts them again.
+            Interlocked.Add(ref _offered[(int)CaseStream.Delivery], -count);
+            throw;
+        }
+
         _deliverySince = last;
     }
 
@@ -825,11 +841,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 var to = Math.Min(record.Sequence - 1, stop);
                 var missing = to - _deliverySince;
                 WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = _deliverySince + 1, ToOrdinal = to, Reason = "evicted" },
-                    EventLimit, () =>
-                    {
-                        Interlocked.Add(ref _offered[(int)CaseStream.Delivery], missing);
-                        Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], missing);
-                    });
+                    EventLimit, () => Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], missing));
+                // Settled (declared, or deferred to a summary): offered now; dropped once declared.
+                Interlocked.Add(ref _offered[(int)CaseStream.Delivery], missing);
                 _deliverySince = to;
             }
 
@@ -867,11 +881,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
                 var last = Math.Min(snapshot.Records[^1].Sequence, stop);
                 var count = last - record.Sequence + 1;
                 WriteMissing(new DiagnosticCaseRecord { Stream = "delivery", FromOrdinal = record.Sequence, ToOrdinal = last, Reason = "size-limit" },
-                    RangeLimit, () =>
-                    {
-                        Interlocked.Add(ref _offered[(int)CaseStream.Delivery], count);
-                        Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], count);
-                    });
+                    RangeLimit, () => Interlocked.Add(ref _dropped[(int)CaseStream.Delivery], count));
+                Interlocked.Add(ref _offered[(int)CaseStream.Delivery], count);
                 _deliverySince = last;
                 return false;
             }
