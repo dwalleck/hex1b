@@ -494,6 +494,29 @@ public partial class DiagnosticCaseTests
         StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "mid-application:");
     }
 
+    // Each continuation fault on a live start's stop: different, labelled, with its path among the differences.
+    [TestMethod]
+    [DataRow("pending-wrap", "cursor.pendingWrap")]
+    [DataRow("last-printed", "lastPrinted.x")]
+    [DataRow("rendition", "rendition.attributes")]
+    [DataRow("margins", "margins.top")]
+    [DataRow("saved-cursor", "savedCursor.x")]
+    [DataRow("pending-grapheme", "pendingGraphemeCombine")]
+    [DataRow("activity", "activity.progressPercentage")]
+    [DataRow("synchronized-update", "synchronizedUpdate.active")]
+    public async Task Reapply_EachContinuationFaultDiffers(string fault, string path)
+    {
+        Assert.AreEqual($"Fault '{fault}' takes no target.", ModelStateFault.Validate($"{fault}:1"));
+        using var root = new CaseRoot();
+        var casePath = await RecordLiveAsync(root);
+        var result = Reapply(new DiagnosticCaseReapplyRequest { Path = casePath, ToLabel = "stop", Faults = [fault] });
+        Assert.AreEqual(("different", true), (result.Comparison, result.FaultInjected), $"{fault}: {result.Problem?.Message} {result.ComparisonReason}");
+        Assert.AreEqual(path, result.Faults!.Single().Path);
+        CollectionAssert.Contains(result.Differences!.Differences.Select(d => d.Path).ToList(), path, $"{fault}: its path is not among the differences");
+        // The recorded path of the same case is unchanged.
+        AssertMatched(Reapply(casePath, label: "stop"), $"{fault}: the unchanged path");
+    }
+
     private static bool IsStart(JsonNode node) => node["checkpoint"]?["trigger"]?.GetValue<string>() == "start";
 
     private static async Task<string> RecordLiveAsync(CaseRoot root)

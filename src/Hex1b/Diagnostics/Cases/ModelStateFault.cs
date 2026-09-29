@@ -14,6 +14,8 @@ internal static class ModelStateFault
     internal static readonly IReadOnlyList<string> Kinds =
     [
         "cell-text", "cell-style", "cursor", "mode", "title", "charset", "tab-stop", "pending-input", "history-row", "history-rows",
+        // Continuation a start restores (ticket 09): each toggles its field, so it differs even from a default.
+        "pending-wrap", "last-printed", "rendition", "margins", "saved-cursor", "pending-grapheme", "activity", "synchronized-update",
     ];
 
     // Kinds that take a target, and its form.
@@ -141,6 +143,56 @@ internal static class ModelStateFault
                     History = history with { Rows = [.. history.Rows.Select(r => r with { OriginalWidth = r.OriginalWidth + 1 })] },
                 };
             }
+            case "pending-wrap":
+                path = "cursor.pendingWrap";
+                return state with { Cursor = state.Cursor with { PendingWrap = !state.Cursor.PendingWrap } };
+            case "last-printed":
+                if (state.LastPrinted is { } last)
+                {
+                    path = "lastPrinted.x";
+                    return state with { LastPrinted = last with { X = last.X == 0 ? 1 : last.X - 1 } };
+                }
+                path = "lastPrinted";
+                return state with { LastPrinted = new DiagnosticModelLastPrinted { Width = 1, Cell = new DiagnosticModelCell { Text = "X" } } };
+            case "rendition":
+            {
+                path = "rendition.attributes";
+                var attributes = state.Rendition.Attributes;
+                return state with
+                {
+                    Rendition = state.Rendition with
+                    {
+                        Attributes = attributes.Contains("bold") ? [.. attributes.Where(a => a != "bold")] : ["bold", .. attributes],
+                    },
+                };
+            }
+            case "margins":
+                path = "margins.top";
+                return state with { Margins = state.Margins with { Top = state.Margins.Top == 0 ? 1 : 0 } };
+            case "saved-cursor":
+                if (state.SavedCursor is { } saved)
+                {
+                    path = "savedCursor.x";
+                    return state with { SavedCursor = saved with { X = saved.X == 0 ? 1 : saved.X - 1 } };
+                }
+                path = "savedCursor";
+                return state with { SavedCursor = new DiagnosticModelSavedCursor { X = 1, Protected = false } };
+            case "pending-grapheme":
+                path = "pendingGraphemeCombine";
+                return state with { PendingGraphemeCombine = !state.PendingGraphemeCombine };
+            case "activity":
+                path = "activity.progressPercentage";
+                return state with { Activity = state.Activity with { ProgressPercentage = state.Activity.ProgressPercentage is null ? 50 : null } };
+            case "synchronized-update":
+                path = "synchronizedUpdate.active";
+                return state with
+                {
+                    SynchronizedUpdate = new DiagnosticSynchronizedUpdate
+                    {
+                        Active = !state.SynchronizedUpdate.Active,
+                        StartedAtSequence = state.SynchronizedUpdate.StartedAtSequence,
+                    },
+                };
             default:
                 problem = Validate(fault) ?? $"Unknown fault '{fault}'.";
                 return null;

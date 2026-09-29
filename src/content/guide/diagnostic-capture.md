@@ -542,6 +542,9 @@ event is `unknown-model-sequence`. In an interrupted or truncated case, whose ta
 - `mode` takes `:<name>`;
 - `history-row` takes `:<index>`, and changes that row's text;
 - `cursor`, `title`, `charset`, `tab-stop`, `pending-input` and `history-rows` take no target.
+- `pending-wrap`, `last-printed`, `rendition`, `margins`, `saved-cursor`, `pending-grapheme`,
+  `activity` and `synchronized-update` (the continuation a live start restores) take no target; each
+  toggles its field, so it differs even where the recorded value is the default.
 
 Such a result is labelled `faultInjected`, and is never the recorded path's outcome. A fault the
 state has nothing to change for (a history fault without history) makes the comparison
