@@ -68,6 +68,35 @@ public sealed partial class Hex1bTerminal
         }
     }
 
+    // The pump item's original bytes, from its read until the model applies it (or the item ends
+    // unapplied). Held whether or not a case is active, so a case started between an item's read and
+    // its application still records it: field writes only, no copy.
+    private ReadOnlyMemory<byte> _caseIngress;
+    private bool _caseIngressPending;
+
+    private void StashCaseIngress(ReadOnlyMemory<byte> data)
+    {
+        _caseIngress = data;
+        _caseIngressPending = true;
+    }
+
+    private void ClearCaseIngress()
+    {
+        _caseIngress = default;
+        _caseIngressPending = false;
+    }
+
+    // Must hold _bufferLock, right after the model sequence advanced for an application. The first
+    // application of a pump item takes that item's bytes; an application with none (a model change not
+    // driven by the pump) is recorded as such.
+    private void NotifyCaseApplicationUnsafe()
+    {
+        var pending = _caseIngressPending;
+        var ingress = _caseIngress;
+        ClearCaseIngress();
+        _diagnosticCase?.RecordApplication(_modelSequence, _width, _height, pending, ingress.Span);
+    }
+
     // Must hold _bufferLock, right after the model sequence advanced for this event.
     private void NotifyCaseModelEventUnsafe(string kind, int width, int height) =>
         _diagnosticCase?.RecordModelEvent(kind, _modelSequence, width, height);

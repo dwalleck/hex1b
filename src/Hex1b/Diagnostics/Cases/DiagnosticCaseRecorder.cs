@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 
 namespace Hex1b.Diagnostics.Cases;
 
@@ -20,6 +21,9 @@ internal sealed class DiagnosticCaseRecorder
     private const int Stopping = 1;
     private const int Stopped = 2;
     private const int StreamCount = 4;
+
+    /// <summary>Counts ingress copies made in the current async flow while a test has set a counter.</summary>
+    internal static readonly AsyncLocal<StrongBox<int>?> IngressCopiesForTesting = new();
 
     private readonly CaseEventQueue _queue = new();
     private readonly CaseArtifactWriter _writer;
@@ -65,6 +69,27 @@ internal sealed class DiagnosticCaseRecorder
     /// <summary>Starts the writer; called once, after the terminal armed this recorder.</summary>
     internal void Start() => _writerTask = Task.Factory.StartNew(WriteLoopAsync, CancellationToken.None,
         TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+
+    /// <summary>
+    /// Records an output application with its original input bytes, copied only under
+    /// <c>reapplication-data</c>. The caller holds the model lock, which orders model events.
+    /// </summary>
+    internal void RecordApplication(long modelSequence, int width, int height, bool hasIngress, ReadOnlySpan<byte> ingress)
+    {
+        if (!IsRecording)
+            return;
+        var ordinal = Interlocked.Increment(ref _ordinals[(int)CaseStream.Model]);
+        byte[]? payload = null;
+        if (IncludeModelPayloads && hasIngress)
+        {
+            payload = ingress.ToArray();
+            if (IngressCopiesForTesting.Value is { } copies)
+                Interlocked.Increment(ref copies.Value);
+        }
+
+        Offer(new CaseEvent(CaseStream.Model, ordinal, Interlocked.Increment(ref _caseSequence), Stopwatch.GetTimestamp(),
+            hasIngress ? "application" : "application-without-ingress", modelSequence, width, height, ingress.Length, payload));
+    }
 
     /// <summary>Records a model event. The caller holds the terminal's model lock, which orders model events.</summary>
     internal void RecordModelEvent(string kind, long modelSequence, int width, int height)

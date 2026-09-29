@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using Hex1b.Diagnostics;
+using Hex1b.Widgets;
 
 namespace Hex1b.Tests.Diagnostics;
 
@@ -222,6 +223,445 @@ public class DiagnosticCaseTests
             Assert.AreEqual(OwnerFile, File.GetUnixFileMode(file), file);
     }
 
+    [TestMethod]
+    public async Task Authorizations_IngressOnlyWithReapplicationData()
+    {
+        using var root = new CaseRoot();
+        var sentinel = Encoding.ASCII.GetBytes("ZQX-INGRESS-SECRET");
+        foreach (var authorized in new[] { false, true })
+        {
+            var copies = Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.IngressCopiesForTesting.Value = new System.Runtime.CompilerServices.StrongBox<int>();
+            var workload = new ScriptedWorkload();
+            await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = authorized ? [DiagnosticAuthorization.ReapplicationData] : [] })
+                .Build();
+            DiagnosticCaseResult stopped;
+            using (new Running(terminal))
+            {
+                await workload.WriteAndWaitAsync(terminal, sentinel);
+                stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+            }
+
+            // Oracle: the raw files, not a reader. The chunk is exactly the sentinel, so its base64 appears whole.
+            var raw = string.Concat(Directory.GetFiles(stopped.Path!).Select(File.ReadAllText));
+            var artifact = Artifact.Read(stopped.Path!);
+            var model = artifact.Manifest.GetProperty("streams").EnumerateArray().Single(e => e.GetProperty("stream").GetString() == "model");
+            Assert.AreEqual(authorized, raw.Contains(Convert.ToBase64String(sentinel), StringComparison.Ordinal), $"authorized={authorized}: sentinel presence");
+            Assert.AreEqual(authorized ? "included" : "excluded", model.GetProperty("payloads").GetString());
+            Assert.AreEqual(authorized ? "complete" : "excluded", artifact.Manifest.GetProperty("checkpoint").GetProperty("status").GetString());
+            Assert.AreEqual(sentinel.Length, artifact.ModelEvents().Single().GetProperty("length").GetInt32(), "the length is recorded either way");
+            if (authorized)
+                Assert.IsGreaterThan(0, copies.Value, "fixture: an authorized case copied nothing");
+            else
+                Assert.AreEqual(0, copies.Value, "an unauthorized case copied ingress bytes");
+        }
+    }
+
+    [TestMethod]
+    public async Task Ingress_ByteAndChunkFidelity()
+    {
+        using var root = new CaseRoot();
+
+        // Raw-byte workload: chunks split UTF-8 scalars, a CSI and an OSC 8, plus one 64 KiB chunk.
+        var chunks = new List<byte[]>
+        {
+            "caf"u8.ToArray(), new byte[] { 0xC3 }, new byte[] { 0xA9, (byte)' ' }, "\u001b"u8.ToArray(), "[31mred\u001b[0m "u8.ToArray(),
+            "\u001b]8;;https://ex"u8.ToArray(), "ample.test\u001b\\link\u001b]8;;\u001b\\\r\n"u8.ToArray(),
+            Enumerable.Repeat((byte)'x', 64 * 1024).Concat("\r\n"u8.ToArray()).ToArray(),
+        };
+        var random = new Random(7);
+        var tail = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(0, 40).Select(i => $"é{i}漢\u001b[{i % 7 + 30}m👩‍💻 ")));
+        for (var offset = 0; offset < tail.Length && chunks.Count < 37;)
+        {
+            var size = Math.Min(random.Next(1, 23), tail.Length - offset);
+            chunks.Add(tail[offset..(offset + size)]);
+            offset += size;
+        }
+
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        DiagnosticCaseResult stopped;
+        using (new Running(terminal))
+        {
+            foreach (var chunk in chunks)
+                await workload.WriteAndWaitAsync(terminal, chunk);
+            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var recorded = Artifact.Read(stopped.Path!).ModelEvents().Select(e => Convert.FromBase64String(e.GetProperty("data").GetString()!)).ToList();
+        var returned = workload.Returned();
+        Assert.HasCount(returned.Count, recorded, "chunk count");
+        for (var i = 0; i < returned.Count; i++)
+            CollectionAssert.AreEqual(returned[i], recorded[i], $"chunk {i} differs");
+    }
+
+    [TestMethod]
+    public async Task ApplicationIngress_EqualsTheItemsTheModelReads()
+    {
+        using var root = new CaseRoot();
+        var appAdapter = new Hex1bAppWorkloadAdapter();
+        var tap = new TapWorkload(appAdapter);
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(tap).WithHeadless().WithDimensions(60, 20)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        using var app = new Hex1bApp(ctx => Task.FromResult(Widgets.Build(ctx, 0)), new Hex1bAppOptions { WorkloadAdapter = appAdapter });
+        DiagnosticCaseResult stopped;
+        List<byte[]> consumed;
+        using (new Running(terminal))
+        {
+            using var appCts = new CancellationTokenSource();
+            var appRun = app.RunAsync(appCts.Token);
+            await WaitForTextAsync(terminal, "Panel");
+            foreach (var (w, h) in new[] { (40, 15), (72, 24), (60, 20) })
+            {
+                await terminal.ResizeForAutomationAsync(w, h);
+                await Settle(terminal);
+            }
+            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+            // What the model had read when the case stopped (the app's exit output comes later).
+            consumed = tap.Items();
+            await appCts.CancelAsync();
+            try { await appRun; } catch (OperationCanceledException) { }
+        }
+
+        var recorded = Artifact.Read(stopped.Path!).ModelEvents().Where(e => e.GetProperty("kind").GetString() == "application")
+            .Select(e => Convert.FromBase64String(e.GetProperty("data").GetString()!)).ToList();
+        var kinds = string.Join(",", Artifact.Read(stopped.Path!).ModelEvents().Select(e => e.GetProperty("kind").GetString()));
+        Assert.IsGreaterThan(3, consumed.Count, "fixture: the app wrote too little");
+        Assert.HasCount(consumed.Count, recorded, $"item count; recorded kinds: {kinds}");
+        for (var i = 0; i < consumed.Count; i++)
+            CollectionAssert.AreEqual(consumed[i], recorded[i], $"item {i} differs");
+    }
+
+    [TestMethod]
+    public async Task ModelStream_EveryTickOnceInOrder()
+    {
+        using var root = new CaseRoot();
+        var clock = new Microsoft.Extensions.Time.Testing.FakeTimeProvider();
+        var workload = new ScriptedWorkload();
+        var hold = new HoldingFilter();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .WithTimeProvider(clock).AddWorkloadFilter(hold)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        var expected = new List<(long Sequence, string Kind)>();
+        void Expect(string kind) => expected.Add((terminal.CurrentModelSequence, kind));
+        DiagnosticCaseResult stopped;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "a"u8.ToArray()); Expect("application");
+            terminal.Resize(40, 10); Expect("resize");
+            await workload.WriteAndWaitAsync(terminal, "\u001b[?2026h"u8.ToArray()); Expect("application");
+            var beforeTimeout = terminal.CurrentModelSequence;
+            clock.Advance(TimeSpan.FromSeconds(2));
+            await WaitAsync(() => terminal.CurrentModelSequence > beforeTimeout);
+            Expect("synchronized-update-timeout");
+            await workload.WriteAndWaitAsync(terminal, [0xC3]); Expect("application");
+            await workload.WriteAndWaitAsync(terminal, [0xA9]); Expect("application");
+
+            // A chunk held after its read while another thread resizes the model.
+            hold.Arm();
+            workload.Enqueue("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"u8.ToArray());
+            Assert.IsTrue(hold.Held.Wait(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken), "fixture: the chunk was never held");
+            await Task.Run(() => terminal.Resize(20, 10)); Expect("resize");
+            var beforeRelease = terminal.CurrentModelSequence;
+            hold.Release.Set();
+            await WaitAsync(() => terminal.CurrentModelSequence > beforeRelease);
+            Expect("application");
+            await Settle(terminal);
+            using (var snapshot = terminal.CreateSnapshot())
+                // "aé" occupies columns 0-1, so the 30-column chunk wraps after 18 columns at width 20;
+                // applied at the old width of 40 it would fit on row 0.
+                Assert.AreEqual("STUVWXYZ0123", snapshot.GetScreenText().Split('\n')[1].TrimEnd(), "oracle: the held chunk wrapped at the new width");
+            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var model = Artifact.Read(stopped.Path!).ModelEvents();
+        var actual = model.Select(e => (e.GetProperty("modelSequence").GetInt64(), e.GetProperty("kind").GetString()!)).ToList();
+        CollectionAssert.AreEqual(Enumerable.Range(1, actual.Count).Select(i => (long)i).ToList(), actual.Select(a => a.Item1).ToList(),
+            "model sequences are not 1..N: a tick was missed or recorded twice");
+        CollectionAssert.AreEqual(expected, actual, string.Join(", ", actual));
+        CollectionAssert.AreEqual(new byte[] { 0xC3 }, Convert.FromBase64String(model[4].GetProperty("data").GetString()!), "the continuation-only chunk");
+    }
+
+    [TestMethod]
+    public async Task LiveStart_InFlightChunkOnce()
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        var hold = new HoldingFilter();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .AddWorkloadFilter(hold).Build();
+        DiagnosticCaseResult started;
+        using (new Running(terminal))
+        {
+            hold.Arm();
+            workload.Enqueue("INFLIGHT"u8.ToArray());
+            Assert.IsTrue(hold.Held.Wait(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken), "fixture: the chunk was never held");
+            var diagnostics = new TerminalDiagnostics(terminal);
+            started = diagnostics.StartCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] });
+            hold.Release.Set();
+            await workload.WriteAndWaitAsync(terminal, "NEXT"u8.ToArray());
+            await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var artifact = Artifact.Read(started.Path!);
+        var payloads = artifact.ModelEvents().Select(e => Encoding.ASCII.GetString(Convert.FromBase64String(e.GetProperty("data").GetString()!))).ToList();
+        CollectionAssert.AreEqual(new[] { "INFLIGHT", "NEXT" }, payloads, "the in-flight chunk was lost or recorded twice");
+        Assert.IsFalse(artifact.Manifest.GetProperty("fresh").GetBoolean(), "a model that had read bytes is not fresh");
+        Assert.AreEqual("unsupported", artifact.Manifest.GetProperty("checkpoint").GetProperty("status").GetString());
+    }
+
+    [TestMethod]
+    public async Task ApplicationCase_BytesReproduceModel()
+    {
+        using var root = new CaseRoot();
+        await using var live = Hex1bTerminal.CreateBuilder().WithHex1bApp(ctx => Widgets.Build(ctx, ctx is null ? 0 : 1)).WithHeadless().WithDimensions(60, 20)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        string liveDigest;
+        DiagnosticCaseResult stopped;
+        using (new Running(live))
+        {
+            await WaitForTextAsync(live, "Panel");
+            foreach (var (w, h) in new[] { (40, 15), (72, 24), (33, 12), (60, 20) })
+            {
+                await live.ResizeForAutomationAsync(w, h);
+                await Settle(live);
+            }
+            await Settle(live);
+            liveDigest = Corpus.Digest(live);
+            stopped = await new TerminalDiagnostics(live).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        // Replay only the recorded events into a fresh terminal of the recorded configuration.
+        var artifact = Artifact.Read(stopped.Path!);
+        var configuration = artifact.Manifest.GetProperty("checkpoint").GetProperty("configuration");
+        var workload = new ScriptedWorkload();
+        await using var replay = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless()
+            .WithDimensions(configuration.GetProperty("width").GetInt32(), configuration.GetProperty("height").GetInt32()).Build();
+        using (new Running(replay))
+        {
+            foreach (var e in artifact.ModelEvents())
+            {
+                switch (e.GetProperty("kind").GetString())
+                {
+                    case "application":
+                        await workload.WriteAndWaitAsync(replay, Convert.FromBase64String(e.GetProperty("data").GetString()!));
+                        break;
+                    case "resize":
+                        replay.Resize(e.GetProperty("width").GetInt32(), e.GetProperty("height").GetInt32());
+                        break;
+                    default:
+                        Assert.Fail($"unexpected model event {e}");
+                        break;
+                }
+            }
+            await Settle(replay);
+            Assert.AreEqual(liveDigest, Corpus.Digest(replay), "the recorded application bytes and resizes do not reproduce the model");
+        }
+    }
+
+    [TestMethod]
+    public async Task Semantics_Unchanged()
+    {
+        using var root = new CaseRoot();
+        var chunks = new[] { "caf"u8.ToArray(), new byte[] { 0xC3 }, new byte[] { 0xA9, 0x0D, 0x0A }, "\u001b[1;32mgreen\u001b[0m"u8.ToArray(), "\u001b]0;T\u0007done"u8.ToArray() };
+        async Task<(string Presentation, string Model)> RunAsync(bool armed)
+        {
+            var driver = new FakeConsoleDriver { TerminalSize = (40, 10) };
+            var presentation = new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25));
+            var workload = new ScriptedWorkload();
+            var builder = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithPresentation(presentation).WithDimensions(40, 10);
+            if (armed)
+                builder.WithDiagnosticCase(new DiagnosticCaseStartRequest
+                {
+                    Directory = root.Path,
+                    Authorizations = [DiagnosticAuthorization.ReapplicationData, DiagnosticAuthorization.RawInput, DiagnosticAuthorization.EditorText, DiagnosticAuthorization.NativeOutput],
+                });
+            await using var terminal = builder.Build();
+            using (new Running(terminal))
+            {
+                foreach (var chunk in chunks)
+                    await workload.WriteAndWaitAsync(terminal, chunk);
+                await Settle(terminal);
+                return (driver.WrittenText, Corpus.Digest(terminal));
+            }
+        }
+
+        var unarmed = await RunAsync(armed: false);
+        var armed = await RunAsync(armed: true);
+        Assert.AreEqual(unarmed.Model, armed.Model, "recording changed the model");
+        Assert.AreEqual(unarmed.Presentation, armed.Presentation, "recording changed the presentation output");
+        StringAssert.Contains(armed.Model, "é", "fixture: the split scalar did not decode");
+    }
+
+    // Measured with PumpAllocation.Measure on the base revision (5a4b0a6c, no case support) in this
+    // configuration; the same routine runs in the base probe (…/scratchpad/t07s2/basealloc).
+#if DEBUG
+    private const long BasePumpBytesPer1000Chunks = 19_106_300;
+#else
+    private const long BasePumpBytesPer1000Chunks = 19_104_800;
+#endif
+
+    [TestMethod]
+    [DoNotParallelize]
+    public async Task Unarmed_PumpAllocatesAsBase()
+    {
+        var bytes = await PumpAllocation.MeasureAsync();
+        // One allocation per chunk adds 24 KB or more.
+        Assert.IsLessThanOrEqualTo(BasePumpBytesPer1000Chunks + 16_000, bytes,
+            $"the unarmed pump allocates {bytes} bytes per 1,000 chunks; the base allocated {BasePumpBytesPer1000Chunks}");
+    }
+
+    /// <summary>
+    /// Bytes an unarmed raw terminal's output pump allocates for 1,000 prepared 64-byte chunks. The pump
+    /// runs on the calling thread (every read completes synchronously) so the thread's own allocation
+    /// counter measures it alone. Kept textually identical to the base probe's copy.
+    /// </summary>
+    internal static class PumpAllocation
+    {
+        public static async Task<long> MeasureAsync()
+        {
+            var chunks = Enumerable.Range(0, 1200).Select(i => Encoding.ASCII.GetBytes($"line {i:D5} " + new string('x', 53))).ToArray();
+            var workload = new MeasuredWorkload();
+            await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(80, 24).Build();
+            var pump = typeof(Hex1bTerminal).GetMethod("PumpWorkloadOutputAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+                .CreateDelegate<Func<CancellationToken, Task>>(terminal);
+
+            RunPump(pump, workload, chunks[..200]);
+            var start = GC.GetAllocatedBytesForCurrentThread();
+            RunPump(pump, workload, chunks[200..]);
+            var allocated = GC.GetAllocatedBytesForCurrentThread() - start;
+            if (terminal.OutputBytesRead != 1200L * 64)
+                throw new InvalidOperationException("fixture: the pump did not read every chunk");
+            return allocated;
+        }
+
+        private static void RunPump(Func<CancellationToken, Task> pump, MeasuredWorkload workload, byte[][] chunks)
+        {
+            using var cts = new CancellationTokenSource();
+            workload.Load(chunks, cts);
+            var run = pump(cts.Token);
+            if (!run.IsCompleted)
+                throw new InvalidOperationException("fixture: the pump did not run synchronously");
+            run.GetAwaiter().GetResult();
+        }
+
+        // Returns each prepared chunk synchronously; once they are exhausted it cancels the pump.
+        private sealed class MeasuredWorkload : IHex1bTerminalWorkloadAdapter
+        {
+            private byte[][] _chunks = [];
+            private int _next;
+            private CancellationTokenSource? _cts;
+
+            public void Load(byte[][] chunks, CancellationTokenSource cts) => (_chunks, _next, _cts) = (chunks, 0, cts);
+
+            public ValueTask<ReadOnlyMemory<byte>> ReadOutputAsync(CancellationToken ct = default)
+            {
+                if (_next < _chunks.Length)
+                    return new ValueTask<ReadOnlyMemory<byte>>(_chunks[_next++]);
+                _cts!.Cancel();
+                return ValueTask.FromCanceled<ReadOnlyMemory<byte>>(ct);
+            }
+
+            public ValueTask WriteInputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default) => ValueTask.CompletedTask;
+            public ValueTask ResizeAsync(int width, int height, CancellationToken ct = default) => ValueTask.CompletedTask;
+            public event Action? Disconnected { add { } remove { } }
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    private static async Task WaitAsync(Func<bool> condition)
+    {
+        for (var i = 0; i < 500 && !condition(); i++)
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        Assert.IsTrue(condition(), "fixture: condition never held");
+    }
+
+    private static Task WaitForTextAsync(Hex1bTerminal terminal, string text) => WaitAsync(() =>
+    {
+        using var snapshot = terminal.CreateSnapshot();
+        return snapshot.GetScreenText().Contains(text, StringComparison.Ordinal);
+    });
+
+    // Waits until the model sequence has been stable for 60 ms.
+    private static async Task Settle(Hex1bTerminal terminal)
+    {
+        var last = terminal.CurrentModelSequence;
+        for (var i = 0; i < 100; i++)
+        {
+            await Task.Delay(60, TestContext.Current.CancellationToken);
+            var now = terminal.CurrentModelSequence;
+            if (now == last)
+                return;
+            last = now;
+        }
+    }
+
+    /// <summary>A workload filter that holds the pump after a chunk was read and tokenized, before the model applies it.</summary>
+    private sealed class HoldingFilter : IHex1bTerminalWorkloadFilter
+    {
+        private volatile bool _armed;
+        public ManualResetEventSlim Held { get; } = new();
+        public ManualResetEventSlim Release { get; } = new();
+        public void Arm() { Held.Reset(); Release.Reset(); _armed = true; }
+        public ValueTask OnOutputAsync(IReadOnlyList<Hex1b.Tokens.AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default)
+        {
+            if (_armed)
+            {
+                _armed = false;
+                Held.Set();
+                Release.Wait(TimeSpan.FromSeconds(10));
+            }
+            return ValueTask.CompletedTask;
+        }
+        public ValueTask OnSessionStartAsync(int width, int height, DateTimeOffset timestamp, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask OnFrameCompleteAsync(TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask OnInputAsync(IReadOnlyList<Hex1b.Tokens.AnsiToken> tokens, TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask OnResizeAsync(int width, int height, TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+        public ValueTask OnSessionEndAsync(TimeSpan elapsed, CancellationToken ct = default) => ValueTask.CompletedTask;
+    }
+
+    /// <summary>Wraps the real application workload and logs every item's bytes as the terminal consumes them.</summary>
+    private sealed class TapWorkload(Hex1bAppWorkloadAdapter inner) : IHex1bTerminalTokenWorkloadAdapter
+    {
+        private readonly List<byte[]> _items = [];
+
+        public List<byte[]> Items() { lock (_items) return [.. _items]; }
+
+        public async ValueTask<WorkloadOutputItem> ReadOutputItemAsync(CancellationToken ct = default)
+        {
+            var item = await inner.ReadOutputItemAsync(ct);
+            if (!item.Bytes.IsEmpty)
+                lock (_items) _items.Add(item.Bytes.ToArray());
+            return item;
+        }
+
+        public ValueTask<ReadOnlyMemory<byte>> ReadOutputAsync(CancellationToken ct = default) => inner.ReadOutputAsync(ct);
+        public ValueTask WriteInputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default) => inner.WriteInputAsync(data, ct);
+        public ValueTask ResizeAsync(int width, int height, CancellationToken ct = default) => inner.ResizeAsync(width, height, ct);
+        public event Action? Disconnected { add => inner.Disconnected += value; remove => inner.Disconnected -= value; }
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
+    }
+
+    /// <summary>An application exercising styles, Unicode, borders, a hyperlink and tabs (evidence P1).</summary>
+    private static class Widgets
+    {
+        public static Hex1bWidget Build(RootContext ctx, int tick) => ctx.VStack(v =>
+        [
+            v.Text($"Tick {tick} — plain ASCII, then 漢字かな, emoji 👩‍💻🎉, combining é e\u0301, box ╔═╗"),
+            v.Border(v.Text($"Bordered {tick} with a long line that has to wrap across the available width of the panel")),
+            v.Text("Panel"),
+            v.Hyperlink($"Link {tick}", "https://example.com/path?q=1"),
+            v.Button($"Button {tick}"),
+            v.Progress(tick % 100, 0, 100),
+            v.Text(new string('x', tick % 7) + "\ttab\tstops"),
+        ]);
+    }
+
     [DllImport("libc", EntryPoint = "umask")]
     private static extern uint Umask(uint mask);
 
@@ -265,6 +705,8 @@ public class DiagnosticCaseTests
             JsonElement? completion = File.Exists(completionPath) ? JsonDocument.Parse(File.ReadAllText(completionPath)).RootElement : null;
             return new Artifact(manifest, events, completion);
         }
+
+        public List<JsonElement> ModelEvents() => Events.Where(e => e.GetProperty("stream").GetString() == "model").ToList();
     }
 
     /// <summary>Runs a terminal until disposed.</summary>
@@ -290,9 +732,10 @@ public class DiagnosticCaseTests
 
         public void Enqueue(byte[] chunk) => _chunks.Writer.TryWrite(chunk);
 
-        public async Task WriteAndWaitAsync(Hex1bTerminal terminal, string text)
+        public Task WriteAndWaitAsync(Hex1bTerminal terminal, string text) => WriteAndWaitAsync(terminal, Encoding.UTF8.GetBytes(text));
+
+        public async Task WriteAndWaitAsync(Hex1bTerminal terminal, byte[] bytes)
         {
-            var bytes = Encoding.UTF8.GetBytes(text);
             var target = terminal.OutputBytesRead + bytes.Length;
             var sequence = terminal.CurrentModelSequence;
             Enqueue(bytes);
@@ -301,7 +744,17 @@ public class DiagnosticCaseTests
             Assert.IsGreaterThanOrEqualTo(target, terminal.OutputBytesRead, "fixture: the chunk was never read");
         }
 
-        public async ValueTask<ReadOnlyMemory<byte>> ReadOutputAsync(CancellationToken ct = default) => await _chunks.Reader.ReadAsync(ct);
+        private readonly List<byte[]> _returned = [];
+
+        public List<byte[]> Returned() { lock (_returned) return [.. _returned]; }
+
+        public async ValueTask<ReadOnlyMemory<byte>> ReadOutputAsync(CancellationToken ct = default)
+        {
+            var chunk = await _chunks.Reader.ReadAsync(ct);
+            lock (_returned) _returned.Add(chunk);
+            return chunk;
+        }
+
         public ValueTask WriteInputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default) => ValueTask.CompletedTask;
         public ValueTask ResizeAsync(int width, int height, CancellationToken ct = default) => ValueTask.CompletedTask;
         public event Action? Disconnected { add { } remove { } }

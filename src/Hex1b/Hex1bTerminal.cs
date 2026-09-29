@@ -1662,6 +1662,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 }
 
                 Interlocked.Add(ref _outputBytesRead, data.Length);
+                StashCaseIngress(data);
 
                 GeometryGatedDelivery? acceptedDelivery = null;
                 if (readItem.Delivery is { } gatedDelivery)
@@ -1679,6 +1680,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                             ct).ConfigureAwait(false);
                         // Handled whether presentation applied or refused it: a refused batch
                         // was composed for a superseded geometry and is recomposed.
+                        ClearCaseIngress();
                         CompleteMilestoneItem(readItem);
                         continue;
                     }
@@ -1697,6 +1699,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                             System.Buffers.ArrayPool<byte>.Shared.Return(pooledItemBuffer);
                         if (pooledItemTokens is not null && pooledItemTokensReturn is not null)
                             pooledItemTokensReturn(pooledItemTokens);
+                        ClearCaseIngress();
                         CompleteMilestoneItem(readItem);
                         continue;
                     }
@@ -1992,6 +1995,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 }
                 finally
                 {
+                    ClearCaseIngress();
                     if (!milestoneItemFaulted)
                         CompleteMilestoneItem(readItem);
                     Hmp1ReplayActivityState = null;
