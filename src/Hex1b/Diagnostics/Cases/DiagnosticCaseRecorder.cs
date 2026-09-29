@@ -83,6 +83,14 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// </summary>
     internal static readonly AsyncLocal<Action?> BeforeMarkCaptureForTesting = new();
 
+    /// <summary>
+    /// Runs on the producer's thread after a model event's offer has returned (its in-flight count released),
+    /// taken from the arming flow while a test has set it.
+    /// </summary>
+    internal static readonly AsyncLocal<Action?> AfterModelOfferForTesting = new();
+
+    private readonly Action? _afterModelOffer = AfterModelOfferForTesting.Value;
+
     /// <summary>At most this many marks await the writer; a mark beyond is refused (design approval item 2).</summary>
     internal const int MaxPendingMarks = 64;
 
@@ -222,16 +230,15 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// </summary>
     internal void StopWithoutModelLock(DiagnosticCaseStopReason reason, string checkpointReason)
     {
-        if (!IsRecording)
-        {
-            StopRecording(reason);
-            return;
-        }
-
+        // Counted in progress before the recording check (both full fences), as a mark is: either this sees the
+        // case already stopped, or every closing sweep sees this checkpoint in progress and waits for it.
         Interlocked.Increment(ref _marksInProgress);
         try
         {
+            var recording = IsRecording;
             StopRecording(reason);
+            if (!recording)
+                return;
             WaitForOffersInFlight();
             RecordStopCheckpoint(LastOfferedModelSequence, new CheckpointCapture(null, null, "unavailable", checkpointReason, 0));
         }
@@ -381,6 +388,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         try
         {
             Offer(CaseStream.Model, kind, modelSequence, width, height, length, payload, null);
+            _afterModelOffer?.Invoke();
         }
         catch (Exception error)
         {
@@ -590,19 +598,31 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     }
 
     /// <summary>
-    /// Records the stop checkpoint. The caller holds the model lock and stops the case in the same hold, so
-    /// the checkpoint is the model's state at the stop; only the first is kept.
+    /// Records the stop checkpoint: from a stop holding the model lock (which stops the case in the same hold),
+    /// or from a stop that could not take it (<see cref="StopWithoutModelLock"/>). The first claim wins
+    /// atomically, as the two can race; a later one returns its reserved state bytes.
     /// </summary>
     internal void RecordStopCheckpoint(long modelSequence, CheckpointCapture capture)
     {
-        if (_stopCheckpoint is not null)
+        if (Interlocked.CompareExchange(ref _stopCheckpointClaimed, 1, 0) != 0)
         {
             ReleaseStateBytes(capture.StateBytes);
             return;
         }
+        _afterStopCheckpointClaim?.Invoke();
         _stopCheckpoint = new PendingCheckpoint(modelSequence,
             Checkpoint(Interlocked.Increment(ref _checkpointsTaken), "stop", "stop", capture), capture.StateBytes);
     }
+
+    private int _stopCheckpointClaimed;
+
+    /// <summary>
+    /// Runs after a stop checkpoint's claim, before it is kept, taken from the arming flow while a test has
+    /// set it.
+    /// </summary>
+    internal static readonly AsyncLocal<Action?> AfterStopCheckpointClaimForTesting = new();
+
+    private readonly Action? _afterStopCheckpointClaim = AfterStopCheckpointClaimForTesting.Value;
 
     private static DiagnosticCaseCheckpointEvent Checkpoint(long ordinal, string label, string trigger, CheckpointCapture capture) => new()
     {
@@ -638,7 +658,10 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         StopRecording(reason);
     }
 
-    /// <summary>Stops recording: the first reason wins. The terminal's stop callback calls this under the model lock.</summary>
+    /// <summary>
+    /// Stops recording: the first reason wins. The terminal's stop callback calls this under the model lock, or
+    /// through <see cref="StopWithoutModelLock"/> when it could not take it.
+    /// </summary>
     internal void StopRecording(DiagnosticCaseStopReason reason)
     {
         Interlocked.CompareExchange(ref _stopReason, (int)reason, -1);

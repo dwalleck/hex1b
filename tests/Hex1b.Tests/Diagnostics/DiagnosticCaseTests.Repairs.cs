@@ -184,23 +184,35 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
-    public async Task Stop_ModelLockBusyWaitsForAnEventTheHolderIsRecording()
-    {
+    public Task Stop_ModelLockBusyWaitsForAnEventTheHolderIsRecording() =>
         // F43: a slow (not wedged) lock holder records a model event while the busy stop runs; the stop checkpoint
-        // must not name an event before one the case records.
+        // must not name an event before one the case records. The holder pauses inside the offer, past its
+        // recording check, until the stop has begun: the stop must wait for it.
+        BusyStopAroundAHolderOffer(afterOffer: false);
+
+    [TestMethod]
+    public Task Stop_ModelLockBusyNamesAnEventWhoseOfferHasReturned() =>
+        // F46: the holder pauses after its offer returned (no longer in flight) until the stop has finished; the
+        // offer's model sequence must already be published, so the stop checkpoint names it.
+        BusyStopAroundAHolderOffer(afterOffer: true);
+
+    private async Task BusyStopAroundAHolderOffer(bool afterOffer)
+    {
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
         using var paused = new ManualResetEventSlim();
-        using var resume = new ManualResetEventSlim();
         var pauseArmed = 0;
-        DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = () =>
+        Func<bool>? resumeWhen = null;
+        Action pause = () =>
         {
             if (Interlocked.Exchange(ref pauseArmed, 0) == 1)
             {
                 paused.Set();
-                resume.Wait(TimeSpan.FromSeconds(10));
+                SpinWait.SpinUntil(() => Volatile.Read(ref resumeWhen) is { } resume && resume(), TimeSpan.FromSeconds(10));
             }
         };
+        var hook = afterOffer ? DiagnosticCaseRecorder.AfterModelOfferForTesting : DiagnosticCaseRecorder.BeforeEnqueueForTesting;
+        hook.Value = pause;
         Hex1bTerminal terminal;
         string path;
         try
@@ -209,7 +221,7 @@ public partial class DiagnosticCaseTests
         }
         finally
         {
-            DiagnosticCaseRecorder.BeforeEnqueueForTesting.Value = null;
+            hook.Value = null;
         }
 
         await using (terminal)
@@ -222,7 +234,7 @@ public partial class DiagnosticCaseTests
             {
                 lock (modelLock)
                 {
-                    // The holder's resize is a model event, offered under the lock and paused past its check.
+                    // The holder's resize is a model event, offered under the lock and paused at the hook.
                     Volatile.Write(ref pauseArmed, 1);
                     terminal.Resize(30, 8);
                     release.Wait(TimeSpan.FromSeconds(30));
@@ -231,9 +243,12 @@ public partial class DiagnosticCaseTests
             holder.Start();
             Assert.IsTrue(paused.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken), "fixture: the resize was never offered");
             var stop = Task.Run(() => diagnostics.StopCaseAsync(TestContext.Current.CancellationToken));
-            await WaitAsync(() => diagnostics.GetCaseStatus().State == DiagnosticCaseState.Stopping, TimeSpan.FromSeconds(10));
-            resume.Set();
-            var finished = await Task.WhenAny(stop, Task.Delay(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken)) == stop;
+            // Resumed from the holder's own thread, so no test-thread scheduling delay counts against the stop's
+            // bounded wait for offers in flight.
+            Volatile.Write(ref resumeWhen, afterOffer
+                ? () => stop.IsCompleted
+                : () => diagnostics.GetCaseStatus().State == DiagnosticCaseState.Stopping);
+            var finished = await Task.WhenAny(stop, Task.Delay(TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken)) == stop;
             release.Set();
             holder.Join();
             Assert.IsTrue(finished, "the stop did not finish");
@@ -246,6 +261,58 @@ public partial class DiagnosticCaseTests
             "the stop checkpoint names an event before one the case recorded");
         var counts = artifact.Completion!.Value.GetProperty("checkpoints");
         Assert.AreEqual((1L, 1L), (counts.GetProperty("offered").GetInt64(), counts.GetProperty("written").GetInt64()));
+    }
+
+    [TestMethod]
+    public async Task Stop_CheckpointClaimIsFirstWinsWhileTheFirstIsBeingKept()
+    {
+        // F45: a busy stop records its checkpoint without the model lock, so two stops can race. The second must
+        // lose while the first is still being kept: one checkpoint taken, and the loser's state bytes returned.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        using var claimed = new ManualResetEventSlim();
+        using var secondReturned = new ManualResetEventSlim();
+        var first = 1;
+        DiagnosticCaseRecorder.AfterStopCheckpointClaimForTesting.Value = () =>
+        {
+            if (Interlocked.Exchange(ref first, 0) == 1)
+            {
+                claimed.Set();
+                secondReturned.Wait(TimeSpan.FromSeconds(10));
+            }
+        };
+        Hex1bTerminal terminal;
+        string path;
+        try
+        {
+            (terminal, path) = Checkpointed(root, workload);
+        }
+        finally
+        {
+            DiagnosticCaseRecorder.AfterStopCheckpointClaimForTesting.Value = null;
+        }
+
+        var pendingField = typeof(DiagnosticCaseRecorder).GetField("_pendingStateBytes", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        DiagnosticCaseRecorder recorder;
+        await using (terminal)
+        {
+            await workload.WriteAndWaitAsync(terminal, "before");
+            recorder = terminal.DiagnosticCase!;
+            Assert.IsTrue(recorder.TryReserveStateBytes(10) && recorder.TryReserveStateBytes(20), "fixture: no budget");
+            var keeping = Task.Run(() => recorder.RecordStopCheckpoint(5, new(null, null, "unavailable", "first", 10)));
+            Assert.IsTrue(claimed.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken), "fixture: the first claim never ran");
+            var second = Task.Run(() => recorder.RecordStopCheckpoint(7, new(null, null, "unavailable", "second", 20)));
+            await Task.WhenAny(second, Task.Delay(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+            secondReturned.Set();
+            await Task.WhenAll(keeping, second);
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var stop = StopCheckpoint(Artifact.Read(path));
+        Assert.AreEqual((1L, 5L, "first"), (stop.GetProperty("checkpoint").GetProperty("ordinal").GetInt64(),
+            stop.GetProperty("modelSequence").GetInt64(), stop.GetProperty("checkpoint").GetProperty("reason").GetString()),
+            "the stop checkpoint is not the first claim's alone");
+        Assert.AreEqual(0L, (long)pendingField.GetValue(recorder)!, "a losing stop checkpoint's state bytes were not returned");
     }
 
     [TestMethod]
