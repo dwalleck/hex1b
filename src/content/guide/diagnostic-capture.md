@@ -412,7 +412,9 @@ taken in one hold of the model lock, between two model events, at the model sequ
   nested model event recorded the application early, the case started inside the callback, or its
   model stream failed.
 - A stop that could not take the model lock names the last model event the case recorded, never an
-  application still in progress (or the model's sequence when the case started, if it recorded none).
+  application the case has not yet recorded (or the model's sequence when the case started, if it
+  recorded none). That event can itself be unfinished: an outer application that a nested one
+  recorded early, or the application a case started inside.
 
 A mark (`case-mark`) takes an optional label of 1–64 printable ASCII characters. By default the
 label is `mark-` and the checkpoint's ordinal. Labels need not be unique: a re-application target
