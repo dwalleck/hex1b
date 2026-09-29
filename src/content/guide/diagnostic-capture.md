@@ -211,6 +211,65 @@ not retained. Capabilities list each milestone, its guarantee, and whether this 
 Milestones are observations of this process's application and terminal model; none of them is a
 native delivery or presentation acknowledgment.
 
+## Native delivery
+
+A diagnostics-enabled terminal whose presentation can report its writes records every write it
+makes to that presentation. Each record says whether the write was `accepted`, `refused` or
+`failed`. The record stream is separate from application frames and the terminal model: it shows
+what the host was sent, not what the model or the application holds.
+
+- `accepted`: the presentation's write returned normally, so the host operating system or
+  transport took the bytes. It is not an acknowledgment that anything was displayed.
+- `refused`: the presentation declined to write. For example, a geometry-gated batch composed for
+  a geometry the host no longer reports (`geometry-changed`), a WebSocket that is not open
+  (`socket-not-open`), or a disposed presentation (`presentation-disposed`).
+- `failed`: the write raised an error, which the record reports with its type and message. The
+  error then propagates exactly as it does without diagnostics. A WebSocket presentation
+  swallows socket errors, and still does.
+
+Request it with `hex1b capture delivery <id>`, the MCP tool `capture_native_delivery`, or the
+socket method `delivery`, with optional `since` (a sequence), `limit` (1–4,096) and `authorize`.
+The result carries:
+
+- `deliveryLayer`: `console` for a native terminal, `websocket` for a WebSocket transport;
+- `coverageStartedAt`: recording starts when a diagnostics engine attaches;
+- `records`: oldest first;
+- `totals`: counts per outcome and bytes accepted since coverage started, never evicted;
+- `evictedRecords`;
+- `writesInProgress`.
+
+Each record carries:
+
+- its per-session `sequence`, assigned when the write started;
+- `source`: `workload-output`, `gated-delivery` or `terminal-control` (the terminal's own mode
+  and exit sequences);
+- `phase`: `before-model` for raw passthrough and gated writes, which reach the host before the
+  model applies the same bytes; `after-model` for filtered output;
+- `length` and `bytesAccepted`: for a failed console write, the bytes the host took before the
+  error;
+- its interval in the `process-monotonic` clock domain of capture acquisitions;
+- `modelSequenceAtStart`;
+- `outputSequence`, when the session tracks input milestones. It links the write to the frame
+  whose output mark covers it; a frame is never inferred from timing.
+
+Written bytes appear only with the `native-output` authorization, base64 in `content`. The
+session keeps the most recent 4,096 records and 1 MiB of written bytes (64 KiB per record);
+`truncated` and `bytesEvicted` flag what was cut. Reading the record never writes to the
+terminal.
+
+Outcomes:
+
+- Headless terminals and MCP local sessions report `unavailable` / `no-native-presentation`.
+- Presentations that cannot report their writes (HMP1 and HWT1 relays, the terminal widget,
+  third-party adapters) report `presentation-delivery-unobservable`.
+- A terminal without a diagnostics engine records nothing.
+- A native write failure is observable only while the process survives it. Closing a host
+  terminal that is the process's controlling terminal delivers SIGHUP, which ends the process
+  before any write fails. `failed` records come from hosts whose output terminal is not the
+  controlling terminal, or from transports.
+- Socket clients read one JSON line per request. The reply begins with a UTF-8 byte-order mark,
+  which a raw client must skip (it may arrive in its own read).
+
 ## Capabilities
 
 `hex1b capture capabilities <id>` and the MCP tool `get_terminal_diagnostic_capabilities`
@@ -221,7 +280,7 @@ model-history support, and authorizations. They also report each evidence layer:
 |-------|-----------|-------|
 | `terminal-model` | yes | Cells, cursor, modes, and retained model history. |
 | `application-frame` | Hex1b applications with `WithDiagnostics()` | Operation `application-frame`, timing `latest-published`, authorization `editor-text`. Otherwise unavailable with the reason the operation reports. |
-| `native-delivery` | no | Native delivery outcomes are not observed. |
+| `native-delivery` | console and WebSocket presentations with a diagnostics engine | Operation `delivery`, timing `immediate`, authorization `native-output`. Otherwise unavailable: `no-native-presentation` or `presentation-delivery-unobservable`. |
 | `native-presentation` | no | What a host terminal physically displayed is not observable by Hex1b. |
 
 ## Current limitations

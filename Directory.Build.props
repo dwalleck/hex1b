@@ -44,6 +44,7 @@
   <ItemGroup Condition="$(MSBuildProjectName.EndsWith('.Tests'))">
     <Compile Include="$(MSBuildThisFileDirectory)tests\Shared\TestSeq.cs" Link="Shared\TestSeq.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)tests\Shared\MSTestSettings.cs" Link="Shared\MSTestSettings.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)tests\Shared\ControlledWebSocket.cs" Link="Shared\ControlledWebSocket.cs" />
     <Using Include="Hex1b.Testing" />
   </ItemGroup>
 

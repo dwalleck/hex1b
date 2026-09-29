@@ -230,6 +230,26 @@ supports, with the reason for each unavailable layer. Always writes JSON.
 hex1b capture capabilities <id>
 ```
 
+### `capture delivery`
+
+Show what the terminal's native presentation did with each write: accepted, refused or failed,
+with source, phase relative to model application, byte counts and links
+([native delivery](../guide/diagnostic-capture.md#native-delivery)). Reading never writes to the
+terminal.
+
+```bash
+hex1b capture delivery <id> [options]
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--since` | long | | Only records after this sequence |
+| `--limit` | int | `4096` | Most records to return (1–4096) |
+| `--authorize` | string | | `native-output` adds each record's written bytes (base64) |
+
+Without `--json` it prints totals and one line per record. With `--json` it writes the full
+contract result. Headless targets exit 1 with `no-native-presentation`.
+
 ### `capture recording start`
 
 Start recording a terminal session in asciinema `.cast` format.

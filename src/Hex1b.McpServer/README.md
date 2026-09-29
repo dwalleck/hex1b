@@ -49,6 +49,7 @@ Every capture tool returns `capture`, the shared [diagnostic capture contract](h
 
 ### Application frames
 
+- **capture_native_delivery** - Return what the terminal's native presentation did with each write (accepted, refused, failed), with source, phase relative to model application, byte counts and links; optional `since`, `limit`, and `authorize` `native-output` for the written bytes. Local PTY sessions report `no-native-presentation`. See [native delivery](https://hex1b.dev/guide/diagnostic-capture#native-delivery).
 - **capture_application_frame** - Return the latest frame a Hex1b application published (node tree with visible bounds and clip state, focus ring, popups, focused-editor carets and selections, timings), with optional `authorize` `editor-text` for the focused editor's text. Local PTY sessions report `no-application-layer`.
 - **get_hex1b_tree** - The same result for a Hex1b application by process ID.
 

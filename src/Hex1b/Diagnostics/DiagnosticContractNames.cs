@@ -65,6 +65,19 @@ internal static class DiagnosticContractNames
         return (new DiagnosticApplicationFrameRequest { Authorizations = parsed }, null);
     }
 
+    /// <summary>
+    /// Builds a delivery request from client values, or an invalid-request result describing the first
+    /// unrecognized authorization. Range checks belong to the engine.
+    /// </summary>
+    public static (DiagnosticDeliveryRequest? Request, DiagnosticDeliveryResult? Invalid) ParseDeliveryRequest(
+        long? since, int? limit, IEnumerable<string>? authorizations)
+    {
+        if (!TryParseAuthorizations(authorizations, out var parsed, out var unsupported))
+            return (null, TerminalDiagnostics.DeliveryProblem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", unsupported));
+
+        return (new DiagnosticDeliveryRequest { Since = since, Limit = limit, Authorizations = parsed }, null);
+    }
+
     private static bool TryParseAuthorizations(IEnumerable<string>? names, out List<DiagnosticAuthorization> parsed, out string unsupported)
     {
         parsed = [];

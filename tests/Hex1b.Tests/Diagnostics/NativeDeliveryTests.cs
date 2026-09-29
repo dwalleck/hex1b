@@ -366,7 +366,7 @@ public class NativeDeliveryTests
     [TestMethod]
     public async Task WebSocket_RefusedWhenNotOpenAndFailedWhenTheSendIsSwallowed()
     {
-        var socket = new StateWebSocket();
+        var socket = new ControlledWebSocket();
         var presentation = new WebSocketPresentationAdapter(socket, 40, 6);
         var workload = new Hex1bAppWorkloadAdapter();
         await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithPresentation(presentation).WithDimensions(40, 6).Build();
@@ -457,42 +457,6 @@ public class NativeDeliveryTests
 
     [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "ioctl", SetLastError = true)]
     private static extern int Ioctl(int fd, ulong request, out int value);
-
-    // A WebSocket whose state and send failures the test controls.
-    private sealed class StateWebSocket : System.Net.WebSockets.WebSocket
-    {
-        public System.Net.WebSockets.WebSocketState CurrentState { get; set; } = System.Net.WebSockets.WebSocketState.Open;
-        public bool FailSends { get; set; }
-        public List<byte[]> Sent { get; } = [];
-        public override System.Net.WebSockets.WebSocketCloseStatus? CloseStatus => null;
-        public override string? CloseStatusDescription => null;
-        public override System.Net.WebSockets.WebSocketState State => CurrentState;
-        public override string? SubProtocol => null;
-        public override void Abort() { }
-        public override Task CloseAsync(System.Net.WebSockets.WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) => Task.CompletedTask;
-        public override Task CloseOutputAsync(System.Net.WebSockets.WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) => Task.CompletedTask;
-        public override void Dispose() { }
-        public override async Task<System.Net.WebSockets.WebSocketReceiveResult> ReceiveAsync(ArraySegment<byte> buffer, CancellationToken cancellationToken)
-        {
-            await Task.Delay(Timeout.Infinite, cancellationToken);
-            throw new OperationCanceledException();
-        }
-        public override async ValueTask<System.Net.WebSockets.ValueWebSocketReceiveResult> ReceiveAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-        {
-            await Task.Delay(Timeout.Infinite, cancellationToken);
-            throw new OperationCanceledException();
-        }
-        public override Task SendAsync(ArraySegment<byte> buffer, System.Net.WebSockets.WebSocketMessageType messageType, bool endOfMessage, CancellationToken cancellationToken) =>
-            SendAsync(buffer.AsMemory(), messageType, endOfMessage, cancellationToken).AsTask();
-        public override ValueTask SendAsync(ReadOnlyMemory<byte> buffer, System.Net.WebSockets.WebSocketMessageType messageType, bool endOfMessage, CancellationToken cancellationToken = default)
-        {
-            lock (Sent)
-                Sent.Add(buffer.ToArray());
-            if (FailSends)
-                throw new System.Net.WebSockets.WebSocketException("The remote party closed the connection.");
-            return ValueTask.CompletedTask;
-        }
-    }
 
     private static string Decode(DiagnosticDeliveryRecord record) =>
         record.Content is { } content ? Encoding.UTF8.GetString(Convert.FromBase64String(content)) : "";

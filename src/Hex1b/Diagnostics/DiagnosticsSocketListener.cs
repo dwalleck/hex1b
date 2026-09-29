@@ -578,6 +578,7 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
             "capture" => await HandleCaptureRequestAsync(request.Capture, cancellationToken),
             "capabilities" => HandleCapabilitiesRequest(),
             TerminalDiagnostics.ApplicationFrameOperation => await HandleApplicationFrameRequestAsync(request.ApplicationFrame, cancellationToken),
+            TerminalDiagnostics.DeliveryOperation => HandleDeliveryRequest(request.Delivery),
             "input" => await TrackedSendAsync("text", () => HandleInputRequestAsync(request.Data), cancellationToken),
             "key" => await TrackedSendAsync("key", () => HandleKeyRequestAsync(request.Key, request.Modifiers), cancellationToken),
             "click" => await TrackedSendAsync("mouse", () => Task.FromResult(HandleClickRequest(request.X, request.Y, request.Button)), cancellationToken),
@@ -653,6 +654,19 @@ public sealed class McpDiagnosticsPresentationFilter : ITerminalAwarePresentatio
             Success = result.Outcome == DiagnosticOutcome.Captured,
             Error = result.Problem?.Message,
             ApplicationFrame = result
+        };
+    }
+
+    private DiagnosticsResponse HandleDeliveryRequest(DiagnosticDeliveryRequest? request)
+    {
+        var result = _diagnostics?.CaptureDelivery(request ?? new DiagnosticDeliveryRequest())
+            ?? TerminalDiagnostics.DeliveryProblem(DiagnosticOutcome.Unavailable, "target-not-initialized",
+                "The terminal is not initialized.");
+        return new DiagnosticsResponse
+        {
+            Success = result.Outcome == DiagnosticOutcome.Captured,
+            Error = result.Problem?.Message,
+            Delivery = result,
         };
     }
 

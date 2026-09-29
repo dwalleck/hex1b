@@ -286,6 +286,25 @@ public class UnifiedTerminalTools(TerminalSessionManager sessionManager)
     }
 
     /// <summary>
+    /// Returns the native delivery record of any target through the shared contract.
+    /// </summary>
+    [McpServerTool, Description("Returns what the terminal's native presentation did with each write (accepted, refused, or failed), through the shared diagnostic contract: per-write source, phase relative to model application, byte counts, timing, model sequence and output-item links, with totals. Accepted means the host OS or transport took the bytes, not that anything was displayed. Reading never writes to the terminal. Targets without a native presentation (for example local PTY sessions) report outcome 'unavailable' with code 'no-native-presentation'.")]
+    public async Task<DeliveryToolResult> CaptureNativeDelivery(
+        [Description("Session ID of the terminal target")] string sessionId,
+        [Description("Only records after this sequence (the last sequence you already have).")] long? since = null,
+        [Description("Most records to return (1-4096; default 4096).")] int? limit = null,
+        [Description(CaptureToolSupport.DeliveryAuthorizeDescription)] string? authorize = null,
+        CancellationToken ct = default)
+    {
+        var target = sessionManager.GetTarget(sessionId);
+        return target == null
+            ? CaptureToolSupport.DeliveryResult(
+                TerminalDiagnostics.DeliveryProblem(DiagnosticOutcome.Unavailable, "session-not-found", $"Session '{sessionId}' not found."),
+                sessionId)
+            : await CaptureToolSupport.CaptureDeliveryAsync(target.CaptureDeliveryAsync, since, limit, authorize, ct, sessionId);
+    }
+
+    /// <summary>
     /// Describes the diagnostic capabilities of any target.
     /// </summary>
     [McpServerTool, Description("Describes what diagnostic observations a terminal target supports: operations, formats, timing, authorizations, evidence layers (terminal model, application frame, native delivery, native presentation) with reasons for unavailable layers, and exact limitations.")]

@@ -709,6 +709,88 @@ public class CaptureContractCliTests
             JsonDocument.Parse(model).RootElement.GetProperty("problem").GetProperty("code").GetString());
     }
 
+    [TestMethod]
+    public async Task Delivery_AttachedAppMatchesTheEngineAndHidesBytesByDefault()
+    {
+        var (target, _) = await StartDeliveryAppAsync();
+        await using var owned = target;
+
+        var (exitCode, stdout, stderr) = await RunCliAsync("capture", "delivery", Pid, "--json");
+        var (rawExit, raw, rawErr) = await RunCliAsync("capture", "delivery", Pid, "--json", "--authorize", "native-output");
+        var engine = new TerminalDiagnostics(target, "CliDelivery").CaptureDelivery(new DiagnosticDeliveryRequest());
+
+        Assert.AreEqual(0, exitCode, stderr);
+        using var json = JsonDocument.Parse(stdout);
+        Assert.AreEqual("captured", json.RootElement.GetProperty("outcome").GetString());
+        Assert.AreEqual("websocket", json.RootElement.GetProperty("deliveryLayer").GetString());
+        var records = json.RootElement.GetProperty("records").EnumerateArray().ToList();
+        Assert.IsNotEmpty(records, "fixture: the app's output produced no delivery records");
+        Assert.IsTrue(records.All(r => !r.TryGetProperty("content", out _)), "bytes returned without native-output");
+        var engineJson = JsonSerializer.SerializeToElement(engine, DiagnosticsJsonContext.Default.DiagnosticDeliveryResult);
+        Assert.IsTrue(JsonElement.DeepEquals(WithoutAcquisition(engineJson), WithoutAcquisition(json.RootElement)),
+            $"CLI delivery differs from the engine's.\nengine: {engineJson}\ncli:    {json.RootElement}");
+
+        Assert.AreEqual(0, rawExit, rawErr);
+        var contents = JsonDocument.Parse(raw).RootElement.GetProperty("records").EnumerateArray()
+            .Where(r => r.TryGetProperty("content", out _))
+            .Select(r => System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(r.GetProperty("content").GetString()!)));
+        Assert.IsTrue(contents.Any(c => c.Contains("DELIVERY-SENTINEL", StringComparison.Ordinal)), "native-output did not return the written bytes");
+    }
+
+    [TestMethod]
+    public async Task Delivery_TextOutputUnavailableAndInvalid()
+    {
+        var (target, _) = await StartDeliveryAppAsync();
+        await using (target)
+        {
+            var (exitCode, text, stderr) = await RunCliAsync("capture", "delivery", Pid);
+            var (invalidExit, _, invalidErr) = await RunCliAsync("capture", "delivery", Pid, "--limit", "0");
+
+            Assert.AreEqual(0, exitCode, stderr);
+            StringAssert.Contains(text, "Delivery layer: websocket");
+            StringAssert.Contains(text, "accepted workload-output");
+            Assert.AreEqual(1, invalidExit);
+            StringAssert.Contains(invalidErr, "invalid-limit");
+        }
+
+        await using var headless = await StartAttachedAppAsync();
+        var (headlessExit, _, headlessErr) = await RunCliAsync("capture", "delivery", Pid, "--json");
+        Assert.AreEqual(1, headlessExit);
+        StringAssert.Contains(headlessErr, "no-native-presentation");
+    }
+
+    // An attached app presented over a WebSocket, so its writes are observable delivery.
+    private static async Task<(Hex1bTerminal Terminal, ControlledWebSocket Socket)> StartDeliveryAppAsync()
+    {
+        await WaitForSocketReleaseAsync(TestContext.Current.CancellationToken);
+        var socket = new ControlledWebSocket();
+        var terminal = Hex1bTerminal.CreateBuilder()
+            .WithDimensions(40, 5)
+            .WithPresentation(new WebSocketPresentationAdapter(socket, 40, 5))
+            .WithHex1bApp(_ => new TextBlockWidget("DELIVERY-SENTINEL"))
+            .WithDiagnostics(appName: "CliDelivery", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync(TestContext.Current.CancellationToken);
+        await WaitForSocketAsync(TestContext.Current.CancellationToken);
+        for (var i = 0; i < 300; i++)
+        {
+            lock (socket.Sent)
+                if (socket.Sent.Any(b => System.Text.Encoding.UTF8.GetString(b).Contains("DELIVERY-SENTINEL", StringComparison.Ordinal)))
+                    break;
+            await Task.Delay(20, TestContext.Current.CancellationToken);
+        }
+
+        await Task.Delay(300, TestContext.Current.CancellationToken);
+        return (terminal, socket);
+    }
+
+    private static JsonElement WithoutAcquisition(JsonElement result)
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(result.GetRawText())!;
+        (node["identity"] as System.Text.Json.Nodes.JsonObject)?.Remove("acquisition");
+        return JsonDocument.Parse(node.ToJsonString()).RootElement.Clone();
+    }
+
     // === Helpers ===
 
     private static string Pid => Environment.ProcessId.ToString();

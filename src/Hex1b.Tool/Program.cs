@@ -51,6 +51,7 @@ public class Program
         // Capture commands
         builder.Services.AddTransient<Commands.Capture.CaptureScreenshotCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureCapabilitiesCommand>();
+        builder.Services.AddTransient<Commands.Capture.CaptureDeliveryCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureRecordingStartCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureRecordingStopCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureRecordingStatusCommand>();

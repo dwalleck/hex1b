@@ -171,7 +171,7 @@ internal sealed class AppTreeCommand : BaseCommand
     // (or a hostile socket peer) cannot inject control sequences.
     private static string Quote(string text) => JsonSerializer.Serialize(text, DiagnosticsJsonContext.Default.String);
 
-    private static string Safe(string? text)
+    internal static string Safe(string? text)
     {
         if (string.IsNullOrEmpty(text))
             return "";

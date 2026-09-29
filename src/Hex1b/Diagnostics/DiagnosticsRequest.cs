@@ -91,4 +91,10 @@ internal sealed class DiagnosticsRequest
     /// </summary>
     [JsonPropertyName("applicationFrame")]
     public DiagnosticApplicationFrameRequest? ApplicationFrame { get; set; }
+
+    /// <summary>
+    /// For "delivery" method, the native delivery request; absent means every retained record, no bytes.
+    /// </summary>
+    [JsonPropertyName("delivery")]
+    public DiagnosticDeliveryRequest? Delivery { get; set; }
 }

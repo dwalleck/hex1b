@@ -96,6 +96,12 @@ public interface ITerminalTarget : IAsyncDisposable
     Task<DiagnosticApplicationFrameResult> CaptureApplicationFrameAsync(DiagnosticApplicationFrameRequest request, CancellationToken ct = default);
 
     /// <summary>
+    /// Returns the target's native delivery record through the shared delivery contract; targets
+    /// without an observable native presentation report it unavailable.
+    /// </summary>
+    Task<DiagnosticDeliveryResult> CaptureDeliveryAsync(DiagnosticDeliveryRequest request, CancellationToken ct = default);
+
+    /// <summary>
     /// Describes the target's diagnostic capabilities and their limits.
     /// </summary>
     Task<DiagnosticCapabilities> GetDiagnosticCapabilitiesAsync(CancellationToken ct = default);

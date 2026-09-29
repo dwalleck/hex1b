@@ -122,6 +122,28 @@ internal sealed class DiagnosticsSocketClient
     }
 
     /// <summary>
+    /// Returns an attached target's native delivery record. Transport, protocol, and contract failures
+    /// become diagnostic outcomes; only caller cancellation throws.
+    /// </summary>
+    public async Task<DiagnosticDeliveryResult> CaptureDeliveryAsync(
+        string socketPath, DiagnosticDeliveryRequest request, CancellationToken cancellationToken = default)
+    {
+        var (response, problem) = await ExchangeAsync(socketPath,
+            new DiagnosticsRequest { Method = TerminalDiagnostics.DeliveryOperation, Delivery = request },
+            cancellationToken).ConfigureAwait(false);
+        if (problem is not null)
+            return TerminalDiagnostics.DeliveryProblem(problem.Value.Outcome, problem.Value.Code, problem.Value.Message);
+
+        if (response!.Delivery is not { } result)
+        {
+            var (outcome, code, message) = Unexpected(response);
+            return TerminalDiagnostics.DeliveryProblem(outcome, code, message);
+        }
+
+        return Validate(result);
+    }
+
+    /// <summary>
     /// Describes an attached target's capabilities. Transport, protocol, and contract failures
     /// become diagnostic outcomes; only caller cancellation throws.
     /// </summary>
@@ -174,6 +196,35 @@ internal sealed class DiagnosticsSocketClient
         }
 
         return result.Outcome == DiagnosticOutcome.Captured ? ExplainOmittedFields(result) : result;
+    }
+
+    private static DiagnosticDeliveryResult Validate(DiagnosticDeliveryResult result)
+    {
+        result = result with
+        {
+            Records = result.Records ?? [],
+            ContentCoverage = (result.ContentCoverage ?? []).Where(entry => entry is not null).ToArray(),
+            UnavailableFields = (result.UnavailableFields ?? []).Where(entry => entry is not null).ToArray(),
+            Limitations = (result.Limitations ?? []).Where(entry => entry is not null).ToArray(),
+        };
+
+        if (result.ContractVersion != TerminalDiagnostics.ContractVersion)
+            return TerminalDiagnostics.DeliveryProblem(DiagnosticOutcome.Failed, "incompatible-target", VersionMessage(result.ContractVersion));
+
+        if (result.Outcome == DiagnosticOutcome.Captured
+            && (result.Totals is null || result.Identity is null || result.DeliveryLayer is null || result.Records.Any(r => r is null)))
+        {
+            return TerminalDiagnostics.DeliveryProblem(DiagnosticOutcome.Failed, "protocol-error",
+                "The target reported a delivery record without its totals, identity, layer, or with a missing record.");
+        }
+
+        if (result.Outcome != DiagnosticOutcome.Captured && result.Problem is null)
+        {
+            return TerminalDiagnostics.DeliveryProblem(DiagnosticOutcome.Failed, "protocol-error",
+                $"The target reported outcome '{DiagnosticContractNames.Of(result.Outcome)}' without a problem.");
+        }
+
+        return result;
     }
 
     private static DiagnosticApplicationFrameResult Validate(DiagnosticApplicationFrameResult result)

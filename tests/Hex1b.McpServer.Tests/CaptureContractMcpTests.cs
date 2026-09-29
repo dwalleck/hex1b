@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using Hex1b.Automation;
 using Hex1b.Diagnostics;
@@ -532,6 +533,86 @@ public class CaptureContractMcpTests : McpServerTestBase
         {
             await CallAsync(client, "remove_session", new() { ["sessionId"] = local });
         }
+    }
+
+    [TestMethod]
+    public async Task Delivery_AttachedMatchesTheEngineAndLocalSessionIsUnavailable()
+    {
+        await using var terminal = await StartDeliveryAppAsync();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var sessionId = await ConnectAttachedAsync(client);
+
+        var plain = await CallAsync(client, "capture_native_delivery", new() { ["sessionId"] = sessionId });
+        var raw = await CallAsync(client, "capture_native_delivery", new() { ["sessionId"] = sessionId, ["authorize"] = "native-output" });
+        var engine = new TerminalDiagnostics(terminal, "McpDelivery").CaptureDelivery(new DiagnosticDeliveryRequest());
+
+        Assert.IsTrue(plain.GetProperty("success").GetBoolean(), plain.ToString());
+        var delivery = plain.GetProperty("delivery");
+        Assert.AreEqual("websocket", delivery.GetProperty("deliveryLayer").GetString());
+        Assert.IsTrue(delivery.GetProperty("records").EnumerateArray().All(r => !r.TryGetProperty("content", out _)),
+            "bytes returned without native-output");
+        var engineJson = JsonSerializer.SerializeToElement(engine, DiagnosticsJsonContext.Default.DiagnosticDeliveryResult);
+        Assert.IsTrue(JsonElement.DeepEquals(WithoutAcquisition(engineJson), WithoutAcquisition(delivery)),
+            $"MCP delivery differs from the engine's.\nengine: {engineJson}\nmcp:    {delivery}");
+        var contents = raw.GetProperty("delivery").GetProperty("records").EnumerateArray()
+            .Where(r => r.TryGetProperty("content", out _))
+            .Select(r => Encoding.UTF8.GetString(Convert.FromBase64String(r.GetProperty("content").GetString()!)));
+        Assert.IsTrue(contents.Any(c => c.Contains("DELIVERY-SENTINEL", StringComparison.Ordinal)), "native-output did not return the written bytes");
+
+        var local = await StartLocalSessionAsync(client);
+        try
+        {
+            var unavailable = await CallAsync(client, "capture_native_delivery", new() { ["sessionId"] = local });
+            Assert.IsFalse(unavailable.GetProperty("success").GetBoolean());
+            Assert.AreEqual("no-native-presentation",
+                unavailable.GetProperty("delivery").GetProperty("problem").GetProperty("code").GetString());
+        }
+        finally
+        {
+            await CallAsync(client, "remove_session", new() { ["sessionId"] = local });
+        }
+    }
+
+    // An attached app presented over a WebSocket, so its writes are observable delivery.
+    private static async Task<Hex1bTerminal> StartDeliveryAppAsync()
+    {
+        var socketPath = McpDiagnosticsPresentationFilter.GetSocketPath();
+        for (var attempt = 0; attempt < 100 && File.Exists(socketPath); attempt++)
+            await Task.Delay(50);
+        var socket = new ControlledWebSocket();
+        var terminal = Hex1bTerminal.CreateBuilder()
+            .WithDimensions(40, 5)
+            .WithPresentation(new WebSocketPresentationAdapter(socket, 40, 5))
+            .WithHex1bApp(_ => new TextBlockWidget("DELIVERY-SENTINEL"))
+            .WithDiagnostics(appName: "McpDelivery", forceEnable: true)
+            .Build();
+        _ = terminal.RunAsync();
+        var client = new DiagnosticsSocketClient();
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            if (File.Exists(socketPath) && await client.TryProbeAsync(socketPath) is { Success: true })
+                break;
+            await Task.Delay(50);
+        }
+
+        for (var i = 0; i < 300; i++)
+        {
+            lock (socket.Sent)
+                if (socket.Sent.Any(b => Encoding.UTF8.GetString(b).Contains("DELIVERY-SENTINEL", StringComparison.Ordinal)))
+                    break;
+            await Task.Delay(20);
+        }
+
+        await Task.Delay(300);
+        return terminal;
+    }
+
+    private static JsonElement WithoutAcquisition(JsonElement result)
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(result.GetRawText())!;
+        (node["identity"] as System.Text.Json.Nodes.JsonObject)?.Remove("acquisition");
+        return JsonDocument.Parse(node.ToJsonString()).RootElement.Clone();
     }
 
     // === Helpers ===

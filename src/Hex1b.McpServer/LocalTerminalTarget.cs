@@ -75,6 +75,9 @@ public sealed class LocalTerminalTarget : ITerminalTarget
     public Task<DiagnosticApplicationFrameResult> CaptureApplicationFrameAsync(DiagnosticApplicationFrameRequest request, CancellationToken ct = default)
         => _session.Diagnostics.CaptureApplicationFrameAsync(request, ct);
 
+    public Task<DiagnosticDeliveryResult> CaptureDeliveryAsync(DiagnosticDeliveryRequest request, CancellationToken ct = default)
+        => Task.FromResult(_session.Diagnostics.CaptureDelivery(request));
+
     /// <inheritdoc />
     public Task<DiagnosticCapabilities> GetDiagnosticCapabilitiesAsync(CancellationToken ct = default)
         => Task.FromResult(_session.Diagnostics.GetCapabilities());

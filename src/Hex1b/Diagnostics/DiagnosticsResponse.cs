@@ -93,6 +93,12 @@ internal sealed class DiagnosticsResponse
     public DiagnosticApplicationFrameResult? ApplicationFrame { get; set; }
 
     /// <summary>
+    /// For "delivery" method: the native delivery record, including failures.
+    /// </summary>
+    [JsonPropertyName("delivery")]
+    public DiagnosticDeliveryResult? Delivery { get; set; }
+
+    /// <summary>
     /// For "input", "key", "click" and "drag": the input ids the send was assigned, when the
     /// target tracks input.
     /// </summary>

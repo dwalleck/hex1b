@@ -80,6 +80,36 @@ internal static class CaptureToolSupport
     public static JsonElement ToJson(DiagnosticApplicationFrameResult result) =>
         JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticApplicationFrameResult);
 
+    public static JsonElement ToJson(DiagnosticDeliveryResult result) =>
+        JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticDeliveryResult);
+
+    public const string DeliveryAuthorizeDescription =
+        "Opt in to content beyond metadata (comma-separated): native-output adds each record's written bytes (base64).";
+
+    /// <summary>
+    /// Parses the arguments, reads the native delivery record, and wraps the contract result for MCP.
+    /// </summary>
+    public static async Task<DeliveryToolResult> CaptureDeliveryAsync(
+        Func<DiagnosticDeliveryRequest, CancellationToken, Task<DiagnosticDeliveryResult>> capture,
+        long? since, int? limit, string? authorize, CancellationToken ct, string? sessionId = null)
+    {
+        var authorizations = authorize?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var (request, invalid) = DiagnosticContractNames.ParseDeliveryRequest(since, limit, authorizations);
+        var result = invalid ?? await capture(request!, ct);
+        return DeliveryResult(result, sessionId);
+    }
+
+    public static DeliveryToolResult DeliveryResult(DiagnosticDeliveryResult result, string? sessionId) => new()
+    {
+        Success = result.Outcome == DiagnosticOutcome.Captured,
+        SessionId = sessionId,
+        Message = result.Outcome == DiagnosticOutcome.Captured
+            ? $"Read {result.Records.Count} {result.DeliveryLayer} delivery records ({result.Totals!.Accepted} accepted, " +
+              $"{result.Totals.Refused} refused, {result.Totals.Failed} failed since coverage started)."
+            : $"Native delivery {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}",
+        Delivery = ToJson(result),
+    };
+
     /// <summary>
     /// Parses the authorize argument, captures the latest application frame, and wraps the
     /// contract result for MCP.
