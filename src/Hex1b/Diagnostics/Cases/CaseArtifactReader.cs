@@ -60,7 +60,8 @@ internal static class CaseArtifactReader
             if (manifest.FormatVersion is not (CaseArtifactWriter.FormatVersion or CaseArtifactWriter.LegacyFormatVersion))
                 return Problem(DiagnosticOutcome.Failed, "unsupported-format", $"Artifact format {manifest.FormatVersion} is not supported (expected {CaseArtifactWriter.LegacyFormatVersion} or {CaseArtifactWriter.FormatVersion}).") with { Path = path };
 
-            scan = Scan(System.IO.Path.Combine(path, CaseArtifactWriter.EventsFile), request.Since ?? 0, request.Limit ?? 0);
+            scan = Scan(System.IO.Path.Combine(path, CaseArtifactWriter.EventsFile), request.Since ?? 0, request.Limit ?? 0,
+                manifest.Checkpoint.ModelSequence ?? 0);
 
             var completionPath = System.IO.Path.Combine(path, CaseArtifactWriter.CompletionFile);
             if (File.Exists(completionPath))
@@ -163,7 +164,9 @@ internal static class CaseArtifactReader
         private static Dictionary<string, StreamScan> Streams_() => StreamNames.ToDictionary(s => s, _ => new StreamScan());
     }
 
-    private static ScanResult Scan(string eventsPath, long since, int limit)
+    // A case started on a model that had applied output records model events from after its start's sequence
+    // (modelStart); a fresh case from 1.
+    private static ScanResult Scan(string eventsPath, long since, int limit, long modelStart)
     {
         var result = new ScanResult();
         if (!File.Exists(eventsPath))
@@ -217,7 +220,7 @@ internal static class CaseArtifactReader
 
             if (item.Stream == "model" && item.ModelSequence is { } modelSequence)
             {
-                var next = (result.LastModelSequence ?? 0) + 1;
+                var next = (result.LastModelSequence ?? modelStart) + 1;
                 if (modelSequence != next && result.ModelGapAfter is null)
                     result.ModelGapAfter = next - 1;
                 result.LastModelSequence = modelSequence;
@@ -408,8 +411,11 @@ internal static class CaseArtifactReader
             ];
         }
 
-        // A fresh checkpoint is model sequence 0; the interval runs to the first event it cannot cover.
-        var last = scan.LastModelSequence ?? 0;
+        // The interval runs from the checkpoint's model sequence (0 for a fresh model; a start's for a case started
+        // on a model that had applied output) to the first event it cannot cover. Model events are recorded from the
+        // next sequence, so a model-stream ordinal n is model sequence from + n.
+        var from = manifest.Checkpoint.ModelSequence ?? 0;
+        var last = scan.LastModelSequence ?? from;
         var model = scan.Streams["model"];
         (long To, string Reason)? end = null;
         void Consider(long to, string reason)
@@ -422,7 +428,7 @@ internal static class CaseArtifactReader
         if (scan.IntervalEnd is { } intervalEnd)
             Consider(intervalEnd.Sequence - 1, intervalEnd.Reason);
         foreach (var missing in model.Missing)
-            Consider(Math.Max(0, (missing.FromOrdinal ?? 1) - 1), missing.Reason == "unknown" ? "model-events-missing" : missing.Reason);
+            Consider(from + Math.Max(0, (missing.FromOrdinal ?? 1) - 1), missing.Reason == "unknown" ? "model-events-missing" : missing.Reason);
         if (scan.ModelGapAfter is { } gap)
             Consider(gap, "model-events-missing");
         if (state == DiagnosticCaseCompletionState.Truncated)
@@ -431,6 +437,6 @@ internal static class CaseArtifactReader
             Consider(last, "interrupted");
 
         var (to, reason) = end ?? (last, $"case-stopped: {(completion is null ? "unknown" : DiagnosticContractNames.Of(completion.StopReason))}");
-        return [new DiagnosticCaseInterval { Valid = true, FromModelSequence = 0, ToModelSequence = to, EndReason = reason }];
+        return [new DiagnosticCaseInterval { Valid = true, FromModelSequence = from, ToModelSequence = to, EndReason = reason }];
     }
 }

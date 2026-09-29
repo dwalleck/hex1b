@@ -9,6 +9,33 @@ namespace Hex1b.Diagnostics.Cases;
 internal static class StartCheckpoint
 {
     /// <summary>
+    /// The manifest checkpoint of a start taken at <paramref name="modelSequence"/>: complete when its state holds
+    /// only restorable surfaces; otherwise unsupported, naming the surfaces or why no state was taken.
+    /// </summary>
+    internal static DiagnosticCaseCheckpoint Describe(DiagnosticCaseModelConfiguration configuration, long modelSequence,
+        DiagnosticCaseRecorder.CheckpointCapture start)
+    {
+        var described = new DiagnosticCaseCheckpoint
+        {
+            Profile = DiagnosticCaseCheckpointProfiles.TextState,
+            Configuration = configuration,
+            ModelSequence = modelSequence,
+            UnsupportedSurfaces = [],
+        };
+        if (start.State is not { } state)
+            return described with { Status = DiagnosticCaseCheckpointStatus.Unsupported, Reason = start.Reason };
+        var surfaces = Unsupported(state);
+        return surfaces.Count > 0
+            ? described with
+            {
+                Status = DiagnosticCaseCheckpointStatus.Unsupported,
+                Reason = $"unsupported-surfaces: the start held {string.Join(", ", surfaces)}, which this checkpoint cannot restore yet.",
+                UnsupportedSurfaces = surfaces,
+            }
+            : described with { Status = DiagnosticCaseCheckpointStatus.Complete, CoveredSurfaces = FreshModelCheckpoint.CoveredSurfaces };
+    }
+
+    /// <summary>
     /// The surfaces a start state holds that its restore cannot represent, in a fixed order; empty when it can be
     /// restored. It reads only the projection.
     /// </summary>

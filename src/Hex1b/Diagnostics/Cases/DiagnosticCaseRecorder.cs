@@ -103,7 +103,13 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// <summary>A smaller pending-state budget, taken from the arming flow while a test has set it.</summary>
     internal static readonly AsyncLocal<long?> PendingStateBudgetForTesting = new();
 
-    private readonly long _pendingStateBudget = PendingStateBudgetForTesting.Value ?? PendingStateBudget;
+    private readonly long _pendingStateBudget = PendingStateBudgetInEffect;
+
+    /// <summary>The pending-state budget a case armed now holds: the fixed budget, or a test's.</summary>
+    internal static long PendingStateBudgetInEffect => PendingStateBudgetForTesting.Value ?? PendingStateBudget;
+
+    /// <summary>Runs before the start projection is taken, in the arming hold, while a test has set it.</summary>
+    internal static readonly AsyncLocal<Action?> BeforeStartCaptureForTesting = new();
 
     /// <summary>
     /// A checkpoint as the terminal took it: its state (or none), how long the lock was held, its status and
@@ -600,6 +606,21 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
 
     /// <summary>Bytes left in the tier the stop checkpoint is written in, so a stop can skip a state that cannot fit.</summary>
     internal long StopCheckpointRoom => RangeLimit - _writer.BytesWritten;
+
+    /// <summary>
+    /// Records the start checkpoint of a case armed on a model that had applied output, before any model event
+    /// (the caller holds the model lock at arming). Only a complete <c>text-state/1</c> start is kept: its state is
+    /// the restore's source. It holds a mark's place and its state bytes until written, as a mark does.
+    /// </summary>
+    internal void RecordStartCheckpoint(long modelSequence, CheckpointCapture capture)
+    {
+        if (capture.State is null || Manifest.Checkpoint is not { Profile: DiagnosticCaseCheckpointProfiles.TextState, Status: DiagnosticCaseCheckpointStatus.Complete })
+            return;
+        Interlocked.Increment(ref _pendingMarks);
+        Interlocked.Add(ref _pendingStateBytes, capture.StateBytes);
+        _checkpoints.Enqueue(new PendingCheckpoint(modelSequence,
+            Checkpoint(Interlocked.Increment(ref _checkpointsTaken), "start", "start", capture), capture.StateBytes));
+    }
 
     /// <summary>
     /// Records a reserved mark's checkpoint. The caller holds the model lock, so every model event before it

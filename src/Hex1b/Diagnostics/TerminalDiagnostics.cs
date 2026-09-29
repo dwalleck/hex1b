@@ -775,7 +775,7 @@ public sealed class TerminalDiagnostics
             _terminal.NativeDelivery,
             _terminal.StopDiagnosticCaseWithCheckpoint);
         Diagnostics.Cases.DiagnosticCaseRecorder.BeforeArmForTesting.Value?.Invoke();
-        var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase((fresh, unsupported, configuration) =>
+        var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase(reapplication, (fresh, unsupported, configuration, start) =>
             new Diagnostics.Cases.DiagnosticCaseRecorder(new DiagnosticCaseManifest
             {
                 FormatVersion = Diagnostics.Cases.CaseArtifactWriter.FormatVersion,
@@ -786,7 +786,9 @@ public sealed class TerminalDiagnostics
                 StartTimestamp = startTimestamp,
                 TimestampFrequency = Stopwatch.Frequency,
                 Fresh = fresh,
-                Checkpoint = Diagnostics.Cases.FreshModelCheckpoint.Describe(fresh, reapplication, unsupported, configuration),
+                Checkpoint = start is var (sequence, capture)
+                    ? Diagnostics.Cases.StartCheckpoint.Describe(configuration, sequence, capture)
+                    : Diagnostics.Cases.FreshModelCheckpoint.Describe(reapplication, unsupported, configuration),
                 Bounds = new DiagnosticCaseBounds { MaxBytes = maxBytes, MaxSeconds = maxSeconds },
                 Authorizations = granted,
                 Identity = identity,

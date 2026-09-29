@@ -57,10 +57,12 @@ public sealed partial class Hex1bTerminal
     /// <summary>
     /// Arms a diagnostic case under the model lock. The model is fresh when it has applied no model
     /// event and its pump has read no output bytes. A remote (HMP1) workload's model is driven by state
-    /// the case cannot hold, so its checkpoint is unsupported. Returns the armed recorder, or why none was armed.
+    /// the case cannot hold, so its checkpoint is unsupported. A model that is not fresh, when the case may
+    /// hold state (<paramref name="takeStart"/>), is projected in the same hold: the start checkpoint, so
+    /// every model event is either in it or recorded after it. Returns the armed recorder, or why none was armed.
     /// </summary>
-    internal (DiagnosticCaseRecorder? Recorder, string? ProblemCode, string? ActiveCaseId) TryArmDiagnosticCase(
-        Func<bool, string?, DiagnosticCaseModelConfiguration, DiagnosticCaseRecorder> create)
+    internal (DiagnosticCaseRecorder? Recorder, string? ProblemCode, string? ActiveCaseId) TryArmDiagnosticCase(bool takeStart,
+        Func<bool, string?, DiagnosticCaseModelConfiguration, (long Sequence, DiagnosticCaseRecorder.CheckpointCapture Capture)?, DiagnosticCaseRecorder> create)
     {
         lock (_bufferLock)
         {
@@ -71,7 +73,13 @@ public sealed partial class Hex1bTerminal
             var unsupported = _workload is IHmp1TerminalOutputSource
                 ? "hmp1-workload: a remote workload's model is driven by state synchronization the case does not hold."
                 : null;
-            var recorder = create(_modelSequence == 0 && OutputBytesRead == 0, unsupported, _caseConfiguration);
+            var fresh = _modelSequence == 0 && OutputBytesRead == 0;
+            (long, DiagnosticCaseRecorder.CheckpointCapture)? start = !fresh && takeStart && unsupported is null
+                ? (_modelSequence, TakeStartCaptureUnsafe())
+                : null;
+            var recorder = create(fresh, unsupported, _caseConfiguration, start);
+            if (start is var (sequence, capture))
+                recorder.RecordStartCheckpoint(sequence, capture);
             recorder.SeedModelSequence(_modelSequence);
             // Registered with the arming, so the input and frame streams start with the model stream.
             InputMilestones?.SetStreamObserver(recorder);
@@ -172,6 +180,28 @@ public sealed partial class Hex1bTerminal
 
     // Must hold _bufferLock. The state only with reapplication-data and within the pending-state budget,
     // both judged from geometry before any state is read. A size-limit stop skips a state that could not fit
+    // The start projection, in the arming hold: refused (without projecting) inside an application or past the
+    // pending-state budget, and never failing the arming.
+    private DiagnosticCaseRecorder.CheckpointCapture TakeStartCaptureUnsafe()
+    {
+        if (_captureApplicationDepth > 0)
+            return new(null, null, "unavailable", "mid-application: the case was started inside an application that had not finished", 0);
+        var estimate = EstimateModelStateBytesUnsafe();
+        if (estimate > DiagnosticCaseRecorder.PendingStateBudgetInEffect)
+            return new(null, null, "unavailable", "pending-state budget: the start state is larger than the state a case may hold awaiting its writer", 0);
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value?.Invoke();
+            var state = CaptureModelState();
+            return new(state, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds, "recorded", null, estimate);
+        }
+        catch (Exception error)
+        {
+            return new(null, null, "unavailable", $"capture-failed: {error.GetType().Name}: {error.Message}", 0);
+        }
+    }
+
     // what is left of the case. A projection that fails leaves the boundary without state rather than
     // failing the stop or the mark.
     // Returns the checkpoint's model sequence with it: the current one, or, when the checkpoint is re-entered

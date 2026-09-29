@@ -115,11 +115,11 @@ public partial class DiagnosticCaseTests
 
         Assert.AreEqual("complete", untouched.Artifact.Manifest.GetProperty("checkpoint").GetProperty("status").GetString());
         Assert.AreEqual("live", untouched.Artifact.Manifest.GetProperty("startPath").GetString());
+        // A model that has applied output owns a text-state/1 start instead (ticket 09).
         foreach (var (name, result) in new[] { ("applied batch", applied), ("same-size resize", resized) })
         {
             var checkpoint = result.Artifact.Manifest.GetProperty("checkpoint");
-            Assert.AreEqual("unsupported", checkpoint.GetProperty("status").GetString(), name);
-            StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "not-fresh", name);
+            Assert.AreEqual(("text-state/1", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()), name);
             Assert.IsFalse(result.Artifact.Manifest.GetProperty("fresh").GetBoolean(), name);
         }
     }
@@ -447,7 +447,10 @@ public partial class DiagnosticCaseTests
         var payloads = artifact.ModelEvents().Select(e => Encoding.ASCII.GetString(Convert.FromBase64String(e.GetProperty("data").GetString()!))).ToList();
         CollectionAssert.AreEqual(new[] { "INFLIGHT", "NEXT" }, payloads, "the in-flight chunk was lost or recorded twice");
         Assert.IsFalse(artifact.Manifest.GetProperty("fresh").GetBoolean(), "a model that had read bytes is not fresh");
-        Assert.AreEqual("unsupported", artifact.Manifest.GetProperty("checkpoint").GetProperty("status").GetString());
+        // It had applied nothing: its start (ticket 09) is at model sequence 0, and the held chunk is recorded after it.
+        var checkpoint = artifact.Manifest.GetProperty("checkpoint");
+        Assert.AreEqual(("text-state/1", "complete", 0L), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString(),
+            checkpoint.GetProperty("modelSequence").GetInt64()));
     }
 
     [TestMethod]
@@ -785,7 +788,7 @@ public partial class DiagnosticCaseTests
         var interrupted = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = copy });
         Assert.AreEqual((DiagnosticCaseCompletionState.Interrupted, "interrupted"), (interrupted.CompletionState, interrupted.Intervals.Single().EndReason));
 
-        // A case that did not start fresh has no valid interval.
+        // A case started on a model that had applied output: its interval runs from its start (ticket 09).
         var late = new ScriptedWorkload();
         await using var nonFresh = Hex1bTerminal.CreateBuilder().WithWorkload(late).WithHeadless().WithDimensions(40, 10).Build();
         using (new Running(nonFresh))
@@ -795,8 +798,8 @@ public partial class DiagnosticCaseTests
             await late.WriteAndWaitAsync(nonFresh, "after");
             await new TerminalDiagnostics(nonFresh).StopCaseAsync(TestContext.Current.CancellationToken);
             var notFresh = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = liveCase.Path! }).Intervals.Single();
-            Assert.IsFalse(notFresh.Valid, "a case that did not start fresh reported a re-applicable interval");
-            StringAssert.StartsWith(notFresh.EndReason, "checkpoint unsupported");
+            Assert.AreEqual((true, 1L, 2L), (notFresh.Valid, notFresh.FromModelSequence, notFresh.ToModelSequence),
+                "a live start's interval does not run from its start to its last event");
         }
 
         // Unreadable and unknown-format manifests.

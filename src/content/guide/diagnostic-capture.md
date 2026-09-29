@@ -308,8 +308,15 @@ Start a case in one of two ways:
   case's checkpoint (`fresh-model/1`) is then the complete fresh model, and the recorded bytes
   re-apply from model sequence 0.
 - **On a running target**: `hex1b capture case start <id>`, the MCP tool `start_diagnostic_case`,
-  or the socket method `case-start`. A model that has already applied output has no re-applicable
-  checkpoint, so the case records from now on with its checkpoint `unsupported` (`not-fresh`).
+  or the socket method `case-start`. With `reapplication-data`, a model that has already applied
+  output is projected at the arming, in the same hold of the model lock. The case owns a
+  `text-state/1` start checkpoint (a `checkpoint` line labelled `start`, at the arming model
+  sequence), and every later model event is recorded after it. The start is `complete` when the
+  model holds only what its restore can represent. Otherwise it is `unsupported`, and
+  `unsupportedSurfaces` names each surface found: `retained-history`, `saved-screen` (the
+  alternate screen is active), `titles`, `command-marks`, `pending-input`, `dcs-continuation`
+  and `graphics`. A start larger than the 256 MiB pending-state budget, or one taken inside an
+  application, is `unsupported` with that reason. The case records either way.
 
 Stop the case with `hex1b capture case stop`, `stop_diagnostic_case`, or `case-stop`. Mark a
 boundary while it records with `hex1b capture case mark`, `mark_diagnostic_case`, or `case-mark`.
@@ -341,9 +348,10 @@ relative directory against their own working directory, not the target's. Withou
 
 - `caseId`, `path`, `state` (`recording`, `stopping`, `stopped`), `startPath` (`construction`,
   `live`);
-- `bounds`, the granted `authorizations`, and the `checkpoint` (`fresh-model/1`: `complete`,
-  `unsupported` or `excluded`, with the reason and the model configuration that determines the
-  fresh state);
+- `bounds`, the granted `authorizations`, and the `checkpoint`: `fresh-model/1`, or `text-state/1`
+  for a start on a model that had applied output, with its `modelSequence` and
+  `unsupportedSurfaces`. Its status is `complete`, `unsupported` or `excluded`, with the reason and
+  the recorded model configuration;
 - `startedAt`, `elapsedSeconds`, `bytesWritten`;
 - `streams`: `offered`, `written` and `dropped` for each recorded stream;
 - `stopReason` once stopped: `requested`, `size-limit`, `time-limit`, `collector-failed` or

@@ -18,7 +18,11 @@ internal static class FreshModelCheckpoint
         "graphics-placements-and-resources",
     ];
 
-    internal static DiagnosticCaseCheckpoint Describe(bool fresh, bool authorized, string? unsupported, DiagnosticCaseModelConfiguration configuration)
+    /// <summary>
+    /// The checkpoint of a case armed on a fresh model, or of one that may not hold state (unauthorized, or an HMP1
+    /// workload). A model that had applied output takes a <c>text-state/1</c> start instead (<see cref="StartCheckpoint"/>).
+    /// </summary>
+    internal static DiagnosticCaseCheckpoint Describe(bool authorized, string? unsupported, DiagnosticCaseModelConfiguration configuration)
     {
         if (!authorized)
         {
@@ -39,18 +43,11 @@ internal static class FreshModelCheckpoint
             };
         }
 
-        return fresh
-            ? new DiagnosticCaseCheckpoint
-            {
-                Status = DiagnosticCaseCheckpointStatus.Complete,
-                Configuration = configuration,
-                CoveredSurfaces = CoveredSurfaces,
-            }
-            : new DiagnosticCaseCheckpoint
-            {
-                Status = DiagnosticCaseCheckpointStatus.Unsupported,
-                Reason = "not-fresh: the model had applied output or a geometry change, or read output bytes, before recording started. Mid-session checkpoints are not supported yet.",
-                Configuration = configuration,
-            };
+        return new DiagnosticCaseCheckpoint
+        {
+            Status = DiagnosticCaseCheckpointStatus.Complete,
+            Configuration = configuration,
+            CoveredSurfaces = CoveredSurfaces,
+        };
     }
 }
