@@ -578,6 +578,152 @@ public class CaptureContractMcpTests : McpServerTestBase
         }
     }
 
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_AttachedStartStatusStopInspectMatchTheEngine()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        await using var terminal = await StartAttachedAppAsync();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var sessionId = await ConnectAttachedAsync(client);
+        var engine = new TerminalDiagnostics(terminal, "McpAttached");
+
+        var start = await CallAsync(client, "start_diagnostic_case", new()
+        {
+            ["sessionId"] = sessionId,
+            ["directory"] = root.Path,
+            ["authorize"] = "reapplication-data",
+            ["maxSeconds"] = 300,
+        });
+        Assert.IsTrue(start.GetProperty("success").GetBoolean(), start.ToString());
+        AssertCaseEquals(engine.GetCaseStatus(), start.GetProperty("case"), "start", "elapsedSeconds", "bytesWritten", "streams");
+
+        JsonElement status = default;
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            var before = engine.GetCaseStatus() with { ElapsedSeconds = null };
+            status = (await CallAsync(client, "get_diagnostic_case_status", new() { ["sessionId"] = sessionId })).GetProperty("case");
+            if (JsonSerializer.Serialize(before, DiagnosticsJsonContext.Default.DiagnosticCaseResult)
+                == JsonSerializer.Serialize(engine.GetCaseStatus() with { ElapsedSeconds = null }, DiagnosticsJsonContext.Default.DiagnosticCaseResult))
+                break;
+            await Task.Delay(100);
+        }
+        AssertCaseEquals(engine.GetCaseStatus(), status, "status", "elapsedSeconds");
+
+        var recorder = terminal.DiagnosticCase!;
+        var stop = await CallAsync(client, "stop_diagnostic_case", new() { ["sessionId"] = sessionId });
+        Assert.IsTrue(stop.GetProperty("success").GetBoolean(), stop.ToString());
+        Assert.AreEqual("requested", stop.GetProperty("case").GetProperty("stopReason").GetString());
+        AssertCaseEquals(recorder.Describe(), stop.GetProperty("case"), "stop", "elapsedSeconds");
+
+        var path = stop.GetProperty("case").GetProperty("path").GetString()!;
+        var inspect = await CallAsync(client, "inspect_diagnostic_case", new() { ["path"] = path, ["limit"] = 50 });
+        var expected = JsonSerializer.SerializeToElement(DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path, Limit = 50 }),
+            DiagnosticsJsonContext.Default.DiagnosticCaseInspection);
+        Assert.IsTrue(JsonElement.DeepEquals(expected, inspect.GetProperty("inspection")),
+            $"MCP inspect differs from the inspector.\ninspector: {expected}\nmcp:       {inspect.GetProperty("inspection")}");
+
+        var none = await CallAsync(client, "get_diagnostic_case_status", new() { ["sessionId"] = sessionId });
+        var unknown = await CallAsync(client, "stop_diagnostic_case", new() { ["sessionId"] = "no-such-session" });
+        Assert.AreEqual("no-active-case", none.GetProperty("case").GetProperty("problem").GetProperty("code").GetString());
+        Assert.AreEqual("session-not-found", unknown.GetProperty("case").GetProperty("problem").GetProperty("code").GetString());
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_LocalSessionRecordsFromTheFirstByte()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        var loose = Path.Combine(root.Path, "loose");
+        Directory.CreateDirectory(loose, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+
+        var refused = await CallAsync(client, "start_bash_terminal", new() { ["recordCase"] = true, ["caseDirectory"] = loose });
+        var orphan = await CallAsync(client, "start_bash_terminal", new() { ["caseDirectory"] = root.Path });
+        Assert.AreEqual((false, "storage-refused"), (refused.GetProperty("success").GetBoolean(),
+            refused.GetProperty("case").GetProperty("problem").GetProperty("code").GetString()), refused.ToString());
+        Assert.IsEmpty(Directory.EnumerateFileSystemEntries(loose), "a refused start wrote to the loose root");
+        Assert.IsEmpty(SessionManager.GetAllSessions(), "a refused case left a session");
+        Assert.AreEqual((false, "invalid-request"), (orphan.GetProperty("success").GetBoolean(),
+            orphan.GetProperty("case").GetProperty("problem").GetProperty("code").GetString()), orphan.ToString());
+
+        var start = await CallAsync(client, "start_bash_terminal", new()
+        {
+            ["width"] = 60,
+            ["height"] = 10,
+            ["workingDirectory"] = Path.GetTempPath(),
+            ["recordCase"] = true,
+            ["caseDirectory"] = root.Path,
+            ["caseAuthorize"] = "reapplication-data",
+        });
+        Assert.IsTrue(start.GetProperty("success").GetBoolean(), start.ToString());
+        var sessionId = start.GetProperty("sessionId").GetString()!;
+        try
+        {
+            var started = start.GetProperty("case");
+            Assert.AreEqual(("construction", "complete"), (started.GetProperty("startPath").GetString(),
+                started.GetProperty("checkpoint").GetProperty("status").GetString()), started.ToString());
+
+            await CallAsync(client, "send_terminal_input", new() { ["sessionId"] = sessionId, ["text"] = "echo CASE-MCP-$((20+22))\r" });
+            var wait = await CallAsync(client, "wait_for_terminal_text", new() { ["sessionId"] = sessionId, ["text"] = "CASE-MCP-42", ["timeoutSeconds"] = 10 });
+            Assert.IsTrue(wait.GetProperty("found").GetBoolean(), wait.ToString());
+
+            var stop = await CallAsync(client, "stop_diagnostic_case", new() { ["sessionId"] = sessionId });
+            Assert.IsTrue(stop.GetProperty("success").GetBoolean(), stop.ToString());
+            var inspection = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest
+            {
+                Path = stop.GetProperty("case").GetProperty("path").GetString()!,
+                Limit = 4096,
+            });
+            var model = inspection.Events.Where(e => e.Stream == "model").ToList();
+            Assert.AreEqual(1L, model[0].ModelSequence, "the case missed the shell's first output");
+            var bytes = model.Where(e => e.Data is not null).SelectMany(e => Convert.FromBase64String(e.Data!)).ToArray();
+            StringAssert.Contains(Encoding.UTF8.GetString(bytes), "CASE-MCP-42");
+            Assert.AreEqual((DiagnosticCaseCompletionState.Complete, true), (inspection.CompletionState, inspection.Intervals.Single().Valid));
+        }
+        finally
+        {
+            await CallAsync(client, "remove_session", new() { ["sessionId"] = sessionId });
+        }
+    }
+
+    private static void AssertCaseEquals(DiagnosticCaseResult engine, JsonElement client, string operation, params string[] volatileFields)
+    {
+        var expected = System.Text.Json.Nodes.JsonNode.Parse(JsonSerializer.Serialize(engine, DiagnosticsJsonContext.Default.DiagnosticCaseResult))!.AsObject();
+        var actual = System.Text.Json.Nodes.JsonNode.Parse(client.GetRawText())!.AsObject();
+        foreach (var field in volatileFields)
+        {
+            expected.Remove(field);
+            actual.Remove(field);
+        }
+
+        Assert.IsTrue(System.Text.Json.Nodes.JsonNode.DeepEquals(expected, actual), $"MCP {operation} differs from the engine's.\nengine: {expected}\nmcp:    {actual}");
+    }
+
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    private sealed class CaseRoot : IDisposable
+    {
+        public CaseRoot()
+        {
+            Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "hex1b-mcp-case-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(Path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        public string Path { get; }
+
+        public void Dispose()
+        {
+            try { Directory.Delete(Path, recursive: true); } catch (IOException) { }
+        }
+    }
+
     // An attached app presented over a WebSocket, so its writes are observable delivery.
     private static async Task<Hex1bTerminal> StartDeliveryAppAsync()
     {

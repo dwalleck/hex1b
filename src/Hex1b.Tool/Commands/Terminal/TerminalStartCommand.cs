@@ -1,5 +1,6 @@
 using System.CommandLine;
 using System.Diagnostics;
+using System.Text.Json;
 using Hex1b.Diagnostics;
 using Hex1b.Tool.Hosting;
 using Hex1b.Tool.Infrastructure;
@@ -20,6 +21,17 @@ internal sealed class TerminalStartCommand : BaseCommand
     private static readonly Option<bool> s_passthruOption = new("--passthru") { Description = "Run in passthru mode: PTY bridges directly to the current terminal with no chrome" };
     private static readonly Option<int?> s_portOption = new("--port") { Description = "Port for WebSocket diagnostics listener" };
     private static readonly Option<string?> s_bindOption = new("--bind") { Description = "Bind address for the WebSocket listener (default: 127.0.0.1, use 0.0.0.0 for containers)" };
+    private static readonly Option<bool> s_recordCaseOption = new("--record-case")
+    {
+        Description = "Record a bounded diagnostic case from the terminal's construction (see 'capture case')"
+    };
+    private static readonly Option<long?> s_caseMaxBytesOption = new("--case-max-bytes") { Description = "With --record-case: largest artifact, in bytes (1 MiB-1 GiB; default 64 MiB)" };
+    private static readonly Option<int?> s_caseMaxSecondsOption = new("--case-max-seconds") { Description = "With --record-case: longest recording, in seconds (1-86400; default 600)" };
+    private static readonly Option<string[]> s_caseAuthorizeOption = new("--case-authorize")
+    {
+        Description = "With --record-case: payloads beyond metadata (repeatable or comma-separated): reapplication-data, raw-input, editor-text, native-output"
+    };
+    private static readonly Option<string?> s_caseDirOption = new("--case-dir") { Description = "With --record-case: owner-only root for the case directory" };
     private static readonly Argument<string[]> s_commandArgument = new("command")
     {
         Description = "Command and arguments to run (after --). Defaults to PowerShell on Windows or bash on Linux/macOS."
@@ -43,6 +55,11 @@ internal sealed class TerminalStartCommand : BaseCommand
         Options.Add(s_passthruOption);
         Options.Add(s_portOption);
         Options.Add(s_bindOption);
+        Options.Add(s_recordCaseOption);
+        Options.Add(s_caseMaxBytesOption);
+        Options.Add(s_caseMaxSecondsOption);
+        Options.Add(s_caseAuthorizeOption);
+        Options.Add(s_caseDirOption);
         Arguments.Add(s_commandArgument);
     }
 
@@ -66,9 +83,31 @@ internal sealed class TerminalStartCommand : BaseCommand
             return 1;
         }
 
+        // Case options are validated here, before a host is spawned; the host re-validates bounds and storage.
+        var recordCase = parseResult.GetValue(s_recordCaseOption);
+        var caseAuthorizations = parseResult.GetValue(s_caseAuthorizeOption)?
+            .SelectMany(value => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).ToArray() ?? [];
+        var caseDir = parseResult.GetValue(s_caseDirOption);
+        var caseMaxBytes = parseResult.GetValue(s_caseMaxBytesOption);
+        var caseMaxSeconds = parseResult.GetValue(s_caseMaxSecondsOption);
+        if (!recordCase && (caseAuthorizations.Length > 0 || caseDir != null || caseMaxBytes != null || caseMaxSeconds != null))
+        {
+            Formatter.WriteError("--case-max-bytes, --case-max-seconds, --case-authorize and --case-dir require --record-case");
+            return 1;
+        }
+
+        var (caseRequest, invalidCase) = recordCase
+            ? DiagnosticContractNames.ParseCaseStartRequest(caseMaxBytes, caseMaxSeconds, caseAuthorizations, caseDir)
+            : (null, null);
+        if (invalidCase != null)
+        {
+            Formatter.WriteError($"invalid-request ({invalidCase.Problem!.Code}): {invalidCase.Problem.Message}");
+            return 1;
+        }
+
         if (passthru)
         {
-            return await RunPassthruAsync(parseResult, width, height, cwd, record, port, bind, command, cancellationToken);
+            return await RunPassthruAsync(parseResult, width, height, cwd, record, port, bind, caseRequest, command, cancellationToken);
         }
 
         // Build args for the host process
@@ -88,6 +127,18 @@ internal sealed class TerminalStartCommand : BaseCommand
         if (bind != null)
         {
             hostArgs.AddRange(["--bind", bind]);
+        }
+        if (caseRequest != null)
+        {
+            hostArgs.Add("--record-case");
+            if (caseRequest.MaxBytes is { } maxBytes)
+                hostArgs.AddRange(["--case-max-bytes", maxBytes.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
+            if (caseRequest.MaxSeconds is { } maxSeconds)
+                hostArgs.AddRange(["--case-max-seconds", maxSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
+            foreach (var authorization in caseRequest.Authorizations ?? [])
+                hostArgs.AddRange(["--case-authorize", DiagnosticContractNames.Of(authorization)]);
+            if (caseRequest.Directory != null)
+                hostArgs.AddRange(["--case-dir", caseRequest.Directory]);
         }
         hostArgs.AddRange(command);
 
@@ -161,6 +212,9 @@ internal sealed class TerminalStartCommand : BaseCommand
                     }
 
                     var id = process.Id.ToString();
+                    var startedCase = caseRequest != null
+                        ? await _client.GetCaseStatusAsync(expectedSocket, cancellationToken)
+                        : null;
 
                     if (parseResult.GetValue(s_attachOption))
                     {
@@ -189,12 +243,22 @@ internal sealed class TerminalStartCommand : BaseCommand
                             jsonOutput["port"] = port.Value;
                             jsonOutput["wsUrl"] = $"ws://localhost:{port.Value}/ws/attach";
                         }
+                        if (startedCase != null)
+                        {
+                            jsonOutput["case"] = JsonSerializer.SerializeToElement(startedCase, DiagnosticsJsonContext.Default.DiagnosticCaseResult);
+                        }
                         Formatter.WriteJson(jsonOutput);
                     }
                     else
                     {
                         var portInfo = port.HasValue ? $", ws://localhost:{port.Value}/ws/attach" : "";
                         Formatter.WriteLine($"Terminal started: {id} ({info.AppName}, {info.Width}x{info.Height}{portInfo})");
+                        if (startedCase != null)
+                        {
+                            Formatter.WriteLine(startedCase.Outcome == DiagnosticOutcome.Captured
+                                ? $"Recording case {startedCase.CaseId} to {startedCase.Path} (checkpoint {DiagnosticContractNames.Of(startedCase.Checkpoint!.Status)})"
+                                : $"Case status {DiagnosticContractNames.Of(startedCase.Outcome)} ({startedCase.Problem?.Code}): {startedCase.Problem?.Message}");
+                        }
                     }
 
                     return 0;
@@ -214,6 +278,7 @@ internal sealed class TerminalStartCommand : BaseCommand
         int width, int height,
         string? cwd, string? record,
         int? port, string? bind,
+        DiagnosticCaseStartRequest? caseRequest,
         string[] command,
         CancellationToken cancellationToken)
     {
@@ -231,7 +296,8 @@ internal sealed class TerminalStartCommand : BaseCommand
             Port = port,
             BindAddress = bind,
             WorkingDirectory = cwd,
-            RecordPath = record
+            RecordPath = record,
+            DiagnosticCase = caseRequest
         };
 
         Logger.LogInformation("Starting passthru terminal: {Command}", config.Command);

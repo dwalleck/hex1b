@@ -35,8 +35,25 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// <summary>A stream whose next offered event fails, taken from the arming flow while a test has set it.</summary>
     internal static readonly AsyncLocal<string?> StreamFaultForTesting = new();
 
+    /// <summary>Runs just before a start arms its case, on the starting flow, while a test has set it.</summary>
+    internal static readonly AsyncLocal<Action?> BeforeArmForTesting = new();
+
     /// <summary>A shorter drain bound for tests, taken from the arming flow while a test has set it.</summary>
     internal static readonly AsyncLocal<TimeSpan?> DrainTimeoutForTesting = new();
+
+    /// <summary>
+    /// Test-only: milliseconds the writer waits after the manifest before its first pass, so an end-to-end
+    /// harness can overload a real target's queue. Read once per case; ignored unless a positive integer
+    /// below the drain bound.
+    /// </summary>
+    internal const string WriterHoldEnvironmentVariable = "HEX1B_DIAGNOSTIC_CASE_TEST_WRITER_HOLD_MS";
+
+    private static TimeSpan ReadWriterHold() =>
+        int.TryParse(Environment.GetEnvironmentVariable(WriterHoldEnvironmentVariable), out var ms) && ms is > 0 and < 10_000
+            ? TimeSpan.FromMilliseconds(ms)
+            : TimeSpan.Zero;
+
+    private readonly TimeSpan _writerHold = ReadWriterHold();
 
     /// <summary>How long a stop waits for queued events to reach the artifact (spec Q11).</summary>
     internal static readonly TimeSpan DrainTimeout = TimeSpan.FromSeconds(10);
@@ -301,6 +318,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         try
         {
             _writer.WriteManifest(Manifest);
+            if (_writerHold > TimeSpan.Zero)
+                await Task.Delay(_writerHold).ConfigureAwait(false);
             while (true)
             {
                 _writerGate?.Wait();

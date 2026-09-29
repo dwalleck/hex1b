@@ -99,6 +99,12 @@ internal sealed class DiagnosticsResponse
     public DiagnosticDeliveryResult? Delivery { get; set; }
 
     /// <summary>
+    /// For "case-start", "case-stop" and "case-status": the case result, including failures.
+    /// </summary>
+    [JsonPropertyName("case")]
+    public DiagnosticCaseResult? Case { get; set; }
+
+    /// <summary>
     /// For "input", "key", "click" and "drag": the input ids the send was assigned, when the
     /// target tracks input.
     /// </summary>

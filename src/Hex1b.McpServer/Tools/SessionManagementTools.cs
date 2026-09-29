@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using Hex1b.Diagnostics;
 using ModelContextProtocol.Server;
 
 namespace Hex1b.McpServer.Tools;
@@ -18,9 +19,15 @@ public class SessionManagementTools(TerminalSessionManager sessionManager)
         [Description("Terminal width in columns (default: 80)")] int width = 80,
         [Description("Terminal height in rows (default: 24)")] int height = 24,
         [Description("Optional path to save an asciinema recording file (.cast extension recommended)")] string? asciinemaFilePath = null,
+        [Description("Record a bounded diagnostic case from the session's first byte (see start_diagnostic_case); the result's 'case' reports it.")] bool recordCase = false,
+        [Description("With recordCase: " + DiagnosticCaseTools.AuthorizeDescription)] string? caseAuthorize = null,
+        [Description("With recordCase: largest artifact in bytes (1 MiB to 1 GiB; default 64 MiB).")] long? caseMaxBytes = null,
+        [Description("With recordCase: longest recording in seconds (1 to 86400; default 600).")] int? caseMaxSeconds = null,
+        [Description("With recordCase: owner-only root directory for the case.")] string? caseDirectory = null,
         CancellationToken ct = default)
     {
-        return await StartShellAsync("bash", [], workingDirectory, width, height, asciinemaFilePath, ct);
+        return await StartShellAsync("bash", [], workingDirectory, width, height, asciinemaFilePath,
+            CaseOptions(recordCase, caseAuthorize, caseMaxBytes, caseMaxSeconds, caseDirectory), ct);
     }
 
     /// <summary>
@@ -32,9 +39,32 @@ public class SessionManagementTools(TerminalSessionManager sessionManager)
         [Description("Terminal width in columns (default: 80)")] int width = 80,
         [Description("Terminal height in rows (default: 24)")] int height = 24,
         [Description("Optional path to save an asciinema recording file (.cast extension recommended)")] string? asciinemaFilePath = null,
+        [Description("Record a bounded diagnostic case from the session's first byte (see start_diagnostic_case); the result's 'case' reports it.")] bool recordCase = false,
+        [Description("With recordCase: " + DiagnosticCaseTools.AuthorizeDescription)] string? caseAuthorize = null,
+        [Description("With recordCase: largest artifact in bytes (1 MiB to 1 GiB; default 64 MiB).")] long? caseMaxBytes = null,
+        [Description("With recordCase: longest recording in seconds (1 to 86400; default 600).")] int? caseMaxSeconds = null,
+        [Description("With recordCase: owner-only root directory for the case.")] string? caseDirectory = null,
         CancellationToken ct = default)
     {
-        return await StartShellAsync("pwsh", [], workingDirectory, width, height, asciinemaFilePath, ct);
+        return await StartShellAsync("pwsh", [], workingDirectory, width, height, asciinemaFilePath,
+            CaseOptions(recordCase, caseAuthorize, caseMaxBytes, caseMaxSeconds, caseDirectory), ct);
+    }
+
+    // The case options when recordCase is set: the request, or why it is invalid. Other case options without
+    // recordCase are refused, rather than silently starting a session without a case.
+    private static (bool Record, DiagnosticCaseStartRequest? Request, DiagnosticCaseResult? Invalid) CaseOptions(
+        bool recordCase, string? authorize, long? maxBytes, int? maxSeconds, string? directory)
+    {
+        if (!recordCase)
+        {
+            return authorize is null && maxBytes is null && maxSeconds is null && directory is null
+                ? (false, null, null)
+                : (false, null, TerminalDiagnostics.CaseProblem(DiagnosticOutcome.InvalidRequest, "invalid-request",
+                    "caseAuthorize, caseMaxBytes, caseMaxSeconds and caseDirectory require recordCase."));
+        }
+
+        var (request, invalid) = DiagnosticCaseTools.ParseStart(maxBytes, maxSeconds, authorize, directory);
+        return (true, request, invalid);
     }
 
     private async Task<StartTerminalResult> StartShellAsync(
@@ -44,8 +74,12 @@ public class SessionManagementTools(TerminalSessionManager sessionManager)
         int width,
         int height,
         string? asciinemaFilePath,
+        (bool Record, DiagnosticCaseStartRequest? Request, DiagnosticCaseResult? Invalid) diagnosticCase,
         CancellationToken ct)
     {
+        if (diagnosticCase.Invalid is { } invalid)
+            return Failed(command, arguments, workingDirectory, width, height, $"Failed to start terminal: {invalid.Problem!.Code}: {invalid.Problem.Message}", invalid);
+
         try
         {
             var session = await sessionManager.StartSessionAsync(
@@ -56,6 +90,7 @@ public class SessionManagementTools(TerminalSessionManager sessionManager)
                 width,
                 height,
                 asciinemaFilePath,
+                diagnosticCase.Request,
                 ct);
 
             return new StartTerminalResult
@@ -71,26 +106,35 @@ public class SessionManagementTools(TerminalSessionManager sessionManager)
                 WorkingDirectory = session.WorkingDirectory,
                 Width = session.Width,
                 Height = session.Height,
-                AsciinemaFilePath = session.AsciinemaFilePath
+                AsciinemaFilePath = session.AsciinemaFilePath,
+                Case = diagnosticCase.Record ? DiagnosticCaseTools.ToJson(session.Diagnostics.GetCaseStatus()) : null
             };
+        }
+        catch (DiagnosticCaseStartException ex)
+        {
+            return Failed(command, arguments, workingDirectory, width, height, $"Failed to start terminal: {ex.Message}", ex.Result);
         }
         catch (Exception ex)
         {
-            return new StartTerminalResult
-            {
-                Success = false,
-                SessionId = null,
-                ProcessId = null,
-                Message = $"Failed to start terminal: {ex.Message}",
-                Command = command,
-                Arguments = arguments,
-                WorkingDirectory = workingDirectory,
-                Width = width,
-                Height = height,
-                AsciinemaFilePath = null
-            };
+            return Failed(command, arguments, workingDirectory, width, height, $"Failed to start terminal: {ex.Message}", null);
         }
     }
+
+    private static StartTerminalResult Failed(string command, string[] arguments, string? workingDirectory, int width, int height,
+        string message, DiagnosticCaseResult? diagnosticCase) => new()
+    {
+        Success = false,
+        SessionId = null,
+        ProcessId = null,
+        Message = message,
+        Command = command,
+        Arguments = arguments,
+        WorkingDirectory = workingDirectory,
+        Width = width,
+        Height = height,
+        AsciinemaFilePath = null,
+        Case = diagnosticCase is null ? null : DiagnosticCaseTools.ToJson(diagnosticCase)
+    };
 
     /// <summary>
     /// Stops a terminal session's process but keeps the session for inspection.

@@ -24,8 +24,8 @@ The server communicates via stdio using the MCP protocol.
 
 ### Session Management
 
-- **start_bash_terminal** - Start a new bash terminal session (Linux/macOS)
-- **start_pwsh_terminal** - Start a new PowerShell terminal session (Windows/cross-platform)
+- **start_bash_terminal** - Start a new bash terminal session (Linux/macOS); `recordCase` records a diagnostic case from its first byte
+- **start_pwsh_terminal** - Start a new PowerShell terminal session (Windows/cross-platform); `recordCase` as for bash
 - **stop_terminal** - Stop a terminal session's process
 - **remove_session** - Remove a terminal session and dispose resources
 - **list_terminals** - List all active terminal sessions
@@ -59,6 +59,13 @@ Both return `applicationFrame`, the shared [application-frame result](https://he
 ### Native delivery
 
 - **capture_native_delivery** - Return what the terminal's native presentation did with each write (accepted, refused, failed), with source, phase relative to model application, byte counts and links; optional `since`, `limit`, and `authorize` `native-output` for the written bytes. Local PTY sessions report `no-native-presentation`. See [native delivery](https://hex1b.dev/guide/diagnostic-capture#native-delivery).
+
+### Diagnostic cases
+
+- **start_diagnostic_case** - Start recording a bounded diagnostic case on a target: model events (with the original input bytes under `authorize` `reapplication-data`), input, application frames and native delivery, written by the target to an owner-only local directory; optional `maxBytes`, `maxSeconds`, `authorize`, `directory`. A case started on a running target has no re-applicable checkpoint; use `recordCase` at session start for that.
+- **stop_diagnostic_case** - Stop the active case (at most 10 s of draining) and return its final state and stop reason.
+- **get_diagnostic_case_status** - The active case's state, bounds, progress and per-stream counts.
+- **inspect_diagnostic_case** - Read a case artifact offline: `complete`, `interrupted` or `truncated`, coverage and missing ranges, the re-applicable interval, and a page of events. See [diagnostic cases](https://hex1b.dev/guide/diagnostic-capture#diagnostic-cases).
 
 ### Recording
 

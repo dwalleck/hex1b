@@ -35,6 +35,11 @@ public class StartTerminalResult
     [JsonPropertyName("asciinemaFilePath")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AsciinemaFilePath { get; init; }
+
+    /// <summary>With recordCase: the diagnostic case's status after start, or why it was refused.</summary>
+    [JsonPropertyName("case")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public System.Text.Json.JsonElement? Case { get; init; }
 }
 
 public class StopTerminalResult

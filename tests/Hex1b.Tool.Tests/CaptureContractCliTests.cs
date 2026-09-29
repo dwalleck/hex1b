@@ -759,6 +759,196 @@ public class CaptureContractCliTests
         StringAssert.Contains(headlessErr, "no-native-presentation");
     }
 
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_AttachedStartStatusStopInspectMatchTheEngine()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        await using var target = await StartAttachedAppAsync();
+        var engine = new TerminalDiagnostics(target, "CliAttached");
+
+        var (startExit, start, startErr) = await RunCliAsync("capture", "case", "start", Pid, "--dir", root.Path,
+            "--authorize", "reapplication-data", "--max-seconds", "300", "--json");
+        Assert.AreEqual(0, startExit, startErr);
+        var started = JsonDocument.Parse(start).RootElement.Clone();
+        Assert.AreEqual("recording", started.GetProperty("state").GetString());
+        Assert.AreEqual("live", started.GetProperty("startPath").GetString());
+        AssertCaseEquals(engine.GetCaseStatus(), started, "start", "elapsedSeconds", "bytesWritten", "streams");
+
+        var status = await StableStatusAsync(engine, async () => (await RunCliAsync("capture", "case", "status", Pid, "--json")).Stdout);
+        AssertCaseEquals(engine.GetCaseStatus(), status, "status", "elapsedSeconds");
+
+        var recorder = target.DiagnosticCase!;
+        var (stopExit, stop, stopErr) = await RunCliAsync("capture", "case", "stop", Pid, "--json");
+        Assert.AreEqual(0, stopExit, stopErr);
+        var stopped = JsonDocument.Parse(stop).RootElement.Clone();
+        Assert.AreEqual("requested", stopped.GetProperty("stopReason").GetString());
+        AssertCaseEquals(recorder.Describe(), stopped, "stop", "elapsedSeconds");
+
+        var path = stopped.GetProperty("path").GetString()!;
+        var (inspectExit, inspect, inspectErr) = await RunCliAsync("capture", "case", "inspect", path, "--limit", "50", "--json");
+        Assert.AreEqual(0, inspectExit, inspectErr);
+        var expected = JsonSerializer.SerializeToElement(DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path, Limit = 50 }),
+            DiagnosticsJsonContext.Default.DiagnosticCaseInspection);
+        var inspected = JsonDocument.Parse(inspect).RootElement;
+        Assert.IsTrue(JsonElement.DeepEquals(expected, inspected), $"CLI inspect differs from the inspector.\ninspector: {expected}\ncli:       {inspected}");
+        Assert.AreEqual("complete", inspected.GetProperty("completionState").GetString());
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_RefusalsAndTextOutput()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        var loose = Path.Combine(root.Path, "loose");
+        Directory.CreateDirectory(loose, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+        await using var target = await StartAttachedAppAsync();
+
+        var none = await RunCliAsync("capture", "case", "status", Pid);
+        var bogus = await RunCliAsync("capture", "case", "start", Pid, "--authorize", "bogus", "--dir", root.Path);
+        var bounds = await RunCliAsync("capture", "case", "start", Pid, "--max-bytes", "5", "--dir", root.Path);
+        var refused = await RunCliAsync("capture", "case", "start", Pid, "--dir", loose, "--json");
+        var badPath = await RunCliAsync("capture", "case", "start", Pid, "--dir", "bad\0path");
+        Assert.AreEqual((1, true), (badPath.ExitCode, badPath.Stderr.Contains("invalid-directory", StringComparison.Ordinal)), badPath.Stderr);
+        Assert.AreEqual((1, true), (none.ExitCode, none.Stderr.Contains("no-active-case", StringComparison.Ordinal)), none.Stderr);
+        Assert.AreEqual((1, true), (bogus.ExitCode, bogus.Stderr.Contains("unsupported-authorization", StringComparison.Ordinal)), bogus.Stderr);
+        Assert.AreEqual((1, true), (bounds.ExitCode, bounds.Stderr.Contains("invalid-bounds", StringComparison.Ordinal)), bounds.Stderr);
+        Assert.AreEqual(1, refused.ExitCode);
+        Assert.AreEqual("storage-refused", JsonDocument.Parse(refused.Stdout).RootElement.GetProperty("problem").GetProperty("code").GetString());
+        Assert.IsEmpty(Directory.EnumerateFileSystemEntries(loose), "a refused start wrote to the loose root");
+
+        var (startExit, started, startErr) = await RunCliAsync("capture", "case", "start", Pid, "--dir", root.Path);
+        Assert.AreEqual(0, startExit, startErr);
+        StringAssert.Contains(started, "started: recording");
+        StringAssert.Contains(started, "Checkpoint: fresh-model/1 excluded");
+        var again = await RunCliAsync("capture", "case", "start", Pid, "--dir", root.Path);
+        Assert.AreEqual((1, true), (again.ExitCode, again.Stderr.Contains("case-active", StringComparison.Ordinal)), again.Stderr);
+        var (statusExit, status, _) = await RunCliAsync("capture", "case", "status", Pid);
+        Assert.AreEqual(0, statusExit);
+        StringAssert.Contains(status, "  model: ");
+
+        var (stopExit, stopped, stopErr) = await RunCliAsync("capture", "case", "stop", Pid);
+        Assert.AreEqual(0, stopExit, stopErr);
+        StringAssert.Contains(stopped, "stopped: stopped (requested)");
+        var path = Directory.GetDirectories(root.Path).Single(d => d != loose);
+        var (inspectExit, inspected, _) = await RunCliAsync("capture", "case", "inspect", path);
+        Assert.AreEqual(0, inspectExit);
+        StringAssert.Contains(inspected, "complete (requested)");
+        StringAssert.Contains(inspected, "Not re-applicable: checkpoint excluded");
+        var missing = await RunCliAsync("capture", "case", "inspect", Path.Combine(root.Path, "absent"));
+        Assert.AreEqual((1, true), (missing.ExitCode, missing.Stderr.Contains("case-not-found", StringComparison.Ordinal)), missing.Stderr);
+
+        // Launch-time options are validated before any host is spawned.
+        var orphan = await RunCliAsync("terminal", "start", "--case-dir", root.Path, "--", "/bin/true");
+        var badLaunch = await RunCliAsync("terminal", "start", "--record-case", "--case-authorize", "bogus", "--", "/bin/true");
+        Assert.AreEqual((1, true), (orphan.ExitCode, orphan.Stderr.Contains("require --record-case", StringComparison.Ordinal)), orphan.Stderr);
+        Assert.AreEqual((1, true), (badLaunch.ExitCode, badLaunch.Stderr.Contains("unsupported-authorization", StringComparison.Ordinal)), badLaunch.Stderr);
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_HostedPtyRecordsFromConstruction()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var config = new TerminalHostConfig
+        {
+            Width = 40,
+            Height = 6,
+            Command = "/bin/sh",
+            Arguments = ["-c", "printf 'CASE-FROM-FIRST-BYTE\\n'; exec sleep 60"],
+            DiagnosticCase = new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] },
+        };
+
+        await WaitForSocketReleaseAsync(cts.Token);
+        var host = TerminalHost.RunAsync(config, cts.Token);
+        try
+        {
+            await WaitForSocketAsync(cts.Token);
+            Assert.IsNotNull(await WaitForCliTextAsync("CASE-FROM-FIRST-BYTE", cts.Token), "hosted PTY output never reached the model");
+
+            var (statusExit, status, statusErr) = await RunCliAsync("capture", "case", "status", Pid, "--json");
+            Assert.AreEqual(0, statusExit, statusErr);
+            var root_ = JsonDocument.Parse(status).RootElement;
+            Assert.AreEqual(("construction", "complete"), (root_.GetProperty("startPath").GetString(),
+                root_.GetProperty("checkpoint").GetProperty("status").GetString()));
+
+            var (stopExit, stop, stopErr) = await RunCliAsync("capture", "case", "stop", Pid, "--json");
+            Assert.AreEqual(0, stopExit, stopErr);
+            var inspection = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest
+            {
+                Path = JsonDocument.Parse(stop).RootElement.GetProperty("path").GetString()!,
+                Limit = 4096,
+            });
+            var model = inspection.Events.Where(e => e.Stream == "model").ToList();
+            Assert.AreEqual(1L, model[0].ModelSequence, "the case missed the child's first output");
+            var bytes = model.Where(e => e.Data is not null).SelectMany(e => Convert.FromBase64String(e.Data!)).ToArray();
+            StringAssert.Contains(System.Text.Encoding.UTF8.GetString(bytes), "CASE-FROM-FIRST-BYTE");
+            Assert.AreEqual((true, 0L), (inspection.Intervals.Single().Valid, inspection.Intervals.Single().FromModelSequence));
+        }
+        finally
+        {
+            await cts.CancelAsync();
+            try { await host; } catch (OperationCanceledException) { }
+        }
+    }
+
+    // Status of a settled case: engine counts equal twice in a row around the client's read.
+    private static async Task<JsonElement> StableStatusAsync(TerminalDiagnostics engine, Func<Task<string>> read)
+    {
+        for (var attempt = 0; attempt < 20; attempt++)
+        {
+            var before = Progress(engine.GetCaseStatus());
+            var json = JsonDocument.Parse(await read()).RootElement.Clone();
+            if (before == Progress(engine.GetCaseStatus()))
+                return json;
+            await Task.Delay(100, TestContext.Current.CancellationToken);
+        }
+
+        Assert.Fail("fixture: the case never settled");
+        return default;
+
+        static string Progress(DiagnosticCaseResult result) =>
+            $"{result.BytesWritten}:{string.Join(",", result.Streams.Select(s => $"{s.Offered}/{s.Written}/{s.Dropped}"))}";
+    }
+
+    private static void AssertCaseEquals(DiagnosticCaseResult engine, JsonElement client, string operation, params string[] volatileFields)
+    {
+        var expected = System.Text.Json.Nodes.JsonNode.Parse(JsonSerializer.Serialize(engine, DiagnosticsJsonContext.Default.DiagnosticCaseResult))!.AsObject();
+        var actual = System.Text.Json.Nodes.JsonNode.Parse(client.GetRawText())!.AsObject();
+        foreach (var field in volatileFields)
+        {
+            expected.Remove(field);
+            actual.Remove(field);
+        }
+
+        Assert.IsTrue(System.Text.Json.Nodes.JsonNode.DeepEquals(expected, actual), $"CLI {operation} differs from the engine's.\nengine: {expected}\ncli:    {actual}");
+    }
+
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    private sealed class CaseRoot : IDisposable
+    {
+        public CaseRoot()
+        {
+            Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "hex1b-cli-case-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(Path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        public string Path { get; }
+
+        public void Dispose()
+        {
+            try { Directory.Delete(Path, recursive: true); } catch (IOException) { }
+        }
+    }
+
     // An attached app presented over a WebSocket, so its writes are observable delivery.
     private static async Task<(Hex1bTerminal Terminal, ControlledWebSocket Socket)> StartDeliveryAppAsync()
     {

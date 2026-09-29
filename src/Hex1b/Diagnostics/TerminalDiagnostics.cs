@@ -50,6 +50,23 @@ public sealed class TerminalDiagnostics
     /// <summary>Operation name for the native delivery record.</summary>
     public const string DeliveryOperation = "delivery";
 
+    /// <summary>Operation names for a bounded diagnostic case: start, stop and live status.</summary>
+    public const string CaseStartOperation = "case-start";
+
+    /// <inheritdoc cref="CaseStartOperation"/>
+    public const string CaseStopOperation = "case-stop";
+
+    /// <inheritdoc cref="CaseStartOperation"/>
+    public const string CaseStatusOperation = "case-status";
+
+    private static readonly IReadOnlyList<string> CaseLimitations =
+    [
+        "The case writes to the target's filesystem; offline inspect reads the artifact without the target.",
+        "One case records a terminal at a time; a checkpoint is complete only when recording starts before the model's first event.",
+        "Events past 4,096 queued (or 8 MiB) are dropped newest-first and recorded as missing ranges.",
+        "A stop waits at most 10 s for queued events; the unwritten tail is recorded as missing.",
+    ];
+
     /// <summary>Most delivery records one request may return.</summary>
     internal const int MaxDeliveryRecords = NativeDeliveryRecorder.MaxRecords;
     private const string NoNativePresentation =
@@ -753,6 +770,7 @@ public sealed class TerminalDiagnostics
             _terminal.InputMilestones,
             _terminal.Workload as Hex1bAppWorkloadAdapter,
             _terminal.NativeDelivery);
+        Diagnostics.Cases.DiagnosticCaseRecorder.BeforeArmForTesting.Value?.Invoke();
         var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase((fresh, unsupported, configuration) =>
             new Diagnostics.Cases.DiagnosticCaseRecorder(new DiagnosticCaseManifest
             {
@@ -925,6 +943,15 @@ public sealed class TerminalDiagnostics
                     Timing = [ImmediateTiming],
                     Authorizations = [DiagnosticAuthorization.NativeOutput],
                     Limitations = DeliveryLimitations,
+                },
+                new DiagnosticOperationCapability
+                {
+                    Operation = CaseStartOperation,
+                    Layer = DiagnosticLayer.TerminalModel,
+                    Timing = ["recorded"],
+                    Authorizations = [DiagnosticAuthorization.ReapplicationData, DiagnosticAuthorization.RawInput,
+                        DiagnosticAuthorization.EditorText, DiagnosticAuthorization.NativeOutput],
+                    Limitations = CaseLimitations,
                 },
                 new DiagnosticOperationCapability
                 {

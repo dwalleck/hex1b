@@ -11,12 +11,14 @@ internal sealed class CaptureCommand : Command
         CaptureScreenshotCommand screenshotCommand,
         CaptureCapabilitiesCommand capabilitiesCommand,
         CaptureDeliveryCommand deliveryCommand,
+        CaptureCaseCommand caseCommand,
         CaptureRecordingCommand recordingCommand)
         : base("capture", "Capture terminal output (screenshots and recordings)")
     {
         Subcommands.Add(screenshotCommand);
         Subcommands.Add(capabilitiesCommand);
         Subcommands.Add(deliveryCommand);
+        Subcommands.Add(caseCommand);
         Subcommands.Add(recordingCommand);
     }
 }

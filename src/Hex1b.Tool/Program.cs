@@ -52,6 +52,11 @@ public class Program
         builder.Services.AddTransient<Commands.Capture.CaptureScreenshotCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureCapabilitiesCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureDeliveryCommand>();
+        builder.Services.AddTransient<Commands.Capture.CaptureCaseStartCommand>();
+        builder.Services.AddTransient<Commands.Capture.CaptureCaseStopCommand>();
+        builder.Services.AddTransient<Commands.Capture.CaptureCaseStatusCommand>();
+        builder.Services.AddTransient<Commands.Capture.CaptureCaseInspectCommand>();
+        builder.Services.AddTransient<Commands.Capture.CaptureCaseCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureRecordingStartCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureRecordingStopCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureRecordingStatusCommand>();

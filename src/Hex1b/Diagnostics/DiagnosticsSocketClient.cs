@@ -144,6 +144,44 @@ internal sealed class DiagnosticsSocketClient
     }
 
     /// <summary>
+    /// Starts a bounded diagnostic case on an attached target; the target validates the request and writes
+    /// the artifact on its own filesystem. The exchange is not timed out: a start the target is still
+    /// applying is never reported failed. Transport, protocol, and contract failures become diagnostic
+    /// outcomes; only caller cancellation throws.
+    /// </summary>
+    public Task<DiagnosticCaseResult> StartCaseAsync(string socketPath, DiagnosticCaseStartRequest request,
+        CancellationToken cancellationToken = default) =>
+        CaseExchangeAsync(socketPath, new DiagnosticsRequest { Method = TerminalDiagnostics.CaseStartOperation, CaseStart = request },
+            untimed: true, cancellationToken);
+
+    /// <summary>
+    /// Stops an attached target's case, returning once its artifact is finished or its drain bound passed.
+    /// Not timed out, like <see cref="StartCaseAsync"/>.
+    /// </summary>
+    public Task<DiagnosticCaseResult> StopCaseAsync(string socketPath, CancellationToken cancellationToken = default) =>
+        CaseExchangeAsync(socketPath, new DiagnosticsRequest { Method = TerminalDiagnostics.CaseStopOperation }, untimed: true, cancellationToken);
+
+    /// <summary>Reports an attached target's active case.</summary>
+    public Task<DiagnosticCaseResult> GetCaseStatusAsync(string socketPath, CancellationToken cancellationToken = default) =>
+        CaseExchangeAsync(socketPath, new DiagnosticsRequest { Method = TerminalDiagnostics.CaseStatusOperation }, untimed: false, cancellationToken);
+
+    private async Task<DiagnosticCaseResult> CaseExchangeAsync(string socketPath, DiagnosticsRequest request, bool untimed,
+        CancellationToken cancellationToken)
+    {
+        var (response, problem) = await ExchangeAsync(socketPath, request, cancellationToken, untimed: untimed).ConfigureAwait(false);
+        if (problem is not null)
+            return TerminalDiagnostics.CaseProblem(problem.Value.Outcome, problem.Value.Code, problem.Value.Message);
+
+        if (response!.Case is not { } result)
+        {
+            var (outcome, code, message) = Unexpected(response);
+            return TerminalDiagnostics.CaseProblem(outcome, code, message);
+        }
+
+        return Validate(result);
+    }
+
+    /// <summary>
     /// Describes an attached target's capabilities. Transport, protocol, and contract failures
     /// become diagnostic outcomes; only caller cancellation throws.
     /// </summary>
@@ -196,6 +234,33 @@ internal sealed class DiagnosticsSocketClient
         }
 
         return result.Outcome == DiagnosticOutcome.Captured ? ExplainOmittedFields(result) : result;
+    }
+
+    private static DiagnosticCaseResult Validate(DiagnosticCaseResult result)
+    {
+        result = result with
+        {
+            Authorizations = result.Authorizations ?? [],
+            Streams = (result.Streams ?? []).Where(entry => entry is not null).ToArray(),
+        };
+
+        if (result.ContractVersion != TerminalDiagnostics.ContractVersion)
+            return TerminalDiagnostics.CaseProblem(DiagnosticOutcome.Failed, "incompatible-target", VersionMessage(result.ContractVersion));
+
+        if (result.Outcome == DiagnosticOutcome.Captured
+            && (result.CaseId is null || result.Path is null || result.State is null || result.Bounds is null || result.Checkpoint is null))
+        {
+            return TerminalDiagnostics.CaseProblem(DiagnosticOutcome.Failed, "protocol-error",
+                "The target reported a case without its id, path, state, bounds or checkpoint.");
+        }
+
+        if (result.Outcome != DiagnosticOutcome.Captured && result.Problem is null)
+        {
+            return TerminalDiagnostics.CaseProblem(DiagnosticOutcome.Failed, "protocol-error",
+                $"The target reported outcome '{DiagnosticContractNames.Of(result.Outcome)}' without a problem.");
+        }
+
+        return result;
     }
 
     private static DiagnosticDeliveryResult Validate(DiagnosticDeliveryResult result)
@@ -356,11 +421,11 @@ internal sealed class DiagnosticsSocketClient
             : TimeSpan.FromMilliseconds(Math.Max(0, milestone.TimeoutMs ?? TerminalDiagnostics.DefaultMilestoneTimeoutMs));
 
     private async Task<(DiagnosticsResponse? Response, (DiagnosticOutcome Outcome, string Code, string Message)? Problem)> ExchangeAsync(
-        string socketPath, DiagnosticsRequest request, CancellationToken cancellationToken, TimeSpan extraWait = default)
+        string socketPath, DiagnosticsRequest request, CancellationToken cancellationToken, TimeSpan extraWait = default, bool untimed = false)
     {
         try
         {
-            return (await SendAsync(socketPath, request, cancellationToken, _observationTimeout + extraWait).ConfigureAwait(false), null);
+            return (await SendAsync(socketPath, request, cancellationToken, untimed ? null : _observationTimeout + extraWait).ConfigureAwait(false), null);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

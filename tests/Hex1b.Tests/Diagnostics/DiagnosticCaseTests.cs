@@ -53,6 +53,42 @@ public class DiagnosticCaseTests
     }
 
     [TestMethod]
+    public async Task ConstructionStart_ArmsBeforeThePumpsRead()
+    {
+        // Output is ready before Build, and the pump is given every chance to apply it before the case
+        // arms: a construction start holds the pumps until the case is armed, so it stays fresh.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        workload.Enqueue("ready before build"u8.ToArray());
+        Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.BeforeArmForTesting.Value = () =>
+        {
+            SpinWait.SpinUntil(() => workload.Returned().Count > 0, TimeSpan.FromMilliseconds(500));
+            Thread.Sleep(200);
+        };
+        Hex1bTerminal terminal;
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+                .Build();
+        }
+        finally
+        {
+            Hex1b.Diagnostics.Cases.DiagnosticCaseRecorder.BeforeArmForTesting.Value = null;
+        }
+
+        await using (terminal)
+        {
+            var diagnostics = new TerminalDiagnostics(terminal);
+            Assert.AreEqual(DiagnosticCaseCheckpointStatus.Complete, diagnostics.GetCaseStatus().Checkpoint!.Status);
+            await WaitAsync(() => terminal.CurrentModelSequence >= 1);
+            var stopped = await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+            Assert.AreEqual(1L, Artifact.Read(stopped.Path!).ModelEvents()[0].GetProperty("modelSequence").GetInt64(),
+                "the output ready before Build is not the case's first model event");
+        }
+    }
+
+    [TestMethod]
     public async Task LiveStart_FreshnessVerdicts()
     {
         using var root = new CaseRoot();

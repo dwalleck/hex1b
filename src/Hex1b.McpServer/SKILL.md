@@ -108,6 +108,13 @@ Use it to tell a wrong layout or a slow model from output that never reached the
 - `accepted` means the host took the bytes, not that anything was displayed; local PTY sessions report `no-native-presentation`
 - To read incrementally, pass the last returned record's `sequence` as the next `since`; `totals.lastSequence` can skip a write still in progress
 
+#### Diagnostic cases (`start_diagnostic_case`, `stop_diagnostic_case`, `get_diagnostic_case_status`, `inspect_diagnostic_case`)
+Use a case to keep evidence of a problem you cannot reproduce on demand: it records to a local directory you can inspect after the process is gone.
+- To record from the first byte, start the session with `recordCase: true` (with `caseAuthorize: "reapplication-data"` to keep the model's input bytes); a case started later records from then on with checkpoint `unsupported`
+- `start_diagnostic_case` takes `sessionId`, optional `maxBytes`, `maxSeconds`, `authorize` (comma-separated: `reapplication-data`, `raw-input`, `editor-text`, `native-output`) and `directory`; one case per terminal (`case-active`)
+- `stop_diagnostic_case` returns `case.path` and `case.stopReason`; pass the path to `inspect_diagnostic_case` (optional `since`, `limit`) for `completionState`, per-stream `missing` ranges and the re-applicable `intervals`
+- Losses are always recorded: overload drops the newest events past 4,096 queued, and size limits, drain timeouts and failures each leave a `missing` range with its reason
+
 ### Session Management
 
 #### `ConnectToHex1bStack`

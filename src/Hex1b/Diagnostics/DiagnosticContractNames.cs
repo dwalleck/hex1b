@@ -78,6 +78,32 @@ internal static class DiagnosticContractNames
         return (new DiagnosticDeliveryRequest { Since = since, Limit = limit, Authorizations = parsed }, null);
     }
 
+    /// <summary>
+    /// Builds a case start request from client text; the engine validates the bounds and storage. A relative
+    /// directory is resolved here, in the client, rather than against an attached target's working directory.
+    /// </summary>
+    public static (DiagnosticCaseStartRequest? Request, DiagnosticCaseResult? Invalid) ParseCaseStartRequest(
+        long? maxBytes, int? maxSeconds, IEnumerable<string>? authorizations, string? directory)
+    {
+        if (!TryParseAuthorizations(authorizations, out var parsed, out var unsupported))
+            return (null, TerminalDiagnostics.CaseProblem(DiagnosticOutcome.InvalidRequest, "unsupported-authorization", unsupported));
+
+        string? root = null;
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            try
+            {
+                root = Path.GetFullPath(directory);
+            }
+            catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                return (null, TerminalDiagnostics.CaseProblem(DiagnosticOutcome.InvalidRequest, "invalid-directory", "directory must be a valid path."));
+            }
+        }
+
+        return (new DiagnosticCaseStartRequest { MaxBytes = maxBytes, MaxSeconds = maxSeconds, Authorizations = parsed, Directory = root }, null);
+    }
+
     private static bool TryParseAuthorizations(IEnumerable<string>? names, out List<DiagnosticAuthorization> parsed, out string unsupported)
     {
         parsed = [];

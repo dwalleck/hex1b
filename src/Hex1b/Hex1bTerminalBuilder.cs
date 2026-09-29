@@ -1567,15 +1567,14 @@ public sealed class Hex1bTerminalBuilder
             options.PresentationFilters.Add(filter);
         }
 
-        var terminal = new Hex1bTerminal(options);
-        if (_diagnosticCase is { } caseRequest)
+        if (_diagnosticCase is not { } caseRequest)
+            return new Hex1bTerminal(options);
+
+        var (terminal, started) = Hex1bTerminal.CreateWithDiagnosticCase(options, caseRequest);
+        if (started.Outcome != Diagnostics.DiagnosticOutcome.Captured)
         {
-            var started = new Diagnostics.TerminalDiagnostics(terminal).StartCase(caseRequest, Diagnostics.DiagnosticCaseStartPath.Construction);
-            if (started.Outcome != Diagnostics.DiagnosticOutcome.Captured)
-            {
-                terminal.Dispose();
-                throw new InvalidOperationException($"The diagnostic case could not start: {started.Problem?.Code}: {started.Problem?.Message}");
-            }
+            terminal.Dispose();
+            throw new InvalidOperationException($"The diagnostic case could not start: {started.Problem?.Code}: {started.Problem?.Message}");
         }
 
         return terminal;

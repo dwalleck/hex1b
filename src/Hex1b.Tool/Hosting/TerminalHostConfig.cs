@@ -59,4 +59,10 @@ internal sealed class TerminalHostConfig
     /// Set to "0.0.0.0" or "*" to listen on all interfaces (e.g. for container scenarios).
     /// </summary>
     public string? BindAddress { get; set; }
+
+    /// <summary>
+    /// When set, a bounded diagnostic case records the terminal from construction, before the child's
+    /// first output reaches the model.
+    /// </summary>
+    public Diagnostics.DiagnosticCaseStartRequest? DiagnosticCase { get; set; }
 }

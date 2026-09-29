@@ -37,6 +37,11 @@ internal sealed class TerminalHost
             builder.WithAsciinemaRecording(config.RecordPath);
         }
 
+        if (config.DiagnosticCase != null)
+        {
+            builder.WithDiagnosticCase(config.DiagnosticCase);
+        }
+
         await using var terminal = builder.Build();
 
         WebSocketDiagnosticsListener? wsListener = null;
@@ -79,6 +84,11 @@ internal sealed class TerminalHost
         if (config.RecordPath != null)
         {
             builder.WithAsciinemaRecording(config.RecordPath);
+        }
+
+        if (config.DiagnosticCase != null)
+        {
+            builder.WithDiagnosticCase(config.DiagnosticCase);
         }
 
         await using var terminal = builder.Build();

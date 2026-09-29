@@ -102,6 +102,18 @@ public interface ITerminalTarget : IAsyncDisposable
     Task<DiagnosticDeliveryResult> CaptureDeliveryAsync(DiagnosticDeliveryRequest request, CancellationToken ct = default);
 
     /// <summary>
+    /// Starts a bounded diagnostic case on the target; the target validates the request and writes the
+    /// artifact on its own filesystem.
+    /// </summary>
+    Task<DiagnosticCaseResult> StartCaseAsync(DiagnosticCaseStartRequest request, CancellationToken ct = default);
+
+    /// <summary>Stops the target's active case, returning once its artifact is finished or its drain bound passed.</summary>
+    Task<DiagnosticCaseResult> StopCaseAsync(CancellationToken ct = default);
+
+    /// <summary>Reports the target's active case.</summary>
+    Task<DiagnosticCaseResult> GetCaseStatusAsync(CancellationToken ct = default);
+
+    /// <summary>
     /// Describes the target's diagnostic capabilities and their limits.
     /// </summary>
     Task<DiagnosticCapabilities> GetDiagnosticCapabilitiesAsync(CancellationToken ct = default);

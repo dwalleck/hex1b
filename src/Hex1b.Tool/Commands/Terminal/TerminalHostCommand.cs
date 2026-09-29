@@ -17,6 +17,11 @@ internal sealed class TerminalHostCommand : BaseCommand
     private static readonly Option<string?> s_recordOption = new("--record") { Description = "Record to asciinema file" };
     private static readonly Option<int?> s_portOption = new("--port") { Description = "Port for WebSocket diagnostics listener" };
     private static readonly Option<string?> s_bindOption = new("--bind") { Description = "Bind address for the WebSocket listener (default: 127.0.0.1, use 0.0.0.0 for containers)" };
+    private static readonly Option<bool> s_recordCaseOption = new("--record-case") { Description = "Record a bounded diagnostic case from construction" };
+    private static readonly Option<long?> s_caseMaxBytesOption = new("--case-max-bytes") { Description = "Largest case artifact, in bytes" };
+    private static readonly Option<int?> s_caseMaxSecondsOption = new("--case-max-seconds") { Description = "Longest case, in seconds" };
+    private static readonly Option<string[]> s_caseAuthorizeOption = new("--case-authorize") { Description = "Case payload authorizations" };
+    private static readonly Option<string?> s_caseDirOption = new("--case-dir") { Description = "Owner-only root for the case directory" };
     private static readonly Argument<string[]> s_commandArgument = new("command")
     {
         Description = "Command and arguments to run. Defaults to PowerShell on Windows or bash on Linux/macOS."
@@ -35,6 +40,11 @@ internal sealed class TerminalHostCommand : BaseCommand
         Options.Add(s_recordOption);
         Options.Add(s_portOption);
         Options.Add(s_bindOption);
+        Options.Add(s_recordCaseOption);
+        Options.Add(s_caseMaxBytesOption);
+        Options.Add(s_caseMaxSecondsOption);
+        Options.Add(s_caseAuthorizeOption);
+        Options.Add(s_caseDirOption);
         Arguments.Add(s_commandArgument);
     }
 
@@ -51,6 +61,21 @@ internal sealed class TerminalHostCommand : BaseCommand
             : TerminalHostPlatformDefaults.GetDefaultCommandLine();
         command = TerminalHostPlatformDefaults.NormalizeCommandLine(command);
 
+        Diagnostics.DiagnosticCaseStartRequest? caseRequest = null;
+        if (parseResult.GetValue(s_recordCaseOption))
+        {
+            var (request, invalid) = Diagnostics.DiagnosticContractNames.ParseCaseStartRequest(
+                parseResult.GetValue(s_caseMaxBytesOption), parseResult.GetValue(s_caseMaxSecondsOption),
+                parseResult.GetValue(s_caseAuthorizeOption), parseResult.GetValue(s_caseDirOption));
+            if (invalid != null)
+            {
+                Formatter.WriteError($"{invalid.Problem!.Code}: {invalid.Problem.Message}");
+                return 1;
+            }
+
+            caseRequest = request;
+        }
+
         var config = new TerminalHostConfig
         {
             Command = command[0],
@@ -60,7 +85,8 @@ internal sealed class TerminalHostCommand : BaseCommand
             WorkingDirectory = cwd,
             RecordPath = record,
             Port = port,
-            BindAddress = bind
+            BindAddress = bind,
+            DiagnosticCase = caseRequest
         };
 
         Logger.LogInformation("Starting terminal host: {Command} ({Width}x{Height})", config.Command, config.Width, config.Height);

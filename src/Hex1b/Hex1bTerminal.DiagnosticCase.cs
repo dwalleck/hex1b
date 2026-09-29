@@ -18,6 +18,23 @@ public sealed partial class Hex1bTerminal
     /// <summary>The time source for this terminal's clocks and timers.</summary>
     internal TimeProvider TimeProvider => _timeProvider;
 
+    /// <summary>
+    /// Constructs a terminal and starts its diagnostic case before the pumps can read output, so the case's
+    /// checkpoint is the fresh model. The pumps then start as the constructor would have started them. The
+    /// caller owns the terminal either way, and disposes it when the case did not start.
+    /// </summary>
+    internal static (Hex1bTerminal Terminal, DiagnosticCaseResult Case) CreateWithDiagnosticCase(Hex1bTerminalOptions options,
+        DiagnosticCaseStartRequest request)
+    {
+        var startPumps = options.RunCallback == null && !options.DeferStart;
+        options.DeferStart = true;
+        var terminal = new Hex1bTerminal(options);
+        var started = new TerminalDiagnostics(terminal).StartCase(request, DiagnosticCaseStartPath.Construction);
+        if (started.Outcome == DiagnosticOutcome.Captured && startPumps)
+            terminal.Start();
+        return (terminal, started);
+    }
+
     private void CaptureCaseConfiguration(Hex1bTerminalOptions options)
     {
         var reflow = _presentation as Reflow.ITerminalReflowProvider;

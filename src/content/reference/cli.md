@@ -47,6 +47,11 @@ hex1b terminal start [options] -- <command...>
 | `--cwd` | string | | Working directory for the command |
 | `--record` | string | | Record session to an asciinema `.cast` file |
 | `--attach` | flag | | Immediately attach to the terminal after starting |
+| `--record-case` | flag | | Record a bounded [diagnostic case](../guide/diagnostic-capture.md#diagnostic-cases) from construction; the output names the case and its path |
+| `--case-max-bytes` | long | `67108864` | With `--record-case`: largest artifact (1 MiB–1 GiB) |
+| `--case-max-seconds` | int | `600` | With `--record-case`: longest recording (1–86400) |
+| `--case-authorize` | string | | With `--record-case`: `reapplication-data`, `raw-input`, `editor-text`, `native-output` (repeatable or comma-separated) |
+| `--case-dir` | string | `~/.hex1b/cases` | With `--record-case`: owner-only root for the case directory |
 
 **Examples:**
 
@@ -249,6 +254,36 @@ hex1b capture delivery <id> [options]
 
 Without `--json` it prints totals and one line per record. With `--json` it writes the full
 contract result. Headless targets exit 1 with `no-native-presentation`.
+
+### `capture case`
+
+Record a bounded [diagnostic case](../guide/diagnostic-capture.md#diagnostic-cases): the terminal
+model's events with (when authorized) the original bytes it read, plus input, application frames
+and native delivery, written by the target to an owner-only local directory.
+
+```bash
+hex1b capture case start <id> [options]
+hex1b capture case status <id>
+hex1b capture case stop <id>
+hex1b capture case inspect <path> [--since N] [--limit N]
+```
+
+| `start` option | Type | Default | Description |
+|----------------|------|---------|-------------|
+| `--max-bytes` | long | `67108864` | Largest artifact (1 MiB–1 GiB) |
+| `--max-seconds` | int | `600` | Longest recording (1–86400) |
+| `--authorize` | string | | `reapplication-data`, `raw-input`, `editor-text`, `native-output` (repeatable or comma-separated) |
+| `--dir` | string | `~/.hex1b/cases` | Owner-only root for the case directory |
+
+A case started on a running terminal has no re-applicable checkpoint. To record from the first
+byte, use `hex1b terminal start --record-case`. `stop` waits at most 10 s for queued events.
+`inspect` reads the artifact offline, verifies every line's checksum, and reports whether the case
+is `complete`, `interrupted` or `truncated`. It also reports per-stream coverage and missing
+ranges, the re-applicable model interval, and, with `--limit`, a page of events.
+
+Without `--json` each command prints a summary. With `--json` it writes the full contract result.
+Refusals exit 1 with the problem code (`case-active`, `no-active-case`, `storage-refused`,
+`invalid-bounds`, …).
 
 ### `capture recording start`
 

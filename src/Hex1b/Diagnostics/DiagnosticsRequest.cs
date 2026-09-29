@@ -97,4 +97,10 @@ internal sealed class DiagnosticsRequest
     /// </summary>
     [JsonPropertyName("delivery")]
     public DiagnosticDeliveryRequest? Delivery { get; set; }
+
+    /// <summary>
+    /// For "case-start" method, the case's bounds, authorizations and storage; absent means the defaults.
+    /// </summary>
+    [JsonPropertyName("caseStart")]
+    public DiagnosticCaseStartRequest? CaseStart { get; set; }
 }

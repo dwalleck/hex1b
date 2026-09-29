@@ -130,6 +130,7 @@ public sealed class TerminalSession : IAsyncDisposable
     /// <param name="width">Terminal width in columns.</param>
     /// <param name="height">Terminal height in rows.</param>
     /// <param name="asciinemaFilePath">Optional path to save an asciinema recording from session start.</param>
+    /// <param name="diagnosticCase">When set, a bounded diagnostic case records the session from construction.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>A started terminal session.</returns>
     public static async Task<TerminalSession> StartAsync(
@@ -141,6 +142,7 @@ public sealed class TerminalSession : IAsyncDisposable
         int width = 80,
         int height = 24,
         string? asciinemaFilePath = null,
+        DiagnosticCaseStartRequest? diagnosticCase = null,
         CancellationToken ct = default)
     {
         Hex1bTerminalChildProcess? process = null;
@@ -187,7 +189,18 @@ public sealed class TerminalSession : IAsyncDisposable
             // The terminal constructor starts pumps. Do not create them until startup
             // succeeds; output produced meanwhile remains buffered by the PTY.
             await process.StartAsync(ct);
-            terminal = new Hex1bTerminal(terminalOptions);
+            if (diagnosticCase is null)
+            {
+                terminal = new Hex1bTerminal(terminalOptions);
+            }
+            else
+            {
+                // The case is armed before the pumps read the child's first output.
+                DiagnosticCaseResult started;
+                (terminal, started) = Hex1bTerminal.CreateWithDiagnosticCase(terminalOptions, diagnosticCase);
+                if (started.Outcome != DiagnosticOutcome.Captured)
+                    throw new DiagnosticCaseStartException(started);
+            }
 
             return new TerminalSession(id, process, terminal, presentation, asciinemaRecorder, command, arguments, workingDirectory, asciinemaFilePath, width, height);
         }

@@ -291,6 +291,120 @@ Outcomes:
 - Socket clients read one JSON line per request. The reply begins with a UTF-8 byte-order mark,
   which a raw client must skip (it may arrive in its own read).
 
+## Diagnostic cases
+
+A diagnostic case records a bounded stretch of a terminal's life to a local artifact, so a problem
+can be studied after the process is gone. It records the terminal model's events in order: each
+output application, resize, and synchronized-update timeout. When authorized, each application
+carries the original bytes the model read. The case also records input acceptance and processing,
+each published application frame, and each native delivery record. Everything is written on the
+target's own filesystem. Nothing is uploaded.
+
+Start a case in one of two ways:
+
+- **At construction**, before the model's first event: `Hex1bTerminalBuilder.WithDiagnosticCase`,
+  `hex1b terminal start --record-case`, or `recordCase` on the MCP `start_bash_terminal` /
+  `start_pwsh_terminal` tools. The case is armed before the terminal's pumps read any output. The
+  case's checkpoint (`fresh-model/1`) is then the complete fresh model, and the recorded bytes
+  re-apply from model sequence 0.
+- **On a running target**: `hex1b capture case start <id>`, the MCP tool `start_diagnostic_case`,
+  or the socket method `case-start`. A model that has already applied output has no re-applicable
+  checkpoint, so the case records from now on with its checkpoint `unsupported` (`not-fresh`).
+
+Stop the case with `hex1b capture case stop`, `stop_diagnostic_case`, or `case-stop`. Read its
+progress with `hex1b capture case status`, `get_diagnostic_case_status`, or `case-status`. Inspect
+a finished (or broken) artifact offline, without the process that wrote it, with
+`hex1b capture case inspect <path>` or `inspect_diagnostic_case`.
+
+### Start request
+
+| Field | Wire name | Values | Default |
+|-------|-----------|--------|---------|
+| Size bound | `maxBytes` | 1 MiB – 1 GiB | 64 MiB |
+| Time bound | `maxSeconds` | 1 – 86,400 | 600 |
+| Authorizations | `authorizations` | `reapplication-data` (model input bytes), `raw-input` (sent input text), `editor-text` (the focused editor's text in frames), `native-output` (written bytes) | none: metadata only |
+| Storage root | `directory` | an owner-only directory | `~/.hex1b/cases` |
+
+The case directory is created under the root with mode 0700, and every file in it with 0600. Both
+modes are verified after creation. An existing root that is group- or world-accessible, a symbolic
+link, or not a directory is refused (`storage-refused`) before anything is written. Without
+`reapplication-data`, the checkpoint is `excluded` and no model bytes are copied.
+
+### Result
+
+`case-start`, `case-stop` and `case-status` return one result shape:
+
+- `caseId`, `path`, `state` (`recording`, `stopping`, `stopped`), `startPath` (`construction`,
+  `live`);
+- `bounds`, the granted `authorizations`, and the `checkpoint` (`fresh-model/1`: `complete`,
+  `unsupported` or `excluded`, with the reason and the model configuration that determines the
+  fresh state);
+- `startedAt`, `elapsedSeconds`, `bytesWritten`;
+- `streams`: `offered`, `written` and `dropped` for each recorded stream;
+- `stopReason` once stopped: `requested`, `size-limit`, `time-limit`, `collector-failed` or
+  `target-disposed`.
+
+Problem codes: `invalid-bounds`, `unsupported-authorization` and `invalid-directory`
+(`invalid-request`); `case-active`, `no-active-case` and `target-disposed` (`unavailable`);
+`storage-refused` (`failed`). One case records a terminal at a time.
+
+### Artifact
+
+A case directory holds three files:
+
+- `manifest.json`: identities, bounds, authorizations, start path, checkpoint, and each stream's
+  coverage (`included`, or `unavailable` with why);
+- `events.jsonl`: one event per line, prefixed by its CRC-32 in hex and a tab;
+- `completion.json`: written last, by rename. It holds the stop reason, the last case sequence,
+  bytes written, and per-stream counts.
+
+Events are numbered by `caseSequence` in file order. Each stream also numbers its own events by
+`ordinal`:
+
+| Stream | Events |
+|--------|--------|
+| `model` | `application` (with the original bytes as base64 `data` under `reapplication-data`), `application-without-ingress`, `resize`, `synchronized-update-timeout`, each with its `modelSequence` and geometry |
+| `input` | `accepted` and `processed`, with input ids (text only with `raw-input`) |
+| `frames` | `published`: the frame's identity, and its projection (editor text only with `editor-text`) |
+| `delivery` | `delivery`: the native delivery record (bytes only with `native-output`) |
+| `case` | `missing` ranges, `interval-end`, and `stream-failed` |
+
+Streams a target cannot observe are declared `unavailable` in the manifest. For example, frames
+are unavailable for PTY workloads, and delivery for headless terminals.
+
+### Bounds and losses
+
+- **Overload:** the recording queue holds 4,096 events or 8 MiB. Past that it drops the newest
+  events and never blocks the terminal. Each drop is recorded as a `missing` range (`overload`)
+  outside the queue.
+- **Size bound:** the case stops with `size-limit` before a line would cross it. The events it
+  could not write become `size-limit` missing ranges.
+- **Time bound:** the case stops with `time-limit`, on the terminal's `TimeProvider`.
+- **Stop drain:** a stop waits at most 10 s for queued events. Anything still unwritten becomes a
+  `drain-timeout` missing range.
+- **Failures:** a storage or writer failure stops the case with `collector-failed`, and disposing
+  the terminal stops it with `target-disposed`. A failure inside one stream marks that stream
+  `failed` and the others keep recording.
+- **Re-applicable interval:** the model interval ends at the first model event the case cannot
+  reproduce. That is an application without recorded bytes, graphics state the case does not hold,
+  a missing model event, a failed model stream, or the end of the verified file.
+
+### Inspect
+
+Inspection verifies every line's checksum before using it. It reports:
+
+- `completionState`: `complete`, `interrupted` (no completion record: the writer died), or
+  `truncated`, with `truncatedAtLine` (the first line that failed its checksum or was torn; the
+  verified prefix is every line before it);
+- each stream's event count, ordinal range, `state` (`complete`, `incomplete`, `failed`) and
+  `missing` ranges. A gap in ordinals that no recorded range explains is reported with reason
+  `unknown`;
+- the re-applicable model `intervals`;
+- a page of events: `since` (a case sequence) and `limit` (1–4,096; none by default).
+
+Problem codes: `invalid-path`, `invalid-limit` and `invalid-since` (`invalid-request`);
+`case-not-found` (`unavailable`); `invalid-artifact` and `unsupported-format` (`failed`).
+
 ## Capabilities
 
 `hex1b capture capabilities <id>` and the MCP tool `get_terminal_diagnostic_capabilities`
@@ -303,6 +417,9 @@ model-history support, and authorizations. They also report each evidence layer:
 | `application-frame` | Hex1b applications with `WithDiagnostics()` | Operation `application-frame`, timing `latest-published`, authorization `editor-text`. Otherwise unavailable with the reason the operation reports. |
 | `native-delivery` | console and WebSocket presentations with a diagnostics engine | Operation `delivery`, timing `immediate`, authorization `native-output`. Otherwise unavailable: `no-native-presentation` or `presentation-delivery-unobservable`. |
 | `native-presentation` | no | What a host terminal physically displayed is not observable by Hex1b. |
+
+The operations list also names `case-start` (timing `recorded`, the four case authorizations, and
+its limitations): see [Diagnostic cases](#diagnostic-cases).
 
 ## Current limitations
 
@@ -333,4 +450,7 @@ model-history support, and authorizations. They also report each evidence layer:
 - `identity.hex1bVersion` is the loaded assembly's informational version. A build made from
   uncommitted changes reports the revision it was based on.
 - Capture and capability requests to an attached target time out after 10 seconds with a
-  `timeout` failure. Input, resize, and recording requests are not timed out by the client.
+  `timeout` failure. Input, resize, and recording requests are not timed out by the client, and
+  neither are case start and stop. Case status is timed out like capture.
+- A case started on a running target has no re-applicable checkpoint; only a case started at
+  construction can be re-applied from its first byte.
