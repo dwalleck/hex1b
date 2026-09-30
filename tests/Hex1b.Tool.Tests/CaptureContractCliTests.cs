@@ -1150,6 +1150,55 @@ public class CaptureContractCliTests
         }
     }
 
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_TitleAndMarkFaults()
+    {
+        // A hosted PTY that pushes a title and emits OSC 133 marks, recorded from construction: the CLI's title-stack and
+        // command-mark faults differ at the paths they name and are labelled (ticket 11).
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var config = new TerminalHostConfig
+        {
+            Width = 40,
+            Height = 6,
+            Command = "/bin/sh",
+            Arguments = ["-c", "printf '\\033]0;one\\007\\033]22;\\007\\033]0;two\\007\\033]133;A\\007$ \\033]133;B\\007cmd\\r\\n\\033]133;D;0\\007FAULTS-READY\\n'; exec sleep 60"],
+            DiagnosticCase = new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] },
+        };
+
+        await WaitForSocketReleaseAsync(cts.Token);
+        var host = TerminalHost.RunAsync(config, cts.Token);
+        string path;
+        try
+        {
+            await WaitForSocketAsync(cts.Token);
+            Assert.IsNotNull(await WaitForCliTextAsync("FAULTS-READY", cts.Token), "hosted PTY output never reached the model");
+            var (stopExit, stop, stopErr) = await RunCliAsync("capture", "case", "stop", Pid, "--json");
+            Assert.AreEqual(0, stopExit, stopErr);
+            path = JsonDocument.Parse(stop).RootElement.GetProperty("path").GetString()!;
+        }
+        finally
+        {
+            await cts.CancelAsync();
+            try { await host; } catch (OperationCanceledException) { }
+        }
+
+        foreach (var (fault, faultPath) in new[] { ("title-stack", "titles.stack[0].window"), ("command-mark", "commandMarks[0].column") })
+        {
+            var (exit, json, err) = await RunCliAsync("capture", "case", "reapply", path, "--to", "stop", "--inject-fault", fault, "--json");
+            Assert.AreEqual(2, exit, err + json);
+            var result = JsonDocument.Parse(json).RootElement;
+            Assert.AreEqual(("different", true), (result.GetProperty("comparison").GetString(), result.GetProperty("faultInjected").GetBoolean()), json);
+            CollectionAssert.Contains(result.GetProperty("differences").GetProperty("differences").EnumerateArray()
+                .Select(d => d.GetProperty("path").GetString()).ToList(), faultPath, fault);
+            var (_, text, _) = await RunCliAsync("capture", "case", "reapply", path, "--to", "stop", "--inject-fault", fault);
+            StringAssert.Contains(text, $"Fault injected: {fault} at {faultPath}");
+        }
+    }
+
     // Status of a settled case: engine counts equal twice in a row around the client's read.
     private static async Task<JsonElement> StableStatusAsync(TerminalDiagnostics engine, Func<Task<string>> read)
     {

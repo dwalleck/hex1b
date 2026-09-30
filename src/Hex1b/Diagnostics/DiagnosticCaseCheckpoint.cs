@@ -23,8 +23,8 @@ public sealed record DiagnosticCaseCheckpoint
 
     /// <summary>
     /// The state surfaces the checkpoint represents faithfully. A complete <c>text-state/1</c> start covers every surface
-    /// of the shared checkpoint table: retained history, titles, command marks, pending input and graphics only as
-    /// empty, because a start holding any of them is unsupported and names it in <see cref="UnsupportedSurfaces"/>.
+    /// of the shared checkpoint table, retained history, titles and command marks included; pending input and graphics
+    /// only as empty, because a start holding either is unsupported and names it in <see cref="UnsupportedSurfaces"/>.
     /// </summary>
     [JsonPropertyName("coveredSurfaces")]
     public IReadOnlyList<string> CoveredSurfaces { get; init; } = [];
@@ -37,8 +37,8 @@ public sealed record DiagnosticCaseCheckpoint
     public long? ModelSequence { get; init; }
 
     /// <summary>
-    /// The state surfaces a <c>text-state/1</c> start held that its restore cannot represent (for example
-    /// <c>retained-history</c>, <c>titles</c>, <c>pending-input</c>); empty when complete. Absent for <c>fresh-model/1</c>.
+    /// The state surfaces a <c>text-state/1</c> start held that its restore cannot represent (<c>pending-input</c>,
+    /// <c>dcs-continuation</c>, <c>graphics</c>); empty when complete. Absent for <c>fresh-model/1</c>.
     /// </summary>
     [JsonPropertyName("unsupportedSurfaces")]
     public IReadOnlyList<string>? UnsupportedSurfaces { get; init; }

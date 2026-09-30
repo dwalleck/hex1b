@@ -17,7 +17,8 @@ public class ModelStateComparerTests
     [TestMethod]
     public async Task Compare_Discriminates()
     {
-        var corpus = "\u001b[31mred\u001b[m plain\r\n" + string.Concat(Enumerable.Range(1, 12).Select(i => $"line {i}\r\n")) + "\u001b[?1h\u001b]0;T\u0007\u001b(0q\u001b(B";
+        var corpus = "\u001b[31mred\u001b[m plain\r\n" + string.Concat(Enumerable.Range(1, 12).Select(i => $"line {i}\r\n")) + "\u001b[?1h\u001b]0;T\u0007\u001b(0q\u001b(B"
+            + "\u001b]22;\u0007\u001b]133;A\u0007$ ";
         var state = await ProjectAsync(corpus);
         var same = await ProjectAsync(corpus);
         var identical = ModelStateComparer.Compare(state, same, ModelStateComparer.DefaultMaxDifferences);
@@ -38,6 +39,10 @@ public class ModelStateComparerTests
         var noHistory = await ProjectAsync("x", scrollback: null);
         Assert.IsNull(ModelStateFault.Apply(noHistory, "history-rows", out _, out var needsHistory));
         StringAssert.Contains(needsHistory, "has no retained history");
+        Assert.IsNull(ModelStateFault.Apply(noHistory, "title-stack", out _, out var needsStack));
+        StringAssert.Contains(needsStack, "has no saved title");
+        Assert.IsNull(ModelStateFault.Apply(noHistory, "command-mark", out _, out var needsMark));
+        StringAssert.Contains(needsMark, "has no command mark with a position");
 
         // Equal counts, different content: one cell's text, one cell's color, one history row's text.
         AssertOnly(await ProjectAsync("abc"), await ProjectAsync("abd"), "screen[0][2].text", "lastPrinted.cell.text");

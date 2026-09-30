@@ -234,6 +234,40 @@ public partial class DiagnosticCaseTests
         AssertMatched(Reapply(path, label: "stop"), "the cumulative surface");
     }
 
+    [TestMethod]
+    public async Task Reapply_TitleAndMarkFaults()
+    {
+        // Each fault differs at the path it names and is labelled; a case with no stack or no placed mark refuses it.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = HistoryTerminal(workload, strategy: null, capacity: 100);
+        await workload.WriteAndWaitAsync(terminal, ShellPrompts(1, 4));
+        var path = StartLive(terminal, root);
+        await workload.WriteAndWaitAsync(terminal, "after");
+        await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        foreach (var (fault, faultPath) in new[] { ("title-stack", "titles.stack[0].window"), ("command-mark", "commandMarks[0].column") })
+        {
+            var result = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "stop", Faults = [fault] });
+            Assert.AreEqual((DiagnosticOutcome.Captured, "different", true), (result.Outcome, result.Comparison, result.FaultInjected), $"{fault}: {result.Problem?.Message}");
+            CollectionAssert.Contains(result.Differences!.Differences.Select(d => d.Path).ToList(), faultPath, fault);
+            Assert.IsTrue(File.Exists(Path.Combine(result.RunPath!, "faulted.json")), $"{fault}: no faulted.json");
+        }
+
+        using var bareRoot = new CaseRoot();
+        var bareWorkload = new ScriptedWorkload();
+        await using var bare = HistoryTerminal(bareWorkload, strategy: null, capacity: 100);
+        await bareWorkload.WriteAndWaitAsync(bare, "plain text");
+        var barePath = StartLive(bare, bareRoot);
+        await bareWorkload.WriteAndWaitAsync(bare, " after");
+        await new TerminalDiagnostics(bare).StopCaseAsync(TestContext.Current.CancellationToken);
+        foreach (var fault in new[] { "title-stack", "command-mark" })
+        {
+            var refused = Reapply(new DiagnosticCaseReapplyRequest { Path = barePath, ToLabel = "stop", Faults = [fault] });
+            Assert.AreEqual(("unavailable", "fault-not-applicable"), (refused.Comparison, refused.ComparisonReason?.Split(':')[0]),
+                $"{fault}: {refused.ComparisonReason} {refused.Problem?.Message}");
+        }
+    }
+
     // Shell-like prompts: a title (a push every other prompt, push-and-set every third), and OSC 133 A/B/C/D marks
     // with parameters and exit codes.
     private static string ShellPrompts(int from, int to) => string.Concat(Enumerable.Range(from, to - from + 1).Select(i =>

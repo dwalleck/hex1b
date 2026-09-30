@@ -16,6 +16,8 @@ internal static class ModelStateFault
         "cell-text", "cell-style", "cursor", "mode", "title", "charset", "tab-stop", "pending-input", "history-row", "history-rows",
         // Continuation a start restores (ticket 09): each toggles its field, so it differs even from a default.
         "pending-wrap", "last-printed", "rendition", "margins", "saved-cursor", "pending-grapheme", "activity", "synchronized-update",
+        // Titles and command marks a start restores (ticket 11): the top saved title, and the first placed mark's column.
+        "title-stack", "command-mark",
     ];
 
     // Kinds that take a target, and its form.
@@ -104,6 +106,31 @@ internal static class ModelStateFault
             case "title":
                 path = "titles.window";
                 return state with { Titles = state.Titles with { Window = state.Titles.Window + "!" } };
+            case "title-stack":
+                if (state.Titles.Stack.Count == 0)
+                {
+                    problem = $"fault '{fault}': the reconstructed state has no saved title.";
+                    return null;
+                }
+                path = "titles.stack[0].window";
+                return state with
+                {
+                    Titles = state.Titles with { Stack = [state.Titles.Stack[0] with { Window = state.Titles.Stack[0].Window + "!" }, .. state.Titles.Stack.Skip(1)] },
+                };
+            case "command-mark":
+            {
+                var index = state.CommandMarks.ToList().FindIndex(mark => mark.Column is not null);
+                if (index < 0)
+                {
+                    problem = $"fault '{fault}': the reconstructed state has no command mark with a position.";
+                    return null;
+                }
+                var mark = state.CommandMarks[index];
+                path = $"commandMarks[{index}].column";
+                var marks = state.CommandMarks.ToArray();
+                marks[index] = mark with { Column = mark.Column == 0 ? 1 : mark.Column - 1 };
+                return state with { CommandMarks = marks };
+            }
             case "charset":
                 path = "charsets.g0";
                 return state with { Charsets = state.Charsets with { G0 = state.Charsets.G0 == "0" ? "B" : "0" } };

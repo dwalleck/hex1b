@@ -747,6 +747,54 @@ public class CaptureContractMcpTests : McpServerTestBase
 
     [TestMethod]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_TitleAndMarkFaults()
+    {
+        // A bash session recorded from its first byte pushes a title and emits OSC 133 marks: reapply_diagnostic_case's
+        // title-stack and command-mark faults differ at the paths they name and are labelled (ticket 11).
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var start = await CallAsync(client, "start_bash_terminal", new()
+        {
+            ["workingDirectory"] = Path.GetTempPath(),
+            ["recordCase"] = true,
+            ["caseDirectory"] = root.Path,
+            ["caseAuthorize"] = "reapplication-data",
+        });
+        Assert.IsTrue(start.GetProperty("success").GetBoolean(), start.ToString());
+        var sessionId = start.GetProperty("sessionId").GetString()!;
+        string path;
+        try
+        {
+            await CallAsync(client, "send_terminal_input", new()
+            {
+                ["sessionId"] = sessionId,
+                ["text"] = "printf '\\033]22;\\007\\033]133;A\\007$ MCP-FAULTS-%s\\n\\033]133;D;0\\007' $((1+1))\r",
+            });
+            var wait = await CallAsync(client, "wait_for_terminal_text", new() { ["sessionId"] = sessionId, ["text"] = "MCP-FAULTS-2", ["timeoutSeconds"] = 10 });
+            Assert.IsTrue(wait.GetProperty("found").GetBoolean(), wait.ToString());
+            var stop = await CallAsync(client, "stop_diagnostic_case", new() { ["sessionId"] = sessionId });
+            path = stop.GetProperty("case").GetProperty("path").GetString()!;
+        }
+        finally
+        {
+            await CallAsync(client, "remove_session", new() { ["sessionId"] = sessionId });
+        }
+
+        foreach (var (fault, faultPath) in new[] { ("title-stack", "titles.stack[0].window"), ("command-mark", "commandMarks[0].column") })
+        {
+            var result = (await CallAsync(client, "reapply_diagnostic_case", new() { ["path"] = path, ["to"] = "stop", ["injectFault"] = fault }))
+                .GetProperty("reapplication");
+            Assert.AreEqual(("different", true), (result.GetProperty("comparison").GetString(), result.GetProperty("faultInjected").GetBoolean()), result.ToString());
+            CollectionAssert.Contains(result.GetProperty("differences").GetProperty("differences").EnumerateArray()
+                .Select(d => d.GetProperty("path").GetString()).ToList(), faultPath, fault);
+        }
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task CaseLiveStart_ReapplyFromTheStartMatchesTheReapplier()
     {
         // Ticket 09: a case started over MCP on a running application owns a text-state/1 start, and re-applies from
