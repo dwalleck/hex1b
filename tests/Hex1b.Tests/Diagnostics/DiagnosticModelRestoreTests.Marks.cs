@@ -321,6 +321,46 @@ public partial class DiagnosticModelRestoreTests
         Assert.IsEmpty(differences, $"{shape}: " + string.Join("; ", differences.Take(3)));
     }
 
+    // Never-written cells keep write sequence 0 in the replica (review round 3, RR3#1): a VS16 arriving in a later chunk
+    // widens a glyph at the right edge onto the next row's never-written cells, which then read as one glyph.
+    [TestMethod]
+    [DataRow("vs16 in the next chunk", new[] { "\u2764", "\uFE0F" })]
+    [DataRow("vs16 after a style change", new[] { "\u2764\u001b[m\uFE0F" })]
+    public void ModelRestore_NeverWrittenCellsStayUnwritten(string shape, string[] after)
+    {
+        var (original, replica) = ContinuationPair(10, 4, retroactive: true, "\u001b[1;10H");
+        Assert.IsNotNull(original.CaptureModelState().Screen[1].Unwritten, "fixture: the next row is never written");
+        foreach (var chunk in after.Append("\u001b[D\u001b]133;A\u0007"))
+        {
+            original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(chunk));
+            replica.ApplyRecordedOutput(Encoding.UTF8.GetBytes(chunk));
+        }
+        var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(differences, $"{shape}: " + string.Join("; ", differences.Take(3)));
+    }
+
+    // The flag is projected at every column after the first and on history rows too (review round 3, RR3#3).
+    [TestMethod]
+    public void ModelRestore_ContinuationFlagsProjectedEverywhere()
+    {
+        var original = MarkModel(MarkScenarios["screen and history"], "none");
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u6f22x\r\n" + MarkLines(12) + "\u6f22y"));
+        var state = original.CaptureModelState();
+        var history = state.History!.Rows;
+        var row = history.Single(r => r.Cells[0].Text == "\u6f22");
+        Assert.IsTrue(row.Cells[1].Continues, "a history row's continuation at column 1 is not flagged");
+        var replica = MarkModel(MarkScenarios["screen and history"], "none");
+        replica.RestoreModelState(state);
+        Assert.IsEmpty(JsonDifferences(Json(state), Json(replica.CaptureModelState())), "the flags do not round-trip");
+        Assert.IsTrue(state.Screen[state.Cursor.Y].Cells[1].Continues, "a screen row's continuation at column 1 is not flagged");
+        // A mark placed on the screen glyph's continuation (column 1) lands on its first cell in both models.
+        foreach (var t in new[] { original, replica })
+            t.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b[2D\u001b]133;A\u0007"));
+        var after = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(after, "a mark on a column-1 continuation: " + string.Join("; ", after.Take(3)));
+        Assert.AreEqual(0, original.CaptureModelState().CommandMarks[^1].Column, "fixture: the mark lands on the glyph at column 0");
+    }
+
     [TestMethod]
     [DataRow("wide beside an orphan", "\u001b[1;19H\u6f22\u001b[2;19H\u5b57\u001b[?69h\u001b[1;19s\u001b[1S\u001b[?69l")]
     [DataRow("vs16 cluster beside an orphan", "\u001b[1;19H\u6f22\u001b[2;19Hx\uFE0F\u001b[?69h\u001b[1;19s\u001b[1S\u001b[?69l")]
@@ -362,6 +402,10 @@ public partial class DiagnosticModelRestoreTests
     [DataRow("a screen row without cells")]
     [DataRow("a missing saved main row")]
     [DataRow("a history continuation at column 0")]
+    [DataRow("never-written runs not in pairs")]
+    [DataRow("a never-written run past the row")]
+    [DataRow("never-written runs out of order")]
+    [DataRow("a continuation across a never-written edge")]
     public void ModelRestore_RefusesMalformedRows(string shape)
     {
         var shapeScenario = shape.Contains("saved") ? MarkScenarios["alternate"] : MarkScenarios["screen and history"];
@@ -379,11 +423,22 @@ public partial class DiagnosticModelRestoreTests
             "a missing screen row" => state with { Screen = Rows(state.Screen, 1, _ => null!) },
             "a screen row without cells" => state with { Screen = Rows(state.Screen, 1, r => r with { Cells = null! }) },
             "a missing saved main row" => state with { SavedMainScreen = Rows(state.SavedMainScreen!, 1, _ => null!) },
+            "never-written runs not in pairs" => state with { Screen = Rows(state.Screen, 1, r => r with { Unwritten = [3] }) },
+            "a never-written run past the row" => state with { Screen = Rows(state.Screen, 1, r => r with { Unwritten = [30, 11] }) },
+            "never-written runs out of order" => state with { Screen = Rows(state.Screen, 1, r => r with { Unwritten = [10, 2, 4, 2] }) },
+            "a continuation across a never-written edge" => state with
+            {
+                Screen = Rows(state.Screen, 1, r => r with
+                {
+                    Cells = [r.Cells[0] with { Text = "\u6f22" }, r.Cells[1] with { Text = "", Continues = true }, .. r.Cells.Skip(2)],
+                    Unwritten = [1, r.Cells.Count - 1],
+                }),
+            },
             _ => state with { History = state.History! with { Rows = Rows(state.History.Rows, 0, r => FirstCell(r, c => c with { Text = "", Continues = true })) } },
         };
         var replica = MarkModel(shapeScenario, "none");
         var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(forged));
-        StringAssert.Contains(error.Message, shape.Contains("continuation") ? "continuation" : "missing", shape);
+        StringAssert.Contains(error.Message, shape.Contains("continuation") ? "continuation" : shape.Contains("never-written") ? "never-written" : "missing", shape);
         Assert.AreEqual((0L, 0), (replica.CurrentModelSequence, replica.CommandMarks.Count), $"{shape}: a refused restore changed the model");
     }
 

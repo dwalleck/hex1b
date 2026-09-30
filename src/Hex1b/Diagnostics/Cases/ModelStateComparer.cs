@@ -158,12 +158,16 @@ internal static class ModelStateComparer
                 }
                 if (r.Cells.Count != a.Cells.Count)
                     Add(surface, new Path(prefix, row, Field: "count"), Text(r.Cells.Count), Text(a.Cells.Count));
+                if (!(r.Unwritten ?? []).SequenceEqual(a.Unwritten ?? []))
+                    Add(surface, new Path(prefix, row, Field: "unwritten"), Runs(r.Unwritten), Runs(a.Unwritten));
                 for (var column = 0; column < Math.Min(r.Cells.Count, a.Cells.Count); column++)
                     Cell(surface, prefix, row, column, r.Cells[column], a.Cells[column]);
             }
         }
 
         private static string? Text(long? value) => value?.ToString(CultureInfo.InvariantCulture);
+
+        private static string Runs(IReadOnlyList<int>? runs) => runs is null ? "none" : string.Join(",", runs);
 
         private void Cell(string surface, string prefix, int row, int column, in DiagnosticModelCell recorded, in DiagnosticModelCell reapplied)
         {

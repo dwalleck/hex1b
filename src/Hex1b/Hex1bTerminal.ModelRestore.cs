@@ -74,7 +74,7 @@ public sealed partial class Hex1bTerminal
                     var rowCells = new TerminalCell[projected.Cells.Count];
                     for (var column = 0; column < rowCells.Length; column++)
                         rowCells[column] = RestoreCell(projected.Cells[column], state.Styles, cells, built);
-                    SequenceRestoredRowUnsafe(rowCells, projected.Cells);
+                    SequenceRestoredRowUnsafe(rowCells, projected);
                     rows[row] = (rowCells, projected.OriginalWidth ?? rowCells.Length, projected.Id ?? 0);
                 }
                 scrollback.RestoreRows(rows, history.NextRowId, _timeProvider.GetUtcNow());
@@ -204,7 +204,7 @@ public sealed partial class Hex1bTerminal
             var rowCells = new TerminalCell[projected.Count];
             for (var column = 0; column < rowCells.Length; column++)
                 rowCells[column] = RestoreCell(projected[column], styles, cells, built);
-            SequenceRestoredRowUnsafe(rowCells, projected);
+            SequenceRestoredRowUnsafe(rowCells, rows[row]);
             for (var column = 0; column < rowCells.Length; column++)
                 SetCell(row, column, rowCells[column], damageSixel: false);
         }
@@ -242,18 +242,34 @@ public sealed partial class Hex1bTerminal
 
     // One restored cell. A style's colours and attributes are parsed once; each cell holding a hyperlink takes
     // its own counted reference from this model's store, as a cell written by output does.
-    // Restored cells get write sequences in row order, a projected continuation sharing its left neighbour's (as when both
-    // were written together) and every other cell its own. Code that tells a continuation by its sequence (anchors,
-    // selection, rendering) then reads the restored row as the original's. The values themselves are write order, not
-    // state, and are not projected; which cells continue is.
-    private void SequenceRestoredRowUnsafe(TerminalCell[] row, IReadOnlyList<DiagnosticModelCell> projected)
+    // Restored cells get write sequences in row order: a never-written cell 0, as in the original; a projected continuation
+    // its left neighbour's (as when both were written together); every other cell its own. Code that tells cells of one
+    // glyph by a shared sequence (anchors, selection, rendering) then reads the restored row as the original's, and so
+    // does later output that meets never-written cells. The values themselves are write order and are not projected;
+    // which cells share one is.
+    private void SequenceRestoredRowUnsafe(TerminalCell[] row, DiagnosticModelRow projected)
     {
+        var unwritten = UnwrittenMask(projected.Unwritten, row.Length);
         for (var column = 0; column < row.Length; column++)
-            row[column] = row[column] with { Sequence = column > 0 && projected[column].Continues ? row[column - 1].Sequence : ++_writeSequence };
+        {
+            var sequence = unwritten[column] ? 0
+                : column > 0 && projected.Cells[column].Continues ? row[column - 1].Sequence
+                : ++_writeSequence;
+            row[column] = row[column] with { Sequence = sequence };
+        }
     }
 
-    // Why projected rows cannot be restored, or null: every row present with its cells, and a continuation only on an
-    // empty cell after the first column.
+    private static bool[] UnwrittenMask(IReadOnlyList<int>? runs, int width)
+    {
+        var mask = new bool[width];
+        for (var i = 0; runs is not null && i + 1 < runs.Count; i += 2)
+            Array.Fill(mask, true, runs[i], runs[i + 1]);
+        return mask;
+    }
+
+    // Why projected rows cannot be restored, or null: every row present with its cells, a continuation only on an empty
+    // cell after the first column and never across a never-written run's edge, and the runs start, count pairs in column
+    // order within the row.
     private static string? RowsProblem(IReadOnlyList<DiagnosticModelRow>? rows, string what)
     {
         if (rows is null)
@@ -262,9 +278,22 @@ public sealed partial class Hex1bTerminal
         {
             if (rows[row]?.Cells is not { } cells)
                 return $"{what} row {row}: missing";
+            if (rows[row].Unwritten is { } runs)
+            {
+                var end = 0;
+                if (runs.Count == 0 || runs.Count % 2 != 0)
+                    return $"{what} row {row}: never-written runs that are not start, count pairs";
+                for (var i = 0; i < runs.Count; i += 2)
+                {
+                    if (runs[i] < end || runs[i + 1] < 1 || runs[i] + runs[i + 1] > cells.Count)
+                        return $"{what} row {row}: a never-written run at {runs[i]} that is out of order or outside the row";
+                    end = runs[i] + runs[i + 1];
+                }
+            }
+            var unwritten = UnwrittenMask(rows[row].Unwritten, cells.Count);
             for (var column = 0; column < cells.Count; column++)
             {
-                if (cells[column].Continues && (column == 0 || cells[column].Text is not { Length: 0 }))
+                if (cells[column].Continues && (column == 0 || cells[column].Text is not { Length: 0 } || unwritten[column] != unwritten[column - 1]))
                     return $"{what} row {row}: a continuation at column {column} that continues nothing";
             }
         }

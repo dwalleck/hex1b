@@ -21,8 +21,8 @@ public readonly record struct DiagnosticModelCell
     public bool WideWrapPadding { get; init; }
 
     /// <summary>
-    /// Whether this empty cell continues the glyph in the cell to its left (the model wrote them together); omitted when
-    /// false. A continuation left by a glyph that has since moved or changed width is not one.
+    /// Whether this empty cell continues the glyph in the cell to its left (they share a write sequence, as when written
+    /// together); omitted when false.
     /// </summary>
     [JsonPropertyName("c")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]

@@ -117,6 +117,8 @@ public class ModelStateComparerTests
         Assert.IsTrue(row.Cells[3].Continues, "fixture: the wide glyph's continuation");
         AssertOnly(wide, wide with { Screen = [row with { Cells = [.. row.Cells.Take(3), row.Cells[3] with { Continues = false }, .. row.Cells.Skip(4)] }, .. wide.Screen.Skip(1)] },
             "screen[0][3].continues");
+        Assert.IsNotNull(wide.Screen[1].Unwritten, "fixture: a never-written row");
+        AssertOnly(wide, wide with { Screen = [wide.Screen[0], wide.Screen[1] with { Unwritten = null }, .. wide.Screen.Skip(2)] }, "screen[1].unwritten");
 
         // Equal current titles and stack depth: a different saved entry is reported at that entry.
         var stack = await ProjectAsync("\u001b]0;x\u0007\u001b]22;\u0007");

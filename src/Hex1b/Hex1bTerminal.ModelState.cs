@@ -113,7 +113,13 @@ public sealed partial class Hex1bTerminal
                     var cells = new DiagnosticModelCell[row.Cells.Length];
                     for (var column = 0; column < cells.Length; column++)
                         cells[column] = ProjectCell(row.Cells[column], styles, column > 0 && Continues(row.Cells[column], row.Cells[column - 1]));
-                    rows[i] = new DiagnosticModelRow { Cells = cells, Id = entries[i].RowId, OriginalWidth = row.OriginalWidth };
+                    rows[i] = new DiagnosticModelRow
+                    {
+                        Cells = cells,
+                        Id = entries[i].RowId,
+                        OriginalWidth = row.OriginalWidth,
+                        Unwritten = UnwrittenRuns(row.Cells.Length, column => row.Cells[column].Sequence),
+                    };
                 }
                 history = new DiagnosticModelHistory { Capacity = scrollback.Capacity, NextRowId = scrollback.NextRowId, Rows = rows };
             }
@@ -281,7 +287,8 @@ public sealed partial class Hex1bTerminal
             var cells = new DiagnosticModelCell[width];
             for (var column = 0; column < width; column++)
                 cells[column] = ProjectCell(buffer[row, column], styles, column > 0 && Continues(buffer[row, column], buffer[row, column - 1]));
-            rows[row] = new DiagnosticModelRow { Cells = cells };
+            var at = row;
+            rows[row] = new DiagnosticModelRow { Cells = cells, Unwritten = UnwrittenRuns(width, column => buffer[at, column].Sequence) };
         }
         return rows;
     }
@@ -293,6 +300,23 @@ public sealed partial class Hex1bTerminal
         WideWrapPadding = cell.IsWideWrapPadding,
         Continues = continues,
     };
+
+    // The runs of a row's cells with write sequence 0, as start, count pairs; null when there are none.
+    private static int[]? UnwrittenRuns(int width, Func<int, long> sequenceAt)
+    {
+        List<int>? runs = null;
+        for (var column = 0; column < width; column++)
+        {
+            if (sequenceAt(column) != 0)
+                continue;
+            var start = column;
+            while (column + 1 < width && sequenceAt(column + 1) == 0)
+                column++;
+            (runs ??= []).Add(start);
+            runs.Add(column - start + 1);
+        }
+        return runs?.ToArray();
+    }
 
     // Whether an empty cell continues the glyph to its left, as every reader of a row decides it (anchors, selection,
     // rendering): both were written together, so they share a write sequence.
