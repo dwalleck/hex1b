@@ -50,8 +50,11 @@ public sealed partial class Hex1bTerminal
 
         lock (_bufferLock)
         {
-            // The resizes of an empty model move no text into history; the model is still otherwise fresh.
+            // The resizes of an empty model move no text into history; the model is still otherwise fresh. An empty
+            // history continues the row identities the original had advanced (its rows were cleared).
             _scrollbackBuffer?.Clear();
+            if (state.History is { } history && _scrollbackBuffer is { } scrollback)
+                scrollback.SeedNextRowId(history.NextRowId);
             RestoreScreenUnsafe(state.Screen, state.Styles, cells, built);
 
             _cursorX = state.Cursor.X;
@@ -151,6 +154,8 @@ public sealed partial class Hex1bTerminal
             return $"profile '{state.Profile}'";
         if (state.History is { Rows.Count: > 0 })
             return "retained history rows";
+        if (state.History is { NextRowId: < 1 })
+            return "a history whose next row identity is not positive";
         if ((state.SavedMainScreen is not null) != (state.ActiveBuffer == "alternate") || state.ActiveBuffer is not ("main" or "alternate"))
             return $"an active buffer '{state.ActiveBuffer}' that does not match its saved main screen";
         if (state.SavedMainScreen is { Count: > 0 } saved && saved.Any(row => row.Cells.Count != saved[0].Cells.Count))
@@ -283,8 +288,8 @@ public sealed partial class Hex1bTerminal
     // The inverse of ModelStateName: a kebab-case contract name back to a defined enum value (never a number),
     // as the manifest reader parses configuration names.
     private static T ParseName<T>(string name) where T : struct, Enum =>
-        Enum.TryParse<T>(name.Replace("-", "", StringComparison.Ordinal), ignoreCase: true, out var value) && Enum.IsDefined(value)
-            && !int.TryParse(name, out _)
+        name.Replace("-", "", StringComparison.Ordinal) is var joined
+            && Enum.TryParse<T>(joined, ignoreCase: true, out var value) && Enum.IsDefined(value) && !int.TryParse(joined, out _)
             ? value
             : throw new InvalidOperationException($"The state names an unknown {typeof(T).Name} '{name}'.");
 }

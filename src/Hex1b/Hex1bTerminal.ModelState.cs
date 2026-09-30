@@ -34,6 +34,7 @@ public sealed partial class Hex1bTerminal
         _committedGroundEscape = _dcsByteStreamParser.HasPendingGroundEscape;
         _committedFramerUtf8 = _dcsByteStreamParser.PendingUtf8ContinuationBytes;
         _committedInDcs = _dcsByteStreamParser.IsInDcs;
+        _continuationUncommitted = false;
     }
 
     /// <summary>
@@ -443,7 +444,7 @@ public sealed partial class Hex1bTerminal
         Set(InputPath, "_activePasteContext", "_inBracketedPaste", "_incompleteInputSequenceBuffer", "_inputUtf8Decoder");
         Set(Infrastructure,
             "_bufferLock", "_captures", "_captureSequence", "_captureApplicationDepth", "_diagnosticCase", "_disposedCase",
-            "_caseIngress", "_caseIngressPending", "_disposeCts", "_disposed", "_hmp1OutputStateLock", "_hmp1State",
+            "_caseIngress", "_caseIngressPending", "_continuationUncommitted", "_disposeCts", "_disposed", "_hmp1OutputStateLock", "_hmp1State",
             "_deferHmp1ReplayCallbacks", "<Hmp1ReplayActivityState>k__BackingField",
             "<Hmp1ReplayCommandMarkState>k__BackingField", "<Hmp1ReplayScrollbackState>k__BackingField",
             "_inputProcessingTask", "_outputProcessingTask", "_metrics", "_nativeDelivery", "<InputMilestones>k__BackingField",

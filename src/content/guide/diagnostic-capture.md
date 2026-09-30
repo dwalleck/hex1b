@@ -631,5 +631,7 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
 - Capture and capability requests to an attached target time out after 10 seconds with a
   `timeout` failure. Input, resize, and recording requests are not timed out by the client, and
   neither are case start and stop. Case status is timed out like capture.
-- A case started on a running target has no re-applicable checkpoint; only a case started at
-  construction can be re-applied from its first byte.
+- A case started on a running target re-applies from its `text-state/1` start checkpoint, not
+  from the first byte: only a case started at construction holds the output before it. A start
+  holding a surface the restore cannot represent yet (retained history, titles, command marks,
+  pending input, graphics) is `unsupported`, and names it.

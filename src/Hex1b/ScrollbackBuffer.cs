@@ -59,6 +59,18 @@ internal sealed class ScrollbackBuffer
     internal long NextRowId => _nextRowId;
 
     /// <summary>
+    /// Continues the row identities of an empty buffer from <paramref name="nextRowId"/>, as a buffer whose rows
+    /// were cleared keeps them. Only a model restore calls this, on an empty buffer.
+    /// </summary>
+    internal void SeedNextRowId(long nextRowId)
+    {
+        if (_count != 0)
+            throw new InvalidOperationException("Only an empty scrollback buffer can be seeded.");
+        ArgumentOutOfRangeException.ThrowIfLessThan(nextRowId, 1);
+        _nextRowId = nextRowId;
+    }
+
+    /// <summary>
     /// Adds a row to the buffer. If the buffer is full, the oldest row is evicted
     /// and its tracked object references are released.
     /// </summary>

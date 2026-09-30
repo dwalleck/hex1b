@@ -21,7 +21,11 @@ public sealed record DiagnosticCaseCheckpoint
     [JsonPropertyName("configuration")]
     public DiagnosticCaseModelConfiguration? Configuration { get; init; }
 
-    /// <summary>The state surfaces the profile covers.</summary>
+    /// <summary>
+    /// The state surfaces the checkpoint represents faithfully. A complete <c>text-state/1</c> start covers every surface
+    /// of the shared checkpoint table: retained history, titles, command marks, pending input and graphics only as
+    /// empty, because a start holding any of them is unsupported and names it in <see cref="UnsupportedSurfaces"/>.
+    /// </summary>
     [JsonPropertyName("coveredSurfaces")]
     public IReadOnlyList<string> CoveredSurfaces { get; init; } = [];
 

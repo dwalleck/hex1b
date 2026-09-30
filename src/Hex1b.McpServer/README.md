@@ -62,12 +62,12 @@ Both return `applicationFrame`, the shared [application-frame result](https://he
 
 ### Diagnostic cases
 
-- **start_diagnostic_case** - Start recording a bounded diagnostic case on a target: model events (with the original input bytes under `authorize` `reapplication-data`), input, application frames and native delivery, written by the target to an owner-only local directory; optional `maxBytes`, `maxSeconds`, `authorize`, `directory`. A case started on a running target has no re-applicable checkpoint; use `recordCase` at session start for that.
+- **start_diagnostic_case** - Start recording a bounded diagnostic case on a target: model events (with the original input bytes under `authorize` `reapplication-data`), input, application frames and native delivery, written by the target to an owner-only local directory; optional `maxBytes`, `maxSeconds`, `authorize`, `directory`. A case started on a running target owns a `text-state/1` start checkpoint with `reapplication-data`, and re-applies from it unless the target holds a surface it cannot restore yet (named in `unsupportedSurfaces`); `recordCase` records from the first byte.
 - **stop_diagnostic_case** - Stop the active case (at most 10 s of draining) and return its final state and stop reason.
 - **get_diagnostic_case_status** - The active case's state, bounds, progress and per-stream counts.
 - **mark_diagnostic_case** - Mark a boundary in the active case: a checkpoint of the model's full text state at its current model sequence (with `reapplication-data`; otherwise the boundary only); optional `label`. At most 64 marks await the writer (`busy` beyond).
 - **inspect_diagnostic_case** - Read a case artifact offline: `complete`, `interrupted` or `truncated`, coverage and missing ranges, the re-applicable interval, and a page of events. See [diagnostic cases](https://hex1b.dev/guide/diagnostic-capture#diagnostic-cases).
-- **reapply_diagnostic_case** - Re-apply a case offline to a target (`to`: a model sequence, `case:<n>`, or a checkpoint label) in a detached model rebuilt from its recorded configuration, and compare it with the checkpoint recorded there: `matched`, `different` (typed differences by path) or `unavailable`; optional `injectFault`, `maxDifferences`, `preview`. Writes only `reapplications/<n>` inside the case.
+- **reapply_diagnostic_case** - Re-apply a case offline to a target (`to`: a model sequence, `case:<n>`, or a checkpoint label) in a detached model rebuilt from its recorded configuration (and, for a live start, restored from its start checkpoint), and compare it with the checkpoint recorded there: `matched`, `different` (typed differences by path) or `unavailable`; optional `injectFault`, `maxDifferences`, `preview`. Writes only `reapplications/<n>` inside the case.
 
 ### Recording
 

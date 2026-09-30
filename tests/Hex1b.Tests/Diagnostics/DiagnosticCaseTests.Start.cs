@@ -91,6 +91,11 @@ public partial class DiagnosticCaseTests
             && e.GetProperty("checkpoint").GetProperty("trigger").GetString() == "start"), "an unsupported start wrote a start line");
         Assert.IsNotEmpty(artifact.ModelEvents(), "the case stopped recording");
         Assert.AreEqual("requested", artifact.Completion!.Value.GetProperty("stopReason").GetString());
+        // Re-application of an unsupported start is refused before anything is written.
+        var refused = Reapply(path, label: "stop");
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "no-valid-interval"), (refused.Outcome, refused.Problem?.Code), refused.Problem?.Message);
+        StringAssert.Contains(refused.Problem!.Message, "retained-history");
+        Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), "a refused re-application wrote a run");
     }
 
     [TestMethod]
@@ -198,7 +203,8 @@ public partial class DiagnosticCaseTests
         using (new Running(terminal))
         {
             await workload.WriteAndWaitAsync(terminal, "populated");
-            DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value = () => throw new InvalidOperationException("injected");
+            // A long message: the reason is bounded, as a mark's or stop's failure is.
+            DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value = () => throw new InvalidOperationException("injected" + new string('x', 5000));
             try
             {
                 result = new TerminalDiagnostics(terminal).StartCase(new DiagnosticCaseStartRequest
@@ -218,8 +224,10 @@ public partial class DiagnosticCaseTests
         Assert.IsNotNull(result.Path, $"arming failed: {result.Problem?.Message}");
         var artifact = Artifact.Read(result.Path);
         var checkpoint = artifact.Manifest.GetProperty("checkpoint");
-        Assert.AreEqual(("unsupported", "capture-failed: InvalidOperationException: injected"),
-            (checkpoint.GetProperty("status").GetString(), checkpoint.GetProperty("reason").GetString()));
+        Assert.AreEqual("unsupported", checkpoint.GetProperty("status").GetString());
+        var reason = checkpoint.GetProperty("reason").GetString()!;
+        StringAssert.StartsWith(reason, "capture-failed: InvalidOperationException: injectedxxx");
+        Assert.IsLessThanOrEqualTo(DiagnosticCaseRecorder.MaxFailureMessage, reason.Length, $"the reason is unbounded ({reason.Length} characters)");
         Assert.IsNotEmpty(artifact.ModelEvents(), "the case did not record after a failed start projection");
     }
 
@@ -334,8 +342,68 @@ public partial class DiagnosticCaseTests
     [DataRow(true)]
     public async Task Start_PartitionsInFlightApplicationAndResize(bool resizeFirst)
     {
-        // With the model lock held, the pump reads and tokenizes a chunk (it uses the last printed cell: REP) and waits;
-        // a resize waits too. The case is armed in that window. Each is in the start or recorded after it, once.
+        // While the arming holds the model lock, just before the start projection, the pump reads and tokenizes a
+        // chunk (it uses the last printed cell: REP) and waits for the lock, and a resize waits too. The test does not
+        // hold the lock itself, so an arming that released it between its projection and its registration would let
+        // them in unrecorded. Each must be in the start or recorded after it, once.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10).Build();
+        string path;
+        long start = -1;
+        Task resize = Task.CompletedTask;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "\u001b[1;33mbefore Q");
+            var first = 1;
+            DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value = () =>
+            {
+                if (Interlocked.Exchange(ref first, 0) != 1)
+                    return;
+                start = terminal.CurrentModelSequence;
+                if (resizeFirst)
+                {
+                    resize = Task.Run(() => terminal.Resize(36, 12));
+                    Thread.Sleep(50);
+                }
+                var read = terminal.OutputBytesRead;
+                workload.Enqueue(Encoding.UTF8.GetBytes(" in-flight\u001b[3b"));
+                SpinWait.SpinUntil(() => terminal.OutputBytesRead > read, TimeSpan.FromSeconds(5));
+                Thread.Sleep(20);
+                if (!resizeFirst)
+                    resize = Task.Run(() => terminal.Resize(36, 12));
+                Thread.Sleep(50);
+            };
+            try
+            {
+                path = StartLive(terminal, root);
+            }
+            finally
+            {
+                DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value = null;
+            }
+            await resize;
+            await WaitAsync(() => terminal.CurrentModelSequence >= start + 2);
+            await workload.WriteAndWaitAsync(terminal, " after");
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        Assert.AreNotEqual(-1L, start, "fixture: the start hook never ran");
+        var model = Artifact.Read(path).ModelEvents();
+        Assert.AreEqual(start + 1, model[0].GetProperty("modelSequence").GetInt64(), "the first recorded event is not the start's next");
+        var kinds = model.Take(2).Select(e => e.GetProperty("kind").GetString()).ToList();
+        CollectionAssert.AreEquivalent(new[] { "application", "resize" }, kinds, "the in-flight application and resize were not both recorded after the start");
+        AssertMatched(Reapply(path, label: "stop"), resizeFirst ? "resize first" : "application first");
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task Start_RecordsAnApplicationReadBeforeArming(bool resizeFirst)
+    {
+        // The pump has read, stashed and tokenized a chunk (it uses the last printed cell: REP) before the arming begins,
+        // and waits for the model lock the test holds; a resize waits too. The case is armed in that window: the chunk's
+        // stashed bytes must survive the arming and be recorded after the start, once.
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
         await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10).Build();
@@ -420,8 +488,13 @@ public partial class DiagnosticCaseTests
         {
             var copy = CopyCase(root, path, name.Replace(' ', '-'));
             change(copy);
+            // Inspection sees no verified start with state, so there is no re-applicable interval.
+            var interval = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = copy }).Intervals.Single();
+            Assert.IsFalse(interval.Valid, $"{name}: inspection reports a valid interval without a start");
+            StringAssert.StartsWith(interval.EndReason, "start-missing:", name);
             var result = Reapply(copy, label: "stop");
-            Assert.AreEqual((DiagnosticOutcome.Unavailable, "missing-start"), (result.Outcome, result.Problem?.Code), $"{name}: {result.Problem?.Message}");
+            Assert.AreEqual((DiagnosticOutcome.Unavailable, "no-valid-interval"), (result.Outcome, result.Problem?.Code), $"{name}: {result.Problem?.Message}");
+            StringAssert.Contains(result.Problem!.Message, "start-missing", name);
             Assert.IsFalse(Directory.Exists(Path.Combine(copy, "reapplications")), $"{name}: a refused re-application wrote a run");
         }
     }
@@ -430,6 +503,7 @@ public partial class DiagnosticCaseTests
     [DataRow("retained-history", "history")]
     [DataRow("titles", "titles")]
     [DataRow("pending-input", "pendingInput")]
+    [DataRow("command-marks", "commandMarks")]
     public async Task Reapply_OutOfSurfaceStartRefused(string surface, string field)
     {
         // A start state the restore cannot represent, in a manifest that claims it complete: refused before anything.
@@ -445,6 +519,9 @@ public partial class DiagnosticCaseTests
                     break;
                 case "titles":
                     state["titles"]!["window"] = "T";
+                    break;
+                case "commandMarks":
+                    state["commandMarks"] = JsonNode.Parse("""[{"anchor":"1","phase":"prompt-start","rawParameters":"A"}]""");
                     break;
                 default:
                     state["pendingInput"]!["escapePrefix"] = "[";
@@ -515,6 +592,106 @@ public partial class DiagnosticCaseTests
         CollectionAssert.Contains(result.Differences!.Differences.Select(d => d.Path).ToList(), path, $"{fault}: its path is not among the differences");
         // The recorded path of the same case is unchanged.
         AssertMatched(Reapply(casePath, label: "stop"), $"{fault}: the unchanged path");
+    }
+
+    [TestMethod]
+    public async Task Reapply_LiveStartAfterClearedScrollback()
+    {
+        // A shell that scrolled and cleared its scrollback (ESC[3J) before the start: complete, and rows scrolled after
+        // the start re-apply with the identities the original continued.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .WithScrollback(100).Build();
+        string path;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, string.Concat(Enumerable.Range(1, 14).Select(i => $"{i}\r\n")) + "\u001b[H\u001b[2J\u001b[3J$ ");
+            path = StartLive(terminal, root);
+            await workload.WriteAndWaitAsync(terminal, string.Concat(Enumerable.Range(1, 12).Select(i => $"after {i}\r\n")));
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        Assert.AreEqual("complete", Artifact.Read(path).Manifest.GetProperty("checkpoint").GetProperty("status").GetString());
+        AssertMatched(Reapply(path, label: "start"), "the start");
+        AssertMatched(Reapply(path, label: "stop"), "rows scrolled after the start");
+    }
+
+    [TestMethod]
+    public async Task Start_TooLargeForTheCaseIsUnsupported()
+    {
+        // A start whose state cannot fit the case's size bound is refused at arming, not written as a missing line
+        // under a manifest that claims it complete.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(600, 200).Build();
+        string path;
+        long before, after;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "populated");
+            before = terminal.ModelStateCapturesForTesting;
+            path = new TerminalDiagnostics(terminal).StartCase(new DiagnosticCaseStartRequest
+            {
+                Directory = root.Path,
+                MaxBytes = 1024 * 1024,
+                Authorizations = [DiagnosticAuthorization.ReapplicationData],
+            }).Path!;
+            after = terminal.ModelStateCapturesForTesting;
+            await workload.WriteAndWaitAsync(terminal, " after");
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        Assert.AreEqual(before, after, "a start that cannot fit took a projection");
+        var artifact = Artifact.Read(path);
+        var checkpoint = artifact.Manifest.GetProperty("checkpoint");
+        Assert.AreEqual("unsupported", checkpoint.GetProperty("status").GetString());
+        StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "size-limit:");
+        Assert.IsFalse(artifact.Events.Any(e => e.GetProperty("kind").GetString() == "checkpoint"
+            && e.GetProperty("checkpoint").GetProperty("trigger").GetString() == "start"), "a start line was written");
+        Assert.IsFalse(DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }).Intervals.Single().Valid);
+    }
+
+    [TestMethod]
+    public async Task Start_AfterUnappliedOutputIsUnsupported()
+    {
+        // A batch tokenized but refused without a model event (a geometry-gated refusal) moves the live decoder past
+        // the committed continuation; a start before the next application cannot hold that continuation.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10).Build();
+        string refusedPath, laterPath;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "before ");
+            var modelLock = typeof(Hex1bTerminal).GetField("_bufferLock", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(terminal)!;
+            lock (modelLock)
+            {
+                // The pump's notification for a batch it tokenized and refused (Hex1bTerminal's geometry-gated refusal).
+                typeof(Hex1bTerminal).GetMethod("NotifyCaseUnappliedOutputUnsafe", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(terminal, []);
+                refusedPath = StartLive(terminal, root);
+            }
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+            // Positive control: after an application commits the continuation, a start is complete again.
+            await workload.WriteAndWaitAsync(terminal, "1mred");
+            laterPath = StartLive(terminal, root);
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var refused = Artifact.Read(refusedPath).Manifest.GetProperty("checkpoint");
+        Assert.AreEqual("unsupported", refused.GetProperty("status").GetString());
+        StringAssert.StartsWith(refused.GetProperty("reason").GetString(), "unapplied-output:");
+        Assert.AreEqual("complete", Artifact.Read(laterPath).Manifest.GetProperty("checkpoint").GetProperty("status").GetString());
+    }
+
+    [TestMethod]
+    public void FreshModelCheckpoint_RefusesToDescribeAModelThatIsNotFresh()
+    {
+        var configuration = new DiagnosticCaseModelConfiguration();
+        Assert.ThrowsExactly<ArgumentException>(() => FreshModelCheckpoint.Describe(fresh: false, authorized: true, unsupported: null, configuration));
+        Assert.AreEqual(DiagnosticCaseCheckpointStatus.Complete, FreshModelCheckpoint.Describe(true, true, null, configuration).Status);
+        Assert.AreEqual(DiagnosticCaseCheckpointStatus.Excluded, FreshModelCheckpoint.Describe(false, false, null, configuration).Status);
+        Assert.AreEqual(DiagnosticCaseCheckpointStatus.Unsupported, FreshModelCheckpoint.Describe(false, true, "hmp1-workload", configuration).Status);
     }
 
     private static bool IsStart(JsonNode node) => node["checkpoint"]?["trigger"]?.GetValue<string>() == "start";

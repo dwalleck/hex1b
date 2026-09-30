@@ -61,7 +61,7 @@ public sealed partial class Hex1bTerminal
     /// hold state (<paramref name="takeStart"/>), is projected in the same hold: the start checkpoint, so
     /// every model event is either in it or recorded after it. Returns the armed recorder, or why none was armed.
     /// </summary>
-    internal (DiagnosticCaseRecorder? Recorder, string? ProblemCode, string? ActiveCaseId) TryArmDiagnosticCase(bool takeStart,
+    internal (DiagnosticCaseRecorder? Recorder, string? ProblemCode, string? ActiveCaseId) TryArmDiagnosticCase(bool takeStart, long startRoom,
         Func<bool, string?, DiagnosticCaseModelConfiguration, (long Sequence, DiagnosticCaseRecorder.CheckpointCapture Capture)?, DiagnosticCaseRecorder> create)
     {
         lock (_bufferLock)
@@ -75,7 +75,7 @@ public sealed partial class Hex1bTerminal
                 : null;
             var fresh = _modelSequence == 0 && OutputBytesRead == 0;
             (long, DiagnosticCaseRecorder.CheckpointCapture)? start = !fresh && takeStart && unsupported is null
-                ? (_modelSequence, TakeStartCaptureUnsafe())
+                ? (_modelSequence, TakeStartCaptureUnsafe(startRoom))
                 : null;
             var recorder = create(fresh, unsupported, _caseConfiguration, start);
             if (start is var (sequence, capture))
@@ -180,28 +180,6 @@ public sealed partial class Hex1bTerminal
 
     // Must hold _bufferLock. The state only with reapplication-data and within the pending-state budget,
     // both judged from geometry before any state is read. A size-limit stop skips a state that could not fit
-    // The start projection, in the arming hold: refused (without projecting) inside an application or past the
-    // pending-state budget, and never failing the arming.
-    private DiagnosticCaseRecorder.CheckpointCapture TakeStartCaptureUnsafe()
-    {
-        if (_captureApplicationDepth > 0)
-            return new(null, null, "unavailable", "mid-application: the case was started inside an application that had not finished", 0);
-        var estimate = EstimateModelStateBytesUnsafe();
-        if (estimate > DiagnosticCaseRecorder.PendingStateBudgetInEffect)
-            return new(null, null, "unavailable", "pending-state budget: the start state is larger than the state a case may hold awaiting its writer", 0);
-        var started = System.Diagnostics.Stopwatch.GetTimestamp();
-        try
-        {
-            DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value?.Invoke();
-            var state = CaptureModelState();
-            return new(state, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds, "recorded", null, estimate);
-        }
-        catch (Exception error)
-        {
-            return new(null, null, "unavailable", $"capture-failed: {error.GetType().Name}: {error.Message}", 0);
-        }
-    }
-
     // what is left of the case. A projection that fails leaves the boundary without state rather than
     // failing the stop or the mark.
     // Returns the checkpoint's model sequence with it: the current one, or, when the checkpoint is re-entered
@@ -238,11 +216,45 @@ public sealed partial class Hex1bTerminal
         }
     }
 
+    // The start projection, in the arming hold: refused, without projecting, inside an application, after
+    // unapplied output, when it could not fit the case, or past the pending-state budget; never failing the arming.
+    private DiagnosticCaseRecorder.CheckpointCapture TakeStartCaptureUnsafe(long startRoom)
+    {
+        if (_captureApplicationDepth > 0)
+            return new(null, null, "unavailable", "mid-application: the case was started inside an application that had not finished", 0);
+        if (_continuationUncommitted)
+            return new(null, null, "unavailable", "unapplied-output: output was tokenized without being applied since the last application, so its decoder continuation is not the committed one", 0);
+        // A start line that cannot be written whole would leave the case claiming a start it never wrote.
+        if (EstimateModelStateJsonBytesUnsafe() > startRoom)
+            return new(null, null, "unavailable", "size-limit: the start state is larger than the case's size bound leaves for its events", 0);
+        var estimate = EstimateModelStateBytesUnsafe();
+        if (estimate > DiagnosticCaseRecorder.PendingStateBudgetInEffect)
+            return new(null, null, "unavailable", "pending-state budget: the start state is larger than the state a case may hold awaiting its writer", 0);
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value?.Invoke();
+            var state = CaptureModelState();
+            return new(state, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds, "recorded", null, estimate);
+        }
+        catch (Exception error)
+        {
+            return new(null, null, "unavailable", DiagnosticCaseRecorder.Bounded($"capture-failed: {error.GetType().Name}: {error.Message}"), 0);
+        }
+    }
+
     // Must hold _bufferLock: a batch was tokenized (moving the decoder, escape prefix and DCS framer) but
     // refused without a model event, so no recorded application reproduces that state change; re-applicable
-    // coverage ends at the next model event.
-    private void NotifyCaseUnappliedOutputUnsafe() =>
+    // coverage ends at the next model event. Until the next application commits the continuation again, the
+    // committed copy lags the live decoder, so a start taken meanwhile cannot hold it.
+    private void NotifyCaseUnappliedOutputUnsafe()
+    {
+        _continuationUncommitted = true;
         _diagnosticCase?.EndInterval(_modelSequence + 1, "unapplied-output");
+    }
+
+    // Set by an unapplied tokenization, cleared when an application commits the continuation.
+    private bool _continuationUncommitted;
 
     /// <summary>
     /// Forgets a finished case so a new one can start. Atomic without the model lock, so a finishing writer

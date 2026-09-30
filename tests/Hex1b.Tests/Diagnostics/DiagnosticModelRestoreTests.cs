@@ -140,6 +140,28 @@ public class DiagnosticModelRestoreTests
         Assert.AreEqual(Digest(original), Digest(replica), $"{name}: the public views differ after the revealing input");
     }
 
+    // A shell that scrolled, then cleared its scrollback (ESC[3J), holds no retained rows but has advanced its row
+    // identities: the restored history must continue them, so rows scrolled after the start compare equal.
+    [TestMethod]
+    public void ModelRestore_ClearedScrollbackContinuesRowIdentities()
+    {
+        var original = Detached(new FakeTimeProvider());
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(1, 14).Select(i => $"{i}\r\n")) + "\u001b[H\u001b[2J\u001b[3J"));
+        var state = original.CaptureModelState();
+        Assert.AreEqual((0, true), (state.History?.Rows.Count ?? -1, state.History!.NextRowId > 1), "fixture: the scrollback was not cleared after advancing");
+        Assert.IsEmpty(StartCheckpoint.Unsupported(state), "fixture: a cleared scrollback is restorable");
+
+        var replica = Detached(new FakeTimeProvider());
+        replica.RestoreModelState(state);
+        var start = JsonDifferences(Json(state), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(start, "the restored start differs: " + string.Join("; ", start.Take(5)));
+        var scroll = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(1, 12).Select(i => $"after {i}\r\n")));
+        original.ApplyRecordedOutput(scroll);
+        replica.ApplyRecordedOutput(scroll);
+        var after = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(after, "rows scrolled after the start differ: " + string.Join("; ", after.Take(5)));
+    }
+
     [TestMethod]
     public void ModelRestore_HyperlinksLiveInReplicaStore()
     {
@@ -233,6 +255,8 @@ public class DiagnosticModelRestoreTests
     // codec enforce: a numeric enum name or an out-of-range standard colour index is refused, not coerced.
     [TestMethod]
     [DataRow("underline-style", "1")]
+    [DataRow("underline-style", "1-")]
+    [DataRow("underline-style", "0-1")]
     [DataRow("foreground", "standard:9:#ffffff")]
     [DataRow("foreground", "bright:8:#ffffff")]
     public void ModelRestore_RefusesNamesOutsideTheContract(string field, string value)

@@ -126,6 +126,33 @@ public class OutputFormatterTests
         Assert.Contains("  ", lines[0]);
     }
 
+    [TestMethod]
+    public void CaseResult_UnsupportedStartListsItsSurfacesOnce()
+    {
+        // A start's reason repeats its unsupported surfaces; the text lists them once.
+        var formatter = new OutputFormatter();
+        var result = new Hex1b.Diagnostics.DiagnosticCaseResult
+        {
+            Outcome = Hex1b.Diagnostics.DiagnosticOutcome.Captured,
+            CaseId = "c",
+            Path = "/p",
+            State = Hex1b.Diagnostics.DiagnosticCaseState.Recording,
+            Checkpoint = new Hex1b.Diagnostics.DiagnosticCaseCheckpoint
+            {
+                Profile = "text-state/1",
+                Status = Hex1b.Diagnostics.DiagnosticCaseCheckpointStatus.Unsupported,
+                Reason = "unsupported-surfaces: the start held retained-history, titles, which this checkpoint cannot restore yet.",
+                ModelSequence = 5,
+                UnsupportedSurfaces = ["retained-history", "titles"],
+            },
+            Bounds = new Hex1b.Diagnostics.DiagnosticCaseBounds { MaxBytes = 1, MaxSeconds = 1 },
+        };
+        var output = CaptureConsoleOutput(() => Hex1b.Tool.Commands.Capture.CaseCommandOutput.Write(formatter, result, json: false, "started"));
+        var line = output.Split('\n').Single(l => l.StartsWith("Checkpoint:", StringComparison.Ordinal));
+        Assert.AreEqual(1, System.Text.RegularExpressions.Regex.Matches(line, "retained-history").Count, line);
+        StringAssert.Contains(line, "text-state/1 unsupported at model sequence 5; unsupported surfaces: retained-history, titles");
+    }
+
     private static string CaptureConsoleOutput(Action action)
     {
         var originalOut = Console.Out;

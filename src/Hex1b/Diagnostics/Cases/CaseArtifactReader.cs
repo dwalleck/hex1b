@@ -159,6 +159,7 @@ internal static class CaseArtifactReader
         public long? LastModelSequence;
         public readonly StreamScan Checkpoints = new();
         public long? ModelGapAfter;
+        public bool StartRecorded;
         public (long Sequence, string Reason)? IntervalEnd;
 
         private static Dictionary<string, StreamScan> Streams_() => StreamNames.ToDictionary(s => s, _ => new StreamScan());
@@ -190,6 +191,9 @@ internal static class CaseArtifactReader
             if (item.Checkpoint is { } written)
             {
                 result.Checkpoints.Events++;
+                // A text-state/1 start is the case's first checkpoint line, written with its state (skipped here).
+                if (result.Checkpoints.First is null && written.Trigger == "start" && written.Status == "recorded" && stateOmitted)
+                    result.StartRecorded = true;
                 result.Checkpoints.First ??= written.Ordinal;
                 result.Checkpoints.Last = Math.Max(result.Checkpoints.Last ?? 0, written.Ordinal);
             }
@@ -410,6 +414,10 @@ internal static class CaseArtifactReader
                 },
             ];
         }
+
+        // A text-state/1 start re-applies only from its verified start line with state.
+        if (manifest.Checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState && !scan.StartRecorded)
+            return [new DiagnosticCaseInterval { Valid = false, EndReason = "start-missing: the start checkpoint line is not among the verified events, or holds no state" }];
 
         // The interval runs from the checkpoint's model sequence (0 for a fresh model; a start's for a case started
         // on a model that had applied output) to the first event it cannot cover. Model events are recorded from the

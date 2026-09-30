@@ -702,7 +702,9 @@ public sealed class TerminalDiagnostics
 
     /// <summary>
     /// Starts recording a bounded diagnostic case on a running terminal. At most one case records a
-    /// terminal; its checkpoint is complete only when the model is still fresh.
+    /// terminal. A fresh model's checkpoint is <c>fresh-model/1</c>; a model that has applied output takes a
+    /// <c>text-state/1</c> start checkpoint (with <c>reapplication-data</c>), complete when its restore can
+    /// represent the state, otherwise naming the unsupported surfaces.
     /// </summary>
     /// <param name="request">Bounds, authorizations and storage.</param>
     public DiagnosticCaseResult StartCase(DiagnosticCaseStartRequest request) => StartCase(request, DiagnosticCaseStartPath.Live);
@@ -775,7 +777,8 @@ public sealed class TerminalDiagnostics
             _terminal.NativeDelivery,
             _terminal.StopDiagnosticCaseWithCheckpoint);
         Diagnostics.Cases.DiagnosticCaseRecorder.BeforeArmForTesting.Value?.Invoke();
-        var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase(reapplication, (fresh, unsupported, configuration, start) =>
+        var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase(reapplication, maxBytes - Diagnostics.Cases.DiagnosticCaseRecorder.EventReserve,
+            (fresh, unsupported, configuration, start) =>
             new Diagnostics.Cases.DiagnosticCaseRecorder(new DiagnosticCaseManifest
             {
                 FormatVersion = Diagnostics.Cases.CaseArtifactWriter.FormatVersion,
@@ -788,7 +791,7 @@ public sealed class TerminalDiagnostics
                 Fresh = fresh,
                 Checkpoint = start is var (sequence, capture)
                     ? Diagnostics.Cases.StartCheckpoint.Describe(configuration, sequence, capture)
-                    : Diagnostics.Cases.FreshModelCheckpoint.Describe(reapplication, unsupported, configuration),
+                    : Diagnostics.Cases.FreshModelCheckpoint.Describe(fresh, reapplication, unsupported, configuration),
                 Bounds = new DiagnosticCaseBounds { MaxBytes = maxBytes, MaxSeconds = maxSeconds },
                 Authorizations = granted,
                 Identity = identity,

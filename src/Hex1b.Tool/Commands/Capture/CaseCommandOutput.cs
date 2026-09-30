@@ -24,7 +24,9 @@ internal static class CaseCommandOutput
             (result.StopReason is { } reason ? $" ({DiagnosticContractNames.Of(reason)})" : ""));
         formatter.WriteLine($"Path: {AppTreeCommand.Safe(result.Path)}");
         var checkpoint = result.Checkpoint!;
-        formatter.WriteLine($"Checkpoint: {Checkpoint(checkpoint)}" + (checkpoint.Reason is { } why ? $" ({AppTreeCommand.Safe(why)})" : ""));
+        // A start's unsupported surfaces are listed by Checkpoint(...); its reason repeats them, so it is left out.
+        formatter.WriteLine($"Checkpoint: {Checkpoint(checkpoint)}" +
+            (checkpoint.Reason is { } why && checkpoint.UnsupportedSurfaces is not { Count: > 0 } ? $" ({AppTreeCommand.Safe(why)})" : ""));
         formatter.WriteLine($"Bounds: {result.Bounds!.MaxBytes} bytes, {result.Bounds.MaxSeconds} s; " +
             $"written {result.BytesWritten ?? 0} bytes in {result.ElapsedSeconds ?? 0:0.###} s");
         foreach (var stream in result.Streams)
