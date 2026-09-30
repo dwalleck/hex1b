@@ -18,6 +18,8 @@ internal static class ModelStateFault
         "pending-wrap", "last-printed", "rendition", "margins", "saved-cursor", "pending-grapheme", "activity", "synchronized-update",
         // Titles and command marks a start restores (ticket 11): the top saved title, and the first placed mark's column.
         "title-stack", "command-mark",
+        // Pending input a start restores (ticket 12): each holder dropped, refused when the start holds none.
+        "pending-escape", "pending-ground-escape", "pending-framer",
     ];
 
     // Kinds that take a target, and its form.
@@ -142,8 +144,37 @@ internal static class ModelStateFault
                 return state with { TabStops = state.TabStops with { Columns = columns } };
             }
             case "pending-input":
+                if (state.PendingInput.Utf8.Length == 0)
+                {
+                    problem = $"fault '{fault}': the reconstructed state holds no unfinished UTF-8 scalar.";
+                    return null;
+                }
                 path = "pendingInput.utf8";
-                return state with { PendingInput = state.PendingInput with { Utf8 = state.PendingInput.Utf8.Length == 0 ? "5g==" : "" } };
+                return state with { PendingInput = state.PendingInput with { Utf8 = "" } };
+            case "pending-escape":
+                if (state.PendingInput.EscapePrefix.Length == 0)
+                {
+                    problem = $"fault '{fault}': the reconstructed state holds no unfinished escape sequence.";
+                    return null;
+                }
+                path = "pendingInput.escapePrefix";
+                return state with { PendingInput = state.PendingInput with { EscapePrefix = "" } };
+            case "pending-ground-escape":
+                if (!state.PendingInput.GroundEscape)
+                {
+                    problem = $"fault '{fault}': the reconstructed state holds no ESC before a possible DCS.";
+                    return null;
+                }
+                path = "pendingInput.groundEscape";
+                return state with { PendingInput = state.PendingInput with { GroundEscape = false } };
+            case "pending-framer":
+                if (state.PendingInput.FramerUtf8Remaining == 0)
+                {
+                    problem = $"fault '{fault}': the reconstructed state expects no UTF-8 continuation bytes.";
+                    return null;
+                }
+                path = "pendingInput.framerUtf8Remaining";
+                return state with { PendingInput = state.PendingInput with { FramerUtf8Remaining = 0 } };
             case "history-row":
             {
                 // A history row's text: its first cell's.

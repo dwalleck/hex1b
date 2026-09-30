@@ -66,8 +66,8 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     public async Task Start_UnsupportedSurfaceStillRecords()
     {
-        // Retained rows (restored since ticket 10), a title and pending UTF-8 at once: each refused surface is named,
-        // in order, and the case records.
+        // Retained rows (ticket 10), a title (ticket 11), pending UTF-8 (ticket 12) and a DCS in progress at once: the
+        // one refused surface is named, and the case records.
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
         await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
@@ -76,16 +76,16 @@ public partial class DiagnosticCaseTests
         using (new Running(terminal))
         {
             await workload.WriteAndWaitAsync(terminal, string.Concat(Enumerable.Range(1, 14).Select(i => $"{i}\r\n")) + "\u001b]2;T\u0007");
-            await workload.WriteAndWaitAsync(terminal, [.. "ok "u8, 0xe6, 0xbc]);
+            await workload.WriteAndWaitAsync(terminal, [.. "ok \u6f22\u001bP$q"u8]);
             path = StartLive(terminal, root);
-            await workload.WriteAndWaitAsync(terminal, [0xa2, .. " after"u8]);
+            await workload.WriteAndWaitAsync(terminal, "m\u001b\\ after");
             await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
         }
 
         var artifact = Artifact.Read(path);
         var checkpoint = artifact.Manifest.GetProperty("checkpoint");
         Assert.AreEqual(("text-state/1", "unsupported"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()));
-        Assert.AreEqual("pending-input",
+        Assert.AreEqual("dcs-continuation",
             string.Join(",", checkpoint.GetProperty("unsupportedSurfaces").EnumerateArray().Select(s => s.GetString())));
         StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "unsupported-surfaces:");
         Assert.IsFalse(artifact.Events.Any(e => e.GetProperty("kind").GetString() == "checkpoint"
@@ -95,7 +95,7 @@ public partial class DiagnosticCaseTests
         // Re-application of an unsupported start is refused before anything is written.
         var refused = Reapply(path, label: "stop");
         Assert.AreEqual((DiagnosticOutcome.Unavailable, "no-valid-interval"), (refused.Outcome, refused.Problem?.Code), refused.Problem?.Message);
-        StringAssert.Contains(refused.Problem!.Message, "pending-input");
+        StringAssert.Contains(refused.Problem!.Message, "dcs-continuation");
         Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), "a refused re-application wrote a run");
     }
 
@@ -339,10 +339,14 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
-    [DataRow(false)]
-    [DataRow(true)]
-    public async Task Start_PartitionsInFlightApplicationAndResize(bool resizeFirst)
+    [DataRow(false, false)]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    [DataRow(true, true)]
+    public async Task Start_PartitionsInFlightApplicationAndResize(bool resizeFirst, bool pendingScalar)
     {
+        // With pendingScalar (ticket 12), the model holds the first byte of a scalar at arming and the in-flight chunk
+        // completes it: the start owns the byte, the chunk is the first application, and nothing is fed twice.
         // While the arming holds the model lock, just before the start projection, the pump reads and tokenizes a
         // chunk (it uses the last printed cell: REP) and waits for the lock, and a resize waits too. The test does not
         // hold the lock itself, so an arming that released it between its projection and its registration would let
@@ -355,7 +359,7 @@ public partial class DiagnosticCaseTests
         Task resize = Task.CompletedTask;
         using (new Running(terminal))
         {
-            await workload.WriteAndWaitAsync(terminal, "\u001b[1;33mbefore Q");
+            await workload.WriteAndWaitAsync(terminal, pendingScalar ? [.. "\u001b[1;33mbefore Q"u8, 0xe6] : "\u001b[1;33mbefore Q"u8.ToArray());
             var first = 1;
             DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value = () =>
             {
@@ -368,7 +372,7 @@ public partial class DiagnosticCaseTests
                     Thread.Sleep(50);
                 }
                 var read = terminal.OutputBytesRead;
-                workload.Enqueue(Encoding.UTF8.GetBytes(" in-flight\u001b[3b"));
+                workload.Enqueue(pendingScalar ? [0xbc, 0xa2, .. " in-flight\u001b[3b"u8] : Encoding.UTF8.GetBytes(" in-flight\u001b[3b"));
                 SpinWait.SpinUntil(() => terminal.OutputBytesRead > read, TimeSpan.FromSeconds(5));
                 Thread.Sleep(20);
                 if (!resizeFirst)
@@ -390,10 +394,17 @@ public partial class DiagnosticCaseTests
         }
 
         Assert.AreNotEqual(-1L, start, "fixture: the start hook never ran");
-        var model = Artifact.Read(path).ModelEvents();
+        var artifact = Artifact.Read(path);
+        var model = artifact.ModelEvents();
         Assert.AreEqual(start + 1, model[0].GetProperty("modelSequence").GetInt64(), "the first recorded event is not the start's next");
         var kinds = model.Take(2).Select(e => e.GetProperty("kind").GetString()).ToList();
         CollectionAssert.AreEquivalent(new[] { "application", "resize" }, kinds, "the in-flight application and resize were not both recorded after the start");
+        if (pendingScalar)
+        {
+            Assert.AreEqual("5g==", artifact.Events[0].GetProperty("checkpoint").GetProperty("state").GetProperty("pendingInput").GetProperty("utf8").GetString(), "the start does not own the pending byte");
+            var application = model.First(e => e.GetProperty("kind").GetString() == "application");
+            CollectionAssert.AreEqual(new byte[] { 0xbc, 0xa2 }, Convert.FromBase64String(application.GetProperty("data").GetString()!)[..2], "the in-flight chunk's bytes were regrouped");
+        }
         AssertMatched(Reapply(path, label: "stop"), resizeFirst ? "resize first" : "application first");
     }
 
@@ -502,12 +513,14 @@ public partial class DiagnosticCaseTests
 
     [TestMethod]
     [DataRow("titles", "titles", "incompatible")]
-    [DataRow("pending-input", "pendingInput", "unsupported-start")]
+    [DataRow("pending input", "pendingInput", "incompatible")]
+    [DataRow("dcs-continuation", "unsupported", "unsupported-start")]
     [DataRow("command mark", "commandMarks", "incompatible")]
     public async Task Reapply_OutOfSurfaceStartRefused(string surface, string field, string code)
     {
         // A start state the restore cannot represent, in a manifest that claims it complete: refused before anything.
-        // Titles and marks are restorable since ticket 11, so their rows are malformed ones, refused as incompatible.
+        // Titles, marks (ticket 11) and pending input (ticket 12) are restorable, so their rows are malformed ones,
+        // refused as incompatible; a DCS in progress is still an unsupported surface.
         using var root = new CaseRoot();
         var copy = CopyCase(root, await RecordLiveAsync(root), surface);
         EditEventLine(copy, IsStart, node =>
@@ -521,7 +534,11 @@ public partial class DiagnosticCaseTests
                 case "commandMarks":
                     state["commandMarks"] = JsonNode.Parse("""[{"anchor":"1","phase":"prompt-start","rawParameters":"A"}]""");
                     break;
+                case "unsupported":
+                    state["unsupported"] = JsonNode.Parse("""["dcs-continuation"]""");
+                    break;
                 default:
+                    // Not an unfinished sequence: no ESC introduces it.
                     state["pendingInput"]!["escapePrefix"] = "[";
                     break;
             }
@@ -668,7 +685,8 @@ public partial class DiagnosticCaseTests
         string refusedPath, laterPath;
         using (new Running(terminal))
         {
-            await workload.WriteAndWaitAsync(terminal, "before ");
+            // The model holds a pending scalar (restorable since ticket 12); the unapplied batch still refuses the start.
+            await workload.WriteAndWaitAsync(terminal, [.. "before "u8, 0xe6]);
             var modelLock = typeof(Hex1bTerminal).GetField("_bufferLock", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(terminal)!;
             lock (modelLock)
             {
@@ -678,7 +696,7 @@ public partial class DiagnosticCaseTests
             }
             await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
             // Positive control: after an application commits the continuation, a start is complete again.
-            await workload.WriteAndWaitAsync(terminal, "1mred");
+            await workload.WriteAndWaitAsync(terminal, [0xbc, 0xa2, .. "\u001b[1mred"u8]);
             laterPath = StartLive(terminal, root);
             await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
         }

@@ -3,9 +3,10 @@ namespace Hex1b.Diagnostics.Cases;
 /// <summary>
 /// The <c>text-state/1</c> start checkpoint of a case started on a terminal that has already applied output:
 /// which state surfaces a start may hold. The active text buffer, its continuation, the retained history, titles and
-/// the title stack, command marks and, on the alternate screen, the saved main screen are restored; pending input, a DCS
-/// in progress and graphics are refused while present, until their tickets extend the surface (12; graphics are outside
-/// the text profile). A start whose configuration cannot be rebuilt is never complete.
+/// the title stack, command marks, pending input (an unfinished escape sequence or UTF-8 scalar, a held ESC) and, on the
+/// alternate screen, the saved main screen are restored; a DCS in progress and graphics are refused while present (a DCS
+/// in progress until its ticket extends the surface; graphics are outside the text profile). A start whose configuration
+/// cannot be rebuilt is never complete.
 /// </summary>
 internal static class StartCheckpoint
 {
@@ -61,16 +62,8 @@ internal static class StartCheckpoint
     /// </summary>
     internal static IReadOnlyList<string> Unsupported(DiagnosticModelState state)
     {
-        var surfaces = new List<string>();
-        var pending = state.PendingInput;
-        if (pending.EscapePrefix.Length > 0 || pending.Utf8.Length > 0 || pending.GroundEscape || pending.FramerUtf8Remaining != 0)
-            surfaces.Add("pending-input");
-        // The projection names these itself.
-        foreach (var surface in state.Unsupported)
-        {
-            if (!surfaces.Contains(surface))
-                surfaces.Add(surface);
-        }
-        return surfaces;
+        // Pending input is restored since ticket 12; the projection names the remaining surfaces itself (a DCS in
+        // progress, graphics).
+        return state.Unsupported;
     }
 }

@@ -17,10 +17,15 @@ public class ModelStateComparerTests
     [TestMethod]
     public async Task Compare_Discriminates()
     {
+        // The corpus ends inside a CSI and a scalar (an escape prefix, pending UTF-8 bytes and a framer count); a
+        // second one ends in a bare ESC, the one pending holder that excludes the others (ticket 12).
         var corpus = "\u001b[31mred\u001b[m plain\r\n" + string.Concat(Enumerable.Range(1, 12).Select(i => $"line {i}\r\n")) + "\u001b[?1h\u001b]0;T\u0007\u001b(0q\u001b(B"
-            + "\u001b]22;\u0007\u001b]133;A\u0007$ ";
-        var state = await ProjectAsync(corpus);
-        var same = await ProjectAsync(corpus);
+            + "\u001b]22;\u0007\u001b]133;A\u0007$ \u001b[1;";
+        var state = await ProjectAsync(corpus, tail: [0xe6]);
+        var same = await ProjectAsync(corpus, tail: [0xe6]);
+        var escState = await ProjectAsync(corpus[..^4] + "\u001b");
+        var escSame = await ProjectAsync(corpus[..^4] + "\u001b");
+        Assert.IsTrue(state.PendingInput.Utf8.Length > 0 && state.PendingInput.EscapePrefix.Length > 0 && escState.PendingInput.GroundEscape, "fixture: pending input");
         var identical = ModelStateComparer.Compare(state, same, ModelStateComparer.DefaultMaxDifferences);
         Assert.AreEqual(0, identical.Total, string.Join("; ", identical.Differences.Select(d => d.Path)));
         Assert.IsGreaterThan(0, state.History!.Rows.Count, "fixture: no history");
@@ -28,9 +33,10 @@ public class ModelStateComparerTests
         // Every declared fault differs at the path it declares.
         foreach (var kind in ModelStateFault.Kinds)
         {
-            var faulted = ModelStateFault.Apply(same, kind, out var path, out var problem);
+            var (reference, subject) = kind == "pending-ground-escape" ? (escState, escSame) : (state, same);
+            var faulted = ModelStateFault.Apply(subject, kind, out var path, out var problem);
             Assert.IsNotNull(faulted, $"{kind}: {problem}");
-            var comparison = ModelStateComparer.Compare(state, faulted, ModelStateComparer.DefaultMaxDifferences);
+            var comparison = ModelStateComparer.Compare(reference, faulted, ModelStateComparer.DefaultMaxDifferences);
             Assert.IsGreaterThan(0, comparison.Total, $"{kind}: no difference");
             CollectionAssert.Contains(comparison.Differences.Select(d => d.Path).ToList(), path, $"{kind}: {string.Join("; ", comparison.Differences.Select(d => d.Path))}");
         }
@@ -147,7 +153,7 @@ public class ModelStateComparerTests
         return a?.ToJsonString() == b?.ToJsonString() ? 0 : 1;
     }
 
-    private static async Task<DiagnosticModelState> ProjectAsync(string text, int width = 40, int height = 8, int? scrollback = 50)
+    private static async Task<DiagnosticModelState> ProjectAsync(string text, int width = 40, int height = 8, int? scrollback = 50, byte[]? tail = null)
     {
         var workload = new ScriptedWorkload();
         await using var terminal = new Hex1bTerminal(new Hex1bTerminalOptions
@@ -158,7 +164,7 @@ public class ModelStateComparerTests
             Height = height,
             ScrollbackCapacity = scrollback,
         });
-        var bytes = Encoding.UTF8.GetBytes(text);
+        var bytes = tail is null ? Encoding.UTF8.GetBytes(text) : [.. Encoding.UTF8.GetBytes(text), .. tail];
         workload.Enqueue(bytes);
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
         while ((terminal.OutputBytesRead < bytes.Length || terminal.CurrentModelSequence == 0) && DateTime.UtcNow < deadline)

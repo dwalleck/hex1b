@@ -38,8 +38,8 @@ public sealed record DiagnosticCaseCheckpoint
     public long? ModelSequence { get; init; }
 
     /// <summary>
-    /// The state surfaces a <c>text-state/1</c> start held that its restore cannot represent (<c>pending-input</c>,
-    /// <c>dcs-continuation</c>, <c>graphics</c>); empty when complete. Absent for <c>fresh-model/1</c>.
+    /// The state surfaces a <c>text-state/1</c> start held that its restore cannot represent (<c>dcs-continuation</c>,
+    /// <c>graphics</c>); empty when complete. Absent for <c>fresh-model/1</c>.
     /// </summary>
     [JsonPropertyName("unsupportedSurfaces")]
     public IReadOnlyList<string>? UnsupportedSurfaces { get; init; }
