@@ -59,15 +59,41 @@ internal sealed class ScrollbackBuffer
     internal long NextRowId => _nextRowId;
 
     /// <summary>
-    /// Continues the row identities of an empty buffer from <paramref name="nextRowId"/>, as a buffer whose rows
-    /// were cleared keeps them. Only a model restore calls this, on an empty buffer.
+    /// Restores an empty buffer's retained rows, oldest first, each with its recorded identity, and the identity the
+    /// next pushed row receives (which continues past cleared or evicted rows). Only a model restore calls this. The
+    /// cells' hyperlink references are taken over, not added to: the caller already holds one per cell. Nothing is
+    /// pruned. Refuses rows it cannot hold faithfully: more than the capacity, identities not ascending and positive,
+    /// or a next identity not beyond the last row's.
     /// </summary>
-    internal void SeedNextRowId(long nextRowId)
+    internal void RestoreRows(IReadOnlyList<(TerminalCell[] Cells, int OriginalWidth, long RowId)> rows, long nextRowId, DateTimeOffset timestamp)
     {
         if (_count != 0)
-            throw new InvalidOperationException("Only an empty scrollback buffer can be seeded.");
-        ArgumentOutOfRangeException.ThrowIfLessThan(nextRowId, 1);
+            throw new InvalidOperationException("Only an empty scrollback buffer can be restored.");
+        if (RestoreProblem(rows.Count, rows.Select(r => r.RowId), nextRowId, Capacity) is { } problem)
+            throw new InvalidOperationException(problem);
+        for (var i = 0; i < rows.Count; i++)
+        {
+            _rows[i] = new ScrollbackRow(rows[i].Cells, rows[i].OriginalWidth, timestamp);
+            _rowIds[i] = rows[i].RowId;
+        }
+        _count = rows.Count;
+        _head = rows.Count % Capacity;
         _nextRowId = nextRowId;
+    }
+
+    /// <summary>Why a history of these identities cannot be restored into a buffer of this capacity, or null.</summary>
+    internal static string? RestoreProblem(int count, IEnumerable<long> rowIds, long nextRowId, int capacity)
+    {
+        if (count > capacity)
+            return $"{count} retained rows exceed the capacity of {capacity}.";
+        long last = 0;
+        foreach (var rowId in rowIds)
+        {
+            if (rowId <= last)
+                return $"row identity {rowId} does not follow {last}: identities must ascend from 1.";
+            last = rowId;
+        }
+        return nextRowId > last ? null : $"the next row identity {nextRowId} is not beyond the last row's, {last}.";
     }
 
     /// <summary>

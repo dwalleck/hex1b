@@ -162,6 +162,152 @@ public class DiagnosticModelRestoreTests
         Assert.IsEmpty(after, "rows scrolled after the start differ: " + string.Join("; ", after.Take(5)));
     }
 
+    // Retained history (ticket 10): every row, its identity, original width, soft wrap and styles, in partial and full
+    // rings, and rows kept at a width other than the current one by a strategy that does not reflow.
+    [TestMethod]
+    [DataRow("partial", 100, false)]
+    [DataRow("full ring", 12, false)]
+    [DataRow("off-width rows", 100, true)]
+    public void ModelRestore_HistoryRoundTrips(string shape, int capacity, bool resizedBeforeStart)
+    {
+        var original = Detached(new FakeTimeProvider(), capacity: capacity);
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(HistoryLines(30)));
+        if (resizedBeforeStart)
+            original.Resize(30, 10);
+        var state = original.CaptureModelState();
+        Assert.IsNotEmpty(state.History!.Rows, "fixture: no history");
+        Assert.IsTrue(state.Styles.Any(s => s.Attributes.Contains("soft-wrap")), "fixture: no soft wrap");
+        if (resizedBeforeStart)
+            Assert.IsTrue(state.History.Rows.Any(r => r.OriginalWidth != state.Width), "fixture: no row at another width");
+
+        var replica = Detached(new FakeTimeProvider(), capacity: capacity);
+        replica.RestoreModelState(state);
+        var differences = JsonDifferences(Json(state), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(differences, $"{shape}: the restored history does not project back equal: " + string.Join("; ", differences.Take(5)));
+        Assert.AreEqual(Digest(original), Digest(replica), $"{shape}: the public view (viewport and retained rows) differs");
+        CollectionAssert.AreEqual(RingIds(original), RingIds(replica), $"{shape}: the ring's identities differ");
+    }
+
+    // Later output (with eviction), a shrink, a grow and leaving the alternate screen agree with the original under
+    // every strategy a case can record (evidence P1: seven reflow history, three do not).
+    [TestMethod]
+    [DynamicData(nameof(StrategiesAndShapes))]
+    public void ModelRestore_HistoryReflowsAsTheOriginal(string strategyId, string shape)
+    {
+        var strategy = CaseConfiguration.CreateReflowStrategy(strategyId)!;
+        var capacity = shape == "full" ? 12 : 100;
+        var original = Detached(new FakeTimeProvider(), strategy, capacity);
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(HistoryLines(30) + (shape == "alternate" ? "\u001b[?1049h\u001b[Halt text" : "")));
+        var replica = Detached(new FakeTimeProvider(), strategy, capacity);
+        replica.RestoreModelState(original.CaptureModelState());
+
+        void Both(Action<Hex1bTerminal> step, string at)
+        {
+            step(original);
+            step(replica);
+            var after = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+            Assert.IsEmpty(after, $"{strategyId} {shape} {at}: " + string.Join("; ", after.Take(4)));
+            Assert.AreEqual(Digest(original), Digest(replica), $"{strategyId} {shape} {at}: the public views differ");
+        }
+
+        Both(_ => { }, "start");
+        Both(t => t.ApplyRecordedOutput(Encoding.UTF8.GetBytes(HistoryLines(8, "more"))), "scrolled");
+        Both(t => t.Resize(24, 7), "shrunk");
+        Both(t => t.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b[1;36mafter shrink with a line long enough to wrap\u001b[m\r\n")), "output");
+        Both(t => t.Resize(70, 14), "grown");
+        if (shape == "alternate")
+            Both(t => t.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b[?1049lmain again\r\n")), "left the alternate screen");
+    }
+
+    // A recorded history the model cannot hold as recorded is refused before anything is applied.
+    [TestMethod]
+    [DataRow("ids not ascending")]
+    [DataRow("more rows than the capacity")]
+    [DataRow("another capacity")]
+    [DataRow("next id not beyond the last")]
+    public void ModelRestore_RefusesMalformedHistory(string shape)
+    {
+        var original = Detached(new FakeTimeProvider());
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(HistoryLines(20)));
+        var state = original.CaptureModelState();
+        var history = state.History!;
+        var rows = history.Rows.ToList();
+        history = shape switch
+        {
+            "ids not ascending" => history with { Rows = [rows[1], rows[0], .. rows.Skip(2)] },
+            "more rows than the capacity" => history with { Capacity = rows.Count - 1 },
+            "another capacity" => history with { Capacity = history.Capacity + 1 },
+            _ => history with { NextRowId = rows[^1].Id!.Value },
+        };
+        var replica = Detached(new FakeTimeProvider(), capacity: shape == "more rows than the capacity" ? rows.Count - 1 : 100);
+        var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(state with { History = history }));
+        StringAssert.Contains(error.Message, "history", shape);
+        Assert.AreEqual((0L, 0), (replica.CurrentModelSequence, replica.ScrollbackCount), $"{shape}: a refused restore changed the model");
+    }
+
+    // History hyperlinks are the replica's own, one counted reference per cell: its store holds exactly the distinct
+    // targets its cells reference, and none once every restored row is evicted and the screen cleared. (The original's
+    // own count is not an oracle: scrolling under-counts it, .scratch/hex1b-diagnostics/issues/17.)
+    [TestMethod]
+    public void ModelRestore_HistoryHyperlinksCountedOnce()
+    {
+        var original = Detached(new FakeTimeProvider(), capacity: 12);
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(1, 16).Select(i =>
+            $"\u001b]8;;https://x.test/{i % 3}\u001b\\link {i}\u001b]8;;\u001b\\\r\n"))));
+        var replica = Detached(new FakeTimeProvider(), capacity: 12);
+        replica.RestoreModelState(original.CaptureModelState());
+        var referenced = ReferencedTargets(replica);
+        Assert.IsGreaterThanOrEqualTo(3, referenced.Count, "fixture: the restored cells reference fewer than three targets");
+        Assert.IsTrue(replica.GetScrollbackRows(replica.ScrollbackCount).Any(r => r.Cells.Any(c => c.HyperlinkData is not null)), "fixture: no hyperlink in history");
+        Assert.AreEqual(referenced.Count, Store(replica).HyperlinkCount, "the store does not hold exactly the targets its cells reference");
+        // One counted reference per cell holding an object (no scroll has run yet, so issue 17 cannot interfere).
+        foreach (var (tracked, cells) in CellsPerObject(replica))
+            Assert.AreEqual(cells, tracked.RefCount, $"{tracked.Data.Uri}: {tracked.RefCount} references for {cells} cells");
+
+        // Scroll every restored row out of the ring and clear the screen: nothing references them, and none remain.
+        replica.ApplyRecordedOutput(Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(1, 30).Select(i => $"plain {i}\r\n")) + "\u001b[2J"));
+        Assert.AreEqual((0, 0), (ReferencedTargets(replica).Count, Store(replica).HyperlinkCount), "evicted history hyperlinks outlive their rows");
+    }
+
+    // Each tracked hyperlink object and how many cells hold it, through the public API (viewport and retained rows).
+    private static Dictionary<TrackedObject<HyperlinkData>, int> CellsPerObject(Hex1bTerminal terminal)
+    {
+        var counts = new Dictionary<TrackedObject<HyperlinkData>, int>(ReferenceEqualityComparer.Instance);
+        void Add(TrackedObject<HyperlinkData>? tracked)
+        {
+            if (tracked is not null)
+                counts[tracked] = counts.GetValueOrDefault(tracked) + 1;
+        }
+        for (var y = 0; y < terminal.Height; y++)
+            for (var x = 0; x < terminal.Width; x++)
+                Add(terminal.GetTrackedHyperlinkAt(x, y));
+        foreach (var row in terminal.GetScrollbackRows(terminal.ScrollbackCount))
+            foreach (var cell in row.Cells)
+                Add(cell.TrackedHyperlink);
+        return counts;
+    }
+
+    // The distinct hyperlink targets the model's cells reference, through the public API (viewport and retained rows).
+    private static HashSet<string> ReferencedTargets(Hex1bTerminal terminal)
+    {
+        var targets = new HashSet<string>(StringComparer.Ordinal);
+        void Add(HyperlinkData? data)
+        {
+            if (data is not null)
+                targets.Add(data.Uri + "\u0000" + data.Parameters);
+        }
+        using (var snapshot = terminal.CreateSnapshot())
+        {
+            for (var y = 0; y < snapshot.Height; y++)
+                for (var x = 0; x < snapshot.Width; x++)
+                    Add(snapshot.GetCell(x, y).HyperlinkData);
+        }
+        foreach (var row in terminal.GetScrollbackRows(terminal.ScrollbackCount))
+            foreach (var cell in row.Cells)
+                Add(cell.HyperlinkData);
+        return targets;
+    }
+
     [TestMethod]
     public void ModelRestore_HyperlinksLiveInReplicaStore()
     {
@@ -210,7 +356,7 @@ public class DiagnosticModelRestoreTests
     // Each refused surface is named, checked against the private field that holds it (not the projection).
     [TestMethod]
     [DataRow("", "plain\r\n", "")]
-    [DataRow("retained-history", "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9\r\n10\r\n11\r\n12\r\n", "_scrollbackBuffer")]
+    [DataRow("", "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9\r\n10\r\n11\r\n12\r\n", "_scrollbackBuffer")]
     [DataRow("", "main\u001b[?1049halt", "_savedMainScreenBuffer")]
     [DataRow("titles", "\u001b]2;T\u0007", "_windowTitle")]
     [DataRow("titles", "\u001b]1;I\u0007", "_iconName")]
@@ -237,17 +383,18 @@ public class DiagnosticModelRestoreTests
     {
         var model = Detached(new FakeTimeProvider());
         model.ApplyRecordedOutput([.. Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(1, 14).Select(i => $"{i}\r\n")) + "\u001b]2;T\u0007ok "), 0xe6, 0xbc]);
-        Assert.AreEqual("retained-history,titles,pending-input", string.Join(",", StartCheckpoint.Unsupported(model.CaptureModelState())));
+        // Retained history is restored since ticket 10; the other surfaces are still named, in order.
+        Assert.AreEqual("titles,pending-input", string.Join(",", StartCheckpoint.Unsupported(model.CaptureModelState())));
     }
 
     [TestMethod]
     public void ModelRestore_RefusesStateItCannotRepresent()
     {
         var model = Detached(new FakeTimeProvider());
-        model.ApplyRecordedOutput(Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(1, 14).Select(i => $"{i}\r\n"))));
+        model.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b]2;T\u0007"));
         var replica = Detached(new FakeTimeProvider());
         var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(model.CaptureModelState()));
-        StringAssert.Contains(error.Message, "retained history rows");
+        StringAssert.Contains(error.Message, "titles");
         Assert.AreEqual(0, replica.CurrentModelSequence, "a refused restore changed the model");
     }
 
@@ -271,16 +418,41 @@ public class DiagnosticModelRestoreTests
         Detached(new FakeTimeProvider()).RestoreModelState(state with { Rendition = rendition with { Foreground = "standard:7:#c0c0c0", UnderlineStyle = "curly" } });
     }
 
-    private static Hex1bTerminal Detached(TimeProvider clock) => new(new Hex1bTerminalOptions
+    private static Hex1bTerminal Detached(TimeProvider clock, Hex1b.Reflow.ITerminalReflowProvider? strategy = null, int? capacity = 100) =>
+        new(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = strategy is null
+                ? new HeadlessPresentationAdapter(40, 10)
+                : new HeadlessPresentationAdapter(40, 10).WithReflowStrategy(strategy, enabled: true),
+            WorkloadAdapter = new CaseReapplier.DetachedWorkload(),
+            Width = 40,
+            Height = 10,
+            ScrollbackCapacity = capacity,
+            TimeProvider = clock,
+            DeferStart = true,
+        });
+
+    // Styled lines, every third long enough to soft-wrap past the right edge.
+    private static string HistoryLines(int lines, string prefix = "row") => string.Concat(Enumerable.Range(1, lines).Select(i =>
+        i % 3 == 0
+            ? $"\u001b[{31 + i % 6}m{prefix} {i} is a styled line long enough to soft-wrap past the right edge of the screen\u001b[m\r\n"
+            : $"{prefix} {i} \u001b[1mbold\u001b[m plain\r\n"));
+
+    // The retained rows' identities, read from the ring itself (no projection): the oracle for ids.
+    private static long[] RingIds(Hex1bTerminal terminal)
     {
-        PresentationAdapter = new HeadlessPresentationAdapter(40, 10),
-        WorkloadAdapter = new CaseReapplier.DetachedWorkload(),
-        Width = 40,
-        Height = 10,
-        ScrollbackCapacity = 100,
-        TimeProvider = clock,
-        DeferStart = true,
-    });
+        var buffer = typeof(Hex1bTerminal).GetField("_scrollbackBuffer", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(terminal);
+        if (buffer is null)
+            return [];
+        var count = (int)buffer.GetType().GetProperty("Count")!.GetValue(buffer)!;
+        var entries = (Array)buffer.GetType().GetMethod("GetEntries", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(buffer, [count])!;
+        return entries.Cast<object>().Select(e => (long)e.GetType().GetProperty("RowId")!.GetValue(e)!).ToArray();
+    }
+
+    public static IEnumerable<object[]> StrategiesAndShapes() =>
+        from strategy in CaseConfiguration.StrategyIds
+        from shape in new[] { "partial", "full", "alternate" }
+        select new object[] { strategy, shape };
 
     // Where the model records that the alternate screen is selected: both graphics states and the saved main text
     // coordinates (evidence P9).
@@ -330,6 +502,14 @@ public class DiagnosticModelRestoreTests
                     .Append(cell.Attributes).Append('/').Append(cell.UnderlineStyle).Append('/').Append(cell.UnderlineColor).Append('/')
                     .Append(cell.HyperlinkData?.Uri).Append('|');
             }
+            builder.Append('\n');
+        }
+        foreach (var row in terminal.GetScrollbackRows(terminal.ScrollbackCount))
+        {
+            builder.Append('[').Append(row.OriginalWidth).Append(']');
+            foreach (var cell in row.Cells)
+                builder.Append(cell.Character).Append('/').Append(cell.Foreground).Append('/').Append(cell.Attributes).Append('/')
+                    .Append(cell.HyperlinkData?.Uri).Append('|');
             builder.Append('\n');
         }
         return builder.ToString();

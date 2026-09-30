@@ -66,7 +66,8 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     public async Task Start_UnsupportedSurfaceStillRecords()
     {
-        // Retained rows, a title and pending UTF-8 at once: each is named, in order, and the case records.
+        // Retained rows (restored since ticket 10), a title and pending UTF-8 at once: each refused surface is named,
+        // in order, and the case records.
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
         await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
@@ -84,7 +85,7 @@ public partial class DiagnosticCaseTests
         var artifact = Artifact.Read(path);
         var checkpoint = artifact.Manifest.GetProperty("checkpoint");
         Assert.AreEqual(("text-state/1", "unsupported"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()));
-        Assert.AreEqual("retained-history,titles,pending-input",
+        Assert.AreEqual("titles,pending-input",
             string.Join(",", checkpoint.GetProperty("unsupportedSurfaces").EnumerateArray().Select(s => s.GetString())));
         StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "unsupported-surfaces:");
         Assert.IsFalse(artifact.Events.Any(e => e.GetProperty("kind").GetString() == "checkpoint"
@@ -94,7 +95,7 @@ public partial class DiagnosticCaseTests
         // Re-application of an unsupported start is refused before anything is written.
         var refused = Reapply(path, label: "stop");
         Assert.AreEqual((DiagnosticOutcome.Unavailable, "no-valid-interval"), (refused.Outcome, refused.Problem?.Code), refused.Problem?.Message);
-        StringAssert.Contains(refused.Problem!.Message, "retained-history");
+        StringAssert.Contains(refused.Problem!.Message, "titles");
         Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), "a refused re-application wrote a run");
     }
 
@@ -500,7 +501,6 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
-    [DataRow("retained-history", "history")]
     [DataRow("titles", "titles")]
     [DataRow("pending-input", "pendingInput")]
     [DataRow("command-marks", "commandMarks")]
@@ -514,9 +514,6 @@ public partial class DiagnosticCaseTests
             var state = node["checkpoint"]!["state"]!.AsObject();
             switch (field)
             {
-                case "history":
-                    state["history"] = JsonNode.Parse("""{"capacity":10,"nextRowId":2,"rows":[{"cells":[{"t":"x","s":0}],"id":1,"originalWidth":1}]}""");
-                    break;
                 case "titles":
                     state["titles"]!["window"] = "T";
                     break;

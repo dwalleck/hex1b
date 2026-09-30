@@ -48,6 +48,9 @@ internal static class CaseConfiguration
     }
 
     /// <summary>The strategy a recorded name denotes, or null when this build cannot rebuild it.</summary>
+    /// <summary>The reflow strategy ids a re-applied model can be rebuilt with.</summary>
+    internal static IEnumerable<string> StrategyIds => Strategies.Select(s => s.Id);
+
     internal static ITerminalReflowProvider? CreateReflowStrategy(string id)
     {
         foreach (var (known, strategy) in Strategies)

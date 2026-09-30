@@ -17,8 +17,9 @@ public sealed partial class Hex1bTerminal
     /// write-order fields keep this model's values, as the census classifies them.
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// The state holds something this restore cannot represent (retained rows, titles, command marks, pending
-    /// input, or an unsupported surface), or the model has already applied output.
+    /// The state holds something this restore cannot represent (titles, command marks, pending input, an
+    /// unsupported surface, or a history this model's configured scrollback cannot hold as recorded), or the model
+    /// has already applied output.
     /// </exception>
     internal void RestoreModelState(DiagnosticModelState state)
     {
@@ -28,6 +29,8 @@ public sealed partial class Hex1bTerminal
         {
             if (_modelSequence != 0 || (_scrollbackBuffer?.Count ?? 0) != 0)
                 throw new InvalidOperationException("Only a model that has applied nothing can be restored.");
+            if (HistoryProblem(state.History, _scrollbackBuffer) is { } historyProblem)
+                throw new InvalidOperationException($"The state cannot be restored: its history {historyProblem}");
         }
 
         var cells = new TerminalCell[state.Styles.Count];
@@ -50,11 +53,23 @@ public sealed partial class Hex1bTerminal
 
         lock (_bufferLock)
         {
-            // The resizes of an empty model move no text into history; the model is still otherwise fresh. An empty
-            // history continues the row identities the original had advanced (its rows were cleared).
+            // The resizes of an empty model move no text into history; the model is still otherwise fresh. The
+            // retained rows are restored in order with their identities, and the next identity continues past
+            // cleared or evicted rows.
             _scrollbackBuffer?.Clear();
             if (state.History is { } history && _scrollbackBuffer is { } scrollback)
-                scrollback.SeedNextRowId(history.NextRowId);
+            {
+                var rows = new (TerminalCell[] Cells, int OriginalWidth, long RowId)[history.Rows.Count];
+                for (var row = 0; row < rows.Length; row++)
+                {
+                    var projected = history.Rows[row];
+                    var rowCells = new TerminalCell[projected.Cells.Count];
+                    for (var column = 0; column < rowCells.Length; column++)
+                        rowCells[column] = RestoreCell(projected.Cells[column], state.Styles, cells, built);
+                    rows[row] = (rowCells, projected.OriginalWidth ?? rowCells.Length, projected.Id ?? 0);
+                }
+                scrollback.RestoreRows(rows, history.NextRowId, _timeProvider.GetUtcNow());
+            }
             RestoreScreenUnsafe(state.Screen, state.Styles, cells, built);
 
             _cursorX = state.Cursor.X;
@@ -134,6 +149,21 @@ public sealed partial class Hex1bTerminal
         }
     }
 
+    // Why a recorded history cannot be restored into this model's configured scrollback, or null: its presence and
+    // capacity must be the configuration's, and its rows and identities a ring the buffer can hold as recorded.
+    private static string? HistoryProblem(DiagnosticModelHistory? history, ScrollbackBuffer? scrollback)
+    {
+        if (history is null)
+            return scrollback is null ? null : "is absent, but the model is configured with a scrollback.";
+        if (scrollback is null)
+            return "is present, but the model is configured without a scrollback.";
+        if (history.Capacity != scrollback.Capacity)
+            return $"capacity {history.Capacity} is not the configured {scrollback.Capacity}.";
+        if (history.Rows.Any(row => row.Id is null || row.OriginalWidth is null))
+            return "has a row without its identity or original width.";
+        return ScrollbackBuffer.RestoreProblem(history.Rows.Count, history.Rows.Select(row => row.Id!.Value), history.NextRowId, scrollback.Capacity);
+    }
+
     // Writes projected rows into the active screen buffer, which has their geometry.
     private void RestoreScreenUnsafe(IReadOnlyList<DiagnosticModelRow> rows, IReadOnlyList<DiagnosticModelStyle> styles,
         TerminalCell[] cells, bool[] built)
@@ -152,10 +182,7 @@ public sealed partial class Hex1bTerminal
     {
         if (state.Profile != DiagnosticCaseCheckpointProfiles.TextState)
             return $"profile '{state.Profile}'";
-        if (state.History is { Rows.Count: > 0 })
-            return "retained history rows";
-        if (state.History is { NextRowId: < 1 })
-            return "a history whose next row identity is not positive";
+
         if ((state.SavedMainScreen is not null) != (state.ActiveBuffer == "alternate") || state.ActiveBuffer is not ("main" or "alternate"))
             return $"an active buffer '{state.ActiveBuffer}' that does not match its saved main screen";
         if (state.SavedMainScreen is { Count: > 0 } saved && saved.Any(row => row.Cells.Count != saved[0].Cells.Count))
