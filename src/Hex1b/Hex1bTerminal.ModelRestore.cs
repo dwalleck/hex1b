@@ -27,6 +27,7 @@ public sealed partial class Hex1bTerminal
     {
         if (UnrestorableField(state) is { } field)
             throw new InvalidOperationException($"The state cannot be restored: it holds {field}.");
+        Dictionary<DiagnosticModelRow, long[]> sequences;
         lock (_bufferLock)
         {
             if (_modelSequence != 0 || (_scrollbackBuffer?.Count ?? 0) != 0)
@@ -39,6 +40,7 @@ public sealed partial class Hex1bTerminal
             // Marks last: their positions are checked against rows already validated above.
             if (CommandMarksProblem(state) is { } marksProblem)
                 throw new InvalidOperationException($"The state cannot be restored: it holds {marksProblem}.");
+            sequences = RestoredSequencesUnsafe(state);
         }
 
         var cells = new TerminalCell[state.Styles.Count];
@@ -51,7 +53,7 @@ public sealed partial class Hex1bTerminal
                 Resize(savedWidth, savedHeight);
             lock (_bufferLock)
             {
-                RestoreScreenUnsafe(savedMain, state.Styles, cells, built);
+                RestoreScreenUnsafe(savedMain, state.Styles, cells, built, sequences);
                 DoEnterAlternateScreen();
             }
         }
@@ -74,12 +76,12 @@ public sealed partial class Hex1bTerminal
                     var rowCells = new TerminalCell[projected.Cells.Count];
                     for (var column = 0; column < rowCells.Length; column++)
                         rowCells[column] = RestoreCell(projected.Cells[column], state.Styles, cells, built);
-                    SequenceRestoredRowUnsafe(rowCells, projected);
+                    SequenceRestoredRow(rowCells, sequences[projected]);
                     rows[row] = (rowCells, projected.OriginalWidth ?? rowCells.Length, projected.Id ?? 0);
                 }
                 scrollback.RestoreRows(rows, history.NextRowId, _timeProvider.GetUtcNow());
             }
-            RestoreScreenUnsafe(state.Screen, state.Styles, cells, built);
+            RestoreScreenUnsafe(state.Screen, state.Styles, cells, built, sequences);
 
             _cursorX = state.Cursor.X;
             _cursorY = state.Cursor.Y;
@@ -196,7 +198,7 @@ public sealed partial class Hex1bTerminal
 
     // Writes projected rows into the active screen buffer, which has their geometry.
     private void RestoreScreenUnsafe(IReadOnlyList<DiagnosticModelRow> rows, IReadOnlyList<DiagnosticModelStyle> styles,
-        TerminalCell[] cells, bool[] built)
+        TerminalCell[] cells, bool[] built, Dictionary<DiagnosticModelRow, long[]> sequences)
     {
         for (var row = 0; row < rows.Count; row++)
         {
@@ -204,7 +206,7 @@ public sealed partial class Hex1bTerminal
             var rowCells = new TerminalCell[projected.Count];
             for (var column = 0; column < rowCells.Length; column++)
                 rowCells[column] = RestoreCell(projected[column], styles, cells, built);
-            SequenceRestoredRowUnsafe(rowCells, rows[row]);
+            SequenceRestoredRow(rowCells, sequences[rows[row]]);
             for (var column = 0; column < rowCells.Length; column++)
                 SetCell(row, column, rowCells[column], damageSixel: false);
         }
@@ -219,9 +221,10 @@ public sealed partial class Hex1bTerminal
 
         if ((state.SavedMainScreen is not null) != (state.ActiveBuffer == "alternate") || state.ActiveBuffer is not ("main" or "alternate"))
             return $"an active buffer '{state.ActiveBuffer}' that does not match its saved main screen";
-        if (RowsProblem(state.Screen, "a screen") is { } screenProblem)
+        var historyLast = state.History?.Rows is { Count: > 0 } historyRows ? historyRows[^1] : null;
+        if (RowsProblem(state.Screen, "a screen", state.ActiveBuffer == "main" ? historyLast : null) is { } screenProblem)
             return screenProblem;
-        if (state.SavedMainScreen is not null && RowsProblem(state.SavedMainScreen, "a saved main screen") is { } savedProblem)
+        if (state.SavedMainScreen is not null && RowsProblem(state.SavedMainScreen, "a saved main screen", historyLast) is { } savedProblem)
             return savedProblem;
         if (state.SavedMainScreen is { Count: > 0 } saved && saved.Any(row => row.Cells.Count != saved[0].Cells.Count))
             return "a saved main screen whose rows do not share one width";
@@ -242,35 +245,65 @@ public sealed partial class Hex1bTerminal
 
     // One restored cell. A style's colours and attributes are parsed once; each cell holding a hyperlink takes
     // its own counted reference from this model's store, as a cell written by output does.
-    // Restored cells get write sequences in row order: a never-written cell 0, as in the original; a projected continuation
-    // its left neighbour's (as when both were written together); every other cell its own. Code that tells cells of one
-    // glyph by a shared sequence (anchors, selection, rendering) then reads the restored row as the original's, and so
-    // does later output that meets never-written cells. The values themselves are write order and are not projected;
-    // which cells share one is.
-    private void SequenceRestoredRowUnsafe(TerminalCell[] row, DiagnosticModelRow projected)
+    // Restored cells get write sequences in reading order (the main buffer's history rows then its screen, which is the
+    // saved main screen while the alternate screen is active; the alternate screen alone): a never-written cell 0, as in
+    // the original; a projected continuation the sequence of the cell before it (to its left, or at a row's first column
+    // the previous row's last cell, across a soft wrap); every other cell its own. Code that tells cells of one glyph by a
+    // shared sequence (anchors, selection, rendering, reflow) then reads the restored rows as the original's, and so does
+    // later output that meets never-written cells. The values themselves are write order and are not projected; which
+    // cells share one is. Assigned before any row is written, because the saved main screen is restored before history.
+    private Dictionary<DiagnosticModelRow, long[]> RestoredSequencesUnsafe(DiagnosticModelState state)
     {
-        var unwritten = UnwrittenMask(projected.Unwritten, row.Length);
-        for (var column = 0; column < row.Length; column++)
+        var result = new Dictionary<DiagnosticModelRow, long[]>(ReferenceEqualityComparer.Instance);
+        void Assign(IEnumerable<DiagnosticModelRow> rows)
         {
-            var sequence = unwritten[column] ? 0
-                : column > 0 && projected.Cells[column].Continues ? row[column - 1].Sequence
-                : ++_writeSequence;
-            row[column] = row[column] with { Sequence = sequence };
+            long? previous = null;
+            foreach (var row in rows)
+            {
+                var unwritten = UnwrittenMask(row.Unwritten, row.Cells.Count);
+                var sequences = new long[row.Cells.Count];
+                for (var column = 0; column < sequences.Length; column++)
+                {
+                    var before = column > 0 ? sequences[column - 1] : previous;
+                    sequences[column] = unwritten[column] ? 0
+                        : row.Cells[column].Continues && before is { } shared ? shared
+                        : ++_writeSequence;
+                }
+                if (sequences.Length > 0)
+                    previous = sequences[^1];
+                result[row] = sequences;
+            }
         }
+        var mainScreen = state.ActiveBuffer == "alternate" ? state.SavedMainScreen! : state.Screen;
+        Assign([.. state.History?.Rows ?? [], .. mainScreen]);
+        if (state.ActiveBuffer == "alternate")
+            Assign(state.Screen);
+        return result;
     }
 
+    private static void SequenceRestoredRow(TerminalCell[] row, long[] sequences)
+    {
+        for (var column = 0; column < row.Length; column++)
+            row[column] = row[column] with { Sequence = sequences[column] };
+    }
+
+    // The never-written cells of a row. Runs outside the row are skipped here: validation names them, and may read a row
+    // before its own runs are validated.
     private static bool[] UnwrittenMask(IReadOnlyList<int>? runs, int width)
     {
         var mask = new bool[width];
         for (var i = 0; runs is not null && i + 1 < runs.Count; i += 2)
-            Array.Fill(mask, true, runs[i], runs[i + 1]);
+        {
+            if (runs[i] >= 0 && runs[i + 1] > 0 && (long)runs[i] + runs[i + 1] <= width)
+                Array.Fill(mask, true, runs[i], runs[i + 1]);
+        }
         return mask;
     }
 
     // Why projected rows cannot be restored, or null: every row present with its cells, a continuation only on an empty
     // cell after the first column and never across a never-written run's edge, and the runs start, count pairs in column
     // order within the row.
-    private static string? RowsProblem(IReadOnlyList<DiagnosticModelRow>? rows, string what)
+    private static string? RowsProblem(IReadOnlyList<DiagnosticModelRow>? rows, string what, DiagnosticModelRow? before = null)
     {
         if (rows is null)
             return $"{what}: missing";
@@ -285,15 +318,23 @@ public sealed partial class Hex1bTerminal
                     return $"{what} row {row}: never-written runs that are not start, count pairs";
                 for (var i = 0; i < runs.Count; i += 2)
                 {
-                    if (runs[i] < end || runs[i + 1] < 1 || runs[i] + runs[i + 1] > cells.Count)
+                    if (runs[i] < end || runs[i + 1] < 1 || (long)runs[i] + runs[i + 1] > cells.Count)
                         return $"{what} row {row}: a never-written run at {runs[i]} that is out of order or outside the row";
                     end = runs[i] + runs[i + 1];
                 }
             }
             var unwritten = UnwrittenMask(rows[row].Unwritten, cells.Count);
+            // The row before in reading order, for a continuation at the first column (across a soft wrap).
+            var previous = row > 0 ? rows[row - 1] : before;
+            var previousUnwritten = previous?.Cells is { Count: > 0 } previousCells
+                ? UnwrittenMask(previous.Unwritten, previousCells.Count)[^1]
+                : (bool?)null;
             for (var column = 0; column < cells.Count; column++)
             {
-                if (cells[column].Continues && (column == 0 || cells[column].Text is not { Length: 0 } || unwritten[column] != unwritten[column - 1]))
+                if (!cells[column].Continues)
+                    continue;
+                var leftUnwritten = column > 0 ? unwritten[column - 1] : previousUnwritten;
+                if (cells[column].Text is not { Length: 0 } || leftUnwritten is not { } left || unwritten[column] != left)
                     return $"{what} row {row}: a continuation at column {column} that continues nothing";
             }
         }

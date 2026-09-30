@@ -99,8 +99,13 @@ public sealed partial class Hex1bTerminal
         {
             _modelStateCaptures++;
             var styles = new ModelStyleTable();
-            var screen = ProjectScreen(_screenBuffer, styles);
-            var savedMain = _savedMainScreenBuffer is { } main ? ProjectScreen(main, styles) : null;
+            // In reading order the main screen (or, on the alternate screen, the saved main screen) follows the history,
+            // so its first cell can continue the history's last glyph across a soft wrap; the alternate screen stands alone.
+            long? historyLast = _scrollbackBuffer is { Count: > 0 } retained && retained.GetEntryAt(retained.Count - 1).Row.Cells is { Length: > 0 } lastCells
+                ? lastCells[^1].Sequence
+                : null;
+            var screen = ProjectScreen(_screenBuffer, styles, _inAlternateScreen ? null : historyLast);
+            var savedMain = _savedMainScreenBuffer is { } main ? ProjectScreen(main, styles, historyLast) : null;
 
             DiagnosticModelHistory? history = null;
             if (_scrollbackBuffer is { } scrollback)
@@ -110,9 +115,10 @@ public sealed partial class Hex1bTerminal
                 for (var i = 0; i < entries.Length; i++)
                 {
                     var row = entries[i].Row;
+                    long? before = i > 0 && entries[i - 1].Row.Cells is { Length: > 0 } previous ? previous[^1].Sequence : null;
                     var cells = new DiagnosticModelCell[row.Cells.Length];
                     for (var column = 0; column < cells.Length; column++)
-                        cells[column] = ProjectCell(row.Cells[column], styles, column > 0 && Continues(row.Cells[column], row.Cells[column - 1]));
+                        cells[column] = ProjectCell(row.Cells[column], styles, Continues(row.Cells[column], column > 0 ? row.Cells[column - 1].Sequence : before));
                     rows[i] = new DiagnosticModelRow
                     {
                         Cells = cells,
@@ -277,7 +283,7 @@ public sealed partial class Hex1bTerminal
         ["wraparound"] = _wraparoundMode,
     };
 
-    private static DiagnosticModelRow[] ProjectScreen(TerminalCell[,] buffer, ModelStyleTable styles)
+    private static DiagnosticModelRow[] ProjectScreen(TerminalCell[,] buffer, ModelStyleTable styles, long? before)
     {
         var height = buffer.GetLength(0);
         var width = buffer.GetLength(1);
@@ -285,8 +291,9 @@ public sealed partial class Hex1bTerminal
         for (var row = 0; row < height; row++)
         {
             var cells = new DiagnosticModelCell[width];
+            long? previous = row > 0 ? (width > 0 ? buffer[row - 1, width - 1].Sequence : null) : before;
             for (var column = 0; column < width; column++)
-                cells[column] = ProjectCell(buffer[row, column], styles, column > 0 && Continues(buffer[row, column], buffer[row, column - 1]));
+                cells[column] = ProjectCell(buffer[row, column], styles, Continues(buffer[row, column], column > 0 ? buffer[row, column - 1].Sequence : previous));
             var at = row;
             rows[row] = new DiagnosticModelRow { Cells = cells, Unwritten = UnwrittenRuns(width, column => buffer[at, column].Sequence) };
         }
@@ -318,10 +325,11 @@ public sealed partial class Hex1bTerminal
         return runs?.ToArray();
     }
 
-    // Whether an empty cell continues the glyph to its left, as every reader of a row decides it (anchors, selection,
-    // rendering): both were written together, so they share a write sequence.
-    private static bool Continues(in TerminalCell cell, in TerminalCell left) =>
-        cell.Character.Length == 0 && cell.Sequence == left.Sequence;
+    // Whether an empty cell continues the glyph before it in reading order (the cell to its left, or at a row's first column
+    // the previous row's last cell, across a soft wrap): both were written together, so they share a write sequence. This
+    // is how every reader of the cells decides it (anchors, selection, rendering, reflow).
+    private static bool Continues(in TerminalCell cell, long? before) =>
+        cell.Character.Length == 0 && before is { } sequence && cell.Sequence == sequence;
 
     private static DiagnosticModelStyle ProjectStyle(in TerminalCell cell)
     {

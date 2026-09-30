@@ -339,6 +339,102 @@ public partial class DiagnosticModelRestoreTests
         Assert.IsEmpty(differences, $"{shape}: " + string.Join("; ", differences.Take(3)));
     }
 
+    // A reflow splits a two-cell cluster across a soft wrap (its second half at the next row's first column), and a later
+    // reflow rejoins it: the replica must know the halves belong together (review round 4, RR4#1).
+    [TestMethod]
+    [DataRow("ghostty", "\u0E01\u0E33")]
+    [DataRow("kitty", "\u0E01\u0E33")]
+    [DataRow("alacritty", "\u1100\u1161\u11A8")]
+    [DataRow("wezterm", "\u0915\u093F")]
+    [DataRow("foot", "\u0E01\u0E33")]
+    [DataRow("vte", "\u1100\u1161\u11A8")]
+    [DataRow("windows-terminal", "\u0915\u093F")]
+    public void ModelRestore_ClusterSplitAcrossAWrapRejoins(string strategy, string cluster)
+    {
+        Hex1bTerminal Model() => new(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = new HeadlessPresentationAdapter(9, 4).WithReflowStrategy(CaseConfiguration.CreateReflowStrategy(strategy)!, enabled: true),
+            WorkloadAdapter = new CaseReapplier.DetachedWorkload(),
+            Width = 9,
+            Height = 4,
+            TimeProvider = new FakeTimeProvider(),
+            DeferStart = true,
+        });
+        var original = Model();
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("abcd" + cluster + "xyz"));
+        original.Resize(5, 4);
+        var state = original.CaptureModelState();
+        Assert.IsTrue(state.Screen[1].Cells[0].Continues, $"fixture: {strategy} did not split the cluster across the wrap");
+        var replica = Model();
+        replica.RestoreModelState(state);
+        foreach (var t in new[] { original, replica })
+        {
+            t.Resize(9, 4);
+            t.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b[1;6H\u001b]133;A\u0007"));
+        }
+        var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(differences, $"{strategy}: " + string.Join("; ", differences.Take(3)));
+    }
+
+    [TestMethod]
+    [DataRow("ghostty")]
+    [DataRow("kitty")]
+    public void ModelRestore_ClusterSplitAcrossAWrapRejoinsInHistory(string strategy)
+    {
+        // The split pair scrolls into history before the start; a grow rejoins it there.
+        Hex1bTerminal Model() => new(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = new HeadlessPresentationAdapter(9, 4).WithReflowStrategy(CaseConfiguration.CreateReflowStrategy(strategy)!, enabled: true),
+            WorkloadAdapter = new CaseReapplier.DetachedWorkload(),
+            Width = 9,
+            Height = 4,
+            ScrollbackCapacity = 20,
+            TimeProvider = new FakeTimeProvider(),
+            DeferStart = true,
+        });
+        var original = Model();
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("abcd\u0E01\u0E33xyz"));
+        original.Resize(5, 4);
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\r\n\r\n\r\n\r\n"));
+        var state = original.CaptureModelState();
+        Assert.IsTrue(state.History!.Rows.Any(r => r.Cells.Count > 0 && r.Cells[0].Continues), $"fixture: {strategy} has no split cluster in history");
+        var replica = Model();
+        replica.RestoreModelState(state);
+        foreach (var t in new[] { original, replica })
+            t.Resize(9, 4);
+        var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(differences, $"{strategy}: " + string.Join("; ", differences.Take(3)));
+    }
+
+    // The projected never-written runs are exactly the cells with write sequence 0, read raw from the screen and the
+    // history rows (review round 4, RR4#4): several runs in a row, and history rows too.
+    [TestMethod]
+    public void Projection_UnwrittenRunsAreTheSequenceZeroCells()
+    {
+        var original = MarkModel(MarkScenarios["screen and history"], "none");
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("abcdefghij\u001b[3G\u001b[2X\u001b[7G\u001b[1X\r\n" + MarkLines(10) + "0123456789\u001b[2G\u001b[3X"));
+        var state = original.CaptureModelState();
+        var screen = (TerminalCell[,])PrivateField(original, "_screenBuffer");
+        for (var row = 0; row < state.Screen.Count; row++)
+            CollectionAssert.AreEqual(Zeros(Enumerable.Range(0, screen.GetLength(1)).Select(c => screen[row, c].Sequence)), Mask(state.Screen[row]), $"screen row {row}");
+        var history = original.GetScrollbackRows(original.ScrollbackCount).ToList();
+        Assert.IsGreaterThan(0, history.Count, "fixture: no history");
+        for (var row = 0; row < history.Count; row++)
+            CollectionAssert.AreEqual(Zeros(history[row].Cells.ToArray().Select(c => c.Sequence)), Mask(state.History!.Rows[row]), $"history row {row}");
+        Assert.IsTrue(state.History!.Rows.Any(r => r.Unwritten is { Count: >= 4 }) || state.Screen.Any(r => r.Unwritten is { Count: >= 4 }),
+            "fixture: no row with two runs");
+
+        static bool[] Zeros(IEnumerable<long> sequences) => [.. sequences.Select(s => s == 0)];
+        static bool[] Mask(DiagnosticModelRow row)
+        {
+            var mask = new bool[row.Cells.Count];
+            for (var i = 0; row.Unwritten is { } runs && i < runs.Count; i += 2)
+                for (var c = runs[i]; c < runs[i] + runs[i + 1]; c++)
+                    mask[c] = true;
+            return mask;
+        }
+    }
+
     // The flag is projected at every column after the first and on history rows too (review round 3, RR3#3).
     [TestMethod]
     public void ModelRestore_ContinuationFlagsProjectedEverywhere()
@@ -406,9 +502,14 @@ public partial class DiagnosticModelRestoreTests
     [DataRow("a never-written run past the row")]
     [DataRow("never-written runs out of order")]
     [DataRow("a continuation across a never-written edge")]
+    [DataRow("overlapping never-written runs")]
+    [DataRow("a never-written run of zero cells")]
+    [DataRow("empty never-written runs")]
+    [DataRow("a never-written run that overflows")]
     public void ModelRestore_RefusesMalformedRows(string shape)
     {
-        var shapeScenario = shape.Contains("saved") ? MarkScenarios["alternate"] : MarkScenarios["screen and history"];
+        // The alternate screen's first row has no row before it in reading order, so nothing there can continue.
+        var shapeScenario = shape.Contains("saved") || shape == "a continuation at column 0" ? MarkScenarios["alternate"] : MarkScenarios["screen and history"];
         var original = MarkModel(shapeScenario, "none");
         original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(shapeScenario.Before + "\u6f22"));
         var state = original.CaptureModelState();
@@ -426,6 +527,10 @@ public partial class DiagnosticModelRestoreTests
             "never-written runs not in pairs" => state with { Screen = Rows(state.Screen, 1, r => r with { Unwritten = [3] }) },
             "a never-written run past the row" => state with { Screen = Rows(state.Screen, 1, r => r with { Unwritten = [30, 11] }) },
             "never-written runs out of order" => state with { Screen = Rows(state.Screen, 1, r => r with { Unwritten = [10, 2, 4, 2] }) },
+            "overlapping never-written runs" => state with { Screen = Rows(state.Screen, 1, r => r with { Unwritten = [2, 4, 5, 2] }) },
+            "a never-written run of zero cells" => state with { Screen = Rows(state.Screen, 1, r => r with { Unwritten = [2, 0] }) },
+            "empty never-written runs" => state with { Screen = Rows(state.Screen, 1, r => r with { Unwritten = [] }) },
+            "a never-written run that overflows" => state with { Screen = Rows(state.Screen, 1, r => r with { Unwritten = [1, int.MaxValue] }) },
             "a continuation across a never-written edge" => state with
             {
                 Screen = Rows(state.Screen, 1, r => r with

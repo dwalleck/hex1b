@@ -21,7 +21,8 @@ public readonly record struct DiagnosticModelCell
     public bool WideWrapPadding { get; init; }
 
     /// <summary>
-    /// Whether this empty cell continues the glyph in the cell to its left (they share a write sequence, as when written
+    /// Whether this empty cell continues the glyph in the cell before it in reading order: the cell to its left, or, at a
+    /// row's first column, the previous row's last cell across a soft wrap (they share a write sequence, as when written
     /// together); omitted when false.
     /// </summary>
     [JsonPropertyName("c")]

@@ -655,7 +655,7 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
   soft-wrapped row or on a wide glyph's wrap padding is moved to the next row's start, and a mark
   whose row is gone is dropped, there and nowhere in the recording. A re-application can then report
   `different` at that mark (`commandMarks[i].row`/`column`).
-- A start records which empty cells continue the glyph to their left (`c`) and which cells were
-  never written (a row's `unwritten` runs), not which orphaned half belongs to which glyph elsewhere
+- A start records which empty cells continue the glyph before them in reading order (`c`, including
+  a row's first cell continuing a glyph split across a soft wrap) and which cells were never written (a row's `unwritten` runs), not which orphaned half belongs to which glyph elsewhere
   on the row. A later left/right-margin scroll that rejoins an orphaned half with its own glyph can
   therefore place a new mark there one column off in the re-application.
