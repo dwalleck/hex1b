@@ -618,18 +618,22 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
-    public async Task Start_TooLargeForTheCaseIsUnsupported()
+    [DataRow("geometry", 600, 200)]
+    [DataRow("styles", 100, 100)]
+    public async Task Start_TooLargeForTheCaseIsUnsupported(string kind, int width, int height)
     {
         // A start whose state cannot fit the case's size bound is refused at arming, not written as a missing line
-        // under a manifest that claims it complete.
+        // under a manifest that claims it complete. "geometry": the estimate alone refuses it, without a projection;
+        // "styles": a distinct truecolor style per cell fits the estimate but not the bound (review RR2-1).
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
-        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(600, 200).Build();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(width, height).Build();
         string path;
         long before, after;
         using (new Running(terminal))
         {
-            await workload.WriteAndWaitAsync(terminal, "populated");
+            await workload.WriteAndWaitAsync(terminal, kind == "geometry" ? "populated" : string.Concat(Enumerable.Range(0, width * height)
+                .Select(i => $"\u001b[38;2;{i % 256};{i / 256 % 256};7m\u001b[48;2;9;{i % 251};{i % 239}m\u2580")));
             before = terminal.ModelStateCapturesForTesting;
             path = new TerminalDiagnostics(terminal).StartCase(new DiagnosticCaseStartRequest
             {
@@ -642,7 +646,8 @@ public partial class DiagnosticCaseTests
             await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
         }
 
-        Assert.AreEqual(before, after, "a start that cannot fit took a projection");
+        if (kind == "geometry")
+            Assert.AreEqual(before, after, "a start that the estimate refuses took a projection");
         var artifact = Artifact.Read(path);
         var checkpoint = artifact.Manifest.GetProperty("checkpoint");
         Assert.AreEqual("unsupported", checkpoint.GetProperty("status").GetString());
@@ -692,6 +697,40 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual(DiagnosticCaseCheckpointStatus.Complete, FreshModelCheckpoint.Describe(true, true, null, configuration).Status);
         Assert.AreEqual(DiagnosticCaseCheckpointStatus.Excluded, FreshModelCheckpoint.Describe(false, false, null, configuration).Status);
         Assert.AreEqual(DiagnosticCaseCheckpointStatus.Unsupported, FreshModelCheckpoint.Describe(false, true, "hmp1-workload", configuration).Status);
+    }
+
+    [TestMethod]
+    public async Task Start_LineIsWrittenBeforeEveryModelEvent()
+    {
+        // The start is sized for the room after the manifest (review RR2-1), so the writer writes it first: model events
+        // queued before the writer's first pass follow it in the file.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10).Build();
+        using var gate = new ManualResetEventSlim(false);
+        string path;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "before");
+            DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+            try
+            {
+                path = StartLive(terminal, root);
+            }
+            finally
+            {
+                DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+            }
+            // Queued while the writer's first pass is held.
+            await workload.WriteAndWaitAsync(terminal, " one");
+            await workload.WriteAndWaitAsync(terminal, " two");
+            gate.Set();
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var first = Artifact.Read(path).Events[0];
+        Assert.AreEqual(("case", "checkpoint", "start"), (first.GetProperty("stream").GetString(), first.GetProperty("kind").GetString(),
+            first.GetProperty("checkpoint").GetProperty("trigger").GetString()), "the start line is not the first event line");
     }
 
     private static bool IsStart(JsonNode node) => node["checkpoint"]?["trigger"]?.GetValue<string>() == "start";

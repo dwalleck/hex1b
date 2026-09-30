@@ -257,6 +257,8 @@ public class DiagnosticModelRestoreTests
     [DataRow("underline-style", "1")]
     [DataRow("underline-style", "1-")]
     [DataRow("underline-style", "0-1")]
+    [DataRow("underline-style", "single,double")]
+    [DataRow("underline-style", "Curly")]
     [DataRow("foreground", "standard:9:#ffffff")]
     [DataRow("foreground", "bright:8:#ffffff")]
     public void ModelRestore_RefusesNamesOutsideTheContract(string field, string value)

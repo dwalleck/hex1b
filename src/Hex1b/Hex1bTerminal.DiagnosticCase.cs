@@ -224,9 +224,11 @@ public sealed partial class Hex1bTerminal
             return new(null, null, "unavailable", "mid-application: the case was started inside an application that had not finished", 0);
         if (_continuationUncommitted)
             return new(null, null, "unavailable", "unapplied-output: output was tokenized without being applied since the last application, so its decoder continuation is not the committed one", 0);
-        // A start line that cannot be written whole would leave the case claiming a start it never wrote.
+        // A start line that cannot be written whole would leave the case claiming a start it never wrote. The
+        // geometry estimate refuses the clear cases before projecting; the projection's exact size decides.
+        const string TooLarge = "size-limit: the start state is larger than the case's size bound leaves for its events";
         if (EstimateModelStateJsonBytesUnsafe() > startRoom)
-            return new(null, null, "unavailable", "size-limit: the start state is larger than the case's size bound leaves for its events", 0);
+            return new(null, null, "unavailable", TooLarge, 0);
         var estimate = EstimateModelStateBytesUnsafe();
         if (estimate > DiagnosticCaseRecorder.PendingStateBudgetInEffect)
             return new(null, null, "unavailable", "pending-state budget: the start state is larger than the state a case may hold awaiting its writer", 0);
@@ -235,12 +237,41 @@ public sealed partial class Hex1bTerminal
         {
             DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value?.Invoke();
             var state = CaptureModelState();
+            if (SerializedBytes(state) + DiagnosticCaseRecorder.StartLineOverhead > startRoom)
+                return new(null, null, "unavailable", TooLarge, 0);
             return new(state, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds, "recorded", null, estimate);
         }
         catch (Exception error)
         {
             return new(null, null, "unavailable", DiagnosticCaseRecorder.Bounded($"capture-failed: {error.GetType().Name}: {error.Message}"), 0);
         }
+    }
+
+    // The bytes a state serializes to in an event line (the writer's serializer and encoder), counted without
+    // keeping them.
+    private static long SerializedBytes(DiagnosticModelState state)
+    {
+        using var counter = new ByteCounter();
+        using (var writer = new System.Text.Json.Utf8JsonWriter(counter))
+            System.Text.Json.JsonSerializer.Serialize(writer, state, DiagnosticsJsonContext.Default.DiagnosticModelState);
+        return counter.Length;
+    }
+
+    // A write-only stream that counts the bytes written to it.
+    private sealed class ByteCounter : Stream
+    {
+        private long _length;
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => _length;
+        public override long Position { get => _length; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => _length += count;
+        public override void Write(ReadOnlySpan<byte> buffer) => _length += buffer.Length;
     }
 
     // Must hold _bufferLock: a batch was tokenized (moving the decoder, escape prefix and DCS framer) but

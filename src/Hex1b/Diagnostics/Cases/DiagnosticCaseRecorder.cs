@@ -149,6 +149,13 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     internal const long ClosingReserve = 2 * 1024;
     internal const int MaxFailureMessage = 256;
 
+    /// <summary>
+    /// What a start line may need beyond its state (the event and checkpoint fields, the checksum), plus the manifest
+    /// written before it: the start is sized against <c>MaxBytes − EventReserve − StartLineOverhead</c>, and the writer
+    /// writes it first after the manifest.
+    /// </summary>
+    internal const long StartLineOverhead = 64 * 1024;
+
     private Exception? _writerFault = WriterFaultForTesting.Value;
     private Exception? _writerDisposeFault = WriterDisposeFaultForTesting.Value;
     private Exception? _lossFault = LossFaultForTesting.Value;
@@ -772,6 +779,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         try
         {
             _writer.WriteManifest(Manifest);
+            // A start precedes every model event, and was sized for the room after the manifest: written first.
+            if (_checkpoints.TryPeek(out var first) && first.Checkpoint.Trigger == "start")
+                WriteCheckpoints(1, EventLimit);
             if (_writerHold > TimeSpan.Zero)
                 await Task.Delay(_writerHold).ConfigureAwait(false);
             while (true)

@@ -777,7 +777,7 @@ public sealed class TerminalDiagnostics
             _terminal.NativeDelivery,
             _terminal.StopDiagnosticCaseWithCheckpoint);
         Diagnostics.Cases.DiagnosticCaseRecorder.BeforeArmForTesting.Value?.Invoke();
-        var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase(reapplication, maxBytes - Diagnostics.Cases.DiagnosticCaseRecorder.EventReserve,
+        var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase(reapplication, maxBytes - Diagnostics.Cases.DiagnosticCaseRecorder.EventReserve - Diagnostics.Cases.DiagnosticCaseRecorder.StartLineOverhead,
             (fresh, unsupported, configuration, start) =>
             new Diagnostics.Cases.DiagnosticCaseRecorder(new DiagnosticCaseManifest
             {

@@ -15,7 +15,7 @@ internal sealed class CaptureCaseReapplyCommand : BaseCommand
     private static readonly Argument<string> s_pathArgument = new("path") { Description = "Case directory" };
     private static readonly Option<string> s_toOption = new("--to")
     {
-        Description = "Target: a model sequence (12), a case sequence (case:34), or a checkpoint label (label:name, or the bare name; stop is the stop checkpoint, start a live start's checkpoint)",
+        Description = "Target: a model sequence (12), a case sequence (case:34), or a checkpoint label (label:name, or the bare name; stop is the stop checkpoint, start a live start's checkpoint; a label several checkpoints share is ambiguous, so name one by case:<n>)",
         Required = true,
     };
     private static readonly Option<string[]> s_faultOption = new("--inject-fault")

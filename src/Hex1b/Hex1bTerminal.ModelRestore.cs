@@ -285,11 +285,11 @@ public sealed partial class Hex1bTerminal
         return attributes;
     }
 
-    // The inverse of ModelStateName: a kebab-case contract name back to a defined enum value (never a number),
-    // as the manifest reader parses configuration names.
+    // The inverse of ModelStateName: a kebab-case contract name back to its enum value. Only a name the projection
+    // itself writes is accepted (the value must name back to it), so numbers and combined names are refused.
     private static T ParseName<T>(string name) where T : struct, Enum =>
-        name.Replace("-", "", StringComparison.Ordinal) is var joined
-            && Enum.TryParse<T>(joined, ignoreCase: true, out var value) && Enum.IsDefined(value) && !int.TryParse(joined, out _)
+        Enum.TryParse<T>(name.Replace("-", "", StringComparison.Ordinal), ignoreCase: true, out var value) && Enum.IsDefined(value)
+            && ModelStateName(value.ToString()) == name
             ? value
             : throw new InvalidOperationException($"The state names an unknown {typeof(T).Name} '{name}'.");
 }
