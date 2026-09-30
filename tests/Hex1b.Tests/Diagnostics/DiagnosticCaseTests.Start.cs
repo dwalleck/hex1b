@@ -85,7 +85,7 @@ public partial class DiagnosticCaseTests
         var artifact = Artifact.Read(path);
         var checkpoint = artifact.Manifest.GetProperty("checkpoint");
         Assert.AreEqual(("text-state/1", "unsupported"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()));
-        Assert.AreEqual("titles,pending-input",
+        Assert.AreEqual("pending-input",
             string.Join(",", checkpoint.GetProperty("unsupportedSurfaces").EnumerateArray().Select(s => s.GetString())));
         StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "unsupported-surfaces:");
         Assert.IsFalse(artifact.Events.Any(e => e.GetProperty("kind").GetString() == "checkpoint"
@@ -95,7 +95,7 @@ public partial class DiagnosticCaseTests
         // Re-application of an unsupported start is refused before anything is written.
         var refused = Reapply(path, label: "stop");
         Assert.AreEqual((DiagnosticOutcome.Unavailable, "no-valid-interval"), (refused.Outcome, refused.Problem?.Code), refused.Problem?.Message);
-        StringAssert.Contains(refused.Problem!.Message, "titles");
+        StringAssert.Contains(refused.Problem!.Message, "pending-input");
         Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), "a refused re-application wrote a run");
     }
 
@@ -501,12 +501,13 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
-    [DataRow("titles", "titles")]
-    [DataRow("pending-input", "pendingInput")]
-    [DataRow("command-marks", "commandMarks")]
-    public async Task Reapply_OutOfSurfaceStartRefused(string surface, string field)
+    [DataRow("titles", "titles", "incompatible")]
+    [DataRow("pending-input", "pendingInput", "unsupported-start")]
+    [DataRow("command mark", "commandMarks", "incompatible")]
+    public async Task Reapply_OutOfSurfaceStartRefused(string surface, string field, string code)
     {
         // A start state the restore cannot represent, in a manifest that claims it complete: refused before anything.
+        // Titles and marks are restorable since ticket 11, so their rows are malformed ones, refused as incompatible.
         using var root = new CaseRoot();
         var copy = CopyCase(root, await RecordLiveAsync(root), surface);
         EditEventLine(copy, IsStart, node =>
@@ -515,7 +516,7 @@ public partial class DiagnosticCaseTests
             switch (field)
             {
                 case "titles":
-                    state["titles"]!["window"] = "T";
+                    state["titles"]!["window"] = null;
                     break;
                 case "commandMarks":
                     state["commandMarks"] = JsonNode.Parse("""[{"anchor":"1","phase":"prompt-start","rawParameters":"A"}]""");
@@ -526,7 +527,7 @@ public partial class DiagnosticCaseTests
             }
         });
         var result = Reapply(copy, label: "stop");
-        Assert.AreEqual((DiagnosticOutcome.Unavailable, "unsupported-start"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, code), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
         StringAssert.Contains(result.Problem!.Message, surface);
         Assert.IsFalse(Directory.Exists(Path.Combine(copy, "reapplications")), "a refused re-application wrote a run");
     }

@@ -420,10 +420,11 @@ public partial class DiagnosticModelRestoreTests
     [DataRow("", "plain\r\n", "")]
     [DataRow("", "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9\r\n10\r\n11\r\n12\r\n", "_scrollbackBuffer")]
     [DataRow("", "main\u001b[?1049halt", "_savedMainScreenBuffer")]
-    [DataRow("titles", "\u001b]2;T\u0007", "_windowTitle")]
-    [DataRow("titles", "\u001b]1;I\u0007", "_iconName")]
-    [DataRow("titles", "\u001b]22;\u0007", "_titleStack")]
-    [DataRow("command-marks", "\u001b]133;A\u0007$ ", "_commandMarks")]
+    // Titles and command marks are restored since ticket 11: controls, held but not named.
+    [DataRow("", "\u001b]2;T\u0007", "_windowTitle")]
+    [DataRow("", "\u001b]1;I\u0007", "_iconName")]
+    [DataRow("", "\u001b]22;\u0007", "_titleStack")]
+    [DataRow("", "\u001b]133;A\u0007$ ", "_commandMarks")]
     [DataRow("pending-input", "ok \u001b[", "_incompleteSequenceBuffer")]
     [DataRow("pending-input", "ok æ", "_pendingUtf8OutputLength")]
     [DataRow("dcs-continuation", "ok \u001bP1$r", "_dcsByteStreamParser")]
@@ -445,8 +446,8 @@ public partial class DiagnosticModelRestoreTests
     {
         var model = Detached(new FakeTimeProvider());
         model.ApplyRecordedOutput([.. Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(1, 14).Select(i => $"{i}\r\n")) + "\u001b]2;T\u0007ok "), 0xe6, 0xbc]);
-        // Retained history is restored since ticket 10; the other surfaces are still named, in order.
-        Assert.AreEqual("titles,pending-input", string.Join(",", StartCheckpoint.Unsupported(model.CaptureModelState())));
+        // Retained history (ticket 10) and titles (ticket 11) are restored; pending input is still named.
+        Assert.AreEqual("pending-input", string.Join(",", StartCheckpoint.Unsupported(model.CaptureModelState())));
     }
 
     [TestMethod]

@@ -1072,6 +1072,8 @@ public partial class DiagnosticCaseTests
                 }
                 await WaitAsync(() => terminal.OutputBytesRead == total);
                 await Settle(terminal);
+                // The writer thread writes the manifest before it waits on the gate; under load it may not have yet.
+                await WaitAsync(() => diagnostics.GetCaseStatus().BytesWritten > 0);
 
                 var held = diagnostics.GetCaseStatus();
                 var model = held.Streams.Single(s => s.Stream == "model");
