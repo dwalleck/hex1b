@@ -122,12 +122,10 @@ internal static class CaseReapplier
         }
         var raw = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllBytes(System.IO.Path.Combine(path, CaseArtifactWriter.ManifestFile)))?["checkpoint"]?["configuration"]
             as System.Text.Json.Nodes.JsonObject;
-        if ((raw is null ? "configuration: missing" : CaseConfiguration.Problem(raw, configuration)) is { } configurationProblem)
+        if ((raw is null ? "configuration: missing" : CaseConfiguration.RebuildProblem(raw, configuration)) is { } configurationProblem)
             return Refuse(DiagnosticOutcome.Unavailable, "incompatible", configurationProblem);
-        if (CaseConfiguration.CreateReflowStrategy(configuration.ReflowStrategy) is not { } strategy)
-            return Refuse(DiagnosticOutcome.Unavailable, "incompatible", $"reflowStrategy: '{configuration.ReflowStrategy}' is not a strategy this build can rebuild.");
-        if (CaseConfiguration.TerminalCapabilities(configuration.Capabilities!, out var capabilitiesProblem) is not { } capabilities)
-            return Refuse(DiagnosticOutcome.Unavailable, "incompatible", capabilitiesProblem!);
+        var strategy = CaseConfiguration.CreateReflowStrategy(configuration.ReflowStrategy)!;
+        var capabilities = CaseConfiguration.TerminalCapabilities(configuration.Capabilities!, out _)!;
 
         // The target, resolved from the verified events without applying any (and without reading any state).
         var eventsPath = System.IO.Path.Combine(path, CaseArtifactWriter.EventsFile);

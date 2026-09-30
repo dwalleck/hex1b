@@ -225,10 +225,11 @@ public sealed partial class Hex1bTerminal
         if (_continuationUncommitted)
             return new(null, null, "unavailable", "unapplied-output: output was tokenized without being applied since the last application, so its decoder continuation is not the committed one", 0);
         // A start line that cannot be written whole would leave the case claiming a start it never wrote. The
-        // geometry estimate refuses the clear cases before projecting; the projection's exact size decides (and the
-        // engine adds the manifest's own bytes when it describes the start).
+        // geometry's floor refuses, before projecting, only a start that cannot fit however small its cells; the
+        // projection's exact size decides every other (and the engine adds the manifest's own bytes when it describes
+        // the start).
         const string TooLarge = "size-limit: the start state is larger than the case's size bound leaves for its events";
-        if (EstimateModelStateJsonBytesUnsafe() + DiagnosticCaseRecorder.StartLineAllowance > startRoom)
+        if (MinimumModelStateJsonBytesUnsafe() + DiagnosticCaseRecorder.StartLineAllowance > startRoom)
             return new(null, null, "unavailable", TooLarge, 0);
         var estimate = EstimateModelStateBytesUnsafe();
         if (estimate > DiagnosticCaseRecorder.PendingStateBudgetInEffect)

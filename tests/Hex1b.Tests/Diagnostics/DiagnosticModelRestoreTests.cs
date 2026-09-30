@@ -163,20 +163,33 @@ public class DiagnosticModelRestoreTests
     }
 
     // Retained history (ticket 10): every row, its identity, original width, soft wrap and styles, in partial and full
-    // rings, and rows kept at a width other than the current one by a strategy that does not reflow.
+    // rings, rows kept at a width other than the current one by a strategy that does not reflow, a single row, and wide
+    // glyphs (with their continuations and wrap padding).
     [TestMethod]
     [DataRow("partial", 100, false)]
     [DataRow("full ring", 12, false)]
     [DataRow("off-width rows", 100, true)]
+    [DataRow("one row", 100, false)]
+    [DataRow("wide glyphs", 100, false)]
     public void ModelRestore_HistoryRoundTrips(string shape, int capacity, bool resizedBeforeStart)
     {
         var original = Detached(new FakeTimeProvider(), capacity: capacity);
-        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(HistoryLines(30)));
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(shape switch
+        {
+            "one row" => string.Concat(Enumerable.Range(1, 10).Select(i => $"line {i}\r\n")),
+            "wide glyphs" => HistoryLines(10) + string.Concat(Enumerable.Range(1, 20).Select(i => $"{i} \u8868\u793a\u5e45\u306e\u5e83\u3044\u6587\u5b57\u304c\u4e26\u3076\u884c \U0001F389\U0001F389 wide glyphs that wrap\r\n")),
+            _ => HistoryLines(30),
+        }));
         if (resizedBeforeStart)
             original.Resize(30, 10);
         var state = original.CaptureModelState();
         Assert.IsNotEmpty(state.History!.Rows, "fixture: no history");
-        Assert.IsTrue(state.Styles.Any(s => s.Attributes.Contains("soft-wrap")), "fixture: no soft wrap");
+        if (shape == "one row")
+            Assert.HasCount(1, state.History.Rows, "fixture: not one row");
+        else
+            Assert.IsTrue(state.Styles.Any(s => s.Attributes.Contains("soft-wrap")), "fixture: no soft wrap");
+        if (shape == "wide glyphs")
+            Assert.IsTrue(state.History.Rows.Any(r => r.Cells.Any(c => c.Text.Length == 0)), "fixture: no wide glyph in history");
         if (resizedBeforeStart)
             Assert.IsTrue(state.History.Rows.Any(r => r.OriginalWidth != state.Width), "fixture: no row at another width");
 
@@ -219,12 +232,22 @@ public class DiagnosticModelRestoreTests
             Both(t => t.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b[?1049lmain again\r\n")), "left the alternate screen");
     }
 
-    // A recorded history the model cannot hold as recorded is refused before anything is applied.
+    // A recorded history the model cannot hold as recorded is refused before anything is applied (design C4, as amended).
     [TestMethod]
     [DataRow("ids not ascending")]
+    [DataRow("a duplicate id")]
     [DataRow("more rows than the capacity")]
     [DataRow("another capacity")]
     [DataRow("next id not beyond the last")]
+    [DataRow("absent with a scrollback")]
+    [DataRow("present without a scrollback")]
+    [DataRow("no rows")]
+    [DataRow("a row without its id")]
+    [DataRow("a row without its original width")]
+    [DataRow("a row without cells")]
+    [DataRow("original width 0")]
+    [DataRow("original width above 10,000")]
+    [DataRow("cells not the original width")]
     public void ModelRestore_RefusesMalformedHistory(string shape)
     {
         var original = Detached(new FakeTimeProvider());
@@ -232,15 +255,30 @@ public class DiagnosticModelRestoreTests
         var state = original.CaptureModelState();
         var history = state.History!;
         var rows = history.Rows.ToList();
-        history = shape switch
+        DiagnosticModelHistory? forged = shape switch
         {
             "ids not ascending" => history with { Rows = [rows[1], rows[0], .. rows.Skip(2)] },
+            "a duplicate id" => history with { Rows = [rows[0], rows[1] with { Id = rows[0].Id }, .. rows.Skip(2)] },
             "more rows than the capacity" => history with { Capacity = rows.Count - 1 },
             "another capacity" => history with { Capacity = history.Capacity + 1 },
-            _ => history with { NextRowId = rows[^1].Id!.Value },
+            "next id not beyond the last" => history with { NextRowId = rows[^1].Id!.Value },
+            "absent with a scrollback" => null,
+            "present without a scrollback" => history,
+            "no rows" => history with { Rows = null! },
+            "a row without its id" => history with { Rows = [rows[0] with { Id = null }, .. rows.Skip(1)] },
+            "a row without its original width" => history with { Rows = [rows[0] with { OriginalWidth = null }, .. rows.Skip(1)] },
+            "a row without cells" => history with { Rows = [rows[0] with { Cells = null! }, .. rows.Skip(1)] },
+            "original width 0" => history with { Rows = [rows[0] with { OriginalWidth = 0, Cells = [] }, .. rows.Skip(1)] },
+            "original width above 10,000" => history with { Rows = [rows[0] with { OriginalWidth = 10_001, Cells = [.. Enumerable.Repeat(rows[0].Cells[0], 10_001)] }, .. rows.Skip(1)] },
+            _ => history with { Rows = [rows[0] with { Cells = [.. rows[0].Cells.Take(3)] }, .. rows.Skip(1)] },
         };
-        var replica = Detached(new FakeTimeProvider(), capacity: shape == "more rows than the capacity" ? rows.Count - 1 : 100);
-        var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(state with { History = history }));
+        var replica = Detached(new FakeTimeProvider(), capacity: shape switch
+        {
+            "more rows than the capacity" => rows.Count - 1,
+            "present without a scrollback" => null,
+            _ => 100,
+        });
+        var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(state with { History = forged }));
         StringAssert.Contains(error.Message, "history", shape);
         Assert.AreEqual((0L, 0), (replica.CurrentModelSequence, replica.ScrollbackCount), $"{shape}: a refused restore changed the model");
     }
@@ -249,13 +287,17 @@ public class DiagnosticModelRestoreTests
     // targets its cells reference, and none once every restored row is evicted and the screen cleared. (The original's
     // own count is not an oracle: scrolling under-counts it, .scratch/hex1b-diagnostics/issues/17.)
     [TestMethod]
-    public void ModelRestore_HistoryHyperlinksCountedOnce()
+    [DataRow(false)]
+    [DataRow(true)]
+    public void ModelRestore_HistoryHyperlinksCountedOnce(bool linkOpenAtTheStart)
     {
         var original = Detached(new FakeTimeProvider(), capacity: 12);
         original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(1, 16).Select(i =>
-            $"\u001b]8;;https://x.test/{i % 3}\u001b\\link {i}\u001b]8;;\u001b\\\r\n"))));
+            $"\u001b]8;;https://x.test/{i % 3}\u001b\\link {i}\u001b]8;;\u001b\\\r\n"))
+            + (linkOpenAtTheStart ? "\u001b]8;;https://x.test/open\u001b\\still open" : "")));
         var replica = Detached(new FakeTimeProvider(), capacity: 12);
         replica.RestoreModelState(original.CaptureModelState());
+        Assert.AreEqual(linkOpenAtTheStart, OpenHyperlink(replica) is not null, "fixture: the rendition's link");
         var referenced = ReferencedTargets(replica);
         Assert.IsGreaterThanOrEqualTo(3, referenced.Count, "fixture: the restored cells reference fewer than three targets");
         Assert.IsTrue(replica.GetScrollbackRows(replica.ScrollbackCount).Any(r => r.Cells.Any(c => c.HyperlinkData is not null)), "fixture: no hyperlink in history");
@@ -264,8 +306,9 @@ public class DiagnosticModelRestoreTests
         foreach (var (tracked, cells) in CellsPerObject(replica))
             Assert.AreEqual(cells, tracked.RefCount, $"{tracked.Data.Uri}: {tracked.RefCount} references for {cells} cells");
 
-        // Scroll every restored row out of the ring and clear the screen: nothing references them, and none remain.
-        replica.ApplyRecordedOutput(Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(1, 30).Select(i => $"plain {i}\r\n")) + "\u001b[2J"));
+        // Close the rendition's link, scroll every restored row out of the ring and clear the screen: nothing
+        // references them, and none remain.
+        replica.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b]8;;\u001b\\" + string.Concat(Enumerable.Range(1, 30).Select(i => $"plain {i}\r\n")) + "\u001b[2J"));
         Assert.AreEqual((0, 0), (ReferencedTargets(replica).Count, Store(replica).HyperlinkCount), "evicted history hyperlinks outlive their rows");
     }
 
@@ -284,8 +327,13 @@ public class DiagnosticModelRestoreTests
         foreach (var row in terminal.GetScrollbackRows(terminal.ScrollbackCount))
             foreach (var cell in row.Cells)
                 Add(cell.TrackedHyperlink);
+        Add(OpenHyperlink(terminal));
         return counts;
     }
+
+    // The rendition's open OSC 8 link (it holds one reference), read raw: it has no public accessor.
+    private static TrackedObject<HyperlinkData>? OpenHyperlink(Hex1bTerminal terminal) =>
+        (TrackedObject<HyperlinkData>?)typeof(Hex1bTerminal).GetField("_currentHyperlink", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(terminal);
 
     // The distinct hyperlink targets the model's cells reference, through the public API (viewport and retained rows).
     private static HashSet<string> ReferencedTargets(Hex1bTerminal terminal)
@@ -305,6 +353,7 @@ public class DiagnosticModelRestoreTests
         foreach (var row in terminal.GetScrollbackRows(terminal.ScrollbackCount))
             foreach (var cell in row.Cells)
                 Add(cell.HyperlinkData);
+        Add(OpenHyperlink(terminal)?.Data);
         return targets;
     }
 

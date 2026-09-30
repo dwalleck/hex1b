@@ -52,12 +52,24 @@ internal sealed class TerminalHostCommand : BaseCommand
 
     protected override async Task<int> ExecuteAsync(ParseResult parseResult, CancellationToken cancellationToken)
     {
-        var width = parseResult.GetValue(s_widthOption);
-        var height = parseResult.GetValue(s_heightOption);
-        var cwd = parseResult.GetValue(s_cwdOption);
-        var record = parseResult.GetValue(s_recordOption);
-        var port = parseResult.GetValue(s_portOption);
-        var bind = parseResult.GetValue(s_bindOption);
+        var (config, error) = Config(parseResult);
+        if (config is null)
+        {
+            Formatter.WriteError(error!);
+            return 1;
+        }
+
+        Logger.LogInformation("Starting terminal host: {Command} ({Width}x{Height})", config.Command, config.Width, config.Height);
+
+        return await TerminalHost.RunAsync(config, cancellationToken);
+    }
+
+    /// <summary>
+    /// The host's configuration from its parsed arguments (as <see cref="TerminalStartCommand.HostArguments"/> writes
+    /// them), or why they are invalid.
+    /// </summary>
+    internal static (TerminalHostConfig? Config, string? Error) Config(ParseResult parseResult)
+    {
         var command = parseResult.GetValue(s_commandArgument) is { Length: > 0 } cmd
             ? cmd
             : TerminalHostPlatformDefaults.GetDefaultCommandLine();
@@ -65,10 +77,7 @@ internal sealed class TerminalHostCommand : BaseCommand
 
         var scrollback = parseResult.GetValue(s_scrollbackOption);
         if (scrollback is { } rows && Diagnostics.TerminalDiagnostics.ScrollbackProblem(rows) is { } invalidScrollback)
-        {
-            Formatter.WriteError($"--scrollback: {invalidScrollback}");
-            return 1;
-        }
+            return (null, $"--scrollback: {invalidScrollback}");
 
         Diagnostics.DiagnosticCaseStartRequest? caseRequest = null;
         if (parseResult.GetValue(s_recordCaseOption))
@@ -77,30 +86,23 @@ internal sealed class TerminalHostCommand : BaseCommand
                 parseResult.GetValue(s_caseMaxBytesOption), parseResult.GetValue(s_caseMaxSecondsOption),
                 parseResult.GetValue(s_caseAuthorizeOption), parseResult.GetValue(s_caseDirOption));
             if (invalid != null)
-            {
-                Formatter.WriteError($"{invalid.Problem!.Code}: {invalid.Problem.Message}");
-                return 1;
-            }
+                return (null, $"{invalid.Problem!.Code}: {invalid.Problem.Message}");
 
             caseRequest = request;
         }
 
-        var config = new TerminalHostConfig
+        return (new TerminalHostConfig
         {
             Command = command[0],
             Arguments = command.Length > 1 ? command[1..] : [],
-            Width = width,
-            Height = height,
-            WorkingDirectory = cwd,
-            RecordPath = record,
-            Port = port,
-            BindAddress = bind,
+            Width = parseResult.GetValue(s_widthOption),
+            Height = parseResult.GetValue(s_heightOption),
+            WorkingDirectory = parseResult.GetValue(s_cwdOption),
+            RecordPath = parseResult.GetValue(s_recordOption),
+            Port = parseResult.GetValue(s_portOption),
+            BindAddress = parseResult.GetValue(s_bindOption),
             Scrollback = scrollback,
             DiagnosticCase = caseRequest
-        };
-
-        Logger.LogInformation("Starting terminal host: {Command} ({Width}x{Height})", config.Command, config.Width, config.Height);
-
-        return await TerminalHost.RunAsync(config, cancellationToken);
+        }, null);
     }
 }

@@ -118,41 +118,7 @@ internal sealed class TerminalStartCommand : BaseCommand
             return await RunPassthruAsync(parseResult, width, height, cwd, record, port, bind, scrollback, caseRequest, command, cancellationToken);
         }
 
-        // Build args for the host process
-        var hostArgs = new List<string> { "terminal", "host", "--width", width.ToString(), "--height", height.ToString() };
-        if (cwd != null)
-        {
-            hostArgs.AddRange(["--cwd", cwd]);
-        }
-        if (record != null)
-        {
-            hostArgs.AddRange(["--record", record]);
-        }
-        if (port.HasValue)
-        {
-            hostArgs.AddRange(["--port", port.Value.ToString()]);
-        }
-        if (bind != null)
-        {
-            hostArgs.AddRange(["--bind", bind]);
-        }
-        if (scrollback.HasValue)
-        {
-            hostArgs.AddRange(["--scrollback", scrollback.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
-        }
-        if (caseRequest != null)
-        {
-            hostArgs.Add("--record-case");
-            if (caseRequest.MaxBytes is { } maxBytes)
-                hostArgs.AddRange(["--case-max-bytes", maxBytes.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
-            if (caseRequest.MaxSeconds is { } maxSeconds)
-                hostArgs.AddRange(["--case-max-seconds", maxSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
-            foreach (var authorization in caseRequest.Authorizations ?? [])
-                hostArgs.AddRange(["--case-authorize", DiagnosticContractNames.Of(authorization)]);
-            if (caseRequest.Directory != null)
-                hostArgs.AddRange(["--case-dir", caseRequest.Directory]);
-        }
-        hostArgs.AddRange(command);
+        var hostArgs = HostArguments(width, height, cwd, record, port, bind, scrollback, caseRequest, command);
 
         // Find our own executable
         var selfExe = Environment.ProcessPath ?? "dotnet";
@@ -283,6 +249,54 @@ internal sealed class TerminalStartCommand : BaseCommand
         Formatter.WriteError("Timeout waiting for host process to start");
         try { process.Kill(); } catch { /* best effort */ }
         return 1;
+    }
+
+    /// <summary>
+    /// The arguments of the spawned <c>terminal host</c> process: every option the host takes, forwarded as given.
+    /// </summary>
+    internal static List<string> HostArguments(
+        int width, int height,
+        string? cwd, string? record,
+        int? port, string? bind,
+        int? scrollback,
+        DiagnosticCaseStartRequest? caseRequest,
+        string[] command)
+    {
+        var hostArgs = new List<string> { "terminal", "host", "--width", width.ToString(), "--height", height.ToString() };
+        if (cwd != null)
+        {
+            hostArgs.AddRange(["--cwd", cwd]);
+        }
+        if (record != null)
+        {
+            hostArgs.AddRange(["--record", record]);
+        }
+        if (port.HasValue)
+        {
+            hostArgs.AddRange(["--port", port.Value.ToString()]);
+        }
+        if (bind != null)
+        {
+            hostArgs.AddRange(["--bind", bind]);
+        }
+        if (scrollback.HasValue)
+        {
+            hostArgs.AddRange(["--scrollback", scrollback.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
+        }
+        if (caseRequest != null)
+        {
+            hostArgs.Add("--record-case");
+            if (caseRequest.MaxBytes is { } maxBytes)
+                hostArgs.AddRange(["--case-max-bytes", maxBytes.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
+            if (caseRequest.MaxSeconds is { } maxSeconds)
+                hostArgs.AddRange(["--case-max-seconds", maxSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
+            foreach (var authorization in caseRequest.Authorizations ?? [])
+                hostArgs.AddRange(["--case-authorize", DiagnosticContractNames.Of(authorization)]);
+            if (caseRequest.Directory != null)
+                hostArgs.AddRange(["--case-dir", caseRequest.Directory]);
+        }
+        hostArgs.AddRange(command);
+        return hostArgs;
     }
 
     private async Task<int> RunPassthruAsync(

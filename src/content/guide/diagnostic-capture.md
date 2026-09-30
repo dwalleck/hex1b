@@ -318,8 +318,10 @@ Start a case in one of two ways:
   reflows them as it did the original's. Otherwise it is `unsupported`, and
   `unsupportedSurfaces` names each surface found: `titles`, `command-marks`, `pending-input`,
   `dcs-continuation` and `graphics`. A start too large for the case's `maxBytes` (`size-limit`),
-  one larger than the 256 MiB pending-state budget, or one taken inside an application, is
-  `unsupported` with that reason; no history is ever truncated to fit. The case records either way.
+  one larger than the 256 MiB pending-state budget, one taken inside an application, or one on a
+  terminal whose configuration a re-application could not rebuild (`configuration:`, for example a
+  custom reflow strategy), is `unsupported` with that reason; no history is ever truncated to fit.
+  The case records either way.
 
 A local terminal retains history only when started with a scrollback: `hex1b terminal start
 --scrollback <rows>`, or `scrollback` on the MCP `start_bash_terminal` / `start_pwsh_terminal`

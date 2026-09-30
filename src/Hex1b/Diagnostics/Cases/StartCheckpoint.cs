@@ -2,9 +2,10 @@ namespace Hex1b.Diagnostics.Cases;
 
 /// <summary>
 /// The <c>text-state/1</c> start checkpoint of a case started on a terminal that has already applied output:
-/// which state surfaces a start may hold. The active text buffer, its continuation and, on the alternate screen, the
-/// saved main screen and retained history are restored; titles, command marks, pending input and graphics are refused
-/// while present, until their tickets extend the surface (10, 11, 12; graphics are outside the text profile).
+/// which state surfaces a start may hold. The active text buffer, its continuation, the retained history and, on the
+/// alternate screen, the saved main screen are restored; titles, command marks, pending input and graphics are refused
+/// while present, until their tickets extend the surface (11, 12; graphics are outside the text profile). A start
+/// whose configuration cannot be rebuilt is never complete.
 /// </summary>
 internal static class StartCheckpoint
 {
@@ -22,6 +23,10 @@ internal static class StartCheckpoint
             ModelSequence = modelSequence,
             UnsupportedSurfaces = [],
         };
+        // A start the reapplier would refuse for its configuration is never complete.
+        var raw = System.Text.Json.JsonSerializer.SerializeToNode(configuration, DiagnosticsJsonContext.Default.DiagnosticCaseModelConfiguration)!.AsObject();
+        if (CaseConfiguration.RebuildProblem(raw, configuration) is { } configurationProblem)
+            return described with { Status = DiagnosticCaseCheckpointStatus.Unsupported, Reason = $"configuration: {configurationProblem}" };
         if (start.State is not { } state)
             return described with { Status = DiagnosticCaseCheckpointStatus.Unsupported, Reason = start.Reason };
         var surfaces = Unsupported(state);

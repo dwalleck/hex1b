@@ -7,7 +7,9 @@ public sealed partial class Hex1bTerminal
 {
     /// <summary>
     /// Restores a <c>text-state/1</c> projection into this model: the inverse of the model-state projection
-    /// for the active text buffer and, on the alternate screen, the saved main screen. Only the case reapplier calls
+    /// for the active text buffer, the retained history (each row with its cells, original width and identity, and the
+    /// next identity; rows are stamped with this model's clock) and, on the alternate screen, the saved main screen.
+    /// Only the case reapplier calls
     /// this, on a terminal whose pumps never started. The geometry is set through the model's own resize (an empty
     /// model, so nothing reflows). A state on the alternate screen is entered through the model's own entry: the main
     /// screen's cells are written at the saved screen's geometry, the model enters the alternate screen (which saves
@@ -150,17 +152,29 @@ public sealed partial class Hex1bTerminal
     }
 
     // Why a recorded history cannot be restored into this model's configured scrollback, or null: its presence and
-    // capacity must be the configuration's, and its rows and identities a ring the buffer can hold as recorded.
+    // capacity must be the configuration's, each row whole at a width a model can have, with as many cells as that width
+    // (every push lays a row out at the width it records), and its identities a ring the buffer can hold as recorded.
     private static string? HistoryProblem(DiagnosticModelHistory? history, ScrollbackBuffer? scrollback)
     {
+        // The configuration's width bound: no model lays a row out wider.
+        const int MaxRowWidth = 10_000;
         if (history is null)
             return scrollback is null ? null : "is absent, but the model is configured with a scrollback.";
         if (scrollback is null)
             return "is present, but the model is configured without a scrollback.";
         if (history.Capacity != scrollback.Capacity)
             return $"capacity {history.Capacity} is not the configured {scrollback.Capacity}.";
-        if (history.Rows.Any(row => row.Id is null || row.OriginalWidth is null))
-            return "has a row without its identity or original width.";
+        if (history.Rows is null)
+            return "has no rows.";
+        foreach (var row in history.Rows)
+        {
+            if (row is null || row.Id is null || row.OriginalWidth is not { } width || row.Cells is null)
+                return "has a row without its identity, original width or cells.";
+            if (width is < 1 or > MaxRowWidth)
+                return $"has a row of original width {width}, not 1 to 10,000.";
+            if (row.Cells.Count != width)
+                return $"has a row of {row.Cells.Count} cells at original width {width}.";
+        }
         return ScrollbackBuffer.RestoreProblem(history.Rows.Count, history.Rows.Select(row => row.Id!.Value), history.NextRowId, scrollback.Capacity);
     }
 

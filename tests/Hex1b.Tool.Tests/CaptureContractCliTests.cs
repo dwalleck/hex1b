@@ -1091,17 +1091,19 @@ public class CaptureContractCliTests
             }
         }
 
+        // The host runs as 'terminal start' spawns it: the start command's host arguments, parsed by the CLI into the
+        // host command's configuration.
         using var root = new CaseRoot();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-        var config = new TerminalHostConfig
-        {
-            Width = 40,
-            Height = 6,
-            Command = "/bin/sh",
-            Arguments = ["-c", "printf 'SCROLLBACK-HOST\\n'; exec sleep 60"],
-            Scrollback = scrollback,
-            DiagnosticCase = new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] },
-        };
+        var hostArgs = Hex1b.Tool.Commands.Terminal.TerminalStartCommand.HostArguments(40, 6, null, null, null, null, scrollback,
+            new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] },
+            ["/bin/sh", "-c", "printf 'SCROLLBACK-HOST\\n'; exec sleep 60"]);
+        Assert.AreEqual(scrollback is not null, hostArgs.Contains("--scrollback"), string.Join(' ', hostArgs));
+        using var parser = await Program.BuildApplication([.. hostArgs]);
+        var (config, configError) = Hex1b.Tool.Commands.Terminal.TerminalHostCommand.Config(
+            parser.Services.GetRequiredService<Hex1b.Tool.Commands.RootCommand>().Parse(hostArgs));
+        Assert.IsNotNull(config, configError);
+        Assert.AreEqual(scrollback, config.Scrollback, "the host did not read the forwarded --scrollback");
 
         await WaitForSocketReleaseAsync(cts.Token);
         var host = TerminalHost.RunAsync(config, cts.Token);

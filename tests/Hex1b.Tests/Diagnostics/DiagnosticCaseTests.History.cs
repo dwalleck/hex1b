@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Text;
+using System.Text.Json.Nodes;
 using Hex1b.Diagnostics;
 using Hex1b.Diagnostics.Cases;
 using Microsoft.Extensions.Time.Testing;
@@ -57,6 +58,65 @@ public partial class DiagnosticCaseTests
         Assert.IsFalse(artifact.Events.Any(e => e.GetProperty("kind").GetString() == "checkpoint"
             && e.GetProperty("checkpoint").GetProperty("trigger").GetString() == "start"), "a start line was written");
         Assert.IsNotEmpty(artifact.ModelEvents(), "the case stopped recording");
+    }
+
+    [TestMethod]
+    public async Task Start_HistoryThatFitsTheCaseIsComplete()
+    {
+        // A history whose state fits a 1 MiB case exactly (about 16 bytes a cell), although 24 bytes a cell would not:
+        // the start is complete and re-applies; only the geometry's floor (14 bytes a cell) refuses before projecting.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = HistoryTerminal(workload, strategy: null, capacity: 5_000, width: 200, height: 20);
+        await workload.WriteAndWaitAsync(terminal, string.Concat(Enumerable.Range(1, 250).Select(i => $"\u001b[3{i % 7}m{new string((char)('a' + i % 26), 190)}\u001b[m\r\n")));
+        const long maxBytes = 1024 * 1024;
+        var cells = (terminal.ScrollbackCount + 20L) * 200;
+        Assert.IsGreaterThan(maxBytes, cells * 24, "fixture: 24 bytes a cell would fit");
+        var path = new TerminalDiagnostics(terminal).StartCase(new DiagnosticCaseStartRequest
+        {
+            Directory = root.Path,
+            MaxBytes = maxBytes,
+            Authorizations = [DiagnosticAuthorization.ReapplicationData],
+        }).Path!;
+        await workload.WriteAndWaitAsync(terminal, " after");
+        await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+
+        var checkpoint = Artifact.Read(path).Manifest.GetProperty("checkpoint");
+        Assert.AreEqual("complete", checkpoint.GetProperty("status").GetString(), checkpoint.ToString());
+        AssertMatched(Reapply(path, label: "start"), "a history that fits the case");
+    }
+
+    [TestMethod]
+    [DataRow("scrollback above 1,000,000")]
+    [DataRow("a custom reflow strategy")]
+    public async Task Start_OnAConfigurationThatCannotBeRebuiltIsUnsupported(string shape)
+    {
+        // A live start whose recorded configuration the reapplier would refuse is unsupported, naming it; never complete.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = shape == "a custom reflow strategy"
+            ? HistoryTerminal(workload, new CustomReflow(), 100)
+            : HistoryTerminal(workload, strategy: null, capacity: 1_000_001);
+        await workload.WriteAndWaitAsync(terminal, HistoryText(20));
+        var path = StartLive(terminal, root);
+        await workload.WriteAndWaitAsync(terminal, "after");
+        await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+
+        var checkpoint = Artifact.Read(path).Manifest.GetProperty("checkpoint");
+        Assert.AreEqual("unsupported", checkpoint.GetProperty("status").GetString(), checkpoint.ToString());
+        StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "configuration: ");
+        StringAssert.Contains(checkpoint.GetProperty("reason").GetString(), shape == "a custom reflow strategy" ? "reflowStrategy" : "scrollbackCapacity");
+        Assert.AreEqual(DiagnosticOutcome.Unavailable, Reapply(path, label: "stop").Outcome, "an unsupported start re-applied");
+    }
+
+    // A reflow strategy this build cannot name (recorded as custom:), delegating to Ghostty's.
+    private sealed class CustomReflow : Hex1b.Reflow.ITerminalReflowProvider
+    {
+        private readonly Hex1b.Reflow.GhosttyReflowStrategy _inner = new();
+
+        public Hex1b.Reflow.ReflowResult Reflow(Hex1b.Reflow.ReflowContext context) => _inner.Reflow(context);
+
+        public bool ShouldClearSoftWrapOnAbsolutePosition => _inner.ShouldClearSoftWrapOnAbsolutePosition;
     }
 
     // The prototype's failing shape (styled, wrapped history under Ghostty reflow; shrink, then grow), a full ring
@@ -160,6 +220,53 @@ public partial class DiagnosticCaseTests
         // A reflowing resize renumbers the rows, so identities are compared at the start as well as the stop.
         AssertMatched(Reapply(path, label: "start"), "the cumulative surface at the start");
         AssertMatched(Reapply(path, label: "stop"), "the cumulative surface");
+    }
+
+    [TestMethod]
+    [DataRow("original width 0")]
+    [DataRow("cells not the original width")]
+    [DataRow("a row without cells")]
+    [DataRow("a duplicate id")]
+    public async Task Reapply_MalformedHistoryIsIncompatible(string shape)
+    {
+        // A start line whose history is malformed but checksum-valid (a hand-edited artifact): re-application is
+        // unavailable (incompatible), naming the history, before anything is applied or written.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = HistoryTerminal(workload, strategy: null, capacity: 100);
+        await workload.WriteAndWaitAsync(terminal, HistoryText(20));
+        var path = StartLive(terminal, root);
+        await workload.WriteAndWaitAsync(terminal, "after");
+        await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        AssertMatched(Reapply(path, label: "stop"), "fixture: the unedited case");
+        Directory.Delete(Path.Combine(path, "reapplications"), recursive: true);
+
+        EditEventLine(path, node => node["kind"]?.GetValue<string>() == "checkpoint" && node["checkpoint"]?["trigger"]?.GetValue<string>() == "start", node =>
+        {
+            var rows = node["checkpoint"]!["state"]!["history"]!["rows"]!.AsArray();
+            var first = rows[0]!.AsObject();
+            switch (shape)
+            {
+                case "original width 0":
+                    first["originalWidth"] = 0;
+                    first["cells"] = new JsonArray();
+                    break;
+                case "cells not the original width":
+                    first["cells"]!.AsArray().RemoveAt(0);
+                    break;
+                case "a row without cells":
+                    first["cells"] = null;
+                    break;
+                default:
+                    rows[1]!["id"] = first["id"]!.GetValue<long>();
+                    break;
+            }
+        });
+
+        var result = Reapply(path, label: "stop");
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "incompatible"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
+        StringAssert.Contains(result.Problem!.Message, "history", shape);
+        Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), $"{shape}: a refused re-application wrote a run");
     }
 
     private static Hex1bTerminal HistoryTerminal(ScriptedWorkload workload, Hex1b.Reflow.ITerminalReflowProvider? strategy, int capacity,

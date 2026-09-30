@@ -47,9 +47,10 @@ internal static class CaseConfiguration
         return $"custom:{strategy.GetType().FullName}";
     }
 
-    /// <summary>The strategy a recorded name denotes, or null when this build cannot rebuild it.</summary>
     /// <summary>The reflow strategy ids a re-applied model can be rebuilt with.</summary>
     internal static IEnumerable<string> StrategyIds => Strategies.Select(s => s.Id);
+
+    /// <summary>The strategy a recorded name denotes, or null when this build cannot rebuild it.</summary>
 
     internal static ITerminalReflowProvider? CreateReflowStrategy(string id)
     {
@@ -129,6 +130,19 @@ internal static class CaseConfiguration
         if (!double.IsFinite(configuration.EscapeSequenceTimeoutMs) || configuration.EscapeSequenceTimeoutMs is < 0 or > 86_400_000)
             return $"configuration.escapeSequenceTimeoutMs: {configuration.EscapeSequenceTimeoutMs} is not 0 to 86,400,000";
         return null;
+    }
+
+    /// <summary>
+    /// Why a recorded configuration cannot rebuild a model, or null: its fields (<see cref="Problem"/>), its reflow
+    /// strategy, then its capabilities. The reapplier refuses with it, and a live start that it names is never complete.
+    /// </summary>
+    internal static string? RebuildProblem(System.Text.Json.Nodes.JsonObject raw, DiagnosticCaseModelConfiguration configuration)
+    {
+        if (Problem(raw, configuration) is { } problem)
+            return problem;
+        if (CreateReflowStrategy(configuration.ReflowStrategy) is null)
+            return $"reflowStrategy: '{configuration.ReflowStrategy}' is not a strategy this build can rebuild.";
+        return TerminalCapabilities(configuration.Capabilities!, out var capabilitiesProblem) is null ? capabilitiesProblem : null;
     }
 
     internal static DiagnosticCaseCapabilities Capabilities(TerminalCapabilities capabilities) => new()

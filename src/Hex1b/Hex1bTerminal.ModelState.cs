@@ -49,6 +49,13 @@ public sealed partial class Hex1bTerminal
     /// </summary>
     internal long EstimateModelStateJsonBytesUnsafe() => EstimateModelStateCellsUnsafe() * 24 + 4 * 1024;
 
+    /// <summary>
+    /// The fewest JSON bytes a projection of this geometry can take: 14 a cell, the smallest cell
+    /// (<c>{"t":"","s":0}</c>; every cell writes its text and style). A start is refused before projecting only when even
+    /// this cannot fit. Must hold <c>_bufferLock</c>.
+    /// </summary>
+    internal long MinimumModelStateJsonBytesUnsafe() => EstimateModelStateCellsUnsafe() * 14;
+
     // Retained rows keep the width they were written at (a resize without reflow leaves them), so history is
     // counted row by row: O(rows), no cell read.
     private long EstimateModelStateCellsUnsafe()
