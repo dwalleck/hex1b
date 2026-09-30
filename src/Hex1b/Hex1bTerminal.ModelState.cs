@@ -112,7 +112,7 @@ public sealed partial class Hex1bTerminal
                     var row = entries[i].Row;
                     var cells = new DiagnosticModelCell[row.Cells.Length];
                     for (var column = 0; column < cells.Length; column++)
-                        cells[column] = ProjectCell(row.Cells[column], styles);
+                        cells[column] = ProjectCell(row.Cells[column], styles, column > 0 && Continues(row.Cells[column], row.Cells[column - 1]));
                     rows[i] = new DiagnosticModelRow { Cells = cells, Id = entries[i].RowId, OriginalWidth = row.OriginalWidth };
                 }
                 history = new DiagnosticModelHistory { Capacity = scrollback.Capacity, NextRowId = scrollback.NextRowId, Rows = rows };
@@ -280,18 +280,24 @@ public sealed partial class Hex1bTerminal
         {
             var cells = new DiagnosticModelCell[width];
             for (var column = 0; column < width; column++)
-                cells[column] = ProjectCell(buffer[row, column], styles);
+                cells[column] = ProjectCell(buffer[row, column], styles, column > 0 && Continues(buffer[row, column], buffer[row, column - 1]));
             rows[row] = new DiagnosticModelRow { Cells = cells };
         }
         return rows;
     }
 
-    private static DiagnosticModelCell ProjectCell(in TerminalCell cell, ModelStyleTable styles) => new()
+    private static DiagnosticModelCell ProjectCell(in TerminalCell cell, ModelStyleTable styles, bool continues = false) => new()
     {
         Text = cell.Character,
         Style = styles.IndexOf(cell),
         WideWrapPadding = cell.IsWideWrapPadding,
+        Continues = continues,
     };
+
+    // Whether an empty cell continues the glyph to its left, as every reader of a row decides it (anchors, selection,
+    // rendering): both were written together, so they share a write sequence.
+    private static bool Continues(in TerminalCell cell, in TerminalCell left) =>
+        cell.Character.Length == 0 && cell.Sequence == left.Sequence;
 
     private static DiagnosticModelStyle ProjectStyle(in TerminalCell cell)
     {

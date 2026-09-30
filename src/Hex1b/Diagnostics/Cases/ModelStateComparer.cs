@@ -171,6 +171,8 @@ internal static class ModelStateComparer
                 Add(surface, new Path(prefix, row, column, "text"), Json(recorded.Text), Json(reapplied.Text));
             if (recorded.WideWrapPadding != reapplied.WideWrapPadding)
                 Add(surface, new Path(prefix, row, column, "wideWrapPadding"), Flag(recorded.WideWrapPadding), Flag(reapplied.WideWrapPadding));
+            if (recorded.Continues != reapplied.Continues)
+                Add(surface, new Path(prefix, row, column, "continues"), Flag(recorded.Continues), Flag(reapplied.Continues));
             if (SameStyle(recorded.Style, reapplied.Style))
                 return;
             // Rare (the styles differ), so this prefix is formatted here.

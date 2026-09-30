@@ -19,4 +19,12 @@ public readonly record struct DiagnosticModelCell
     [JsonPropertyName("w")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool WideWrapPadding { get; init; }
+
+    /// <summary>
+    /// Whether this empty cell continues the glyph in the cell to its left (the model wrote them together); omitted when
+    /// false. A continuation left by a glyph that has since moved or changed width is not one.
+    /// </summary>
+    [JsonPropertyName("c")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool Continues { get; init; }
 }

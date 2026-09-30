@@ -74,7 +74,7 @@ public sealed partial class Hex1bTerminal
                     var rowCells = new TerminalCell[projected.Cells.Count];
                     for (var column = 0; column < rowCells.Length; column++)
                         rowCells[column] = RestoreCell(projected.Cells[column], state.Styles, cells, built);
-                    SequenceRestoredRowUnsafe(rowCells);
+                    SequenceRestoredRowUnsafe(rowCells, projected.Cells);
                     rows[row] = (rowCells, projected.OriginalWidth ?? rowCells.Length, projected.Id ?? 0);
                 }
                 scrollback.RestoreRows(rows, history.NextRowId, _timeProvider.GetUtcNow());
@@ -189,6 +189,8 @@ public sealed partial class Hex1bTerminal
             if (row.Cells.Count != width)
                 return $"has a row of {row.Cells.Count} cells at original width {width}.";
         }
+        if (RowsProblem(history.Rows, "history") is { } rowsProblem)
+            return $"has {rowsProblem}.";
         return ScrollbackBuffer.RestoreProblem(history.Rows.Count, history.Rows.Select(row => row.Id!.Value), history.NextRowId, scrollback.Capacity);
     }
 
@@ -202,7 +204,7 @@ public sealed partial class Hex1bTerminal
             var rowCells = new TerminalCell[projected.Count];
             for (var column = 0; column < rowCells.Length; column++)
                 rowCells[column] = RestoreCell(projected[column], styles, cells, built);
-            SequenceRestoredRowUnsafe(rowCells);
+            SequenceRestoredRowUnsafe(rowCells, projected);
             for (var column = 0; column < rowCells.Length; column++)
                 SetCell(row, column, rowCells[column], damageSixel: false);
         }
@@ -217,6 +219,10 @@ public sealed partial class Hex1bTerminal
 
         if ((state.SavedMainScreen is not null) != (state.ActiveBuffer == "alternate") || state.ActiveBuffer is not ("main" or "alternate"))
             return $"an active buffer '{state.ActiveBuffer}' that does not match its saved main screen";
+        if (RowsProblem(state.Screen, "a screen") is { } screenProblem)
+            return screenProblem;
+        if (state.SavedMainScreen is not null && RowsProblem(state.SavedMainScreen, "a saved main screen") is { } savedProblem)
+            return savedProblem;
         if (state.SavedMainScreen is { Count: > 0 } saved && saved.Any(row => row.Cells.Count != saved[0].Cells.Count))
             return "a saved main screen whose rows do not share one width";
         if (state.Titles is null || state.Titles.Window is null || state.Titles.Icon is null || state.Titles.Stack is null
@@ -236,20 +242,33 @@ public sealed partial class Hex1bTerminal
 
     // One restored cell. A style's colours and attributes are parsed once; each cell holding a hyperlink takes
     // its own counted reference from this model's store, as a cell written by output does.
-    // Restored cells get write sequences in row order, a wide glyph's continuation sharing its owner's (as when both were
-    // written together) and an orphaned continuation its own. Code that tells a continuation by its sequence (anchors,
+    // Restored cells get write sequences in row order, a projected continuation sharing its left neighbour's (as when both
+    // were written together) and every other cell its own. Code that tells a continuation by its sequence (anchors,
     // selection, rendering) then reads the restored row as the original's. The values themselves are write order, not
-    // state, and are not projected.
-    private void SequenceRestoredRowUnsafe(TerminalCell[] row)
+    // state, and are not projected; which cells continue is.
+    private void SequenceRestoredRowUnsafe(TerminalCell[] row, IReadOnlyList<DiagnosticModelCell> projected)
     {
         for (var column = 0; column < row.Length; column++)
+            row[column] = row[column] with { Sequence = column > 0 && projected[column].Continues ? row[column - 1].Sequence : ++_writeSequence };
+    }
+
+    // Why projected rows cannot be restored, or null: every row present with its cells, and a continuation only on an
+    // empty cell after the first column.
+    private static string? RowsProblem(IReadOnlyList<DiagnosticModelRow>? rows, string what)
+    {
+        if (rows is null)
+            return $"{what}: missing";
+        for (var row = 0; row < rows.Count; row++)
         {
-            var cell = row[column];
-            var owner = column > 0 ? row[column - 1] : default;
-            var continues = column > 0 && cell.Character.Length == 0 && !cell.IsWideWrapPadding && owner.Character.Length > 0
-                && (DisplayWidth.GetGraphemeWidth(owner.Character) > 1 || owner.Character.Contains('\uFE0F'));
-            row[column] = cell with { Sequence = continues ? owner.Sequence : ++_writeSequence };
+            if (rows[row]?.Cells is not { } cells)
+                return $"{what} row {row}: missing";
+            for (var column = 0; column < cells.Count; column++)
+            {
+                if (cells[column].Continues && (column == 0 || cells[column].Text is not { Length: 0 }))
+                    return $"{what} row {row}: a continuation at column {column} that continues nothing";
+            }
         }
+        return null;
     }
 
     private TerminalCell RestoreCell(DiagnosticModelCell projected, IReadOnlyList<DiagnosticModelStyle> styles,

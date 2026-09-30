@@ -652,5 +652,6 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
   is `unsupported`, and names it.
 - An attached browser view (on every HWT1 frame, and on a marker jump) or an HMP1 client resolves
   command-mark positions in the recorded terminal outside any model event: a mark at the end of a
-  soft-wrapped row is moved to the next row's start there, and nowhere in the recording. A
-  re-application can then report `different` at that mark (`commandMarks[i].row`/`column`).
+  soft-wrapped row or on a wide glyph's wrap padding is moved to the next row's start, and a mark
+  whose row is gone is dropped, there and nowhere in the recording. A re-application can then report
+  `different` at that mark (`commandMarks[i].row`/`column`).

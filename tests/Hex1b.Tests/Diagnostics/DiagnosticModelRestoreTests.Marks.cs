@@ -157,6 +157,7 @@ public partial class DiagnosticModelRestoreTests
     [DataRow("null history cells under a mark")]
     [DataRow("last anchor id at the maximum")]
     [DataRow("negative last anchor id")]
+    [DataRow("last anchor id of -1")]
     [DataRow("column past a narrower history row")]
     public void ModelRestore_RefusesMalformedMarksAndTitles(string shape)
     {
@@ -196,6 +197,7 @@ public partial class DiagnosticModelRestoreTests
             "null history cells under a mark" => state with { History = state.History with { Rows = HistoryWith(r => r with { Cells = null! }) } },
             "last anchor id at the maximum" => state with { CommandMarks = [], LastCommandAnchorId = long.MaxValue },
             "negative last anchor id" => state with { CommandMarks = [], LastCommandAnchorId = -4 },
+            "last anchor id of -1" => state with { CommandMarks = [], LastCommandAnchorId = -1 },
             // History rows keep the 40 columns they were written at, beside a 50-column screen.
             "column past a narrower history row" => state with { CommandMarks = With(historyMark, m => m with { Column = 45 }) },
             _ => state with { Titles = state.Titles with { Stack = [state.Titles.Stack[0] with { Icon = null! }] } },
@@ -224,6 +226,22 @@ public partial class DiagnosticModelRestoreTests
         Assert.AreEqual((40, 50), (state.SavedMainScreen![0].Cells.Count, state.Width), "fixture: the saved main screen's width");
         Assert.IsGreaterThanOrEqualTo(0, index, "fixture: no mark on the saved main screen");
         var forged = state with { CommandMarks = [.. state.CommandMarks.Select((m, j) => j == index ? m with { Column = 45 } : m)] };
+        var replica = MarkModel(shape, "none");
+        var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(forged));
+        StringAssert.Contains(error.Message, "command mark");
+        Assert.AreEqual((0L, 0), (replica.CurrentModelSequence, replica.CommandMarks.Count), "a refused restore changed the model");
+    }
+
+    [TestMethod]
+    public void ModelRestore_RefusesAnAlternateMarkPastItsRow()
+    {
+        var shape = MarkScenarios["alternate"];
+        var original = MarkModel(shape, "none");
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(shape.Before));
+        var state = original.CaptureModelState();
+        var index = state.CommandMarks.ToList().FindIndex(m => m.Buffer == "alternate" && m.Row is not null);
+        Assert.IsGreaterThanOrEqualTo(0, index, "fixture: no mark on the alternate screen");
+        var forged = state with { CommandMarks = [.. state.CommandMarks.Select((m, j) => j == index ? m with { Column = state.Width + 1 } : m)] };
         var replica = MarkModel(shape, "none");
         var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(forged));
         StringAssert.Contains(error.Message, "command mark");
@@ -279,6 +297,109 @@ public partial class DiagnosticModelRestoreTests
             var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
             Assert.IsEmpty(differences, $"after {JsonSerializer.Serialize(step)}: " + string.Join("; ", differences.Take(3)));
         }
+    }
+
+    // Which empty cells continue the glyph to their left is projected (the model's own rule: a shared write sequence), so
+    // a restored row reads as the original's for marks placed later, whatever made the glyph wide or left the cell
+    // behind (review round 2: RR#1, RR#2).
+    [TestMethod]
+    [DataRow("vs16 applied later", 20, 4, true, "ab\u2764\u001b[m\uFE0F", false)]
+    [DataRow("2027 conjunct", 20, 4, false, "ab\u0915\u094D\u0937", false)]
+    [DataRow("2027 spacing mark", 20, 4, false, "ab\u0915\u093F", true)]
+    [DataRow("2027 zwj text", 20, 4, false, "ab\u261D\u200D\u261D", true)]
+    [DataRow("2027 hangul jamo", 20, 4, false, "ab\u1100\u1161\u11A8", true)]
+    [DataRow("2027 thai", 20, 4, false, "ab\u0E01\u0E33", true)]
+    [DataRow("plain wide", 20, 4, false, "ab\u6f22", true)]
+    [DataRow("vs16 inline", 20, 4, true, "ab\u2764\uFE0F", true)]
+    public void ModelRestore_ContinuationsRestored(string shape, int width, int height, bool retroactive, string before, bool continues)
+    {
+        var (original, replica) = ContinuationPair(width, height, retroactive, before);
+        Assert.AreEqual(continues, original.CaptureModelState().Screen[0].Cells[3].Continues, $"fixture: {shape} column 3");
+        foreach (var t in new[] { original, replica })
+            t.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b[D\u001b]133;A\u0007"));
+        var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(differences, $"{shape}: " + string.Join("; ", differences.Take(3)));
+    }
+
+    [TestMethod]
+    [DataRow("wide beside an orphan", "\u001b[1;19H\u6f22\u001b[2;19H\u5b57\u001b[?69h\u001b[1;19s\u001b[1S\u001b[?69l")]
+    [DataRow("vs16 cluster beside an orphan", "\u001b[1;19H\u6f22\u001b[2;19Hx\uFE0F\u001b[?69h\u001b[1;19s\u001b[1S\u001b[?69l")]
+    public void ModelRestore_OrphanedContinuationsRestored(string shape, string before)
+    {
+        // A left/right-margin scroll leaves a glyph's second half beside another glyph: not a continuation of it.
+        var (original, replica) = ContinuationPair(22, 7, retroactive: false, before);
+        foreach (var t in new[] { original, replica })
+            t.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b[1;20H\u001b]133;A\u0007"));
+        var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(differences, $"{shape}: " + string.Join("; ", differences.Take(3)));
+        Assert.AreEqual(19, original.CaptureModelState().CommandMarks[0].Column, $"fixture: {shape} mark column");
+    }
+
+    private static (Hex1bTerminal Original, Hex1bTerminal Replica) ContinuationPair(int width, int height, bool retroactive, string before)
+    {
+        Hex1bTerminal Model() => new(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = new HeadlessPresentationAdapter(width, height, retroactive ? TerminalCapabilities.Modern : TerminalCapabilities.Minimal),
+            WorkloadAdapter = new CaseReapplier.DetachedWorkload(),
+            Width = width,
+            Height = height,
+            TimeProvider = new FakeTimeProvider(),
+            DeferStart = true,
+        });
+        var original = Model();
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(before));
+        var replica = Model();
+        replica.RestoreModelState(original.CaptureModelState());
+        var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(differences, "the continuations do not round-trip: " + string.Join("; ", differences.Take(3)));
+        return (original, replica);
+    }
+
+    [TestMethod]
+    [DataRow("a continuation at column 0")]
+    [DataRow("a continuation on a glyph")]
+    [DataRow("a missing screen row")]
+    [DataRow("a screen row without cells")]
+    [DataRow("a missing saved main row")]
+    [DataRow("a history continuation at column 0")]
+    public void ModelRestore_RefusesMalformedRows(string shape)
+    {
+        var shapeScenario = shape.Contains("saved") ? MarkScenarios["alternate"] : MarkScenarios["screen and history"];
+        var original = MarkModel(shapeScenario, "none");
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(shapeScenario.Before + "\u6f22"));
+        var state = original.CaptureModelState();
+        List<DiagnosticModelRow> Rows(IReadOnlyList<DiagnosticModelRow> rows, int index, Func<DiagnosticModelRow, DiagnosticModelRow> change) =>
+            [.. rows.Select((r, j) => j == index ? change(r) : r)];
+        DiagnosticModelRow FirstCell(DiagnosticModelRow row, Func<DiagnosticModelCell, DiagnosticModelCell> change) =>
+            row with { Cells = [change(row.Cells[0]), .. row.Cells.Skip(1)] };
+        var forged = shape switch
+        {
+            "a continuation at column 0" => state with { Screen = Rows(state.Screen, 0, r => FirstCell(r, c => c with { Text = "", Continues = true })) },
+            "a continuation on a glyph" => state with { Screen = Rows(state.Screen, 0, r => r with { Cells = [r.Cells[0], r.Cells[1] with { Text = "x", Continues = true }, .. r.Cells.Skip(2)] }) },
+            "a missing screen row" => state with { Screen = Rows(state.Screen, 1, _ => null!) },
+            "a screen row without cells" => state with { Screen = Rows(state.Screen, 1, r => r with { Cells = null! }) },
+            "a missing saved main row" => state with { SavedMainScreen = Rows(state.SavedMainScreen!, 1, _ => null!) },
+            _ => state with { History = state.History! with { Rows = Rows(state.History.Rows, 0, r => FirstCell(r, c => c with { Text = "", Continues = true })) } },
+        };
+        var replica = MarkModel(shapeScenario, "none");
+        var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(forged));
+        StringAssert.Contains(error.Message, shape.Contains("continuation") ? "continuation" : "missing", shape);
+        Assert.AreEqual((0L, 0), (replica.CurrentModelSequence, replica.CommandMarks.Count), $"{shape}: a refused restore changed the model");
+    }
+
+    [TestMethod]
+    [DataRow(0L)]
+    [DataRow(long.MaxValue - 1)]
+    public void ModelRestore_AcceptsTheLastAnchorIdBounds(long last)
+    {
+        // The id bound's accepted edges: the next mark continues from them in both models.
+        var original = MarkModel(MarkScenarios["insert delete"], "none");
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("plain\r\n"));
+        var state = original.CaptureModelState() with { LastCommandAnchorId = last };
+        var replica = MarkModel(MarkScenarios["insert delete"], "none");
+        replica.RestoreModelState(state);
+        replica.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b]133;A\u0007$ "));
+        Assert.AreEqual($"command:{last + 1}", replica.CaptureModelState().CommandMarks[0].Anchor);
     }
 
     // Scenarios: the probe's (evidence.md P1), with the strengthened fixtures.
