@@ -61,6 +61,11 @@ internal sealed class TerminalHostConfig
     public string? BindAddress { get; set; }
 
     /// <summary>
+    /// Rows of scrollback the terminal retains, or null for none.
+    /// </summary>
+    public int? Scrollback { get; set; }
+
+    /// <summary>
     /// When set, a bounded diagnostic case records the terminal from construction, before the child's
     /// first output reaches the model.
     /// </summary>

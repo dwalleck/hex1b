@@ -24,8 +24,8 @@ The server communicates via stdio using the MCP protocol.
 
 ### Session Management
 
-- **start_bash_terminal** - Start a new bash terminal session (Linux/macOS); `recordCase` records a diagnostic case from its first byte
-- **start_pwsh_terminal** - Start a new PowerShell terminal session (Windows/cross-platform); `recordCase` as for bash
+- **start_bash_terminal** - Start a new bash terminal session (Linux/macOS); `recordCase` records a diagnostic case from its first byte, and `scrollback` (1 to 1,000,000 rows; default none) gives the terminal retained history
+- **start_pwsh_terminal** - Start a new PowerShell terminal session (Windows/cross-platform); `recordCase` and `scrollback` as for bash
 - **stop_terminal** - Stop a terminal session's process
 - **remove_session** - Remove a terminal session and dispose resources
 - **list_terminals** - List all active terminal sessions

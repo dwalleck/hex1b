@@ -110,7 +110,8 @@ Use it to tell a wrong layout or a slow model from output that never reached the
 
 #### Diagnostic cases (`start_diagnostic_case`, `stop_diagnostic_case`, `get_diagnostic_case_status`, `mark_diagnostic_case`, `inspect_diagnostic_case`, `reapply_diagnostic_case`)
 Use a case to keep evidence of a problem you cannot reproduce on demand: it records to a local directory you can inspect after the process is gone.
-- To record from the first byte, start the session with `recordCase: true` (with `caseAuthorize: "reapplication-data"` to keep the model's input bytes); a case started later records from then on with checkpoint `unsupported`
+- To record from the first byte, start the session with `recordCase: true` (with `caseAuthorize: "reapplication-data"` to keep the model's input bytes). A case started later with `reapplication-data` records the model's state at its start and re-applies from there; its checkpoint is `unsupported` when that state holds titles, command marks, pending input or graphics
+- Pass `scrollback` (rows, 1 to 1,000,000) to `start_bash_terminal` / `start_pwsh_terminal` for a session that retains history; without it there is none
 - `start_diagnostic_case` takes `sessionId`, optional `maxBytes`, `maxSeconds`, `authorize` (comma-separated: `reapplication-data`, `raw-input`, `editor-text`, `native-output`) and `directory`; one case per terminal (`case-active`)
 - `stop_diagnostic_case` returns `case.path` and `case.stopReason`; pass the path to `inspect_diagnostic_case` (optional `since`, `limit`) for `completionState`, per-stream `missing` ranges and the re-applicable `intervals`
 - `mark_diagnostic_case` (`sessionId`, optional `label`) records a checkpoint at the current model sequence while the case records; the stop records one labelled `stop`. Mark just before and just after the moment you want to examine

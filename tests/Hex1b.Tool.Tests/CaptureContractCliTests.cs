@@ -1070,6 +1070,60 @@ public class CaptureContractCliTests
         }
     }
 
+    [TestMethod]
+    [DataRow(null)]
+    [DataRow(1)]
+    [DataRow(1_000_000)]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task TerminalStart_ScrollbackOption(int? scrollback)
+    {
+        // The host gives the terminal the requested capacity (absent: none), as the case's recorded configuration
+        // shows; out-of-range values are refused by 'terminal start' and 'terminal host' before a host runs.
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        foreach (var command in new[] { "start", "host" })
+        {
+            foreach (var invalid in new[] { "0", "1000001", "-1" })
+            {
+                var (exit, _, error) = await RunCliAsync("terminal", command, "--scrollback", invalid, "--", "/bin/true");
+                Assert.AreEqual(1, exit, $"terminal {command} --scrollback {invalid}");
+                StringAssert.Contains(error, "scrollback must be 1 to 1,000,000 rows", $"terminal {command} --scrollback {invalid}");
+            }
+        }
+
+        using var root = new CaseRoot();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+        var config = new TerminalHostConfig
+        {
+            Width = 40,
+            Height = 6,
+            Command = "/bin/sh",
+            Arguments = ["-c", "printf 'SCROLLBACK-HOST\\n'; exec sleep 60"],
+            Scrollback = scrollback,
+            DiagnosticCase = new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] },
+        };
+
+        await WaitForSocketReleaseAsync(cts.Token);
+        var host = TerminalHost.RunAsync(config, cts.Token);
+        try
+        {
+            await WaitForSocketAsync(cts.Token);
+            Assert.IsNotNull(await WaitForCliTextAsync("SCROLLBACK-HOST", cts.Token), "hosted PTY output never reached the model");
+            var (stopExit, stop, stopErr) = await RunCliAsync("capture", "case", "stop", Pid, "--json");
+            Assert.AreEqual(0, stopExit, stopErr);
+            var path = JsonDocument.Parse(stop).RootElement.GetProperty("path").GetString()!;
+            var configuration = JsonDocument.Parse(File.ReadAllText(Path.Combine(path, "manifest.json"))).RootElement
+                .GetProperty("checkpoint").GetProperty("configuration");
+            Assert.AreEqual(scrollback, configuration.TryGetProperty("scrollbackCapacity", out var recorded) ? recorded.GetInt32() : null,
+                configuration.ToString());
+        }
+        finally
+        {
+            await cts.CancelAsync();
+            try { await host; } catch (OperationCanceledException) { }
+        }
+    }
+
     // Status of a settled case: engine counts equal twice in a row around the client's read.
     private static async Task<JsonElement> StableStatusAsync(TerminalDiagnostics engine, Func<Task<string>> read)
     {

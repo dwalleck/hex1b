@@ -24,9 +24,10 @@ public class SessionManagementTools(TerminalSessionManager sessionManager)
         [Description("With recordCase: largest artifact in bytes (1 MiB to 1 GiB; default 64 MiB).")] long? caseMaxBytes = null,
         [Description("With recordCase: longest recording in seconds (1 to 86400; default 600).")] int? caseMaxSeconds = null,
         [Description("With recordCase: owner-only root directory for the case.")] string? caseDirectory = null,
+        [Description("Rows of scrollback the terminal retains (1 to 1,000,000; default none).")] int? scrollback = null,
         CancellationToken ct = default)
     {
-        return await StartShellAsync("bash", [], workingDirectory, width, height, asciinemaFilePath,
+        return await StartShellAsync("bash", [], workingDirectory, width, height, asciinemaFilePath, scrollback,
             CaseOptions(recordCase, caseAuthorize, caseMaxBytes, caseMaxSeconds, caseDirectory), ct);
     }
 
@@ -44,9 +45,10 @@ public class SessionManagementTools(TerminalSessionManager sessionManager)
         [Description("With recordCase: largest artifact in bytes (1 MiB to 1 GiB; default 64 MiB).")] long? caseMaxBytes = null,
         [Description("With recordCase: longest recording in seconds (1 to 86400; default 600).")] int? caseMaxSeconds = null,
         [Description("With recordCase: owner-only root directory for the case.")] string? caseDirectory = null,
+        [Description("Rows of scrollback the terminal retains (1 to 1,000,000; default none).")] int? scrollback = null,
         CancellationToken ct = default)
     {
-        return await StartShellAsync("pwsh", [], workingDirectory, width, height, asciinemaFilePath,
+        return await StartShellAsync("pwsh", [], workingDirectory, width, height, asciinemaFilePath, scrollback,
             CaseOptions(recordCase, caseAuthorize, caseMaxBytes, caseMaxSeconds, caseDirectory), ct);
     }
 
@@ -74,9 +76,12 @@ public class SessionManagementTools(TerminalSessionManager sessionManager)
         int width,
         int height,
         string? asciinemaFilePath,
+        int? scrollback,
         (bool Record, DiagnosticCaseStartRequest? Request, DiagnosticCaseResult? Invalid) diagnosticCase,
         CancellationToken ct)
     {
+        if (scrollback is { } rows && TerminalDiagnostics.ScrollbackProblem(rows) is { } invalidScrollback)
+            return Failed(command, arguments, workingDirectory, width, height, $"Failed to start terminal: invalid-request: {invalidScrollback}", null);
         if (diagnosticCase.Invalid is { } invalid)
             return Failed(command, arguments, workingDirectory, width, height, $"Failed to start terminal: {invalid.Problem!.Code}: {invalid.Problem.Message}", invalid);
 
@@ -91,6 +96,7 @@ public class SessionManagementTools(TerminalSessionManager sessionManager)
                 height,
                 asciinemaFilePath,
                 diagnosticCase.Request,
+                scrollback,
                 ct);
 
             return new StartTerminalResult

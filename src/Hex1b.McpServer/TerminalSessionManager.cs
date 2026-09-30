@@ -147,6 +147,7 @@ public sealed class TerminalSessionManager : IAsyncDisposable
     /// <param name="height">Terminal height in rows.</param>
     /// <param name="asciinemaFilePath">Optional path to save an asciinema recording.</param>
     /// <param name="diagnosticCase">When set, a bounded diagnostic case records the session from construction.</param>
+    /// <param name="scrollback">Rows of scrollback the terminal retains, or null for none.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The created terminal session.</returns>
     public async Task<TerminalSession> StartSessionAsync(
@@ -158,10 +159,11 @@ public sealed class TerminalSessionManager : IAsyncDisposable
         int height = 24,
         string? asciinemaFilePath = null,
         DiagnosticCaseStartRequest? diagnosticCase = null,
+        int? scrollback = null,
         CancellationToken ct = default)
     {
         var id = GenerateSessionId();
-        return await StartSessionAsync(id, command, arguments, workingDirectory, environment, width, height, asciinemaFilePath, diagnosticCase, ct);
+        return await StartSessionAsync(id, command, arguments, workingDirectory, environment, width, height, asciinemaFilePath, diagnosticCase, scrollback, ct);
     }
 
     /// <summary>
@@ -176,6 +178,7 @@ public sealed class TerminalSessionManager : IAsyncDisposable
     /// <param name="height">Terminal height in rows.</param>
     /// <param name="asciinemaFilePath">Optional path to save an asciinema recording.</param>
     /// <param name="diagnosticCase">When set, a bounded diagnostic case records the session from construction.</param>
+    /// <param name="scrollback">Rows of scrollback the terminal retains, or null for none.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>The created terminal session.</returns>
     /// <exception cref="InvalidOperationException">A session with the given ID already exists.</exception>
@@ -189,6 +192,7 @@ public sealed class TerminalSessionManager : IAsyncDisposable
         int height = 24,
         string? asciinemaFilePath = null,
         DiagnosticCaseStartRequest? diagnosticCase = null,
+        int? scrollback = null,
         CancellationToken ct = default)
     {
         if (_disposed)
@@ -204,6 +208,7 @@ public sealed class TerminalSessionManager : IAsyncDisposable
             height,
             asciinemaFilePath,
             diagnosticCase,
+            scrollback,
             ct);
 
         if (!_sessions.TryAdd(id, session))

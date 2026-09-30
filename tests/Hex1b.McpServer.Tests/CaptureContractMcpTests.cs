@@ -695,6 +695,57 @@ public class CaptureContractMcpTests : McpServerTestBase
     }
 
     [TestMethod]
+    [DataRow(null)]
+    [DataRow(1)]
+    [DataRow(1_000_000)]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task StartBash_ScrollbackParameter(int? scrollback)
+    {
+        // The session's terminal has the requested capacity (absent: none), as the case's recorded configuration
+        // shows; out-of-range values are refused as invalid requests without a session.
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+
+        foreach (var invalid in new[] { 0, 1_000_001, -1 })
+        {
+            var refused = await CallAsync(client, "start_bash_terminal", new() { ["scrollback"] = invalid });
+            Assert.IsFalse(refused.GetProperty("success").GetBoolean(), refused.ToString());
+            StringAssert.Contains(refused.GetProperty("message").GetString(), "invalid-request: scrollback must be 1 to 1,000,000 rows", refused.ToString());
+        }
+        Assert.IsEmpty(SessionManager.GetAllSessions(), "a refused scrollback left a session");
+
+        var arguments = new Dictionary<string, object?>
+        {
+            ["workingDirectory"] = Path.GetTempPath(),
+            ["recordCase"] = true,
+            ["caseDirectory"] = root.Path,
+            ["caseAuthorize"] = "reapplication-data",
+        };
+        if (scrollback is { } rows)
+            arguments["scrollback"] = rows;
+        var start = await CallAsync(client, "start_bash_terminal", arguments);
+        Assert.IsTrue(start.GetProperty("success").GetBoolean(), start.ToString());
+        var sessionId = start.GetProperty("sessionId").GetString()!;
+        try
+        {
+            var stop = await CallAsync(client, "stop_diagnostic_case", new() { ["sessionId"] = sessionId });
+            Assert.IsTrue(stop.GetProperty("success").GetBoolean(), stop.ToString());
+            var path = stop.GetProperty("case").GetProperty("path").GetString()!;
+            var configuration = JsonDocument.Parse(File.ReadAllText(Path.Combine(path, "manifest.json"))).RootElement
+                .GetProperty("checkpoint").GetProperty("configuration");
+            Assert.AreEqual(scrollback, configuration.TryGetProperty("scrollbackCapacity", out var recorded) ? recorded.GetInt32() : null,
+                configuration.ToString());
+        }
+        finally
+        {
+            await CallAsync(client, "remove_session", new() { ["sessionId"] = sessionId });
+        }
+    }
+
+    [TestMethod]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task CaseLiveStart_ReapplyFromTheStartMatchesTheReapplier()
     {

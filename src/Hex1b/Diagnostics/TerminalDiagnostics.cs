@@ -911,6 +911,16 @@ public sealed class TerminalDiagnostics
         return null;
     }
 
+    /// <summary>
+    /// Why a client's scrollback rows are out of range, or null; shared by the CLI and MCP hosts. The range is the one
+    /// a case's recorded configuration can rebuild (1 to 1,000,000).
+    /// </summary>
+    internal static string? ScrollbackProblem(int rows) =>
+        rows is < 1 or > Diagnostics.Cases.CaseConfiguration.MaxScrollbackCapacity
+            ? string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"scrollback must be 1 to {Diagnostics.Cases.CaseConfiguration.MaxScrollbackCapacity:N0} rows (was {rows}).")
+            : null;
+
     internal static DiagnosticCaseResult CaseProblem(DiagnosticOutcome outcome, string code, string message) => new()
     {
         Outcome = outcome,

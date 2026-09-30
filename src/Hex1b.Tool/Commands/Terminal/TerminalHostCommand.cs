@@ -17,6 +17,7 @@ internal sealed class TerminalHostCommand : BaseCommand
     private static readonly Option<string?> s_recordOption = new("--record") { Description = "Record to asciinema file" };
     private static readonly Option<int?> s_portOption = new("--port") { Description = "Port for WebSocket diagnostics listener" };
     private static readonly Option<string?> s_bindOption = new("--bind") { Description = "Bind address for the WebSocket listener (default: 127.0.0.1, use 0.0.0.0 for containers)" };
+    private static readonly Option<int?> s_scrollbackOption = new("--scrollback") { Description = "Rows of scrollback the terminal retains" };
     private static readonly Option<bool> s_recordCaseOption = new("--record-case") { Description = "Record a bounded diagnostic case from construction" };
     private static readonly Option<long?> s_caseMaxBytesOption = new("--case-max-bytes") { Description = "Largest case artifact, in bytes" };
     private static readonly Option<int?> s_caseMaxSecondsOption = new("--case-max-seconds") { Description = "Longest case, in seconds" };
@@ -40,6 +41,7 @@ internal sealed class TerminalHostCommand : BaseCommand
         Options.Add(s_recordOption);
         Options.Add(s_portOption);
         Options.Add(s_bindOption);
+        Options.Add(s_scrollbackOption);
         Options.Add(s_recordCaseOption);
         Options.Add(s_caseMaxBytesOption);
         Options.Add(s_caseMaxSecondsOption);
@@ -60,6 +62,13 @@ internal sealed class TerminalHostCommand : BaseCommand
             ? cmd
             : TerminalHostPlatformDefaults.GetDefaultCommandLine();
         command = TerminalHostPlatformDefaults.NormalizeCommandLine(command);
+
+        var scrollback = parseResult.GetValue(s_scrollbackOption);
+        if (scrollback is { } rows && Diagnostics.TerminalDiagnostics.ScrollbackProblem(rows) is { } invalidScrollback)
+        {
+            Formatter.WriteError($"--scrollback: {invalidScrollback}");
+            return 1;
+        }
 
         Diagnostics.DiagnosticCaseStartRequest? caseRequest = null;
         if (parseResult.GetValue(s_recordCaseOption))
@@ -86,6 +95,7 @@ internal sealed class TerminalHostCommand : BaseCommand
             RecordPath = record,
             Port = port,
             BindAddress = bind,
+            Scrollback = scrollback,
             DiagnosticCase = caseRequest
         };
 

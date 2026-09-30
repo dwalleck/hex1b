@@ -312,12 +312,18 @@ Start a case in one of two ways:
   output is projected at the arming, in the same hold of the model lock. The case owns a
   `text-state/1` start checkpoint (a `checkpoint` line labelled `start`, at the arming model
   sequence), and every later model event is recorded after it. The start is `complete` when the
-  model holds only what its restore can represent: the active screen and its continuation and,
-  on the alternate screen (a Hex1b application, a full-screen program), the saved main screen.
-  Otherwise it is `unsupported`, and `unsupportedSurfaces` names each surface found:
-  `retained-history`, `titles`, `command-marks`, `pending-input`, `dcs-continuation` and
-  `graphics`. A start larger than the 256 MiB pending-state budget, or one taken inside an
-  application, is `unsupported` with that reason. The case records either way.
+  model holds only what its restore can represent: the active screen and its continuation, the
+  retained history and, on the alternate screen (a Hex1b application, a full-screen program), the
+  saved main screen. History rows keep their identities and original widths, so a later resize
+  reflows them as it did the original's. Otherwise it is `unsupported`, and
+  `unsupportedSurfaces` names each surface found: `titles`, `command-marks`, `pending-input`,
+  `dcs-continuation` and `graphics`. A start too large for the case's `maxBytes` (`size-limit`),
+  one larger than the 256 MiB pending-state budget, or one taken inside an application, is
+  `unsupported` with that reason; no history is ever truncated to fit. The case records either way.
+
+A local terminal retains history only when started with a scrollback: `hex1b terminal start
+--scrollback <rows>`, or `scrollback` on the MCP `start_bash_terminal` / `start_pwsh_terminal`
+tools (1 to 1,000,000 rows; default none).
 
 Stop the case with `hex1b capture case stop`, `stop_diagnostic_case`, or `case-stop`. Mark a
 boundary while it records with `hex1b capture case mark`, `mark_diagnostic_case`, or `case-mark`.
@@ -633,5 +639,5 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
   neither are case start and stop. Case status is timed out like capture.
 - A case started on a running target re-applies from its `text-state/1` start checkpoint, not
   from the first byte: only a case started at construction holds the output before it. A start
-  holding a surface the restore cannot represent yet (retained history, titles, command marks,
-  pending input, graphics) is `unsupported`, and names it.
+  holding a surface the restore cannot represent yet (titles, command marks, pending input,
+  graphics) is `unsupported`, and names it.

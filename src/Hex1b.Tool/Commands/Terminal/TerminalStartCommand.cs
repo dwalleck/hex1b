@@ -21,6 +21,7 @@ internal sealed class TerminalStartCommand : BaseCommand
     private static readonly Option<bool> s_passthruOption = new("--passthru") { Description = "Run in passthru mode: PTY bridges directly to the current terminal with no chrome" };
     private static readonly Option<int?> s_portOption = new("--port") { Description = "Port for WebSocket diagnostics listener" };
     private static readonly Option<string?> s_bindOption = new("--bind") { Description = "Bind address for the WebSocket listener (default: 127.0.0.1, use 0.0.0.0 for containers)" };
+    private static readonly Option<int?> s_scrollbackOption = new("--scrollback") { Description = "Rows of scrollback the terminal retains (1-1,000,000; default none)" };
     private static readonly Option<bool> s_recordCaseOption = new("--record-case")
     {
         Description = "Record a bounded diagnostic case from the terminal's construction (see 'capture case')"
@@ -55,6 +56,7 @@ internal sealed class TerminalStartCommand : BaseCommand
         Options.Add(s_passthruOption);
         Options.Add(s_portOption);
         Options.Add(s_bindOption);
+        Options.Add(s_scrollbackOption);
         Options.Add(s_recordCaseOption);
         Options.Add(s_caseMaxBytesOption);
         Options.Add(s_caseMaxSecondsOption);
@@ -72,6 +74,7 @@ internal sealed class TerminalStartCommand : BaseCommand
         var passthru = parseResult.GetValue(s_passthruOption);
         var port = parseResult.GetValue(s_portOption);
         var bind = parseResult.GetValue(s_bindOption);
+        var scrollback = parseResult.GetValue(s_scrollbackOption);
         var command = parseResult.GetValue(s_commandArgument) is { Length: > 0 } cmd
             ? cmd
             : TerminalHostPlatformDefaults.GetDefaultCommandLine();
@@ -80,6 +83,12 @@ internal sealed class TerminalStartCommand : BaseCommand
         if (passthru && parseResult.GetValue(s_attachOption))
         {
             Formatter.WriteError("--passthru and --attach are mutually exclusive");
+            return 1;
+        }
+
+        if (scrollback is { } rows && TerminalDiagnostics.ScrollbackProblem(rows) is { } invalidScrollback)
+        {
+            Formatter.WriteError($"--scrollback: {invalidScrollback}");
             return 1;
         }
 
@@ -106,7 +115,7 @@ internal sealed class TerminalStartCommand : BaseCommand
 
         if (passthru)
         {
-            return await RunPassthruAsync(parseResult, width, height, cwd, record, port, bind, caseRequest, command, cancellationToken);
+            return await RunPassthruAsync(parseResult, width, height, cwd, record, port, bind, scrollback, caseRequest, command, cancellationToken);
         }
 
         // Build args for the host process
@@ -126,6 +135,10 @@ internal sealed class TerminalStartCommand : BaseCommand
         if (bind != null)
         {
             hostArgs.AddRange(["--bind", bind]);
+        }
+        if (scrollback.HasValue)
+        {
+            hostArgs.AddRange(["--scrollback", scrollback.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)]);
         }
         if (caseRequest != null)
         {
@@ -277,6 +290,7 @@ internal sealed class TerminalStartCommand : BaseCommand
         int width, int height,
         string? cwd, string? record,
         int? port, string? bind,
+        int? scrollback,
         DiagnosticCaseStartRequest? caseRequest,
         string[] command,
         CancellationToken cancellationToken)
@@ -296,6 +310,7 @@ internal sealed class TerminalStartCommand : BaseCommand
             BindAddress = bind,
             WorkingDirectory = cwd,
             RecordPath = record,
+            Scrollback = scrollback,
             DiagnosticCase = caseRequest
         };
 

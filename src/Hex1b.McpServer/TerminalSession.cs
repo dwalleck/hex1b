@@ -131,6 +131,7 @@ public sealed class TerminalSession : IAsyncDisposable
     /// <param name="height">Terminal height in rows.</param>
     /// <param name="asciinemaFilePath">Optional path to save an asciinema recording from session start.</param>
     /// <param name="diagnosticCase">When set, a bounded diagnostic case records the session from construction.</param>
+    /// <param name="scrollback">Rows of scrollback the terminal retains, or null for none.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <returns>A started terminal session.</returns>
     public static async Task<TerminalSession> StartAsync(
@@ -143,6 +144,7 @@ public sealed class TerminalSession : IAsyncDisposable
         int height = 24,
         string? asciinemaFilePath = null,
         DiagnosticCaseStartRequest? diagnosticCase = null,
+        int? scrollback = null,
         CancellationToken ct = default)
     {
         Hex1bTerminalChildProcess? process = null;
@@ -182,7 +184,8 @@ public sealed class TerminalSession : IAsyncDisposable
                 PresentationAdapter = presentation,
                 WorkloadAdapter = process,
                 Width = width,
-                Height = height
+                Height = height,
+                ScrollbackCapacity = scrollback
             };
             terminalOptions.WorkloadFilters.Add(asciinemaRecorder);
 

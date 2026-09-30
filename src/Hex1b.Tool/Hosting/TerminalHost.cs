@@ -37,6 +37,11 @@ internal sealed class TerminalHost
             builder.WithAsciinemaRecording(config.RecordPath);
         }
 
+        if (config.Scrollback is { } scrollback)
+        {
+            builder.WithScrollback(scrollback);
+        }
+
         if (config.DiagnosticCase != null)
         {
             builder.WithDiagnosticCase(config.DiagnosticCase);
@@ -84,6 +89,11 @@ internal sealed class TerminalHost
         if (config.RecordPath != null)
         {
             builder.WithAsciinemaRecording(config.RecordPath);
+        }
+
+        if (config.Scrollback is { } scrollback)
+        {
+            builder.WithScrollback(scrollback);
         }
 
         if (config.DiagnosticCase != null)
