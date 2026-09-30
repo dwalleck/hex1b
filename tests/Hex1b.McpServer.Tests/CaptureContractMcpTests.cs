@@ -807,6 +807,17 @@ public class CaptureContractMcpTests : McpServerTestBase
             .GetProperty("reapplication");
         Assert.AreEqual("unavailable", refused.GetProperty("comparison").GetString(), refused.ToString());
         StringAssert.StartsWith(refused.GetProperty("comparisonReason").GetString(), "fault-not-applicable");
+
+        // The tool descriptions: the reapply tool names the faults, and the start tool no longer lists pending input among
+        // the surfaces a start cannot restore (review XR#1).
+        var tools = await client.ListToolsAsync();
+        var reapplyTool = tools.Single(t => t.Name == "reapply_diagnostic_case");
+        var faultParameter = reapplyTool.JsonSchema.GetProperty("properties").GetProperty("injectFault").GetProperty("description").GetString()!;
+        foreach (var fault in new[] { "pending-input", "pending-escape", "pending-ground-escape", "pending-framer" })
+            StringAssert.Contains(faultParameter, fault, "the injectFault description");
+        var startDescription = tools.Single(t => t.Name == "start_diagnostic_case").Description!;
+        StringAssert.Contains(startDescription, "a DCS in progress, graphics", "the start description's unsupported surfaces");
+        Assert.IsFalse(startDescription.Contains("pending input, a DCS", StringComparison.Ordinal), "the start description still lists pending input as unsupported");
     }
 
     [TestMethod]

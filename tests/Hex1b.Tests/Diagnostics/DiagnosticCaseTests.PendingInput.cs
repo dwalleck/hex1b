@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Text.Json.Nodes;
 using Hex1b.Diagnostics;
 using Hex1b.Diagnostics.Cases;
@@ -40,9 +41,9 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     public async Task Reapply_PendingInputFaults()
     {
-        // A fault is injected into the state reconstructed at the target, so the target is the start itself, the one
-        // checkpoint that holds pending input. Each fault differs at the path it names and is labelled; a start holding
-        // none of that state refuses it.
+        // A fault is injected into the state reconstructed at the target, so the target is a checkpoint taken while that
+        // input was pending: here the start. Each fault differs at exactly the path it names and is labelled; a
+        // checkpoint holding none of that state refuses it.
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
         await using var terminal = HistoryTerminal(workload, strategy: null, capacity: 100);
@@ -55,7 +56,8 @@ public partial class DiagnosticCaseTests
         {
             var result = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "start", Faults = [fault] });
             Assert.AreEqual((DiagnosticOutcome.Captured, "different", true), (result.Outcome, result.Comparison, result.FaultInjected), $"{fault}: {result.ComparisonReason} {result.Problem?.Message}");
-            CollectionAssert.Contains(result.Differences!.Differences.Select(d => d.Path).ToList(), faultPath, fault);
+            // Exactly one difference: a fault that also changed another holder would be a wrong control.
+            Assert.AreEqual(faultPath, string.Join(",", result.Differences!.Differences.Select(d => d.Path)), fault);
             Assert.IsTrue(File.Exists(Path.Combine(result.RunPath!, "faulted.json")), $"{fault}: no faulted.json");
         }
         var groundRefused = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "start", Faults = ["pending-ground-escape"] });
@@ -70,15 +72,58 @@ public partial class DiagnosticCaseTests
         await new TerminalDiagnostics(esc).StopCaseAsync(TestContext.Current.CancellationToken);
         var ground = Reapply(new DiagnosticCaseReapplyRequest { Path = escPath, ToLabel = "start", Faults = ["pending-ground-escape"] });
         Assert.AreEqual((DiagnosticOutcome.Captured, "different", true), (ground.Outcome, ground.Comparison, ground.FaultInjected), ground.Problem?.Message);
-        CollectionAssert.Contains(ground.Differences!.Differences.Select(d => d.Path).ToList(), "pendingInput.groundEscape");
+        Assert.AreEqual("pendingInput.groundEscape", string.Join(",", ground.Differences!.Differences.Select(d => d.Path)));
         foreach (var fault in new[] { "pending-input", "pending-escape", "pending-framer" })
         {
             var refused = Reapply(new DiagnosticCaseReapplyRequest { Path = escPath, ToLabel = "start", Faults = [fault] });
             Assert.AreEqual(("unavailable", "fault-not-applicable"), (refused.Comparison, refused.ComparisonReason?.Split(':')[0]), $"{fault}: {refused.ComparisonReason}");
         }
-        // At a later target the start's pending input has been consumed, so every pending fault is refused there.
+        // At a later target where the pending input has been consumed, every pending fault is refused.
         var later = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "stop", Faults = ["pending-input"] });
         Assert.AreEqual(("unavailable", "fault-not-applicable"), (later.Comparison, later.ComparisonReason?.Split(':')[0]), later.ComparisonReason);
+    }
+
+    // The documentation fence (design C14): the guide, the CLI reference and the MCP skill name the four faults and no
+    // longer list pending input among the surfaces a start cannot restore. The CLI and MCP descriptions are checked by
+    // the client tests, which read them through the tools.
+    [TestMethod]
+    [DataRow("src/content/guide/diagnostic-capture.md")]
+    [DataRow("src/content/reference/cli.md")]
+    [DataRow("src/Hex1b.McpServer/SKILL.md")]
+    public void DocsMentionPendingInput(string relativePath)
+    {
+        var root = AppContext.BaseDirectory;
+        while (!File.Exists(Path.Combine(root, "src/Hex1b/Hex1b.csproj")))
+            root = Path.GetDirectoryName(root) ?? throw new InvalidOperationException("repository root not found");
+        var text = File.ReadAllText(Path.Combine(root, relativePath));
+        if (relativePath.EndsWith("cli.md", StringComparison.Ordinal) || relativePath.Contains("guide", StringComparison.Ordinal))
+        {
+            foreach (var fault in new[] { "pending-input", "pending-escape", "pending-ground-escape", "pending-framer" })
+                StringAssert.Contains(text, $"`{fault}`", relativePath);
+        }
+        StringAssert.Contains(text, "DCS in progress", relativePath);
+        Assert.IsFalse(Regex.IsMatch(text, @"\(pending input, a DCS in progress, graphics\)"), $"{relativePath} still lists pending input as a surface a start cannot restore");
+        Assert.IsFalse(text.Contains("holds pending input, a DCS in progress or graphics", StringComparison.Ordinal), $"{relativePath} still lists pending input as unsupported");
+    }
+
+    [TestMethod]
+    public async Task Reapply_PendingInputFaultsAtAMarkAndAStop()
+    {
+        // A mark or a stop taken while input is pending holds it too, so the faults apply there (review XR#2).
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = HistoryTerminal(workload, strategy: null, capacity: 100);
+        await workload.WriteAndWaitAsync(terminal, "before ");
+        var path = StartLive(terminal, root);
+        var diagnostics = new TerminalDiagnostics(terminal);
+        await workload.WriteAndWaitAsync(terminal, [0xe6]);
+        diagnostics.MarkCase("mid-scalar");
+        await workload.WriteAndWaitAsync(terminal, [0xbc, 0xa2, .. "\u001b[1;"u8]);
+        await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+        var atMark = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "mid-scalar", Faults = ["pending-input"] });
+        Assert.AreEqual(("different", true, "pendingInput.utf8"), (atMark.Comparison, atMark.FaultInjected, string.Join(",", atMark.Differences!.Differences.Select(d => d.Path))), atMark.ComparisonReason);
+        var atStop = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "stop", Faults = ["pending-escape"] });
+        Assert.AreEqual(("different", true, "pendingInput.escapePrefix"), (atStop.Comparison, atStop.FaultInjected, string.Join(",", atStop.Differences!.Differences.Select(d => d.Path))), atStop.ComparisonReason);
     }
 
     [TestMethod]
@@ -113,16 +158,19 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
-    [DataRow("before the rest", 0)]
-    [DataRow("between the two halves of the rest", 1)]
-    [DataRow("after the rest", 2)]
-    public async Task Reapply_PendingInputAcrossResize(string shape, int resizeAt)
+    [DataRow("before the rest", 0, null)]
+    [DataRow("between the two halves of the rest", 1, null)]
+    [DataRow("after the rest", 2, null)]
+    [DataRow("before the rest", 0, "ghostty")]
+    [DataRow("between the two halves of the rest", 1, "xterm")]
+    [DataRow("after the rest", 2, "kitty")]
+    public async Task Reapply_PendingInputAcrossResize(string shape, int resizeAt, string? strategyId)
     {
         // A resize around the chunks that finish a pending 4-byte scalar and an unfinished CSI is in one event, once,
-        // and re-application matches after it and at the stop.
+        // and re-application matches after it and at the stop, with and without a reflow strategy (review XR#6).
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
-        await using var terminal = HistoryTerminal(workload, strategy: null, capacity: 100);
+        await using var terminal = HistoryTerminal(workload, strategyId is null ? null : CaseConfiguration.CreateReflowStrategy(strategyId), capacity: 100);
         await workload.WriteAndWaitAsync(terminal, [.. "before "u8, 0xf0, 0x9f]);
         var path = StartLive(terminal, root);
         var diagnostics = new TerminalDiagnostics(terminal);

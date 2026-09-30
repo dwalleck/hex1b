@@ -569,8 +569,9 @@ event is `unknown-model-sequence`. In an interrupted or truncated case, whose ta
   unfinished escape sequence (`pendingInput.escapePrefix`), `pending-ground-escape` the held ESC
   (`pendingInput.groundEscape`) and `pending-framer` the framer's continuation count
   (`pendingInput.framerUtf8Remaining`); none takes a target. Faults are injected into the state
-  reconstructed at the target, and only a live start's own checkpoint holds pending input, so
-  target the start (`--to start`); a state without that holder makes the fault not applicable.
+  reconstructed at the target, so target a checkpoint taken while that input was pending: a live
+  start (`--to start`), or a mark or stop taken mid-sequence. A state without that holder makes
+  the fault not applicable.
 
 Such a result is labelled `faultInjected`, and is never the recorded path's outcome. A fault the
 state has nothing to change for (a history fault without history) makes the comparison

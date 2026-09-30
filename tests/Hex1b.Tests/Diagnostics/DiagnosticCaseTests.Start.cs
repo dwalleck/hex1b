@@ -66,8 +66,8 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     public async Task Start_UnsupportedSurfaceStillRecords()
     {
-        // Retained rows (ticket 10), a title (ticket 11), pending UTF-8 (ticket 12) and a DCS in progress at once: the
-        // one refused surface is named, and the case records.
+        // Retained rows (ticket 10), a title (ticket 11) and a DCS in progress at once (the scalar before it is complete):
+        // the one refused surface is named, and the case records.
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
         await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
