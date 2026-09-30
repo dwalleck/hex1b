@@ -95,6 +95,22 @@ public class ModelStateComparerTests
         Assert.AreEqual((10_001L, 1, true), (one.Total, one.Differences.Count, one.Truncated));
     }
 
+    [TestMethod]
+    public async Task CommandMarkPositionsAndStackCompared()
+    {
+        // Equal counts and equal text: a mark one column later is reported at its column alone (ticket 11).
+        var mark = await ProjectAsync("ab\u001b]133;A\u0007cd");
+        var moved = await ProjectAsync("abc\u001b]133;A\u0007d");
+        Assert.AreEqual((1, 1), (mark.CommandMarks.Count, moved.CommandMarks.Count), "fixture: mark counts");
+        AssertOnly(mark, moved, "commandMarks[0].column");
+
+        // Equal current titles and stack depth: a different saved entry is reported at that entry.
+        var stack = await ProjectAsync("\u001b]0;x\u0007\u001b]22;\u0007");
+        var other = await ProjectAsync("\u001b]0;y\u0007\u001b]22;\u0007\u001b]0;x\u0007");
+        Assert.AreEqual((stack.Titles.Window, stack.Titles.Stack.Count), (other.Titles.Window, other.Titles.Stack.Count), "fixture: titles");
+        AssertOnly(stack, other, "titles.stack[0].window", "titles.stack[0].icon");
+    }
+
     private static void AssertOnly(DiagnosticModelState recorded, DiagnosticModelState reapplied, params string[] paths)
     {
         var comparison = ModelStateComparer.Compare(recorded, reapplied, ModelStateComparer.DefaultMaxDifferences);

@@ -25,8 +25,8 @@ internal static class ModelStateComparer
     [
         "clock stamps: each cell's write time and each history row's timestamp",
         "write sequences: the order cells were written in",
-        "text identities: row ids, the text generation and anchor positions, assigned when text is read",
-        "caller-created text anchors and their views",
+        "text identities: row ids and the text generation, assigned when text is read (a command mark's position is compared as its buffer, row and column)",
+        "caller-created text anchors and their views (browser custom markers)",
         "graphics: images, placements and Sixel registers are named unsupported, never compared",
     ];
     internal const int MaxMaxDifferences = 100_000;
@@ -312,6 +312,9 @@ internal static class ModelStateComparer
                 String("commandMarks", $"commandMarks[{i}].phase", recorded[i].Phase, reapplied[i].Phase);
                 Number("commandMarks", $"commandMarks[{i}].exitCode", recorded[i].ExitCode, reapplied[i].ExitCode);
                 String("commandMarks", $"commandMarks[{i}].rawParameters", recorded[i].RawParameters, reapplied[i].RawParameters);
+                String("commandMarks", $"commandMarks[{i}].buffer", recorded[i].Buffer, reapplied[i].Buffer);
+                Number("commandMarks", $"commandMarks[{i}].row", recorded[i].Row, reapplied[i].Row);
+                Number("commandMarks", $"commandMarks[{i}].column", recorded[i].Column, reapplied[i].Column);
             }
         }
 

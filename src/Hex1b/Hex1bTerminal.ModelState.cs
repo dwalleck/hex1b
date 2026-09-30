@@ -115,18 +115,7 @@ public sealed partial class Hex1bTerminal
             foreach (var (title, icon) in _titleStack)
                 titleStack.Add(new DiagnosticModelTitleEntry { Window = title, Icon = icon });
 
-            var marks = new DiagnosticModelCommandMark[_commandMarks.Count];
-            for (var i = 0; i < marks.Length; i++)
-            {
-                var mark = _commandMarks[i];
-                marks[i] = new DiagnosticModelCommandMark
-                {
-                    Anchor = _commandAnchors[mark].Id,
-                    Phase = ModelStateName(mark.Phase.ToString()),
-                    ExitCode = mark.ExitCode,
-                    RawParameters = mark.RawParameters,
-                };
-            }
+            var marks = ProjectCommandMarksUnsafe();
 
             var rendition = new TerminalCell(" ", _currentForeground, _currentBackground, _currentAttributes,
                 TrackedHyperlink: _currentHyperlink, UnderlineColor: _currentUnderlineColor, UnderlineStyle: _currentUnderlineStyle);
@@ -406,7 +395,8 @@ public sealed partial class Hex1bTerminal
         const string WriteOrder = "write-order: write sequences order cell writes and are not state (spec)";
         const string Infrastructure = "infrastructure: pumps, adapters, locks, callbacks, diagnostics or caches, not model state";
         const string InputPath = "input-path: state of the input direction, not of the output model";
-        const string Anchors = "identity: caller-created text anchors and their views; command marks are projected";
+        const string Anchors = "view: caller-created text anchors' views (browser custom markers are not model state)";
+        const string MarkAnchors = "projected: command marks' anchors, as their positions (buffer, row, column)";
         const string Graphics = "unsupported:graphics";
 
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -444,9 +434,10 @@ public sealed partial class Hex1bTerminal
             "_kgpAnimationTimer");
         Set(WriteOrder, "_writeSequence", "TerminalCell.<Sequence>k__BackingField");
         Set(Identity, "<DiagnosticSessionId>k__BackingField", "_textGeneration", "_nextTextRowId", "_textScreenRowIds",
-            "_textHistoryRowIds", "_savedMainTextRowIds", "_savedMainTextHistoryRowIds", "_commandAnchors",
+            "_textHistoryRowIds", "_savedMainTextRowIds", "_savedMainTextHistoryRowIds",
             "_textAnchorReflowPending", "_textAnchorRetentionChanged", "_bufferGeometryVersion");
-        Set(Anchors, "_textAnchors", "_historyTextAnchors", "_customAnchorViews", "_markerDetailsViews");
+        Set(MarkAnchors, "_textAnchors", "_historyTextAnchors", "_commandAnchors");
+        Set(Anchors, "_customAnchorViews", "_markerDetailsViews");
         Set(Configuration, "_commandMarkHistoryCapacity", "_customMarkerLimit", "_escapeTimeout", "_caseConfiguration");
         Set(InputPath, "_activePasteContext", "_inBracketedPaste", "_incompleteInputSequenceBuffer", "_inputUtf8Decoder");
         Set(Infrastructure,

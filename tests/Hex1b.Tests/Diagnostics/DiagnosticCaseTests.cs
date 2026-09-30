@@ -355,11 +355,13 @@ public partial class DiagnosticCaseTests
                 await terminal.ResizeForAutomationAsync(w, h);
                 await Settle(terminal);
             }
-            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
-            // What the model had read when the case stopped (the app's exit output comes later).
-            consumed = tap.Items();
+            // The app stops writing before the case stops: its exit output is read and recorded too, and nothing is
+            // read after the stop, so what the model read is exactly what the case recorded.
             await appCts.CancelAsync();
             try { await appRun; } catch (OperationCanceledException) { }
+            await Settle(terminal);
+            stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+            consumed = tap.Items();
         }
 
         var recorded = Artifact.Read(stopped.Path!).ModelEvents().Where(e => e.GetProperty("kind").GetString() == "application")

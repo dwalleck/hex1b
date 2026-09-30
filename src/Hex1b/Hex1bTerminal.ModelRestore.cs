@@ -19,9 +19,9 @@ public sealed partial class Hex1bTerminal
     /// write-order fields keep this model's values, as the census classifies them.
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// The state holds something this restore cannot represent (titles, command marks, pending input, an
-    /// unsupported surface, or a history this model's configured scrollback cannot hold as recorded), or the model
-    /// has already applied output.
+    /// The state holds something this restore cannot represent (pending input, an unsupported surface, a history
+    /// this model's configured scrollback cannot hold as recorded, or malformed titles or command marks), or the
+    /// model has already applied output.
     /// </exception>
     internal void RestoreModelState(DiagnosticModelState state)
     {
@@ -33,6 +33,9 @@ public sealed partial class Hex1bTerminal
                 throw new InvalidOperationException("Only a model that has applied nothing can be restored.");
             if (HistoryProblem(state.History, _scrollbackBuffer) is { } historyProblem)
                 throw new InvalidOperationException($"The state cannot be restored: its history {historyProblem}");
+            if (state.CommandMarks.Count > _commandMarkHistoryCapacity)
+                throw new InvalidOperationException(
+                    $"The state cannot be restored: its {state.CommandMarks.Count} command marks exceed the configured capacity of {_commandMarkHistoryCapacity}.");
         }
 
         var cells = new TerminalCell[state.Styles.Count];
@@ -124,7 +127,15 @@ public sealed partial class Hex1bTerminal
                 new TerminalProgress(ParseName<TerminalProgressState>(activity.ProgressState), activity.ProgressPercentage),
                 new TerminalShellIntegration(ParseName<TerminalShellIntegrationPhase>(activity.ShellPhase), activity.LastExitCode),
                 new TerminalWorkingDirectory(activity.WorkingDirectoryUri, activity.WorkingDirectoryHost, activity.WorkingDirectoryPath)));
-            _nextCommandAnchorId = state.LastCommandAnchorId;
+
+            // Titles as projected (already normalized); the projection lists the stack top first.
+            _windowTitle = state.Titles.Window;
+            _iconName = state.Titles.Icon;
+            _titleStack.Clear();
+            for (var i = state.Titles.Stack.Count - 1; i >= 0; i--)
+                _titleStack.Push((state.Titles.Stack[i].Window, state.Titles.Stack[i].Icon));
+            // Marks last: their positions are in the screens and history restored above.
+            RestoreCommandMarksUnsafe(state.CommandMarks, state.LastCommandAnchorId);
 
             _hasLastPrintedCell = state.LastPrinted is not null;
             if (state.LastPrinted is { } last)
@@ -200,10 +211,11 @@ public sealed partial class Hex1bTerminal
             return $"an active buffer '{state.ActiveBuffer}' that does not match its saved main screen";
         if (state.SavedMainScreen is { Count: > 0 } saved && saved.Any(row => row.Cells.Count != saved[0].Cells.Count))
             return "a saved main screen whose rows do not share one width";
-        if (state.Titles.Window.Length > 0 || state.Titles.Icon.Length > 0 || state.Titles.Stack.Count > 0)
-            return "titles";
-        if (state.CommandMarks.Count > 0)
-            return "command marks";
+        if (state.Titles is null || state.Titles.Window is null || state.Titles.Icon is null || state.Titles.Stack is null
+            || state.Titles.Stack.Any(entry => entry?.Window is null || entry.Icon is null))
+            return "titles with a missing field";
+        if (CommandMarksProblem(state) is { } marks)
+            return marks;
         if (state.PendingInput.EscapePrefix.Length > 0 || state.PendingInput.Utf8.Length > 0 || state.PendingInput.GroundEscape
             || state.PendingInput.FramerUtf8Remaining != 0)
             return "pending input";

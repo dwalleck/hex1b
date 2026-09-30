@@ -13,7 +13,7 @@ namespace Hex1b.Tests.Diagnostics;
 /// timer, and a start state's unsupported surfaces are named.
 /// </summary>
 [TestClass]
-public class DiagnosticModelRestoreTests
+public partial class DiagnosticModelRestoreTests
 {
     // Every supported surface at once: wide CJK and emoji at the right edge (wrap padding), two hyperlinks with
     // parameters (one target twice), protected cells, 256-colour and RGB styles, curly underline with colour, soft
@@ -452,11 +452,12 @@ public class DiagnosticModelRestoreTests
     [TestMethod]
     public void ModelRestore_RefusesStateItCannotRepresent()
     {
+        // Titles and command marks are restored since ticket 11; pending decoder bytes are not yet (ticket 12).
         var model = Detached(new FakeTimeProvider());
-        model.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b]2;T\u0007"));
+        model.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b]2;T\u0007ok \u001b["));
         var replica = Detached(new FakeTimeProvider());
         var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(model.CaptureModelState()));
-        StringAssert.Contains(error.Message, "titles");
+        StringAssert.Contains(error.Message, "pending input");
         Assert.AreEqual(0, replica.CurrentModelSequence, "a refused restore changed the model");
     }
 
