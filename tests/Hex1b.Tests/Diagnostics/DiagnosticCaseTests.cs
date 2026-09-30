@@ -355,10 +355,13 @@ public partial class DiagnosticCaseTests
                 await terminal.ResizeForAutomationAsync(w, h);
                 await Settle(terminal);
             }
-            // The app stops writing before the case stops: its exit output is read and recorded too, and nothing is
-            // read after the stop, so what the model read is exactly what the case recorded.
+            // The app stops writing before the case stops, and the tap is sealed so nothing more can be read: its exit
+            // output is read and recorded, the model applies what it read, and only then does the case stop. What the
+            // model read is then exactly what the case recorded.
             await appCts.CancelAsync();
             try { await appRun; } catch (OperationCanceledException) { }
+            await Settle(terminal);
+            tap.Seal();
             await Settle(terminal);
             stopped = await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
             consumed = tap.Items();
@@ -2810,12 +2813,20 @@ public partial class DiagnosticCaseTests
     private sealed class TapWorkload(Hex1bAppWorkloadAdapter inner) : IHex1bTerminalTokenWorkloadAdapter
     {
         private readonly List<byte[]> _items = [];
+        private volatile bool _sealed;
 
         public List<byte[]> Items() { lock (_items) return [.. _items]; }
 
+        // After sealing, reads never return: nothing more reaches the model.
+        public void Seal() => _sealed = true;
+
         public async ValueTask<WorkloadOutputItem> ReadOutputItemAsync(CancellationToken ct = default)
         {
+            if (_sealed)
+                await Task.Delay(Timeout.Infinite, ct);
             var item = await inner.ReadOutputItemAsync(ct);
+            if (_sealed)
+                await Task.Delay(Timeout.Infinite, ct);
             if (!item.Bytes.IsEmpty)
                 lock (_items) _items.Add(item.Bytes.ToArray());
             return item;

@@ -1,6 +1,7 @@
 using System.Collections;
 using System.Reflection;
 using System.Text;
+using System.Text.Json;
 using Hex1b.Diagnostics;
 using Hex1b.Diagnostics.Cases;
 using Microsoft.Extensions.Time.Testing;
@@ -54,6 +55,8 @@ public partial class DiagnosticModelRestoreTests
         Assert.AreEqual(ViewerMarks(original), ViewerMarks(replica), $"{scenario}: the viewer resolves the marks differently");
         foreach (var region in shape.Regions)
             Assert.IsTrue(InRegion(state, region), $"fixture: {scenario} has no mark in {region}");
+        if (scenario == "screen and history")
+            Assert.IsTrue(state.CommandMarks.Any(m => m.Phase == "finished" && m.ExitCode is null), "fixture: no finished mark without an exit code");
     }
 
     // The probe's scenarios (evidence P1) under each strategy: every later step leaves both models with the same
@@ -150,6 +153,11 @@ public partial class DiagnosticModelRestoreTests
     [DataRow("more marks than the capacity")]
     [DataRow("null title")]
     [DataRow("null stack entry field")]
+    [DataRow("null history row under a mark")]
+    [DataRow("null history cells under a mark")]
+    [DataRow("last anchor id at the maximum")]
+    [DataRow("negative last anchor id")]
+    [DataRow("column past a narrower history row")]
     public void ModelRestore_RefusesMalformedMarksAndTitles(string shape)
     {
         // The original ends at another geometry than the replica's, so a refusal after the restore's resize would show.
@@ -160,6 +168,11 @@ public partial class DiagnosticModelRestoreTests
         var marks = state.CommandMarks.ToList();
         Assert.IsGreaterThanOrEqualTo(3, marks.Count, "fixture: marks");
         var historyRows = state.History!.Rows.Count;
+        var historyMark = marks.FindIndex(m => m.Row < historyRows);
+        Assert.IsGreaterThanOrEqualTo(0, historyMark, "fixture: no mark in history");
+        var markedRow = marks[historyMark].Row!.Value;
+        List<DiagnosticModelRow> HistoryWith(Func<DiagnosticModelRow, DiagnosticModelRow> change) =>
+            [.. state.History!.Rows.Select((r, j) => j == markedRow ? change(r) : r)];
         List<DiagnosticModelCommandMark> With(int i, Func<DiagnosticModelCommandMark, DiagnosticModelCommandMark> change) =>
             [.. marks.Select((m, j) => j == i ? change(m) : m)];
         var forged = shape switch
@@ -179,13 +192,93 @@ public partial class DiagnosticModelRestoreTests
             "null marks" => state with { CommandMarks = null! },
             "more marks than the capacity" => state,
             "null title" => state with { Titles = state.Titles with { Window = null! } },
+            "null history row under a mark" => state with { History = state.History with { Rows = HistoryWith(_ => null!) } },
+            "null history cells under a mark" => state with { History = state.History with { Rows = HistoryWith(r => r with { Cells = null! }) } },
+            "last anchor id at the maximum" => state with { CommandMarks = [], LastCommandAnchorId = long.MaxValue },
+            "negative last anchor id" => state with { CommandMarks = [], LastCommandAnchorId = -4 },
+            // History rows keep the 40 columns they were written at, beside a 50-column screen.
+            "column past a narrower history row" => state with { CommandMarks = With(historyMark, m => m with { Column = 45 }) },
             _ => state with { Titles = state.Titles with { Stack = [state.Titles.Stack[0] with { Icon = null! }] } },
         };
         var replica = MarkModel(MarkScenarios["screen and history"], "none", markCapacity: shape == "more marks than the capacity" ? marks.Count - 1 : null);
         var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(forged));
-        StringAssert.Contains(error.Message, shape.Contains("title") || shape.Contains("stack") ? "titles" : "command mark", shape);
+        StringAssert.Contains(error.Message, shape.Contains("title") || shape.Contains("stack") ? "titles"
+            : shape.StartsWith("null history", StringComparison.Ordinal) ? "history"
+            : shape.Contains("anchor id") ? "last command anchor id" : "command mark", shape);
         Assert.AreEqual((0L, 40, 8, 0, ""), (replica.CurrentModelSequence, replica.Width, replica.Height, replica.CommandMarks.Count, replica.WindowTitle),
             $"{shape}: a refused restore changed the model");
+    }
+
+    [TestMethod]
+    public void ModelRestore_RefusesAMarkPastItsSavedMainRow()
+    {
+        // On the alternate screen the saved main screen keeps its own width (40) beside a wider alternate screen (50):
+        // a main mark on a saved-main row is checked against that row, not the alternate screen's.
+        var shape = MarkScenarios["alternate"];
+        var original = MarkModel(shape, "none");
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(shape.Before));
+        original.Resize(50, 12);
+        var state = original.CaptureModelState();
+        var history = state.History?.Rows.Count ?? 0;
+        var index = state.CommandMarks.ToList().FindIndex(m => m.Buffer == "main" && m.Row >= history);
+        Assert.AreEqual((40, 50), (state.SavedMainScreen![0].Cells.Count, state.Width), "fixture: the saved main screen's width");
+        Assert.IsGreaterThanOrEqualTo(0, index, "fixture: no mark on the saved main screen");
+        var forged = state with { CommandMarks = [.. state.CommandMarks.Select((m, j) => j == index ? m with { Column = 45 } : m)] };
+        var replica = MarkModel(shape, "none");
+        var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(forged));
+        StringAssert.Contains(error.Message, "command mark");
+        Assert.AreEqual((0L, 0), (replica.CurrentModelSequence, replica.CommandMarks.Count), "a refused restore changed the model");
+    }
+
+    [TestMethod]
+    public void ModelRestore_LastAnchorIdWithoutMarks()
+    {
+        // Marks collected by clearing leave the last anchor id: a restored model numbers its next mark after it.
+        var shape = MarkScenarios["insert delete"];
+        var original = MarkModel(shape, "none");
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(shape.Before + "\u001b[2J\u001b[3J\u001b[H"));
+        var state = original.CaptureModelState();
+        Assert.AreEqual((0, 2L), (state.CommandMarks.Count, state.LastCommandAnchorId), "fixture: no marks, a positive last id");
+        var replica = MarkModel(shape, "none");
+        replica.RestoreModelState(state);
+        foreach (var t in new[] { original, replica })
+            t.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b]133;A\u0007$ "));
+        var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(differences, "the next mark is numbered differently: " + string.Join("; ", differences.Take(3)));
+    }
+
+    [TestMethod]
+    public void ModelRestore_OrphanedContinuationKeepsItsColumn()
+    {
+        // A left/right-margin scroll removes a wide glyph's first cell and leaves its continuation (review XR#2). A mark
+        // placed there after the start stays on it in both models: the restored continuation does not share its left
+        // neighbour's write sequence, so it is not taken for that glyph's second cell.
+        Hex1bTerminal Model()
+        {
+            var options = new Hex1bTerminalOptions
+            {
+                PresentationAdapter = new HeadlessPresentationAdapter(22, 7).WithReflowStrategy(CaseConfiguration.CreateReflowStrategy("ghostty")!, enabled: true),
+                WorkloadAdapter = new CaseReapplier.DetachedWorkload(),
+                Width = 22,
+                Height = 7,
+                CommandMarkHistoryCapacity = 3,
+                TimeProvider = new FakeTimeProvider(),
+                DeferStart = true,
+            };
+            return new Hex1bTerminal(options);
+        }
+        var original = Model();
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(
+            "\t\u001b]133;A\u0007\t\u6f22\u5b57x\u001b]133;B\u0007\u6f22\u001b[1T\u001b[?69h\u001b[1;19s\u001b[2S"));
+        var replica = Model();
+        replica.RestoreModelState(original.CaptureModelState());
+        foreach (var step in new[] { "\u001b[?7l", "\rpppppppppppppppppppppp\u001b]133;B\u0007q", "\u001bD\u001bE", "\t\u001b]133;A\u0007\t" })
+        {
+            original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(step));
+            replica.ApplyRecordedOutput(Encoding.UTF8.GetBytes(step));
+            var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+            Assert.IsEmpty(differences, $"after {JsonSerializer.Serialize(step)}: " + string.Join("; ", differences.Take(3)));
+        }
     }
 
     // Scenarios: the probe's (evidence.md P1), with the strengthened fixtures.
@@ -194,7 +287,7 @@ public partial class DiagnosticModelRestoreTests
     private static readonly Dictionary<string, MarkScenario> MarkScenarios = new()
     {
         // Early marks are evicted before the start (gapped ids); the first step scrolls one row.
-        ["screen and history"] = new(40, 8, 12, MarkPrompts(1, 3) + MarkLines(12) + MarkPrompts(4, 6),
+        ["screen and history"] = new(40, 8, 12, MarkPrompts(1, 3) + MarkLines(12) + MarkPrompts(4, 6) + "\u001b]133;D\u0007",
             [("one line", "x\r\n"), ("more prompts", MarkPrompts(7, 10)), ("evict", MarkLines(10) + MarkPrompts(11, 14)),
              ("shrink", "RESIZE 24 6"), ("grow", "RESIZE 60 10"), ("erase screen", "\u001b[2J" + MarkPrompt(20, 0)),
              ("clear history", "\u001b[3J" + MarkPrompt(21, 1)),

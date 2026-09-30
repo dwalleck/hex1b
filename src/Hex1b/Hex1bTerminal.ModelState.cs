@@ -410,7 +410,8 @@ public sealed partial class Hex1bTerminal
         const string Infrastructure = "infrastructure: pumps, adapters, locks, callbacks, diagnostics or caches, not model state";
         const string InputPath = "input-path: state of the input direction, not of the output model";
         const string Anchors = "view: caller-created text anchors' views (browser custom markers are not model state)";
-        const string MarkAnchors = "projected: command marks' anchors, as their positions (buffer, row, column)";
+        const string MarkAnchors = "projected: command marks' anchors, as their positions (buffer, row, column); "
+            + "browser custom markers' anchors in the same sets are view state, not projected";
         const string Graphics = "unsupported:graphics";
 
         var map = new Dictionary<string, string>(StringComparer.Ordinal);

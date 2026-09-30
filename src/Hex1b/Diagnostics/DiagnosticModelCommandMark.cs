@@ -37,8 +37,8 @@ public sealed record DiagnosticModelCommandMark
     public int? Row { get; init; }
 
     /// <summary>
-    /// The column the mark was placed at: at most the row's width (a mark placed at a pending wrap is past the last
-    /// cell). Null exactly when <see cref="Row"/> is.
+    /// The mark's current column: where it was placed, as later insertions, deletions, wraps and reflow have moved it.
+    /// At most the row's width (a mark at a pending wrap is past the last cell). Null exactly when <see cref="Row"/> is.
     /// </summary>
     [JsonPropertyName("column")]
     public int? Column { get; init; }

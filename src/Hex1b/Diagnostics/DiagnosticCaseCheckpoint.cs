@@ -23,8 +23,9 @@ public sealed record DiagnosticCaseCheckpoint
 
     /// <summary>
     /// The state surfaces the checkpoint represents faithfully. A complete <c>text-state/1</c> start covers every surface
-    /// of the shared checkpoint table, retained history, titles and command marks included; pending input and graphics
-    /// only as empty, because a start holding either is unsupported and names it in <see cref="UnsupportedSurfaces"/>.
+    /// of the shared checkpoint table, retained history, titles and command marks included; pending input, a DCS in
+    /// progress and graphics only as empty, because a start holding any of them is unsupported and names it in
+    /// <see cref="UnsupportedSurfaces"/>.
     /// </summary>
     [JsonPropertyName("coveredSurfaces")]
     public IReadOnlyList<string> CoveredSurfaces { get; init; } = [];

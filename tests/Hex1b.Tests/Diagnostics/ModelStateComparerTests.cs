@@ -108,6 +108,8 @@ public class ModelStateComparerTests
         var moved = await ProjectAsync("abc\u001b]133;A\u0007d");
         Assert.AreEqual((1, 1), (mark.CommandMarks.Count, moved.CommandMarks.Count), "fixture: mark counts");
         AssertOnly(mark, moved, "commandMarks[0].column");
+        AssertOnly(mark, mark with { CommandMarks = [mark.CommandMarks[0] with { Row = 1 }] }, "commandMarks[0].row");
+        AssertOnly(mark, mark with { CommandMarks = [mark.CommandMarks[0] with { Buffer = "alternate" }] }, "commandMarks[0].buffer");
 
         // Equal current titles and stack depth: a different saved entry is reported at that entry.
         var stack = await ProjectAsync("\u001b]0;x\u0007\u001b]22;\u0007");

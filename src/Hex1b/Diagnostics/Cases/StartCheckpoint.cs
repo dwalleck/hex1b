@@ -3,9 +3,9 @@ namespace Hex1b.Diagnostics.Cases;
 /// <summary>
 /// The <c>text-state/1</c> start checkpoint of a case started on a terminal that has already applied output:
 /// which state surfaces a start may hold. The active text buffer, its continuation, the retained history, titles and
-/// the title stack, command marks and, on the alternate screen, the saved main screen are restored; pending input and
-/// graphics are refused while present, until their tickets extend the surface (12; graphics are outside the text
-/// profile). A start whose configuration cannot be rebuilt is never complete.
+/// the title stack, command marks and, on the alternate screen, the saved main screen are restored; pending input, a DCS
+/// in progress and graphics are refused while present, until their tickets extend the surface (12; graphics are outside
+/// the text profile). A start whose configuration cannot be rebuilt is never complete.
 /// </summary>
 internal static class StartCheckpoint
 {

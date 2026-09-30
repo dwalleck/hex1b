@@ -280,7 +280,7 @@ hex1b capture case reapply <path> --to TARGET [--inject-fault KIND] [--max-diffe
 
 A case started on a running terminal with `reapplication-data` owns a `text-state/1` start
 checkpoint and re-applies from it; a terminal holding a surface the start cannot restore yet
-(pending input, graphics) makes it `unsupported`, and the
+(pending input, a DCS in progress, graphics) makes it `unsupported`, and the
 output names the surfaces. To record from the first byte, use `hex1b terminal start --record-case`. `stop` waits at most 10 s for queued events.
 `inspect` reads the artifact offline, verifies every line's checksum, and reports whether the case
 is `complete`, `interrupted` or `truncated`. It also reports per-stream coverage and missing

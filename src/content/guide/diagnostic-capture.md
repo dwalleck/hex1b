@@ -318,7 +318,7 @@ Start a case in one of two ways:
   History rows keep their identities and original widths, so a later resize reflows them as it
   did the original's. Command marks keep their anchor ids and the positions of their text, so
   later output, eviction, reflow and the alternate screen move and expire them as they did the
-  original's. Markers a browser viewer places (HWT1 custom markers) are view state and are not
+  original's (a viewer attached to the recorded terminal is the exception; see the notes at the end). Markers a browser viewer places (HWT1 custom markers) are view state and are not
   recorded. Otherwise it is `unsupported`, and `unsupportedSurfaces` names each surface found:
   `pending-input`, `dcs-continuation` and `graphics`. A start too large for the case's `maxBytes` (`size-limit`),
   one larger than the 256 MiB pending-state budget, one taken inside an application, or one on a
@@ -648,5 +648,9 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
   neither are case start and stop. Case status is timed out like capture.
 - A case started on a running target re-applies from its `text-state/1` start checkpoint, not
   from the first byte: only a case started at construction holds the output before it. A start
-  holding a surface the restore cannot represent yet (pending input, graphics) is `unsupported`,
-  and names it.
+  holding a surface the restore cannot represent yet (pending input, a DCS in progress, graphics)
+  is `unsupported`, and names it.
+- An attached browser view (on every HWT1 frame, and on a marker jump) or an HMP1 client resolves
+  command-mark positions in the recorded terminal outside any model event: a mark at the end of a
+  soft-wrapped row is moved to the next row's start there, and nowhere in the recording. A
+  re-application can then report `different` at that mark (`commandMarks[i].row`/`column`).

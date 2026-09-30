@@ -18,8 +18,8 @@ public sealed partial class Hex1bTerminal
             return marks;
 
         var historyCount = _scrollbackBuffer?.Count ?? 0;
-        var mainScreen = _inAlternateScreen ? _savedMainTextRowIds ?? [] : _textScreenRowIds;
-        var alternateScreen = _inAlternateScreen ? _textScreenRowIds : [];
+        var mainScreen = RowIndex(_inAlternateScreen ? _savedMainTextRowIds ?? [] : _textScreenRowIds);
+        var alternateScreen = RowIndex(_inAlternateScreen ? _textScreenRowIds : []);
         Dictionary<long, int>? historyRows = null;
         for (var i = 0; i < marks.Length; i++)
         {
@@ -29,8 +29,8 @@ public sealed partial class Hex1bTerminal
             if (anchor.RowId is long id)
             {
                 if (anchor.Alternate)
-                    row = Array.IndexOf(alternateScreen, id) is >= 0 and var screenRow ? screenRow : null;
-                else if (Array.IndexOf(mainScreen, id) is >= 0 and var mainRow)
+                    row = alternateScreen.TryGetValue(id, out var screenRow) ? screenRow : null;
+                else if (mainScreen.TryGetValue(id, out var mainRow))
                     row = historyCount + mainRow;
                 else
                     row = (historyRows ??= HistoryRowsByTextRowIdUnsafe()).TryGetValue(id, out var historyRow) ? historyRow : null;
@@ -47,6 +47,15 @@ public sealed partial class Hex1bTerminal
             };
         }
         return marks;
+    }
+
+    // Each screen row's index, keyed by its text row id (row ids are unique).
+    private static Dictionary<long, int> RowIndex(long[] rowIds)
+    {
+        var result = new Dictionary<long, int>(rowIds.Length);
+        for (var row = 0; row < rowIds.Length; row++)
+            result.TryAdd(rowIds[row], row);
+        return result;
     }
 
     // The ring index of each retained history row that has a text row id (assigned when its text was read or a mark
@@ -76,6 +85,8 @@ public sealed partial class Hex1bTerminal
     {
         if (state.CommandMarks is not { } marks)
             return "command marks: missing";
+        if (state.LastCommandAnchorId is < 0 or long.MaxValue)
+            return $"a last command anchor id {state.LastCommandAnchorId} that is not 0 to {long.MaxValue - 1}";
         var historyRows = state.History?.Rows ?? [];
         var mainScreen = state.ActiveBuffer == "alternate" ? state.SavedMainScreen ?? [] : state.Screen;
         long previous = 0;
@@ -88,7 +99,7 @@ public sealed partial class Hex1bTerminal
             if (!TryParseCommandAnchor(mark.Anchor, out var number) || number <= previous || number > state.LastCommandAnchorId)
                 return $"{at}: anchor '{mark.Anchor}' is not command:<n> ascending to at most {state.LastCommandAnchorId}";
             previous = number;
-            if (!TryParseShellPhase(mark.Phase, out _))
+            if (!TryParseName<TerminalShellIntegrationPhase>(mark.Phase, out _))
                 return $"{at}: unknown phase '{mark.Phase}'";
             if (mark.Buffer is not ("main" or "alternate"))
                 return $"{at}: unknown buffer '{mark.Buffer}'";
@@ -97,12 +108,14 @@ public sealed partial class Hex1bTerminal
             if (mark.Row is not int row || mark.Column is not int column)
                 continue;
             int? width;
+            // Rows are validated before marks (history by HistoryProblem, screens by UnrestorableField); a missing row
+            // still counts as outside its buffer.
             if (mark.Buffer == "alternate")
-                width = state.ActiveBuffer == "alternate" && row >= 0 && row < state.Screen.Count ? state.Screen[row].Cells.Count : null;
+                width = state.ActiveBuffer == "alternate" && row >= 0 && row < state.Screen.Count ? state.Screen[row]?.Cells?.Count : null;
             else if (row >= 0 && row < historyRows.Count)
-                width = historyRows[row].Cells.Count;
+                width = historyRows[row]?.Cells?.Count;
             else
-                width = row >= historyRows.Count && row - historyRows.Count < mainScreen.Count ? mainScreen[row - historyRows.Count].Cells.Count : null;
+                width = row >= historyRows.Count && row - historyRows.Count < mainScreen.Count ? mainScreen[row - historyRows.Count]?.Cells?.Count : null;
             if (width is not int rowWidth)
                 return $"{at}: row {row} is outside the {mark.Buffer} buffer";
             if (column < 0 || column > rowWidth)
@@ -121,7 +134,7 @@ public sealed partial class Hex1bTerminal
             EnsureTextRows();
         foreach (var projected in marks)
         {
-            TryParseShellPhase(projected.Phase, out var phase);
+            TryParseName<TerminalShellIntegrationPhase>(projected.Phase, out var phase);
             var alternate = projected.Buffer == "alternate";
             long? rowId = null;
             var inHistory = false;
@@ -166,14 +179,5 @@ public sealed partial class Hex1bTerminal
         return anchor is not null && anchor.StartsWith("command:", StringComparison.Ordinal)
             && long.TryParse(anchor.AsSpan(8), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out number)
             && number > 0;
-    }
-
-    // The names the projection writes for shell phases, and only those.
-    private static bool TryParseShellPhase(string? name, out TerminalShellIntegrationPhase phase)
-    {
-        phase = default;
-        return name is not null
-            && Enum.TryParse(name.Replace("-", "", StringComparison.Ordinal), ignoreCase: true, out phase)
-            && Enum.IsDefined(phase) && ModelStateName(phase.ToString()) == name;
     }
 }

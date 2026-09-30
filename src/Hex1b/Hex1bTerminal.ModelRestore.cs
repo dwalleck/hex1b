@@ -36,6 +36,9 @@ public sealed partial class Hex1bTerminal
             if (state.CommandMarks.Count > _commandMarkHistoryCapacity)
                 throw new InvalidOperationException(
                     $"The state cannot be restored: its {state.CommandMarks.Count} command marks exceed the configured capacity of {_commandMarkHistoryCapacity}.");
+            // Marks last: their positions are checked against rows already validated above.
+            if (CommandMarksProblem(state) is { } marksProblem)
+                throw new InvalidOperationException($"The state cannot be restored: it holds {marksProblem}.");
         }
 
         var cells = new TerminalCell[state.Styles.Count];
@@ -71,6 +74,7 @@ public sealed partial class Hex1bTerminal
                     var rowCells = new TerminalCell[projected.Cells.Count];
                     for (var column = 0; column < rowCells.Length; column++)
                         rowCells[column] = RestoreCell(projected.Cells[column], state.Styles, cells, built);
+                    SequenceRestoredRowUnsafe(rowCells);
                     rows[row] = (rowCells, projected.OriginalWidth ?? rowCells.Length, projected.Id ?? 0);
                 }
                 scrollback.RestoreRows(rows, history.NextRowId, _timeProvider.GetUtcNow());
@@ -195,8 +199,12 @@ public sealed partial class Hex1bTerminal
         for (var row = 0; row < rows.Count; row++)
         {
             var projected = rows[row].Cells;
-            for (var column = 0; column < projected.Count; column++)
-                SetCell(row, column, RestoreCell(projected[column], styles, cells, built), damageSixel: false);
+            var rowCells = new TerminalCell[projected.Count];
+            for (var column = 0; column < rowCells.Length; column++)
+                rowCells[column] = RestoreCell(projected[column], styles, cells, built);
+            SequenceRestoredRowUnsafe(rowCells);
+            for (var column = 0; column < rowCells.Length; column++)
+                SetCell(row, column, rowCells[column], damageSixel: false);
         }
     }
 
@@ -214,8 +222,8 @@ public sealed partial class Hex1bTerminal
         if (state.Titles is null || state.Titles.Window is null || state.Titles.Icon is null || state.Titles.Stack is null
             || state.Titles.Stack.Any(entry => entry?.Window is null || entry.Icon is null))
             return "titles with a missing field";
-        if (CommandMarksProblem(state) is { } marks)
-            return marks;
+        if (state.CommandMarks is null)
+            return "command marks: missing";
         if (state.PendingInput.EscapePrefix.Length > 0 || state.PendingInput.Utf8.Length > 0 || state.PendingInput.GroundEscape
             || state.PendingInput.FramerUtf8Remaining != 0)
             return "pending input";
@@ -228,6 +236,22 @@ public sealed partial class Hex1bTerminal
 
     // One restored cell. A style's colours and attributes are parsed once; each cell holding a hyperlink takes
     // its own counted reference from this model's store, as a cell written by output does.
+    // Restored cells get write sequences in row order, a wide glyph's continuation sharing its owner's (as when both were
+    // written together) and an orphaned continuation its own. Code that tells a continuation by its sequence (anchors,
+    // selection, rendering) then reads the restored row as the original's. The values themselves are write order, not
+    // state, and are not projected.
+    private void SequenceRestoredRowUnsafe(TerminalCell[] row)
+    {
+        for (var column = 0; column < row.Length; column++)
+        {
+            var cell = row[column];
+            var owner = column > 0 ? row[column - 1] : default;
+            var continues = column > 0 && cell.Character.Length == 0 && !cell.IsWideWrapPadding && owner.Character.Length > 0
+                && (DisplayWidth.GetGraphemeWidth(owner.Character) > 1 || owner.Character.Contains('\uFE0F'));
+            row[column] = cell with { Sequence = continues ? owner.Sequence : ++_writeSequence };
+        }
+    }
+
     private TerminalCell RestoreCell(DiagnosticModelCell projected, IReadOnlyList<DiagnosticModelStyle> styles,
         TerminalCell[] cells, bool[] built)
     {
@@ -340,8 +364,15 @@ public sealed partial class Hex1bTerminal
     // The inverse of ModelStateName: a kebab-case contract name back to its enum value. Only a name the projection
     // itself writes is accepted (the value must name back to it), so numbers and combined names are refused.
     private static T ParseName<T>(string name) where T : struct, Enum =>
-        Enum.TryParse<T>(name.Replace("-", "", StringComparison.Ordinal), ignoreCase: true, out var value) && Enum.IsDefined(value)
-            && ModelStateName(value.ToString()) == name
+        TryParseName<T>(name, out var value)
             ? value
             : throw new InvalidOperationException($"The state names an unknown {typeof(T).Name} '{name}'.");
+
+    // The names the projection writes for an enum, and only those.
+    private static bool TryParseName<T>(string? name, out T value) where T : struct, Enum
+    {
+        value = default;
+        return name is not null && Enum.TryParse(name.Replace("-", "", StringComparison.Ordinal), ignoreCase: true, out value)
+            && Enum.IsDefined(value) && ModelStateName(value.ToString()) == name;
+    }
 }
