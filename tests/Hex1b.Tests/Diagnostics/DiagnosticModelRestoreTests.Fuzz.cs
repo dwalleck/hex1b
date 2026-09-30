@@ -26,6 +26,7 @@ public partial class DiagnosticModelRestoreTests
         var strategies = CaseConfiguration.StrategyIds.Append("none").ToArray();
         var failures = new List<string>();
         var crossRow = 0;
+        var pendingStarts = 0;
         for (var seed = first; seed < first + trials; seed++)
         {
             var random = new Random(seed);
@@ -34,8 +35,15 @@ public partial class DiagnosticModelRestoreTests
             var height = random.Next(2, 7);
             int? scrollback = random.Next(4) switch { 0 => null, 1 => 1, 2 => 2, _ => 10 };
             var modern = random.Next(2) == 0;
-            var before = Enumerable.Range(0, random.Next(4, 20)).Select(_ => FuzzStep(random, width, height)).ToList();
-            var after = Enumerable.Range(0, random.Next(4, 20)).Select(_ => FuzzStep(random, width, height)).ToList();
+            // One step list cut at a random point: the start can fall between the two halves of a split chunk, so it
+            // holds pending input (ticket 12).
+            var all = new List<object>();
+            var count = random.Next(8, 40);
+            while (all.Count < count)
+                all.AddRange(FuzzSteps(random, width, height));
+            var cut = random.Next(4, Math.Max(5, all.Count - 3));
+            var before = all.Take(cut).ToList();
+            var after = all.Skip(cut).ToList();
             var where = $"seed {seed} ({strategy}, {width}x{height}, scrollback {scrollback?.ToString() ?? "none"}, {(modern ? "modern" : "default")})";
 
             var original = FuzzModel(width, height, scrollback, strategy, modern);
@@ -43,16 +51,19 @@ public partial class DiagnosticModelRestoreTests
             try
             {
                 foreach (var step in before)
-                    ApplyStep(original, step);
+                    ApplyFuzzStep(original, step);
                 state = original.CaptureModelState();
             }
             catch (Exception crash)
             {
-                failures.Add($"{where}: the model threw {crash.GetType().Name} before the start: {crash.Message} before={JsonSerializer.Serialize(before)}");
+                failures.Add($"{where}: the model threw {crash.GetType().Name} before the start: {crash.Message} before={Describe(before)}");
                 continue;
             }
             if (state.Screen.Concat(state.SavedMainScreen ?? []).Concat(state.History?.Rows ?? []).Any(row => row.Cells.Count > 0 && row.Cells[0].Continues))
                 crossRow++;
+            var p = state.PendingInput;
+            if (p.EscapePrefix.Length > 0 || p.Utf8.Length > 0 || p.GroundEscape || p.FramerUtf8Remaining != 0)
+                pendingStarts++;
             var replica = FuzzModel(width, height, scrollback, strategy, modern);
             try
             {
@@ -60,7 +71,7 @@ public partial class DiagnosticModelRestoreTests
             }
             catch (InvalidOperationException refused)
             {
-                failures.Add($"{where}: a real model was refused: {refused.Message} before={JsonSerializer.Serialize(before)}");
+                failures.Add($"{where}: a real model was refused: {refused.Message} before={Describe(before)}");
                 continue;
             }
             var differences = JsonDifferences(Json(state), Json(replica.CaptureModelState()));
@@ -68,8 +79,8 @@ public partial class DiagnosticModelRestoreTests
             {
                 try
                 {
-                    ApplyStep(original, after[i]);
-                    ApplyStep(replica, after[i]);
+                    ApplyFuzzStep(original, after[i]);
+                    ApplyFuzzStep(replica, after[i]);
                     differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
                 }
                 catch (Exception crash)
@@ -80,11 +91,14 @@ public partial class DiagnosticModelRestoreTests
                     after = after.Take(i + 1).ToList();
             }
             if (differences.Count > 0)
-                failures.Add($"{where}: {string.Join("; ", differences.Take(3))} before={JsonSerializer.Serialize(before)} after={JsonSerializer.Serialize(after)}");
+                failures.Add($"{where}: {string.Join("; ", differences.Take(3))} before={Describe(before)} after={Describe(after)}");
         }
         Assert.IsEmpty(failures, string.Join("\n", failures.Take(5)));
         if (trials >= 4000)
+        {
             Assert.IsGreaterThan(0, crossRow, "the run never split a glyph across a wrap, so it did not exercise first-column continuations");
+            Assert.IsGreaterThan(0, pendingStarts, "the run never started between the halves of a split chunk, so it did not exercise pending input");
+        }
     }
 
     private static Hex1bTerminal FuzzModel(int width, int height, int? scrollback, string strategy, bool modern)
@@ -103,6 +117,31 @@ public partial class DiagnosticModelRestoreTests
             TimeProvider = new FakeTimeProvider(),
             DeferStart = true,
         });
+    }
+
+    private static void ApplyFuzzStep(Hex1bTerminal terminal, object step)
+    {
+        if (step is byte[] bytes)
+            terminal.ApplyRecordedOutput(bytes);
+        else
+            ApplyStep(terminal, (string)step);
+    }
+
+    private static string Describe(IEnumerable<object> steps) =>
+        JsonSerializer.Serialize(steps.Select(s => s is byte[] b ? "bytes:" + Convert.ToHexString(b) : s));
+
+    // One random step, or two when a text step is cut into two byte chunks (one time in four): the cut can fall inside
+    // a scalar or an escape sequence, and a start between the halves holds that pending input.
+    private static IEnumerable<object> FuzzSteps(Random random, int width, int height)
+    {
+        var step = FuzzStep(random, width, height);
+        if (step.StartsWith("RESIZE ", StringComparison.Ordinal) || random.Next(4) != 0)
+            return [step];
+        var bytes = Encoding.UTF8.GetBytes(step);
+        if (bytes.Length < 2)
+            return [step];
+        var cut = random.Next(1, bytes.Length);
+        return [bytes[..cut], bytes[cut..]];
     }
 
     // One random step: text with a wide or multi-cell cluster (weighted up), a resize (weighted up), row and region

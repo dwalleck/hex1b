@@ -19,7 +19,7 @@ public sealed partial class Hex1bTerminal
     /// write-order fields keep this model's values, as the census classifies them.
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// The state holds something this restore cannot represent (pending input, an unsupported surface, a history
+    /// The state holds something this restore cannot represent (malformed pending input, an unsupported surface, a history
     /// this model's configured scrollback cannot hold as recorded, or malformed titles or command marks), or the
     /// model has already applied output.
     /// </exception>
@@ -157,7 +157,8 @@ public sealed partial class Hex1bTerminal
             _pendingGraphemeCombine = state.PendingGraphemeCombine;
 
             _modelSequence = state.ModelSequence;
-            // No pending input is restored (refused above), so the live continuation is empty; commit it.
+            // The continuation the start held goes into the live holders, then is committed as the first application would.
+            RestorePendingInputUnsafe(state.PendingInput);
             CommitOutputContinuationUnsafe();
             if (state.SynchronizedUpdate.Active)
             {
@@ -233,9 +234,8 @@ public sealed partial class Hex1bTerminal
             return "titles with a missing field";
         if (state.CommandMarks is null)
             return "command marks: missing";
-        if (state.PendingInput.EscapePrefix.Length > 0 || state.PendingInput.Utf8.Length > 0 || state.PendingInput.GroundEscape
-            || state.PendingInput.FramerUtf8Remaining != 0)
-            return "pending input";
+        if (PendingInputProblem(state.PendingInput) is { } pendingProblem)
+            return pendingProblem;
         if (state.Unsupported.Count > 0)
             return $"unsupported surfaces ({string.Join(", ", state.Unsupported)})";
         if (state.Screen.Count != state.Height || state.Screen.Any(row => row.Cells.Count != state.Width))

@@ -79,6 +79,26 @@ internal sealed class DcsByteStreamParser
 
     public int RetentionLimit => _retentionLimit;
 
+    /// <summary>
+    /// Puts a parser that has processed nothing into the ground-level state a projected checkpoint recorded: an ESC
+    /// held because the next byte may begin a DCS, or a count of UTF-8 continuation bytes still expected. A DCS in
+    /// progress is not restorable here. Only a model restore calls this, before any byte is processed.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The parser is not at ground with nothing pending.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The count is outside 0..3, or both are set (an ESC resets the count).</exception>
+    internal void RestoreGroundState(bool heldEscape, int utf8ContinuationRemaining)
+    {
+        if (_state != ParserState.Ground || _utf8ContinuationBytesRemaining != 0)
+            throw new InvalidOperationException("Only a parser that has processed nothing can restore pending input.");
+        if (utf8ContinuationRemaining is < 0 or > 3)
+            throw new ArgumentOutOfRangeException(nameof(utf8ContinuationRemaining), utf8ContinuationRemaining, "A UTF-8 lead byte expects 0 to 3 continuation bytes.");
+        if (heldEscape && utf8ContinuationRemaining != 0)
+            throw new ArgumentOutOfRangeException(nameof(utf8ContinuationRemaining), utf8ContinuationRemaining, "An ESC resets the continuation count.");
+        _utf8ContinuationBytesRemaining = utf8ContinuationRemaining;
+        if (heldEscape)
+            _state = ParserState.GroundEscape;
+    }
+
     public DcsByteStreamBatch Process(ReadOnlySpan<byte> data)
     {
         if (data.IsEmpty)

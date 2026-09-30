@@ -41,20 +41,20 @@ public sealed partial class Hex1bTerminal
     /// An upper estimate of a projection's size in memory, from geometry alone (no state is read cell by
     /// cell), so a checkpoint can be refused before its state is taken. Must hold <c>_bufferLock</c>.
     /// </summary>
-    internal long EstimateModelStateBytesUnsafe() => EstimateModelStateCellsUnsafe() * 40 + 64 * 1024 + TitleAndMarkJsonFloorUnsafe() * 4;
+    internal long EstimateModelStateBytesUnsafe() => EstimateModelStateCellsUnsafe() * 40 + 64 * 1024 + (TitleAndMarkJsonFloorUnsafe() + PendingInputJsonFloorUnsafe()) * 4;
 
     /// <summary>
     /// A rough estimate of a projection's JSON size (about 16–24 bytes a cell), from geometry alone, so a stop
     /// at the size bound can skip a state that cannot fit. Must hold <c>_bufferLock</c>.
     /// </summary>
-    internal long EstimateModelStateJsonBytesUnsafe() => EstimateModelStateCellsUnsafe() * 24 + 4 * 1024 + TitleAndMarkJsonFloorUnsafe() * 2;
+    internal long EstimateModelStateJsonBytesUnsafe() => EstimateModelStateCellsUnsafe() * 24 + 4 * 1024 + (TitleAndMarkJsonFloorUnsafe() + PendingInputJsonFloorUnsafe()) * 2;
 
     /// <summary>
     /// The fewest JSON bytes a projection of this geometry can take: 14 a cell, the smallest cell
     /// (<c>{"t":"","s":0}</c>; every cell writes its text and style). A start is refused before projecting only when even
     /// this cannot fit. Must hold <c>_bufferLock</c>.
     /// </summary>
-    internal long MinimumModelStateJsonBytesUnsafe() => EstimateModelStateCellsUnsafe() * 14 + TitleAndMarkJsonFloorUnsafe();
+    internal long MinimumModelStateJsonBytesUnsafe() => EstimateModelStateCellsUnsafe() * 14 + TitleAndMarkJsonFloorUnsafe() + PendingInputJsonFloorUnsafe();
 
     // The fewest JSON bytes the titles, the title stack and the command marks take: each text at least its length in
     // characters, each stack entry at least {"window":"","icon":""} and each mark at least

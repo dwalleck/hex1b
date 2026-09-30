@@ -453,12 +453,12 @@ public partial class DiagnosticModelRestoreTests
     [TestMethod]
     public void ModelRestore_RefusesStateItCannotRepresent()
     {
-        // Titles and command marks are restored since ticket 11; pending decoder bytes are not yet (ticket 12).
+        // Titles, command marks (ticket 11) and pending input (ticket 12) are restored; a DCS in progress is not (issue 25).
         var model = Detached(new FakeTimeProvider());
-        model.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b]2;T\u0007ok \u001b["));
+        model.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b]2;T\u0007ok \u001bP$q"));
         var replica = Detached(new FakeTimeProvider());
         var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(model.CaptureModelState()));
-        StringAssert.Contains(error.Message, "pending input");
+        StringAssert.Contains(error.Message, "dcs-continuation");
         Assert.AreEqual(0, replica.CurrentModelSequence, "a refused restore changed the model");
     }
 
