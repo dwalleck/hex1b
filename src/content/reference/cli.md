@@ -280,8 +280,8 @@ hex1b capture case reapply <path> --to TARGET [--inject-fault KIND] [--max-diffe
 
 A case started on a running terminal with `reapplication-data` owns a `text-state/1` start
 checkpoint and re-applies from it; a terminal holding a surface the start cannot restore yet
-(pending input, a DCS in progress, graphics) makes it `unsupported`, and the
-output names the surfaces. To record from the first byte, use `hex1b terminal start --record-case`. `stop` waits at most 10 s for queued events.
+(a DCS in progress, graphics) makes it `unsupported`, and the output names the surfaces. Output
+held between chunks (an unfinished escape sequence or UTF-8 scalar) is owned by the start. To record from the first byte, use `hex1b terminal start --record-case`. `stop` waits at most 10 s for queued events.
 `inspect` reads the artifact offline, verifies every line's checksum, and reports whether the case
 is `complete`, `interrupted` or `truncated`. It also reports per-stream coverage and missing
 ranges, the re-applicable model interval, and, with `--limit`, a page of events.
@@ -298,7 +298,7 @@ Each run writes its own directory, `reapplications/<n>`, inside the case.
 | `reapply` option | Type | Default | Description |
 |------------------|------|---------|-------------|
 | `--to` | string | (required) | A model sequence (`12`), a case sequence (`case:34`), or a checkpoint label (`label:name`, or the bare name; `stop` is the stop checkpoint, `start` a live start's checkpoint; a label several checkpoints share is ambiguous, so name one by `case:<n>`) |
-| `--inject-fault` | string | | A declared fault to inject before comparing, as `kind` or `kind:target` (repeatable or comma-separated): `cell-text[:row/column]`, `cell-style[:row/column]`, `cursor`, `mode[:name]`, `title`, `charset`, `tab-stop`, `pending-input`, `history-row[:index]`, `history-rows`, `pending-wrap`, `last-printed`, `rendition`, `margins`, `saved-cursor`, `pending-grapheme`, `activity`, `synchronized-update`, `title-stack`, `command-mark`. The result is labelled `faultInjected` |
+| `--inject-fault` | string | | A declared fault to inject before comparing, as `kind` or `kind:target` (repeatable or comma-separated): `cell-text[:row/column]`, `cell-style[:row/column]`, `cursor`, `mode[:name]`, `title`, `charset`, `tab-stop`, `pending-input`, `history-row[:index]`, `history-rows`, `pending-wrap`, `last-printed`, `rendition`, `margins`, `saved-cursor`, `pending-grapheme`, `activity`, `synchronized-update`, `title-stack`, `command-mark`, `pending-escape`, `pending-ground-escape`, `pending-framer` (the `pending-*` faults drop one holder of a live start's pending input; target the start). The result is labelled `faultInjected` |
 | `--max-differences` | int | `1000` | Most differences listed (1–100000); every difference is counted |
 | `--preview` | string | | `text`, `ansi`, `svg`, `html` (repeatable or comma-separated) |
 

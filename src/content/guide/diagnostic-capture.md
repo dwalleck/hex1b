@@ -319,8 +319,13 @@ Start a case in one of two ways:
   did the original's. Command marks keep their anchor ids and the positions of their text, so
   later output, eviction, reflow and the alternate screen move and expire them as they did the
   original's (a viewer attached to the recorded terminal is the exception; see the notes at the end). Markers a browser viewer places (HWT1 custom markers) are view state and are not
-  recorded. Otherwise it is `unsupported`, and `unsupportedSurfaces` names each surface found:
-  `pending-input`, `dcs-continuation` and `graphics`. A start too large for the case's `maxBytes` (`size-limit`),
+  recorded. Output held between chunks at the start (an unfinished escape sequence as the model's
+  decoded text, the bytes of an unfinished UTF-8 scalar, an ESC held until the next byte shows
+  whether a DCS begins, and the continuation bytes the byte framer still expects) is owned by the
+  start and restored before the first recorded chunk, so the rest of a split scalar or sequence is
+  handled as in the original. Otherwise it is `unsupported`, and `unsupportedSurfaces` names each
+  surface found: `dcs-continuation` (a device control string in progress) and `graphics`. A start
+  too large for the case's `maxBytes` (`size-limit`; an unfinished sequence counts toward it),
   one larger than the 256 MiB pending-state budget, one taken inside an application, or one on a
   terminal whose configuration a re-application could not rebuild (`configuration:`, for example a
   custom reflow strategy), is `unsupported` with that reason; no history is ever truncated to fit.
@@ -553,13 +558,19 @@ event is `unknown-model-sequence`. In an interrupted or truncated case, whose ta
 - `cell-text` and `cell-style` take `:<row>/<column>`;
 - `mode` takes `:<name>`;
 - `history-row` takes `:<index>`, and changes that row's text;
-- `cursor`, `title`, `charset`, `tab-stop`, `pending-input` and `history-rows` take no target.
+- `cursor`, `title`, `charset`, `tab-stop` and `history-rows` take no target.
 - `pending-wrap`, `last-printed`, `rendition`, `margins`, `saved-cursor`, `pending-grapheme`,
   `activity` and `synchronized-update` (the continuation a live start restores) take no target; each
   toggles its field, so it differs even where the recorded value is the default.
 - `title-stack` changes the top saved title (`titles.stack[0].window`), and `command-mark` moves the
   first placed mark's column (`commandMarks[i].column`); neither takes a target. A state without a
   saved title or a placed mark makes them not applicable.
+- `pending-input` drops the unfinished scalar's bytes (`pendingInput.utf8`), `pending-escape` the
+  unfinished escape sequence (`pendingInput.escapePrefix`), `pending-ground-escape` the held ESC
+  (`pendingInput.groundEscape`) and `pending-framer` the framer's continuation count
+  (`pendingInput.framerUtf8Remaining`); none takes a target. Faults are injected into the state
+  reconstructed at the target, and only a live start's own checkpoint holds pending input, so
+  target the start (`--to start`); a state without that holder makes the fault not applicable.
 
 Such a result is labelled `faultInjected`, and is never the recorded path's outcome. A fault the
 state has nothing to change for (a history fault without history) makes the comparison
@@ -648,8 +659,9 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
   neither are case start and stop. Case status is timed out like capture.
 - A case started on a running target re-applies from its `text-state/1` start checkpoint, not
   from the first byte: only a case started at construction holds the output before it. A start
-  holding a surface the restore cannot represent yet (pending input, a DCS in progress, graphics)
-  is `unsupported`, and names it.
+  holding a surface the restore cannot represent yet (a DCS in progress, graphics) is
+  `unsupported`, and names it. Output held between chunks is restored; the bytes of an unfinished
+  escape sequence read before the start are owned as the model's decoded text, not as input.
 - An attached browser view (on every HWT1 frame, and on a marker jump) or an HMP1 client resolves
   command-mark positions in the recorded terminal outside any model event: a mark at the end of a
   soft-wrapped row or on a wide glyph's wrap padding is moved to the next row's start, and a mark

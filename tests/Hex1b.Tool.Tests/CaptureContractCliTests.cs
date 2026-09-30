@@ -1152,6 +1152,85 @@ public class CaptureContractCliTests
 
     [TestMethod]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_PendingInputFaults()
+    {
+        // A hosted PTY prints the first byte of a scalar, pauses, then the rest; the case starts during the pause.
+        // The start is complete and holds the byte; re-application matches; the CLI's pending-* faults differ at the
+        // start and are not applicable where the holder is empty (ticket 12).
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        var config = new TerminalHostConfig
+        {
+            Width = 40,
+            Height = 6,
+            Command = "/bin/sh",
+            Arguments = ["-c", "printf 'PENDING-\\346'; sleep 12; printf '\\274\\242 PENDING-DONE\\n'; exec sleep 60"],
+        };
+
+        await WaitForSocketReleaseAsync(cts.Token);
+        var host = TerminalHost.RunAsync(config, cts.Token);
+        string path;
+        try
+        {
+            await WaitForSocketAsync(cts.Token);
+            Assert.IsNotNull(await WaitForCliTextAsync("PENDING-", cts.Token), "hosted PTY output never reached the model");
+            var (startExit, start, startErr) = await RunCliAsync("capture", "case", "start", Pid, "--dir", root.Path, "--authorize", "reapplication-data", "--json");
+            Assert.AreEqual(0, startExit, startErr);
+            var checkpoint = JsonDocument.Parse(start).RootElement.GetProperty("checkpoint");
+            Assert.AreEqual("complete", checkpoint.GetProperty("status").GetString(), $"fixture: the start was not taken during the pause: {checkpoint}");
+            // The shared helper gives up after about 10 s; the pause is 12 s.
+            var done = false;
+            for (var attempt = 0; attempt < 300 && !done; attempt++)
+            {
+                var (exitCode, stdout, _) = await RunCliAsync("capture", "screenshot", Pid);
+                done = exitCode == 0 && stdout.Contains("PENDING-DONE", StringComparison.Ordinal);
+                if (!done)
+                    await Task.Delay(100, cts.Token);
+            }
+            Assert.IsTrue(done, "the rest of the output never reached the model");
+            var (stopExit, stop, stopErr) = await RunCliAsync("capture", "case", "stop", Pid, "--json");
+            Assert.AreEqual(0, stopExit, stopErr);
+            path = JsonDocument.Parse(stop).RootElement.GetProperty("path").GetString()!;
+        }
+        finally
+        {
+            await cts.CancelAsync();
+            try { await host; } catch (OperationCanceledException) { }
+        }
+
+        // The start line (checksum, tab, JSON) holds the pending byte.
+        var startLine = File.ReadLines(Path.Combine(path, "events.jsonl")).Select(l => JsonDocument.Parse(l[(l.IndexOf('\t') + 1)..]).RootElement)
+            .First(e => e.TryGetProperty("checkpoint", out var c) && c.GetProperty("trigger").GetString() == "start");
+        Assert.AreEqual("5g==", startLine.GetProperty("checkpoint").GetProperty("state").GetProperty("pendingInput").GetProperty("utf8").GetString(),
+            "fixture: the start was not taken during the pause (a 12 s window)");
+        var (matchedExit, matched, matchedErr) = await RunCliAsync("capture", "case", "reapply", path, "--to", "stop", "--json");
+        Assert.AreEqual(0, matchedExit, matchedErr + matched);
+        Assert.AreEqual("matched", JsonDocument.Parse(matched).RootElement.GetProperty("comparison").GetString(), matched);
+
+        var (exit, json, err) = await RunCliAsync("capture", "case", "reapply", path, "--to", "start", "--inject-fault", "pending-input", "--json");
+        Assert.AreEqual(2, exit, err + json);
+        var result = JsonDocument.Parse(json).RootElement;
+        Assert.AreEqual(("different", true), (result.GetProperty("comparison").GetString(), result.GetProperty("faultInjected").GetBoolean()), json);
+        CollectionAssert.Contains(result.GetProperty("differences").GetProperty("differences").EnumerateArray()
+            .Select(d => d.GetProperty("path").GetString()).ToList(), "pendingInput.utf8");
+        var (_, text, _) = await RunCliAsync("capture", "case", "reapply", path, "--to", "start", "--inject-fault", "pending-input");
+        StringAssert.Contains(text, "Fault injected: pending-input at pendingInput.utf8");
+        foreach (var fault in new[] { "pending-escape", "pending-ground-escape" })
+        {
+            var (_, refused, _) = await RunCliAsync("capture", "case", "reapply", path, "--to", "start", "--inject-fault", fault, "--json");
+            var refusal = JsonDocument.Parse(refused).RootElement;
+            Assert.AreEqual("unavailable", refusal.GetProperty("comparison").GetString(), refused);
+            StringAssert.StartsWith(refusal.GetProperty("comparisonReason").GetString(), "fault-not-applicable", fault);
+        }
+        var (_, help, _) = await RunCliAsync("capture", "case", "reapply", "--help");
+        foreach (var fault in new[] { "pending-input", "pending-escape", "pending-ground-escape", "pending-framer" })
+            StringAssert.Contains(help, fault, "the --inject-fault description");
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task Case_TitleAndMarkFaults()
     {
         // A hosted PTY that pushes a title and emits OSC 133 marks, recorded from construction: the CLI's title-stack and

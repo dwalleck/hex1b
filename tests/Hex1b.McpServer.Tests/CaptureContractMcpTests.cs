@@ -747,6 +747,70 @@ public class CaptureContractMcpTests : McpServerTestBase
 
     [TestMethod]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_PendingInputFaults()
+    {
+        // A bash session prints the first byte of a scalar, pauses, then the rest; start_diagnostic_case runs during
+        // the pause. The start is complete and holds the byte; re-application matches; the pending-* faults differ at
+        // the start and are not applicable where the holder is empty (ticket 12).
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var session = await CallAsync(client, "start_bash_terminal", new() { ["workingDirectory"] = Path.GetTempPath() });
+        Assert.IsTrue(session.GetProperty("success").GetBoolean(), session.ToString());
+        var sessionId = session.GetProperty("sessionId").GetString()!;
+        string path;
+        try
+        {
+            // Both markers are assembled at run time so the echoed command line contains neither: a wait would otherwise
+            // be satisfied by the echo, before the pause.
+            await CallAsync(client, "send_terminal_input", new()
+            {
+                ["sessionId"] = sessionId,
+                ["text"] = "x=MCP-PEN; printf \"${x}DING-\\346\"; sleep 12; printf \"\\274\\242 ${x}DING-DONE\\n\"\r",
+            });
+            var wait = await CallAsync(client, "wait_for_terminal_text", new() { ["sessionId"] = sessionId, ["text"] = "MCP-PENDING-", ["timeoutSeconds"] = 10 });
+            Assert.IsTrue(wait.GetProperty("found").GetBoolean(), wait.ToString());
+            var start = await CallAsync(client, "start_diagnostic_case", new()
+            {
+                ["sessionId"] = sessionId,
+                ["directory"] = root.Path,
+                ["authorize"] = "reapplication-data",
+            });
+            Assert.IsTrue(start.GetProperty("success").GetBoolean(), start.ToString());
+            var checkpoint = start.GetProperty("case").GetProperty("checkpoint");
+            Assert.AreEqual("complete", checkpoint.GetProperty("status").GetString(), $"fixture: the start was not taken during the pause: {checkpoint}");
+            var done = await CallAsync(client, "wait_for_terminal_text", new() { ["sessionId"] = sessionId, ["text"] = "MCP-PENDING-DONE", ["timeoutSeconds"] = 30 });
+            Assert.IsTrue(done.GetProperty("found").GetBoolean(), done.ToString());
+            var stop = await CallAsync(client, "stop_diagnostic_case", new() { ["sessionId"] = sessionId });
+            path = stop.GetProperty("case").GetProperty("path").GetString()!;
+        }
+        finally
+        {
+            await CallAsync(client, "remove_session", new() { ["sessionId"] = sessionId });
+        }
+
+        // The start line (checksum, tab, JSON) must hold the pending byte: under load the pause can end before the start.
+        var startLine = File.ReadLines(Path.Combine(path, "events.jsonl")).Select(l => JsonDocument.Parse(l[(l.IndexOf('\t') + 1)..]).RootElement)
+            .First(e => e.TryGetProperty("checkpoint", out var c) && c.GetProperty("trigger").GetString() == "start");
+        Assert.AreEqual("5g==", startLine.GetProperty("checkpoint").GetProperty("state").GetProperty("pendingInput").GetProperty("utf8").GetString(),
+            "fixture: the start was not taken during the pause (a 12 s window)");
+        var matched = (await CallAsync(client, "reapply_diagnostic_case", new() { ["path"] = path, ["to"] = "stop" })).GetProperty("reapplication");
+        Assert.AreEqual("matched", matched.GetProperty("comparison").GetString(), matched.ToString());
+        var result = (await CallAsync(client, "reapply_diagnostic_case", new() { ["path"] = path, ["to"] = "start", ["injectFault"] = "pending-input" }))
+            .GetProperty("reapplication");
+        Assert.AreEqual(("different", true), (result.GetProperty("comparison").GetString(), result.GetProperty("faultInjected").GetBoolean()), result.ToString());
+        CollectionAssert.Contains(result.GetProperty("differences").GetProperty("differences").EnumerateArray()
+            .Select(d => d.GetProperty("path").GetString()).ToList(), "pendingInput.utf8");
+        var refused = (await CallAsync(client, "reapply_diagnostic_case", new() { ["path"] = path, ["to"] = "start", ["injectFault"] = "pending-escape" }))
+            .GetProperty("reapplication");
+        Assert.AreEqual("unavailable", refused.GetProperty("comparison").GetString(), refused.ToString());
+        StringAssert.StartsWith(refused.GetProperty("comparisonReason").GetString(), "fault-not-applicable");
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task Case_TitleAndMarkFaults()
     {
         // A bash session recorded from its first byte pushes a title and emits OSC 133 marks: reapply_diagnostic_case's
