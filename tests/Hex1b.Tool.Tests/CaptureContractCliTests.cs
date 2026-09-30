@@ -1107,6 +1107,28 @@ public class CaptureContractCliTests
         Assert.AreEqual((40, 6, "/bin/sh", 2, root.Path, 1), (config.Width, config.Height, config.Command, config.Arguments.Length,
             config.DiagnosticCase?.Directory, config.DiagnosticCase?.Authorizations?.Count), "the host's other forwarded options");
 
+        // Every option the host takes survives the round trip (not run: a port or a recording would open a listener or
+        // write a file).
+        var allArgs = Hex1b.Tool.Commands.Terminal.TerminalStartCommand.HostArguments(81, 7, "/work", "/rec.cast", 4321, "0.0.0.0", 250,
+            new DiagnosticCaseStartRequest
+            {
+                Directory = root.Path,
+                MaxBytes = 2 * 1024 * 1024,
+                MaxSeconds = 30,
+                Authorizations = [DiagnosticAuthorization.ReapplicationData, DiagnosticAuthorization.RawInput],
+            },
+            ["/bin/echo", "a", "b"]);
+        using var allParser = await Program.BuildApplication([.. allArgs]);
+        var (all, allError) = Hex1b.Tool.Commands.Terminal.TerminalHostCommand.Config(
+            allParser.Services.GetRequiredService<Hex1b.Tool.Commands.RootCommand>().Parse(allArgs));
+        Assert.IsNotNull(all, allError);
+        Assert.AreEqual((81, 7, "/work", "/rec.cast", (int?)4321, "0.0.0.0", (int?)250, "/bin/echo", "a b"),
+            (all.Width, all.Height, all.WorkingDirectory, all.RecordPath, all.Port, all.BindAddress, all.Scrollback, all.Command, string.Join(' ', all.Arguments)),
+            string.Join(' ', allArgs));
+        Assert.AreEqual((root.Path, (long?)(2 * 1024 * 1024), (int?)30, "ReapplicationData,RawInput"),
+            (all.DiagnosticCase?.Directory, all.DiagnosticCase?.MaxBytes, all.DiagnosticCase?.MaxSeconds, string.Join(',', all.DiagnosticCase?.Authorizations ?? [])),
+            "the forwarded case options");
+
         await WaitForSocketReleaseAsync(cts.Token);
         var host = TerminalHost.RunAsync(config, cts.Token);
         try
