@@ -455,16 +455,21 @@ public partial class DiagnosticModelRestoreTests
         }
     }
 
-    // The accepted limitation (issue 23, widened in review round 5: RR5#1): a start records continuations between cells
-    // adjacent in reading order only. Halves separated before the start (here by an inserted row) and brought back
-    // together after it are one glyph in the original and two cells in the replica. This pins the known divergence, so
-    // a change to it is noticed; issue 23's fix turns it into a match.
+    // The accepted limitation (issue 23, widened in review rounds 5 and 6: RR5#1, RR6#1): a start records continuations
+    // between cells adjacent in reading order, and at a row's first column only across a soft wrap. Halves that are apart
+    // at the start, or whose row has lost its soft wrap at the start, are one glyph in the original once they meet or the
+    // soft wrap is set again, and two cells in the replica. These rows pin the known divergence, so a change to it is
+    // noticed; issue 23's fix turns them into matches.
     [TestMethod]
-    public void ModelRestore_SeparatedHalvesRejoinedAfterTheStartDiverge()
+    [DataRow("a row inserted between the halves", new[] { "\u001b[2;1H\u001b[L" },
+        new[] { "\u001b[2;1H\u001b[M", "RESIZE 9 4", "\u001b[1;6H\u001b]133;A\u0007" })]
+    [DataRow("the soft wrap set again under left/right margins", new[] { "\u001b[3;5Hq\u001b7", "\u001b[2T", "\u001b[3;5H" },
+        new[] { "\u001b[?69h\u001b[2;5s", "\u001b8Z", "\u001b[?69l", "RESIZE 9 4", "\u001b[3;6H\u001b]133;A\u0007" })]
+    public void ModelRestore_GlyphHalvesJoinedOnlyAfterTheStartDiverge(string shape, string[] before, string[] after)
     {
         Hex1bTerminal Model() => new(new Hex1bTerminalOptions
         {
-            PresentationAdapter = new HeadlessPresentationAdapter(9, 4).WithReflowStrategy(CaseConfiguration.CreateReflowStrategy("ghostty")!, enabled: true),
+            PresentationAdapter = new HeadlessPresentationAdapter(9, 4, TerminalCapabilities.Modern).WithReflowStrategy(CaseConfiguration.CreateReflowStrategy("ghostty")!, enabled: true),
             WorkloadAdapter = new CaseReapplier.DetachedWorkload(),
             Width = 9,
             Height = 4,
@@ -475,16 +480,19 @@ public partial class DiagnosticModelRestoreTests
         var original = Model();
         original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("abcd\u0E01\u0E33xyz"));
         original.Resize(5, 4);
-        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b[2;1H\u001b[L"));
+        foreach (var step in before)
+            ApplyStep(original, step);
+        var state = original.CaptureModelState();
+        Assert.IsFalse(state.Screen.Any(r => r.Cells.Any(c => c.Continues)), $"fixture: {shape} has a flagged continuation at the start");
         var replica = Model();
-        replica.RestoreModelState(original.CaptureModelState());
-        foreach (var step in new[] { "\u001b[2;1H\u001b[M", "RESIZE 9 4", "\u001b[1;6H\u001b]133;A\u0007" })
+        replica.RestoreModelState(state);
+        foreach (var step in after)
         {
             ApplyStep(original, step);
             ApplyStep(replica, step);
         }
         Assert.AreEqual((4, 5), (original.CaptureModelState().CommandMarks[0].Column, replica.CaptureModelState().CommandMarks[0].Column),
-            "the known one-column divergence of issue 23");
+            $"{shape}: the known one-column divergence of issue 23");
     }
 
     // The projected never-written runs are exactly the cells with write sequence 0, read raw from the screen and the
@@ -580,6 +588,9 @@ public partial class DiagnosticModelRestoreTests
     [DataRow("a missing saved main row")]
     [DataRow("a history continuation at column 0")]
     [DataRow("a continuation at column 0 after a row that does not soft-wrap")]
+    [DataRow("a continuation at the screen's first row after a history row that does not soft-wrap")]
+    [DataRow("a continuation after a row that ends in another attribute")]
+    [DataRow("a continuation with the styles missing")]
     [DataRow("never-written runs not in pairs")]
     [DataRow("a never-written run past the row")]
     [DataRow("never-written runs out of order")]
@@ -605,6 +616,26 @@ public partial class DiagnosticModelRestoreTests
             // Both rows wholly written, so only the missing soft wrap refuses it.
             "a continuation at column 0 after a row that does not soft-wrap" => state with
             {
+                Screen = [state.Screen[0] with { Unwritten = null }, FirstCell(state.Screen[1], c => c with { Text = "", Continues = true }) with { Unwritten = null }, .. state.Screen.Skip(2)],
+            },
+            "a continuation at the screen's first row after a history row that does not soft-wrap" => state with
+            {
+                History = state.History! with { Rows = Rows(state.History.Rows, state.History.Rows.Count - 1, r => r with { Unwritten = null }) },
+                Screen = Rows(state.Screen, 0, r => FirstCell(r, c => c with { Text = "", Continues = true }) with { Unwritten = null }),
+            },
+            "a continuation after a row that ends in another attribute" => state with
+            {
+                Styles = [.. state.Styles, new DiagnosticModelStyle { Attributes = ["bold"] }],
+                Screen =
+                [
+                    state.Screen[0] with { Cells = [.. state.Screen[0].Cells.SkipLast(1), state.Screen[0].Cells[^1] with { Style = state.Styles.Count }], Unwritten = null },
+                    FirstCell(state.Screen[1], c => c with { Text = "", Continues = true }) with { Unwritten = null },
+                    .. state.Screen.Skip(2),
+                ],
+            },
+            "a continuation with the styles missing" => state with
+            {
+                Styles = null!,
                 Screen = [state.Screen[0] with { Unwritten = null }, FirstCell(state.Screen[1], c => c with { Text = "", Continues = true }) with { Unwritten = null }, .. state.Screen.Skip(2)],
             },
             "a continuation on a glyph" => state with { Screen = Rows(state.Screen, 0, r => r with { Cells = [r.Cells[0], r.Cells[1] with { Text = "x", Continues = true }, .. r.Cells.Skip(2)] }) },

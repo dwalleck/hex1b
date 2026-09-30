@@ -657,8 +657,10 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
   `different` at that mark (`commandMarks[i].row`/`column`).
 - A start records which empty cells continue the glyph before them in reading order (`c`, including
   a row's first cell continuing a glyph split across a soft wrap) and which cells were never written
-  (a row's `unwritten` runs). It does not record that two cells apart from each other are halves of
-  one glyph. Halves separated before the start (by a left/right-margin scroll, or by a row inserted
-  or scrolled between the halves of a glyph split across a wrap) and brought back together after it
-  are one glyph in the recording and two cells in the re-application, which can then place a new
-  mark there one column off.
+  (a row's `unwritten` runs). It does not record that two cells are halves of one glyph when they
+  are apart at the start, or when the row between them no longer soft-wraps. Such halves can become
+  one glyph again in the recording after the start and stay two cells in the re-application: for
+  example after a left/right-margin scroll, after a row inserted or scrolled between the halves of a
+  glyph split across a wrap, after blank cells between them are cropped by a resize, or when a
+  pending wrap restored under left/right margins sets the soft wrap again. The re-application then
+  reports `different` at that cell's `continues`, and a new mark placed there is one column off.

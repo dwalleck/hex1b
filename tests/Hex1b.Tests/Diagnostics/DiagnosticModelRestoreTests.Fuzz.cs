@@ -15,7 +15,9 @@ public partial class DiagnosticModelRestoreTests
     // The default run is a fixed seed range, so it is deterministic. HEX1B_RESTORE_FUZZ_TRIALS and HEX1B_RESTORE_FUZZ_SEED
     // widen or move it for a review. One known class can diverge in a wider run and is not a defect of the restore: halves
     // of one glyph separated before the start and brought back together after it (see "Current limitations" in the
-    // diagnostic capture guide). The alphabet has no left/right margins, which would make that class common.
+    // diagnostic capture guide). The alphabet has no left/right margins, which would make that class common; without them
+    // it is about one trial in 60,000, so a failure here after an unrelated change to the model may be that class at a new
+    // seed. Compare its steps with the pinned shapes in ModelRestore_GlyphHalvesJoinedOnlyAfterTheStartDiverge first.
     [TestMethod]
     public void ModelRestore_DifferentialFuzz()
     {
@@ -37,9 +39,18 @@ public partial class DiagnosticModelRestoreTests
             var where = $"seed {seed} ({strategy}, {width}x{height}, scrollback {scrollback?.ToString() ?? "none"}, {(modern ? "modern" : "default")})";
 
             var original = FuzzModel(width, height, scrollback, strategy, modern);
-            foreach (var step in before)
-                ApplyStep(original, step);
-            var state = original.CaptureModelState();
+            DiagnosticModelState state;
+            try
+            {
+                foreach (var step in before)
+                    ApplyStep(original, step);
+                state = original.CaptureModelState();
+            }
+            catch (Exception crash)
+            {
+                failures.Add($"{where}: the model threw {crash.GetType().Name} before the start: {crash.Message} before={JsonSerializer.Serialize(before)}");
+                continue;
+            }
             if (state.Screen.Concat(state.SavedMainScreen ?? []).Concat(state.History?.Rows ?? []).Any(row => row.Cells.Count > 0 && row.Cells[0].Continues))
                 crossRow++;
             var replica = FuzzModel(width, height, scrollback, strategy, modern);
@@ -55,9 +66,16 @@ public partial class DiagnosticModelRestoreTests
             var differences = JsonDifferences(Json(state), Json(replica.CaptureModelState()));
             for (var i = 0; differences.Count == 0 && i < after.Count; i++)
             {
-                ApplyStep(original, after[i]);
-                ApplyStep(replica, after[i]);
-                differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+                try
+                {
+                    ApplyStep(original, after[i]);
+                    ApplyStep(replica, after[i]);
+                    differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+                }
+                catch (Exception crash)
+                {
+                    differences = [$"a model threw {crash.GetType().Name}: {crash.Message}"];
+                }
                 if (differences.Count > 0)
                     after = after.Take(i + 1).ToList();
             }
