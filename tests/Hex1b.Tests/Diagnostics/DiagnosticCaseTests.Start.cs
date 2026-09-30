@@ -655,6 +655,8 @@ public partial class DiagnosticCaseTests
         Assert.IsFalse(artifact.Events.Any(e => e.GetProperty("kind").GetString() == "checkpoint"
             && e.GetProperty("checkpoint").GetProperty("trigger").GetString() == "start"), "a start line was written");
         Assert.IsFalse(DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }).Intervals.Single().Valid);
+        if (kind == "styles")
+            StringAssert.Contains(checkpoint.GetProperty("reason").GetString(), "bytes; projected and measured in", "a start refused after projecting does not disclose its cost");
     }
 
     [TestMethod]
@@ -731,6 +733,52 @@ public partial class DiagnosticCaseTests
         var first = Artifact.Read(path).Events[0];
         Assert.AreEqual(("case", "checkpoint", "start"), (first.GetProperty("stream").GetString(), first.GetProperty("kind").GetString(),
             first.GetProperty("checkpoint").GetProperty("trigger").GetString()), "the start line is not the first event line");
+    }
+
+    [TestMethod]
+    public async Task Start_SizedWithItsManifest()
+    {
+        // A start that fits the events tier on its own, but not with a large manifest (a long application name): the
+        // start is unsupported at the size limit and no start line is written (review RR3-2). Its control: the same
+        // terminal and bound with a short name records a complete start.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(200, 100).Build();
+        string refusedPath, fittingPath;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, string.Concat(Enumerable.Range(0, 60).Select(i => $"\u001b[{i % 7 + 31}m{new string('w', 150)}\u001b[m\r\n")).TrimEnd('\n', '\r'));
+            var request = new DiagnosticCaseStartRequest
+            {
+                Directory = root.Path,
+                MaxBytes = 1024 * 1024,
+                Authorizations = [DiagnosticAuthorization.ReapplicationData],
+            };
+            refusedPath = new TerminalDiagnostics(terminal, new string('n', 800_000)).StartCase(request).Path!;
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+            fittingPath = new TerminalDiagnostics(terminal, "short").StartCase(request).Path!;
+            await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+
+        var refused = Artifact.Read(refusedPath);
+        var checkpoint = refused.Manifest.GetProperty("checkpoint");
+        Assert.AreEqual("unsupported", checkpoint.GetProperty("status").GetString());
+        StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "size-limit:");
+        Assert.IsFalse(refused.Events.Any(e => e.GetProperty("kind").GetString() == "checkpoint"
+            && e.GetProperty("checkpoint").GetProperty("trigger").GetString() == "start"), "a start line was written");
+        var fitting = Artifact.Read(fittingPath);
+        Assert.AreEqual("complete", fitting.Manifest.GetProperty("checkpoint").GetProperty("status").GetString(), "fixture: the control's start does not fit");
+        Assert.AreEqual("recorded", fitting.Events[0].GetProperty("checkpoint").GetProperty("status").GetString());
+    }
+
+    [TestMethod]
+    public void StartCheckpoint_FitsAtTheBoundary()
+    {
+        // The manifest, the line's allowance and the state's exact bytes are subtracted once from the events tier.
+        const long maxBytes = 1024 * 1024;
+        var room = maxBytes - DiagnosticCaseRecorder.EventReserve - DiagnosticCaseRecorder.StartLineAllowance - 5_000;
+        Assert.IsTrue(StartCheckpoint.Fits(5_000, new DiagnosticCaseRecorder.CheckpointCapture(null, null, "recorded", null, 0, room), maxBytes));
+        Assert.IsFalse(StartCheckpoint.Fits(5_000, new DiagnosticCaseRecorder.CheckpointCapture(null, null, "recorded", null, 0, room + 1), maxBytes));
     }
 
     private static bool IsStart(JsonNode node) => node["checkpoint"]?["trigger"]?.GetValue<string>() == "start";

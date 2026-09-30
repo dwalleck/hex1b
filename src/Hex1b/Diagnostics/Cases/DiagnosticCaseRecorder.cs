@@ -116,7 +116,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// the reason it has no state, and the pending-state bytes reserved for it.
     /// </summary>
     internal readonly record struct CheckpointCapture(DiagnosticModelState? State, double? Milliseconds, string Status, string? Reason,
-        long StateBytes);
+        long StateBytes, long StateJsonBytes = 0);
 
     /// <summary>A shorter drain bound for tests, taken from the arming flow while a test has set it.</summary>
     internal static readonly AsyncLocal<TimeSpan?> DrainTimeoutForTesting = new();
@@ -150,11 +150,11 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     internal const int MaxFailureMessage = 256;
 
     /// <summary>
-    /// What a start line may need beyond its state (the event and checkpoint fields, the checksum), plus the manifest
-    /// written before it: the start is sized against <c>MaxBytes − EventReserve − StartLineOverhead</c>, and the writer
-    /// writes it first after the manifest.
+    /// What a start line needs beyond its state: the event and checkpoint fields and the checksum (about 230 bytes).
+    /// The writer writes the start first after the manifest, so a start fits when the manifest, this and the state's
+    /// exact bytes stay within <c>MaxBytes − EventReserve</c> (<see cref="StartCheckpoint.Fits"/>).
     /// </summary>
-    internal const long StartLineOverhead = 64 * 1024;
+    internal const long StartLineAllowance = 4 * 1024;
 
     private Exception? _writerFault = WriterFaultForTesting.Value;
     private Exception? _writerDisposeFault = WriterDisposeFaultForTesting.Value;

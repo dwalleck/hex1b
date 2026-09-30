@@ -36,6 +36,21 @@ internal static class StartCheckpoint
     }
 
     /// <summary>
+    /// Whether a recorded start fits the case: the writer writes it first after the manifest, so the manifest's bytes,
+    /// the line's own fields and the state's exact bytes must stay within the events tier.
+    /// </summary>
+    internal static bool Fits(long manifestBytes, DiagnosticCaseRecorder.CheckpointCapture start, long maxBytes) =>
+        manifestBytes + DiagnosticCaseRecorder.StartLineAllowance + start.StateJsonBytes <= maxBytes - DiagnosticCaseRecorder.EventReserve;
+
+    /// <summary>A complete start that does not fit with its manifest (<see cref="Fits"/>): unsupported, at the size limit.</summary>
+    internal static DiagnosticCaseCheckpoint TooLarge(DiagnosticCaseCheckpoint complete, long manifestBytes, long stateJsonBytes) => complete with
+    {
+        Status = DiagnosticCaseCheckpointStatus.Unsupported,
+        Reason = $"size-limit: the start state ({stateJsonBytes} bytes) and the manifest ({manifestBytes} bytes) are larger than the case's size bound leaves for its events",
+        CoveredSurfaces = [],
+    };
+
+    /// <summary>
     /// The surfaces a start state holds that its restore cannot represent, in a fixed order; empty when it can be
     /// restored. It reads only the projection.
     /// </summary>

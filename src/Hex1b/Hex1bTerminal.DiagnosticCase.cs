@@ -225,9 +225,10 @@ public sealed partial class Hex1bTerminal
         if (_continuationUncommitted)
             return new(null, null, "unavailable", "unapplied-output: output was tokenized without being applied since the last application, so its decoder continuation is not the committed one", 0);
         // A start line that cannot be written whole would leave the case claiming a start it never wrote. The
-        // geometry estimate refuses the clear cases before projecting; the projection's exact size decides.
+        // geometry estimate refuses the clear cases before projecting; the projection's exact size decides (and the
+        // engine adds the manifest's own bytes when it describes the start).
         const string TooLarge = "size-limit: the start state is larger than the case's size bound leaves for its events";
-        if (EstimateModelStateJsonBytesUnsafe() > startRoom)
+        if (EstimateModelStateJsonBytesUnsafe() + DiagnosticCaseRecorder.StartLineAllowance > startRoom)
             return new(null, null, "unavailable", TooLarge, 0);
         var estimate = EstimateModelStateBytesUnsafe();
         if (estimate > DiagnosticCaseRecorder.PendingStateBudgetInEffect)
@@ -237,9 +238,11 @@ public sealed partial class Hex1bTerminal
         {
             DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value?.Invoke();
             var state = CaptureModelState();
-            if (SerializedBytes(state) + DiagnosticCaseRecorder.StartLineOverhead > startRoom)
-                return new(null, null, "unavailable", TooLarge, 0);
-            return new(state, System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds, "recorded", null, estimate);
+            var jsonBytes = SerializedBytes(state);
+            var milliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            if (jsonBytes + DiagnosticCaseRecorder.StartLineAllowance > startRoom)
+                return new(null, null, "unavailable", $"{TooLarge} ({jsonBytes} bytes; projected and measured in {milliseconds:0.###} ms)", 0);
+            return new(state, milliseconds, "recorded", null, estimate, jsonBytes);
         }
         catch (Exception error)
         {
@@ -247,13 +250,12 @@ public sealed partial class Hex1bTerminal
         }
     }
 
-    // The bytes a state serializes to in an event line (the writer's serializer and encoder), counted without
-    // keeping them.
+    // The bytes a state serializes to in an event line (the writer's serializer and encoder), counted as the
+    // serializer flushes its buffer to the stream, without keeping them.
     private static long SerializedBytes(DiagnosticModelState state)
     {
         using var counter = new ByteCounter();
-        using (var writer = new System.Text.Json.Utf8JsonWriter(counter))
-            System.Text.Json.JsonSerializer.Serialize(writer, state, DiagnosticsJsonContext.Default.DiagnosticModelState);
+        System.Text.Json.JsonSerializer.Serialize(counter, state, DiagnosticsJsonContext.Default.DiagnosticModelState);
         return counter.Length;
     }
 

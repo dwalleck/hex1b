@@ -777,9 +777,9 @@ public sealed class TerminalDiagnostics
             _terminal.NativeDelivery,
             _terminal.StopDiagnosticCaseWithCheckpoint);
         Diagnostics.Cases.DiagnosticCaseRecorder.BeforeArmForTesting.Value?.Invoke();
-        var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase(reapplication, maxBytes - Diagnostics.Cases.DiagnosticCaseRecorder.EventReserve - Diagnostics.Cases.DiagnosticCaseRecorder.StartLineOverhead,
+        var (recorder, problem, activeId) = _terminal.TryArmDiagnosticCase(reapplication, maxBytes - Diagnostics.Cases.DiagnosticCaseRecorder.EventReserve,
             (fresh, unsupported, configuration, start) =>
-            new Diagnostics.Cases.DiagnosticCaseRecorder(new DiagnosticCaseManifest
+            new Diagnostics.Cases.DiagnosticCaseRecorder(FitStart(new DiagnosticCaseManifest
             {
                 FormatVersion = Diagnostics.Cases.CaseArtifactWriter.FormatVersion,
                 ContractVersion = ContractVersion,
@@ -796,7 +796,7 @@ public sealed class TerminalDiagnostics
                 Authorizations = granted,
                 Identity = identity,
                 Streams = DeclareCaseStreams(granted, sources),
-            }, path, _terminal.TimeProvider, _terminal.ClearDiagnosticCase, sources));
+            }, start?.Capture, maxBytes), path, _terminal.TimeProvider, _terminal.ClearDiagnosticCase, sources));
 
         if (recorder is null)
         {
@@ -810,6 +810,19 @@ public sealed class TerminalDiagnostics
         Diagnostics.Cases.DiagnosticCaseRecorder.AfterArmForTesting.Value?.Invoke();
         recorder.Start();
         return recorder.Describe();
+    }
+
+    // A complete start is written first after the manifest; when the manifest's own bytes leave no room for it, the
+    // start is unsupported at the size limit instead (its line is then not kept).
+    private static DiagnosticCaseManifest FitStart(DiagnosticCaseManifest manifest, Diagnostics.Cases.DiagnosticCaseRecorder.CheckpointCapture? start,
+        long maxBytes)
+    {
+        if (start is not { } capture || manifest.Checkpoint.Status != DiagnosticCaseCheckpointStatus.Complete)
+            return manifest;
+        var manifestBytes = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(manifest, DiagnosticsJsonContext.Default.DiagnosticCaseManifest).LongLength;
+        return Diagnostics.Cases.StartCheckpoint.Fits(manifestBytes, capture, maxBytes)
+            ? manifest
+            : manifest with { Checkpoint = Diagnostics.Cases.StartCheckpoint.TooLarge(manifest.Checkpoint, manifestBytes, capture.StateJsonBytes) };
     }
 
     private static IReadOnlyList<DiagnosticCaseStreamDeclaration> DeclareCaseStreams(DiagnosticAuthorization[] granted,
