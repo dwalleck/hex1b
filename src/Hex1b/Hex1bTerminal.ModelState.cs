@@ -102,7 +102,7 @@ public sealed partial class Hex1bTerminal
             // In reading order the main screen (or, on the alternate screen, the saved main screen) follows the history,
             // so its first cell can continue the history's last glyph across a soft wrap; the alternate screen stands alone.
             long? historyLast = _scrollbackBuffer is { Count: > 0 } retained && retained.GetEntryAt(retained.Count - 1).Row.Cells is { Length: > 0 } lastCells
-                ? lastCells[^1].Sequence
+                ? WrapPredecessor(lastCells[^1])
                 : null;
             var screen = ProjectScreen(_screenBuffer, styles, _inAlternateScreen ? null : historyLast);
             var savedMain = _savedMainScreenBuffer is { } main ? ProjectScreen(main, styles, historyLast) : null;
@@ -115,7 +115,7 @@ public sealed partial class Hex1bTerminal
                 for (var i = 0; i < entries.Length; i++)
                 {
                     var row = entries[i].Row;
-                    long? before = i > 0 && entries[i - 1].Row.Cells is { Length: > 0 } previous ? previous[^1].Sequence : null;
+                    long? before = i > 0 && entries[i - 1].Row.Cells is { Length: > 0 } previous ? WrapPredecessor(previous[^1]) : null;
                     var cells = new DiagnosticModelCell[row.Cells.Length];
                     for (var column = 0; column < cells.Length; column++)
                         cells[column] = ProjectCell(row.Cells[column], styles, Continues(row.Cells[column], column > 0 ? row.Cells[column - 1].Sequence : before));
@@ -291,7 +291,7 @@ public sealed partial class Hex1bTerminal
         for (var row = 0; row < height; row++)
         {
             var cells = new DiagnosticModelCell[width];
-            long? previous = row > 0 ? (width > 0 ? buffer[row - 1, width - 1].Sequence : null) : before;
+            long? previous = row > 0 ? (width > 0 ? WrapPredecessor(buffer[row - 1, width - 1]) : null) : before;
             for (var column = 0; column < width; column++)
                 cells[column] = ProjectCell(buffer[row, column], styles, Continues(buffer[row, column], column > 0 ? buffer[row, column - 1].Sequence : previous));
             var at = row;
@@ -330,6 +330,10 @@ public sealed partial class Hex1bTerminal
     // is how every reader of the cells decides it (anchors, selection, rendering, reflow).
     private static bool Continues(in TerminalCell cell, long? before) =>
         cell.Character.Length == 0 && before is { } sequence && cell.Sequence == sequence;
+
+    // The sequence a row's first cell may continue: the previous row's last cell's, only when that row soft-wraps. A row
+    // that ends without a soft wrap ends its glyphs there for every reader, whatever the sequences say.
+    private static long? WrapPredecessor(in TerminalCell last) => last.IsSoftWrap ? last.Sequence : null;
 
     private static DiagnosticModelStyle ProjectStyle(in TerminalCell cell)
     {

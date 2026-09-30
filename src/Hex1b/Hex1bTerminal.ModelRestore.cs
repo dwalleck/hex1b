@@ -32,7 +32,7 @@ public sealed partial class Hex1bTerminal
         {
             if (_modelSequence != 0 || (_scrollbackBuffer?.Count ?? 0) != 0)
                 throw new InvalidOperationException("Only a model that has applied nothing can be restored.");
-            if (HistoryProblem(state.History, _scrollbackBuffer) is { } historyProblem)
+            if (HistoryProblem(state.History, state.Styles, _scrollbackBuffer) is { } historyProblem)
                 throw new InvalidOperationException($"The state cannot be restored: its history {historyProblem}");
             if (state.CommandMarks.Count > _commandMarkHistoryCapacity)
                 throw new InvalidOperationException(
@@ -172,7 +172,7 @@ public sealed partial class Hex1bTerminal
     // capacity must be the configuration's, each row whole at a width of at least 1, with as many cells as that width
     // (every push lays a row out at the width it records; a resize has no upper width, so neither has a row), and its
     // identities a ring the buffer can hold as recorded.
-    private static string? HistoryProblem(DiagnosticModelHistory? history, ScrollbackBuffer? scrollback)
+    private static string? HistoryProblem(DiagnosticModelHistory? history, IReadOnlyList<DiagnosticModelStyle>? styles, ScrollbackBuffer? scrollback)
     {
         if (history is null)
             return scrollback is null ? null : "is absent, but the model is configured with a scrollback.";
@@ -191,7 +191,7 @@ public sealed partial class Hex1bTerminal
             if (row.Cells.Count != width)
                 return $"has a row of {row.Cells.Count} cells at original width {width}.";
         }
-        if (RowsProblem(history.Rows, "history") is { } rowsProblem)
+        if (RowsProblem(history.Rows, "history", styles) is { } rowsProblem)
             return $"has {rowsProblem}.";
         return ScrollbackBuffer.RestoreProblem(history.Rows.Count, history.Rows.Select(row => row.Id!.Value), history.NextRowId, scrollback.Capacity);
     }
@@ -222,9 +222,9 @@ public sealed partial class Hex1bTerminal
         if ((state.SavedMainScreen is not null) != (state.ActiveBuffer == "alternate") || state.ActiveBuffer is not ("main" or "alternate"))
             return $"an active buffer '{state.ActiveBuffer}' that does not match its saved main screen";
         var historyLast = state.History?.Rows is { Count: > 0 } historyRows ? historyRows[^1] : null;
-        if (RowsProblem(state.Screen, "a screen", state.ActiveBuffer == "main" ? historyLast : null) is { } screenProblem)
+        if (RowsProblem(state.Screen, "a screen", state.Styles, state.ActiveBuffer == "main" ? historyLast : null) is { } screenProblem)
             return screenProblem;
-        if (state.SavedMainScreen is not null && RowsProblem(state.SavedMainScreen, "a saved main screen", historyLast) is { } savedProblem)
+        if (state.SavedMainScreen is not null && RowsProblem(state.SavedMainScreen, "a saved main screen", state.Styles, historyLast) is { } savedProblem)
             return savedProblem;
         if (state.SavedMainScreen is { Count: > 0 } saved && saved.Any(row => row.Cells.Count != saved[0].Cells.Count))
             return "a saved main screen whose rows do not share one width";
@@ -269,6 +269,7 @@ public sealed partial class Hex1bTerminal
                         : row.Cells[column].Continues && before is { } shared ? shared
                         : ++_writeSequence;
                 }
+                // Validation has refused a first-column continuation after a row that does not soft-wrap.
                 if (sequences.Length > 0)
                     previous = sequences[^1];
                 result[row] = sequences;
@@ -300,10 +301,12 @@ public sealed partial class Hex1bTerminal
         return mask;
     }
 
-    // Why projected rows cannot be restored, or null: every row present with its cells, a continuation only on an empty
-    // cell after the first column and never across a never-written run's edge, and the runs start, count pairs in column
-    // order within the row.
-    private static string? RowsProblem(IReadOnlyList<DiagnosticModelRow>? rows, string what, DiagnosticModelRow? before = null)
+    // Why projected rows cannot be restored, or null: every row present with its cells; a continuation only on an empty
+    // cell, after the cell to its left or, at the first column, after the last cell of a row before it in reading order
+    // that soft-wraps, and never across a never-written run's edge; and the runs start, count pairs in column order within
+    // the row.
+    private static string? RowsProblem(IReadOnlyList<DiagnosticModelRow>? rows, string what,
+        IReadOnlyList<DiagnosticModelStyle>? styles, DiagnosticModelRow? before = null)
     {
         if (rows is null)
             return $"{what}: missing";
@@ -326,7 +329,7 @@ public sealed partial class Hex1bTerminal
             var unwritten = UnwrittenMask(rows[row].Unwritten, cells.Count);
             // The row before in reading order, for a continuation at the first column (across a soft wrap).
             var previous = row > 0 ? rows[row - 1] : before;
-            var previousUnwritten = previous?.Cells is { Count: > 0 } previousCells
+            var previousUnwritten = previous?.Cells is { Count: > 0 } previousCells && SoftWraps(previous, styles)
                 ? UnwrittenMask(previous.Unwritten, previousCells.Count)[^1]
                 : (bool?)null;
             for (var column = 0; column < cells.Count; column++)
@@ -340,6 +343,12 @@ public sealed partial class Hex1bTerminal
         }
         return null;
     }
+
+    // Whether a projected row soft-wraps: its last cell's style carries the soft-wrap attribute. A style index outside the
+    // table is not a soft wrap.
+    private static bool SoftWraps(DiagnosticModelRow row, IReadOnlyList<DiagnosticModelStyle>? styles) =>
+        row.Cells is { Count: > 0 } cells && styles is not null && cells[^1] is { } last && (uint)last.Style < (uint)styles.Count
+        && styles[last.Style]?.Attributes?.Contains("soft-wrap") == true;
 
     private TerminalCell RestoreCell(DiagnosticModelCell projected, IReadOnlyList<DiagnosticModelStyle> styles,
         TerminalCell[] cells, bool[] built)

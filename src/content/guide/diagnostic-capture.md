@@ -656,6 +656,9 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
   whose row is gone is dropped, there and nowhere in the recording. A re-application can then report
   `different` at that mark (`commandMarks[i].row`/`column`).
 - A start records which empty cells continue the glyph before them in reading order (`c`, including
-  a row's first cell continuing a glyph split across a soft wrap) and which cells were never written (a row's `unwritten` runs), not which orphaned half belongs to which glyph elsewhere
-  on the row. A later left/right-margin scroll that rejoins an orphaned half with its own glyph can
-  therefore place a new mark there one column off in the re-application.
+  a row's first cell continuing a glyph split across a soft wrap) and which cells were never written
+  (a row's `unwritten` runs). It does not record that two cells apart from each other are halves of
+  one glyph. Halves separated before the start (by a left/right-margin scroll, or by a row inserted
+  or scrolled between the halves of a glyph split across a wrap) and brought back together after it
+  are one glyph in the recording and two cells in the re-application, which can then place a new
+  mark there one column off.

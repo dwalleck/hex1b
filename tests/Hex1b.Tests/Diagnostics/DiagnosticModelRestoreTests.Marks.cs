@@ -406,6 +406,87 @@ public partial class DiagnosticModelRestoreTests
         Assert.IsEmpty(differences, $"{strategy}: " + string.Join("; ", differences.Take(3)));
     }
 
+    // The split pair across the main buffer's boundaries, and across a row boundary that no longer soft-wraps (review
+    // round 5: RR5#2, RR5#3). "Flag" is where the start's column-0 continuation must stand, or none.
+    [TestMethod]
+    [DataRow("history to screen", "", "\u001b[4;1H\n", "", "screen")]
+    [DataRow("history to screen under deeper history", "zz\r\n", "\u001b[4;1H\n\n", "", "screen")]
+    [DataRow("history to saved main", "", "\u001b[4;1H\n\u001b[?1049h", "\u001b[?1049l", "saved")]
+    [DataRow("hard row boundary", "", "\u001b[2;4r\u001b[2;1H\u001bM", "\u001b[4;1H\u001bD\u001b[r", "none")]
+    [DataRow("hard boundary at history's end", "", "\u001b[2;4r\u001b[2;1H\u001bM\u001b[4;1H\u001bD\u001b[r\u001b[4;1H\n", "", "none")]
+    [DataRow("hard boundary inside history", "", "\u001b[2;4r\u001b[2;1H\u001bM\u001b[4;1H\u001bD\u001b[r\u001b[4;1H\n\n", "", "none")]
+    public void ModelRestore_ClusterSplitAcrossABoundary(string shape, string prefix, string before, string after, string flag)
+    {
+        Hex1bTerminal Model() => new(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = new HeadlessPresentationAdapter(9, 4).WithReflowStrategy(CaseConfiguration.CreateReflowStrategy("ghostty")!, enabled: true),
+            WorkloadAdapter = new CaseReapplier.DetachedWorkload(),
+            Width = 9,
+            Height = 4,
+            ScrollbackCapacity = 10,
+            TimeProvider = new FakeTimeProvider(),
+            DeferStart = true,
+        });
+        var original = Model();
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(prefix + "abcd\u0E01\u0E33xyz"));
+        original.Resize(5, 4);
+        Assert.IsTrue(original.CaptureModelState().Screen.Any(r => r.Cells[0].Continues), $"fixture: {shape} did not split the cluster across the wrap");
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(before));
+        var state = original.CaptureModelState();
+        var flagged = (state.Screen[0].Cells[0].Continues ? "screen" : "") + (state.SavedMainScreen?[0].Cells[0].Continues == true ? "saved" : "");
+        Assert.AreEqual(flag == "none" ? "" : flag, flagged, $"{shape}: the start's column-0 flag at a buffer's first row");
+        if (flag == "none")
+        {
+            Assert.IsFalse(state.Screen.Concat(state.History!.Rows).Any(r => r.Cells[0].Continues), $"{shape}: a column-0 flag after a row that does not soft-wrap");
+            Assert.AreEqual(1, state.Screen.Concat(state.History.Rows).Count(r => r.Cells[0].Text.Length == 0), $"fixture: {shape} holds the glyph's second half at a row's start");
+        }
+        else
+        {
+            Assert.AreEqual(prefix.Length > 0 ? 2 : 1, state.History!.Rows.Count, $"fixture: {shape} history rows");
+        }
+        var replica = Model();
+        replica.RestoreModelState(state);
+        foreach (var step in new[] { after, "RESIZE 9 4", "\u001b[1;6H\u001b]133;A\u0007" })
+        {
+            ApplyStep(original, step);
+            ApplyStep(replica, step);
+            var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+            Assert.IsEmpty(differences, $"{shape} after {JsonSerializer.Serialize(step)}: " + string.Join("; ", differences.Take(3)));
+        }
+    }
+
+    // The accepted limitation (issue 23, widened in review round 5: RR5#1): a start records continuations between cells
+    // adjacent in reading order only. Halves separated before the start (here by an inserted row) and brought back
+    // together after it are one glyph in the original and two cells in the replica. This pins the known divergence, so
+    // a change to it is noticed; issue 23's fix turns it into a match.
+    [TestMethod]
+    public void ModelRestore_SeparatedHalvesRejoinedAfterTheStartDiverge()
+    {
+        Hex1bTerminal Model() => new(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = new HeadlessPresentationAdapter(9, 4).WithReflowStrategy(CaseConfiguration.CreateReflowStrategy("ghostty")!, enabled: true),
+            WorkloadAdapter = new CaseReapplier.DetachedWorkload(),
+            Width = 9,
+            Height = 4,
+            ScrollbackCapacity = 10,
+            TimeProvider = new FakeTimeProvider(),
+            DeferStart = true,
+        });
+        var original = Model();
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("abcd\u0E01\u0E33xyz"));
+        original.Resize(5, 4);
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b[2;1H\u001b[L"));
+        var replica = Model();
+        replica.RestoreModelState(original.CaptureModelState());
+        foreach (var step in new[] { "\u001b[2;1H\u001b[M", "RESIZE 9 4", "\u001b[1;6H\u001b]133;A\u0007" })
+        {
+            ApplyStep(original, step);
+            ApplyStep(replica, step);
+        }
+        Assert.AreEqual((4, 5), (original.CaptureModelState().CommandMarks[0].Column, replica.CaptureModelState().CommandMarks[0].Column),
+            "the known one-column divergence of issue 23");
+    }
+
     // The projected never-written runs are exactly the cells with write sequence 0, read raw from the screen and the
     // history rows (review round 4, RR4#4): several runs in a row, and history rows too.
     [TestMethod]
@@ -498,6 +579,7 @@ public partial class DiagnosticModelRestoreTests
     [DataRow("a screen row without cells")]
     [DataRow("a missing saved main row")]
     [DataRow("a history continuation at column 0")]
+    [DataRow("a continuation at column 0 after a row that does not soft-wrap")]
     [DataRow("never-written runs not in pairs")]
     [DataRow("a never-written run past the row")]
     [DataRow("never-written runs out of order")]
@@ -520,6 +602,11 @@ public partial class DiagnosticModelRestoreTests
         var forged = shape switch
         {
             "a continuation at column 0" => state with { Screen = Rows(state.Screen, 0, r => FirstCell(r, c => c with { Text = "", Continues = true })) },
+            // Both rows wholly written, so only the missing soft wrap refuses it.
+            "a continuation at column 0 after a row that does not soft-wrap" => state with
+            {
+                Screen = [state.Screen[0] with { Unwritten = null }, FirstCell(state.Screen[1], c => c with { Text = "", Continues = true }) with { Unwritten = null }, .. state.Screen.Skip(2)],
+            },
             "a continuation on a glyph" => state with { Screen = Rows(state.Screen, 0, r => r with { Cells = [r.Cells[0], r.Cells[1] with { Text = "x", Continues = true }, .. r.Cells.Skip(2)] }) },
             "a missing screen row" => state with { Screen = Rows(state.Screen, 1, _ => null!) },
             "a screen row without cells" => state with { Screen = Rows(state.Screen, 1, r => r with { Cells = null! }) },
