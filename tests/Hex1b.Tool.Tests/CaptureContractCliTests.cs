@@ -1104,6 +1104,8 @@ public class CaptureContractCliTests
             parser.Services.GetRequiredService<Hex1b.Tool.Commands.RootCommand>().Parse(hostArgs));
         Assert.IsNotNull(config, configError);
         Assert.AreEqual(scrollback, config.Scrollback, "the host did not read the forwarded --scrollback");
+        Assert.AreEqual((40, 6, "/bin/sh", 2, root.Path, 1), (config.Width, config.Height, config.Command, config.Arguments.Length,
+            config.DiagnosticCase?.Directory, config.DiagnosticCase?.Authorizations?.Count), "the host's other forwarded options");
 
         await WaitForSocketReleaseAsync(cts.Token);
         var host = TerminalHost.RunAsync(config, cts.Token);

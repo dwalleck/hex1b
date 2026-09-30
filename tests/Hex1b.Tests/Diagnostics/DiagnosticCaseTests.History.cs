@@ -61,17 +61,23 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
-    public async Task Start_HistoryThatFitsTheCaseIsComplete()
+    [DataRow("styled rows", 250, 24)]
+    [DataRow("blank rows", 305, 17)]
+    public async Task Start_HistoryThatFitsTheCaseIsComplete(string shape, int lines, int bytesACellThatCannotFit)
     {
-        // A history whose state fits a 1 MiB case exactly (about 16 bytes a cell), although 24 bytes a cell would not:
-        // the start is complete and re-applies; only the geometry's floor (14 bytes a cell) refuses before projecting.
+        // A history whose state fits a 1 MiB case exactly (about 16 bytes a cell; blank cells are the smallest real
+        // ones), although a pre-check at the given bytes a cell would refuse it: the start is complete and re-applies;
+        // only the geometry's floor (14 bytes a cell) refuses before projecting.
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
         await using var terminal = HistoryTerminal(workload, strategy: null, capacity: 5_000, width: 200, height: 20);
-        await workload.WriteAndWaitAsync(terminal, string.Concat(Enumerable.Range(1, 250).Select(i => $"\u001b[3{i % 7}m{new string((char)('a' + i % 26), 190)}\u001b[m\r\n")));
+        await workload.WriteAndWaitAsync(terminal, shape == "blank rows"
+            ? string.Concat(Enumerable.Repeat("\r\n", lines))
+            : string.Concat(Enumerable.Range(1, lines).Select(i => $"\u001b[3{i % 7}m{new string((char)('a' + i % 26), 190)}\u001b[m\r\n")));
         const long maxBytes = 1024 * 1024;
         var cells = (terminal.ScrollbackCount + 20L) * 200;
-        Assert.IsGreaterThan(maxBytes, cells * 24, "fixture: 24 bytes a cell would fit");
+        Assert.IsGreaterThan(maxBytes - DiagnosticCaseRecorder.EventReserve - DiagnosticCaseRecorder.StartLineAllowance, cells * bytesACellThatCannotFit,
+            $"fixture: {bytesACellThatCannotFit} bytes a cell would fit");
         var path = new TerminalDiagnostics(terminal).StartCase(new DiagnosticCaseStartRequest
         {
             Directory = root.Path,
@@ -83,7 +89,7 @@ public partial class DiagnosticCaseTests
 
         var checkpoint = Artifact.Read(path).Manifest.GetProperty("checkpoint");
         Assert.AreEqual("complete", checkpoint.GetProperty("status").GetString(), checkpoint.ToString());
-        AssertMatched(Reapply(path, label: "start"), "a history that fits the case");
+        AssertMatched(Reapply(path, label: "start"), $"{shape}: a history that fits the case");
     }
 
     [TestMethod]

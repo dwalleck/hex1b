@@ -164,16 +164,20 @@ public class DiagnosticModelRestoreTests
 
     // Retained history (ticket 10): every row, its identity, original width, soft wrap and styles, in partial and full
     // rings, rows kept at a width other than the current one by a strategy that does not reflow, a single row, and wide
-    // glyphs (with their continuations and wrap padding).
+    // glyphs (with their continuations and wrap padding), and rows scrolled wider than 10,000 columns (a resize has no
+    // upper width, and a model that does not reflow keeps them).
     [TestMethod]
     [DataRow("partial", 100, false)]
     [DataRow("full ring", 12, false)]
     [DataRow("off-width rows", 100, true)]
     [DataRow("one row", 100, false)]
     [DataRow("wide glyphs", 100, false)]
+    [DataRow("wider than 10,000 columns", 100, false)]
     public void ModelRestore_HistoryRoundTrips(string shape, int capacity, bool resizedBeforeStart)
     {
         var original = Detached(new FakeTimeProvider(), capacity: capacity);
+        if (shape == "wider than 10,000 columns")
+            original.Resize(10_001, 3);
         original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(shape switch
         {
             "one row" => string.Concat(Enumerable.Range(1, 10).Select(i => $"line {i}\r\n")),
@@ -182,10 +186,14 @@ public class DiagnosticModelRestoreTests
         }));
         if (resizedBeforeStart)
             original.Resize(30, 10);
+        if (shape == "wider than 10,000 columns")
+            original.Resize(40, 10);
         var state = original.CaptureModelState();
         Assert.IsNotEmpty(state.History!.Rows, "fixture: no history");
         if (shape == "one row")
             Assert.HasCount(1, state.History.Rows, "fixture: not one row");
+        else if (shape == "wider than 10,000 columns")
+            Assert.IsTrue(state.History.Rows.Any(r => r.OriginalWidth == 10_001), "fixture: no row wider than 10,000");
         else
             Assert.IsTrue(state.Styles.Any(s => s.Attributes.Contains("soft-wrap")), "fixture: no soft wrap");
         if (shape == "wide glyphs")
@@ -245,13 +253,16 @@ public class DiagnosticModelRestoreTests
     [DataRow("a row without its id")]
     [DataRow("a row without its original width")]
     [DataRow("a row without cells")]
+    [DataRow("a null row")]
     [DataRow("original width 0")]
-    [DataRow("original width above 10,000")]
+    [DataRow("original width -3")]
     [DataRow("cells not the original width")]
     public void ModelRestore_RefusesMalformedHistory(string shape)
     {
+        // The original ends at another geometry than the replica's, so a refusal after the restore's resize would show.
         var original = Detached(new FakeTimeProvider());
         original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(HistoryLines(20)));
+        original.Resize(50, 12);
         var state = original.CaptureModelState();
         var history = state.History!;
         var rows = history.Rows.ToList();
@@ -268,8 +279,9 @@ public class DiagnosticModelRestoreTests
             "a row without its id" => history with { Rows = [rows[0] with { Id = null }, .. rows.Skip(1)] },
             "a row without its original width" => history with { Rows = [rows[0] with { OriginalWidth = null }, .. rows.Skip(1)] },
             "a row without cells" => history with { Rows = [rows[0] with { Cells = null! }, .. rows.Skip(1)] },
+            "a null row" => history with { Rows = [null!, .. rows.Skip(1)] },
             "original width 0" => history with { Rows = [rows[0] with { OriginalWidth = 0, Cells = [] }, .. rows.Skip(1)] },
-            "original width above 10,000" => history with { Rows = [rows[0] with { OriginalWidth = 10_001, Cells = [.. Enumerable.Repeat(rows[0].Cells[0], 10_001)] }, .. rows.Skip(1)] },
+            "original width -3" => history with { Rows = [rows[0] with { OriginalWidth = -3, Cells = [] }, .. rows.Skip(1)] },
             _ => history with { Rows = [rows[0] with { Cells = [.. rows[0].Cells.Take(3)] }, .. rows.Skip(1)] },
         };
         var replica = Detached(new FakeTimeProvider(), capacity: shape switch
@@ -280,7 +292,8 @@ public class DiagnosticModelRestoreTests
         });
         var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(state with { History = forged }));
         StringAssert.Contains(error.Message, "history", shape);
-        Assert.AreEqual((0L, 0), (replica.CurrentModelSequence, replica.ScrollbackCount), $"{shape}: a refused restore changed the model");
+        Assert.AreEqual((0L, 0, 40, 10), (replica.CurrentModelSequence, replica.ScrollbackCount, replica.Width, replica.Height),
+            $"{shape}: a refused restore changed the model");
     }
 
     // History hyperlinks are the replica's own, one counted reference per cell: its store holds exactly the distinct

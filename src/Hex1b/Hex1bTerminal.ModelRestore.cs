@@ -152,12 +152,11 @@ public sealed partial class Hex1bTerminal
     }
 
     // Why a recorded history cannot be restored into this model's configured scrollback, or null: its presence and
-    // capacity must be the configuration's, each row whole at a width a model can have, with as many cells as that width
-    // (every push lays a row out at the width it records), and its identities a ring the buffer can hold as recorded.
+    // capacity must be the configuration's, each row whole at a width of at least 1, with as many cells as that width
+    // (every push lays a row out at the width it records; a resize has no upper width, so neither has a row), and its
+    // identities a ring the buffer can hold as recorded.
     private static string? HistoryProblem(DiagnosticModelHistory? history, ScrollbackBuffer? scrollback)
     {
-        // The configuration's width bound: no model lays a row out wider.
-        const int MaxRowWidth = 10_000;
         if (history is null)
             return scrollback is null ? null : "is absent, but the model is configured with a scrollback.";
         if (scrollback is null)
@@ -170,8 +169,8 @@ public sealed partial class Hex1bTerminal
         {
             if (row is null || row.Id is null || row.OriginalWidth is not { } width || row.Cells is null)
                 return "has a row without its identity, original width or cells.";
-            if (width is < 1 or > MaxRowWidth)
-                return $"has a row of original width {width}, not 1 to 10,000.";
+            if (width < 1)
+                return $"has a row of original width {width}, below 1.";
             if (row.Cells.Count != width)
                 return $"has a row of {row.Cells.Count} cells at original width {width}.";
         }
