@@ -6,8 +6,8 @@ using ModelContextProtocol.Server;
 namespace Hex1b.McpServer.Tools;
 
 /// <summary>
-/// MCP tools for bounded diagnostic cases: start, stop, status and mark through a target, and offline inspection
-/// and re-application.
+/// MCP tools for bounded diagnostic cases: start, stop, status, mark and recover through a target, and offline
+/// inspection and re-application.
 /// The tools translate arguments and wrap the shared contract results; every policy stays in the engine.
 /// </summary>
 [McpServerToolType]
@@ -110,18 +110,47 @@ public class DiagnosticCaseTools(TerminalSessionManager sessionManager)
     }
 
     /// <summary>
+    /// Takes a recovery checkpoint in a target's active case.
+    /// </summary>
+    [McpServerTool, Description("Takes a recovery checkpoint in the terminal target's active diagnostic case after recording loss (overload drops the newest events past 4,096 queued, leaving a gap): the terminal model's full text state at its current model sequence, a new origin that reapply_diagnostic_case restores from for targets after it, so the case stays re-applicable past the gap. Needs the reapplication-data authorization. Classified like a live start: 'complete', or 'unsupported' with the reason (a DCS in progress or graphics, a state too large for the case's remaining room, the pending-state budget, inside an application) and recorded as a boundary only. Never waits for the case's writer ('busy' past 64 pending checkpoints). Earlier loss and the case's initial checkpoint are never changed.")]
+    public async Task<CaseRecoverToolResult> RecoverDiagnosticCase(
+        [Description("Session ID of the terminal target")] string sessionId,
+        [Description("The checkpoint's label: 1-64 printable ASCII characters (default recovery-<ordinal>); labels need not be unique.")] string? label = null,
+        CancellationToken ct = default)
+    {
+        var target = sessionManager.GetTarget(sessionId);
+        var result = target == null
+            ? new DiagnosticCaseRecoverResult
+            {
+                Outcome = DiagnosticOutcome.Unavailable,
+                Problem = new DiagnosticProblem { Code = "session-not-found", Message = $"Session '{sessionId}' not found." },
+            }
+            : await target.RecoverCaseAsync(label, ct);
+        return new CaseRecoverToolResult
+        {
+            Success = result.Outcome == DiagnosticOutcome.Captured,
+            SessionId = sessionId,
+            Message = result.Outcome == DiagnosticOutcome.Captured
+                ? $"Case {result.CaseId} recovered '{result.Label}' at model sequence {result.ModelSequence}: a new origin."
+                : $"Recovery {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}",
+            Recovery = JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticCaseRecoverResult),
+        };
+    }
+
+    /// <summary>
     /// Re-applies a case artifact offline and compares it with a recorded checkpoint.
     /// </summary>
-    [McpServerTool, Description("Re-applies a recorded diagnostic case offline, without the process that wrote it: a detached terminal model rebuilt from the case's recorded configuration applies the recorded events up to a target boundary (each output chunk through the raw output path, each resize, each synchronized-update timeout on a virtual clock), then compares its full text state with the checkpoint recorded there: 'matched', 'different' (typed differences by path, counted per surface), or 'unavailable' (no checkpoint, no state, or graphics). Refuses a target past the case's re-applicable interval, an old or unknown format, and a case directory that is not owner-only. Writes only its own run directory inside the case: result.json, reapplied.json, recorded.json and any previews.")]
+    [McpServerTool, Description("Re-applies a recorded diagnostic case offline, without the process that wrote it: a detached terminal model rebuilt from the case's recorded configuration is restored from the case's origin (its start, or the earliest recovery checkpoint whose re-applicable interval covers the target, or the one 'from' names; the result's 'origin' says which) and applies the recorded events after it up to a target boundary (each output chunk through the raw output path, each resize, each synchronized-update timeout on a virtual clock), then compares its full text state with the checkpoint recorded there: 'matched', 'different' (typed differences by path, counted per surface), or 'unavailable' (no checkpoint, no state, or graphics). Refuses a target past the case's re-applicable interval, an old or unknown format, and a case directory that is not owner-only. Writes only its own run directory inside the case: result.json, reapplied.json, recorded.json and any previews.")]
     public CaseReapplyToolResult ReapplyDiagnosticCase(
         [Description("The case directory (the 'path' a start or stop returned).")] string path,
         [Description("Target: a model sequence (12), a case sequence (case:34), or a checkpoint label (label:name, or the bare name; 'stop' is the stop checkpoint, 'start' a live start's checkpoint; a label several checkpoints share is ambiguous, so name one by case sequence).")] string to,
+        [Description("Origin to restore from: 'start', or a recovery checkpoint by label (label:name or the bare name), case sequence (case:34) or ordinal (checkpoint:2). Default: the earliest origin whose re-applicable interval covers the target. A mark is not-an-origin, an unknown name unknown-origin, and a target outside the named origin's interval beyond-interval.")] string? from = null,
         [Description("Declared faults to inject into the reconstructed state before comparing (comma-separated), as kind or kind:target: cell-text[:row/column], cell-style[:row/column], cursor, mode[:name], title, charset, tab-stop, pending-input, history-row[:index], history-rows, pending-wrap, last-printed, rendition, margins, saved-cursor, pending-grapheme, activity, synchronized-update, title-stack, command-mark, pending-escape, pending-ground-escape, pending-framer (the pending-* faults drop one holder of the start's pending model input; target the start). The result is labelled faultInjected.")] string? injectFault = null,
         [Description("Most differences listed (1-100000; default 1000). Every difference is counted.")] int? maxDifferences = null,
         [Description("Previews to write (comma-separated): text, ansi, svg, html.")] string? preview = null)
     {
         var (request, invalid) = DiagnosticContractNames.ParseCaseReapplyRequest(path, to,
-            injectFault is null ? null : [injectFault], maxDifferences, preview is null ? null : [preview]);
+            injectFault is null ? null : [injectFault], maxDifferences, preview is null ? null : [preview], from);
         var result = invalid ?? DiagnosticCaseReapplier.Reapply(request!);
         return new CaseReapplyToolResult
         {

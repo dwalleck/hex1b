@@ -267,8 +267,9 @@ hex1b capture case start <id> [options]
 hex1b capture case status <id>
 hex1b capture case stop <id>
 hex1b capture case mark <id> [--label NAME]
+hex1b capture case recover <id> [--label NAME]
 hex1b capture case inspect <path> [--since N] [--limit N]
-hex1b capture case reapply <path> --to TARGET [--inject-fault KIND] [--max-differences N] [--preview FORMAT]
+hex1b capture case reapply <path> --to TARGET [--from ORIGIN] [--inject-fault KIND] [--max-differences N] [--preview FORMAT]
 ```
 
 | `start` option | Type | Default | Description |
@@ -284,20 +285,34 @@ checkpoint and re-applies from it; a terminal holding a surface the start cannot
 held between chunks (an unfinished escape sequence or UTF-8 scalar) is owned by the start. To record from the first byte, use `hex1b terminal start --record-case`. `stop` waits at most 10 s for queued events.
 `inspect` reads the artifact offline, verifies every line's checksum, and reports whether the case
 is `complete`, `interrupted` or `truncated`. It also reports per-stream coverage and missing
-ranges, the re-applicable model interval, and, with `--limit`, a page of events.
+ranges (a range of unknown extent bounded by the envelope the case wrote when it stopped says so),
+the re-applicable model intervals, one per origin (the start, and each complete recovery
+checkpoint), each naming its origin, and, with `--limit`, a page of events.
 
 `mark` records a checkpoint in the active case at the model's current sequence. With
 `reapplication-data` the checkpoint holds the model's full text state; otherwise it records the
 boundary only (and says why). `--label` is 1–64 printable ASCII characters. The default is `mark-`
 and the checkpoint's ordinal; labels need not be unique.
 
-`reapply` rebuilds the model offline from the case's recorded configuration and applies its
-recorded events up to a target. It then compares the result with the checkpoint recorded there.
-Each run writes its own directory, `reapplications/<n>`, inside the case.
+`recover` takes a recovery checkpoint in the active case after recording loss (an `overload`
+range: the queue dropped the newest events). It holds the model's full text state at the current
+model sequence and is a new origin: a new re-applicable interval starts there, and `reapply`
+restores from it for targets after the gap. It needs `reapplication-data`, and is classified like a
+live start: `complete`, or `unsupported` with the reason (a DCS in progress or graphics, a state
+too large for the case's remaining room, the pending-state budget, a recovery inside an
+application), recorded as a boundary only. Earlier loss and the case's initial checkpoint never
+change. `--label` is as for `mark`; the default is `recovery-` and the checkpoint's ordinal.
+
+`reapply` rebuilds the model offline from the case's recorded configuration, restores it from the
+case's origin (its start, or the earliest recovery checkpoint whose interval covers the target, or
+the one `--from` names; the result's `origin` says which) and applies the recorded events after
+it up to the target. It then compares the result with the checkpoint recorded there. Each run
+writes its own directory, `reapplications/<n>`, inside the case.
 
 | `reapply` option | Type | Default | Description |
 |------------------|------|---------|-------------|
 | `--to` | string | (required) | A model sequence (`12`), a case sequence (`case:34`), or a checkpoint label (`label:name`, or the bare name; `stop` is the stop checkpoint, `start` a live start's checkpoint; a label several checkpoints share is ambiguous, so name one by `case:<n>`) |
+| `--from` | string | | The origin to restore from: `start`, or a recovery checkpoint by label (`label:name`, or the bare name), case sequence (`case:34`) or ordinal (`checkpoint:2`). Default: the earliest origin whose re-applicable interval covers the target. A mark is `not-an-origin`, an unknown name `unknown-origin`, and a target outside the named origin's interval `beyond-interval` |
 | `--inject-fault` | string | | A declared fault to inject before comparing, as `kind` or `kind:target` (repeatable or comma-separated): `cell-text[:row/column]`, `cell-style[:row/column]`, `cursor`, `mode[:name]`, `title`, `charset`, `tab-stop`, `pending-input`, `history-row[:index]`, `history-rows`, `pending-wrap`, `last-printed`, `rendition`, `margins`, `saved-cursor`, `pending-grapheme`, `activity`, `synchronized-update`, `title-stack`, `command-mark`, `pending-escape`, `pending-ground-escape`, `pending-framer` (the `pending-*` faults drop one holder of a live start's pending input; target the start). The result is labelled `faultInjected` |
 | `--max-differences` | int | `1000` | Most differences listed (1–100000); every difference is counted |
 | `--preview` | string | | `text`, `ansi`, `svg`, `html` (repeatable or comma-separated) |
@@ -306,7 +321,8 @@ Each run writes its own directory, `reapplications/<n>`, inside the case.
 
 Without `--json` each command prints a summary. With `--json` it writes the full contract result.
 Refusals exit 1 with the problem code (`case-active`, `no-active-case`, `storage-refused`,
-`invalid-bounds`, `busy`, `invalid-label`, `incompatible`, `beyond-interval`, `unknown-model-sequence`, …).
+`invalid-bounds`, `busy`, `invalid-label`, `incompatible`, `beyond-interval`, `unknown-model-sequence`,
+`not-an-origin`, `unknown-origin`, …).
 
 ### `capture recording start`
 

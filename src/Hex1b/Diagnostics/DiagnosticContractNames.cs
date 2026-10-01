@@ -115,7 +115,7 @@ internal static class DiagnosticContractNames
     /// other text); faults and previews are repeatable and comma-separated. The reapplier validates the rest.
     /// </summary>
     public static (DiagnosticCaseReapplyRequest? Request, DiagnosticCaseReapplyResult? Invalid) ParseCaseReapplyRequest(
-        string path, string? to, IEnumerable<string>? faults, int? maxDifferences, IEnumerable<string>? previews)
+        string path, string? to, IEnumerable<string>? faults, int? maxDifferences, IEnumerable<string>? previews, string? from = null)
     {
         static DiagnosticCaseReapplyResult Invalid(string code, string message) => new()
         {
@@ -145,7 +145,8 @@ internal static class DiagnosticContractNames
             values?.SelectMany(value => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).ToArray() is { Length: > 0 } list
                 ? list
                 : null;
-        return (request with { Faults = Split(faults), Previews = Split(previews) }, null);
+        // The origin is named as a target is (start, a label, case:N, checkpoint:N); the reapplier resolves it.
+        return (request with { Faults = Split(faults), Previews = Split(previews), From = string.IsNullOrWhiteSpace(from) ? null : from.Trim() }, null);
     }
 
     private static bool TryParseAuthorizations(IEnumerable<string>? names, out List<DiagnosticAuthorization> parsed, out string unsupported)

@@ -54,13 +54,14 @@ internal static class CaseCommandOutput
             formatter.WriteLine($"  {AppTreeCommand.Safe(stream.Stream)}: {AppTreeCommand.Safe(stream.State)}, {stream.Events} events" +
                 (stream.FirstOrdinal is { } first ? $" ({first}..{stream.LastOrdinal})" : ""));
             foreach (var missing in stream.Missing)
-                formatter.WriteLine($"    missing {missing.FromOrdinal}..{(missing.ToOrdinal?.ToString() ?? "end")}: {AppTreeCommand.Safe(missing.Reason)}");
+                formatter.WriteLine($"    missing {missing.FromOrdinal}..{(missing.ToOrdinal?.ToString() ?? "end")}" +
+                    (missing.Extent == "envelope" ? " (bounded by its envelope)" : "") + $": {AppTreeCommand.Safe(missing.Reason)}");
         }
 
         foreach (var interval in inspection.Intervals)
-            formatter.WriteLine(interval.Valid
+            formatter.WriteLine((interval.Valid
                 ? $"Re-applicable: model {interval.FromModelSequence}..{interval.ToModelSequence} (ends: {AppTreeCommand.Safe(interval.EndReason)})"
-                : $"Not re-applicable: {AppTreeCommand.Safe(interval.EndReason)}");
+                : $"Not re-applicable: {AppTreeCommand.Safe(interval.EndReason)}") + Origin(interval.Origin));
         formatter.WriteLine($"Events on this page: {inspection.Events.Count}");
         return 0;
     }
@@ -80,6 +81,20 @@ internal static class CaseCommandOutput
         return 0;
     }
 
+    public static int Write(OutputFormatter formatter, DiagnosticCaseRecoverResult result, bool json)
+    {
+        if (json)
+            Console.WriteLine(JsonSerializer.Serialize(result, DiagnosticsJsonOptions.Indented.GetTypeInfo(typeof(DiagnosticCaseRecoverResult))));
+        if (result.Outcome != DiagnosticOutcome.Captured)
+            return Failure(formatter, result.Outcome, result.Problem);
+        if (json)
+            return 0;
+
+        formatter.WriteLine($"Case {AppTreeCommand.Safe(result.CaseId)} recovered '{AppTreeCommand.Safe(result.Label)}' " +
+            $"(checkpoint {result.CheckpointOrdinal}) at model sequence {result.ModelSequence}: a new origin");
+        return 0;
+    }
+
     public static int Write(OutputFormatter formatter, DiagnosticCaseReapplyResult result, bool json)
     {
         if (json)
@@ -95,8 +110,10 @@ internal static class CaseCommandOutput
             return result.Comparison == "matched" ? 0 : 2;
 
         var target = result.Target!;
-        if (result.Checkpoint is { ModelSequence: { } start } restored)
-            formatter.WriteLine($"Restored from the {AppTreeCommand.Safe(restored.Profile)} start at model sequence {start}");
+        if (result.Origin is { Trigger: "start", Profile: DiagnosticCaseCheckpointProfiles.TextState } start)
+            formatter.WriteLine($"Restored from the {AppTreeCommand.Safe(start.Profile)} start at model sequence {start.ModelSequence}");
+        else if (result.Origin is { } recovery && recovery.Trigger != "start")
+            formatter.WriteLine($"Restored from recovery '{AppTreeCommand.Safe(recovery.Label)}' (checkpoint {recovery.CheckpointOrdinal}) at model sequence {recovery.ModelSequence}");
         formatter.WriteLine($"Re-applied to model sequence {target.ModelSequence}" +
             (target.Label is { } label ? $" ('{AppTreeCommand.Safe(label)}')" : "") + $": {AppTreeCommand.Safe(result.Comparison)}" +
             (result.ComparisonReason is { } reason ? $" ({AppTreeCommand.Safe(reason)})" : ""));
@@ -120,6 +137,10 @@ internal static class CaseCommandOutput
         $"{AppTreeCommand.Safe(checkpoint.Profile)} {DiagnosticContractNames.Of(checkpoint.Status)}" +
         (checkpoint.ModelSequence is { } start ? $" at model sequence {start}" : "") +
         (checkpoint.UnsupportedSurfaces is { Count: > 0 } surfaces ? $"; unsupported surfaces: {string.Join(", ", surfaces.Select(AppTreeCommand.Safe))}" : "");
+
+    // An interval's origin: the case's start, or the recovery checkpoint it restores from.
+    private static string Origin(DiagnosticCaseOrigin? origin) =>
+        origin is null ? "" : origin.Trigger == "start" ? " from the start" : $" from recovery '{AppTreeCommand.Safe(origin.Label)}' (checkpoint {origin.CheckpointOrdinal})";
 
     private static int Failure(OutputFormatter formatter, DiagnosticOutcome outcome, DiagnosticProblem? problem)
     {

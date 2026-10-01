@@ -1152,6 +1152,88 @@ public class CaptureContractCliTests
 
     [TestMethod]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_RecoverAndReapplyFromMatchTheEngineAndTheReapplier()
+    {
+        // Ticket 13: `capture case recover` equals the engine's recovery and the checkpoint line the target wrote, and
+        // its refusals the engine's; `reapply --from` equals the reapplier's for the same request, origin included.
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        await using var target = await StartAttachedAppAsync(new DiagnosticCaseStartRequest
+        {
+            Directory = root.Path,
+            Authorizations = [DiagnosticAuthorization.ReapplicationData],
+        });
+        var engine = new TerminalDiagnostics(target, "CliRecover");
+
+        var tooLong = new string('x', 65);
+        var (badExit, bad, _) = await RunCliAsync("capture", "case", "recover", Pid, "--label", tooLong, "--json");
+        Assert.AreEqual(1, badExit);
+        AssertJsonEquals(engine.RecoverCase(tooLong), bad, "invalid label");
+
+        var (markExit, _, markErr) = await RunCliAsync("capture", "case", "mark", Pid, "--label", "cli-mark", "--json");
+        Assert.AreEqual(0, markExit, markErr);
+        // A model event between the mark and the recovery, so the mark is before the recovery's interval.
+        var marked = target.CurrentModelSequence;
+        target.Resize(42, 6);
+        for (var i = 0; i < 500 && target.CurrentModelSequence == marked; i++)
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        Assert.AreNotEqual(marked, target.CurrentModelSequence, "fixture: the resize raised no model event");
+        var (recoverExit, recovered, recoverErr) = await RunCliAsync("capture", "case", "recover", Pid, "--label", "cli-recover", "--json");
+        Assert.AreEqual(0, recoverExit, recoverErr);
+        var (textExit, text, _) = await RunCliAsync("capture", "case", "recover", Pid);
+        Assert.AreEqual(0, textExit);
+        StringAssert.Contains(text, "recovered 'recovery-");
+        StringAssert.Contains(text, "a new origin");
+        var recorder = target.DiagnosticCase!;
+        var (stopExit, stop, stopErr) = await RunCliAsync("capture", "case", "stop", Pid, "--json");
+        Assert.AreEqual(0, stopExit, stopErr);
+        var path = JsonDocument.Parse(stop).RootElement.GetProperty("path").GetString()!;
+        var (noneExit, none, _) = await RunCliAsync("capture", "case", "recover", Pid, "--json");
+        Assert.AreEqual(1, noneExit);
+        AssertJsonEquals(engine.RecoverCase(), none, "recover without a case");
+        var line = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path, Limit = 4096 }).Events
+            .Single(e => e.Checkpoint?.Label == "cli-recover");
+        Assert.AreEqual("recovery", line.Checkpoint!.Trigger);
+        AssertJsonEquals(new DiagnosticCaseRecoverResult
+        {
+            Outcome = DiagnosticOutcome.Captured,
+            CaseId = recorder.CaseId,
+            Label = "cli-recover",
+            CheckpointOrdinal = line.Checkpoint.Ordinal,
+            ModelSequence = line.ModelSequence,
+            Status = "complete",
+        }, recovered, "recovery");
+
+        // Re-application with --from equals the reapplier's for the same request, apart from each run's own directory.
+        foreach (var (args, request, code, origin) in new (string[], DiagnosticCaseReapplyRequest, string?, string?)[]
+        {
+            (["--to", "stop"], new() { Path = path, ToLabel = "stop" }, null, "start"),
+            (["--to", "stop", "--from", "cli-recover"], new() { Path = path, ToLabel = "stop", From = "cli-recover" }, null, "cli-recover"),
+            (["--to", "stop", "--from", $"checkpoint:{line.Checkpoint.Ordinal}"], new() { Path = path, ToLabel = "stop", From = $"checkpoint:{line.Checkpoint.Ordinal}" }, null, "cli-recover"),
+            (["--to", "stop", "--from", "cli-mark"], new() { Path = path, ToLabel = "stop", From = "cli-mark" }, "not-an-origin", null),
+            (["--to", "stop", "--from", "nobody"], new() { Path = path, ToLabel = "stop", From = "nobody" }, "unknown-origin", null),
+            (["--to", "cli-mark", "--from", "cli-recover"], new() { Path = path, ToLabel = "cli-mark", From = "cli-recover" }, "beyond-interval", null),
+        })
+        {
+            var (exit, json, err) = await RunCliAsync(["capture", "case", "reapply", path, .. args, "--json"]);
+            var expected = DiagnosticCaseReapplier.Reapply(request);
+            Assert.AreEqual((code, origin), (expected.Problem?.Code, expected.Origin?.Label ?? expected.Origin?.Trigger), $"fixture: {string.Join(" ", args)}: {expected.Problem?.Message}");
+            Assert.AreEqual(expected.Outcome != DiagnosticOutcome.Captured ? 1 : expected.Comparison == "matched" ? 0 : 2, exit, err);
+            AssertJsonEquals(expected, json, string.Join(" ", args), "runPath");
+        }
+
+        var (fromExit, fromText, fromErr) = await RunCliAsync("capture", "case", "reapply", path, "--to", "stop", "--from", "cli-recover");
+        Assert.AreEqual(0, fromExit, fromErr + fromText);
+        StringAssert.Contains(fromText, $"Restored from recovery 'cli-recover' (checkpoint {line.Checkpoint.Ordinal}) at model sequence {line.ModelSequence}");
+        var (inspectExit, inspectText, _) = await RunCliAsync("capture", "case", "inspect", path);
+        Assert.AreEqual(0, inspectExit);
+        StringAssert.Contains(inspectText, "from the start");
+        StringAssert.Contains(inspectText, $"from recovery 'cli-recover' (checkpoint {line.Checkpoint.Ordinal})");
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task Case_PendingInputFaults()
     {
         // A hosted PTY prints the first byte of a scalar, pauses, then the rest; the case starts during the pause.

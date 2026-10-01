@@ -198,6 +198,39 @@ internal sealed class DiagnosticsSocketClient
         Problem = new DiagnosticProblem { Code = code, Message = message },
     };
 
+    /// <summary>
+    /// Takes a recovery checkpoint in an attached target's active case: a new origin to re-apply from after recording
+    /// loss. Untimed like a mark: a recovery the target took is never reported failed.
+    /// </summary>
+    public async Task<DiagnosticCaseRecoverResult> RecoverCaseAsync(string socketPath, string? label = null, CancellationToken cancellationToken = default)
+    {
+        var (response, problem) = await ExchangeAsync(socketPath,
+            new DiagnosticsRequest { Method = TerminalDiagnostics.CaseRecoverOperation, CaseRecoverLabel = label }, cancellationToken, untimed: true).ConfigureAwait(false);
+        if (problem is not null)
+            return RecoverProblem(problem.Value.Outcome, problem.Value.Code, problem.Value.Message);
+        if (response!.CaseRecover is not { } result)
+        {
+            var (outcome, code, message) = Unexpected(response);
+            return RecoverProblem(outcome, code, message);
+        }
+
+        if (result.ContractVersion != TerminalDiagnostics.ContractVersion)
+            return RecoverProblem(DiagnosticOutcome.Failed, "incompatible-target", VersionMessage(result.ContractVersion));
+        if (result.Outcome == DiagnosticOutcome.Captured
+            && (result.CaseId is null || result.Label is null || result.CheckpointOrdinal is null || result.ModelSequence is null || result.Status is null))
+            return RecoverProblem(DiagnosticOutcome.Failed, "protocol-error", "The target reported a recovery without its case, label, ordinal, model sequence or status.");
+        if (result.Outcome != DiagnosticOutcome.Captured && result.Problem is null)
+            return RecoverProblem(DiagnosticOutcome.Failed, "protocol-error",
+                $"The target reported outcome '{DiagnosticContractNames.Of(result.Outcome)}' without a problem.");
+        return result;
+    }
+
+    private static DiagnosticCaseRecoverResult RecoverProblem(DiagnosticOutcome outcome, string code, string message) => new()
+    {
+        Outcome = outcome,
+        Problem = new DiagnosticProblem { Code = code, Message = message },
+    };
+
     private async Task<DiagnosticCaseResult> CaseExchangeAsync(string socketPath, DiagnosticsRequest request, bool untimed,
         CancellationToken cancellationToken)
     {

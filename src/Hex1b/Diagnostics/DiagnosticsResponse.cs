@@ -108,6 +108,10 @@ internal sealed class DiagnosticsResponse
     [JsonPropertyName("caseMark")]
     public DiagnosticCaseMarkResult? CaseMark { get; set; }
 
+    /// <summary>For "case-recover": the recovery result, including failures.</summary>
+    [JsonPropertyName("caseRecover")]
+    public DiagnosticCaseRecoverResult? CaseRecover { get; set; }
+
     /// <summary>
     /// For "input", "key", "click" and "drag": the input ids the send was assigned, when the
     /// target tracks input.

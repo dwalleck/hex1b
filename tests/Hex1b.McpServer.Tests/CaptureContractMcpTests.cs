@@ -747,6 +747,84 @@ public class CaptureContractMcpTests : McpServerTestBase
 
     [TestMethod]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task Case_RecoverAndReapplyFromMatchTheEngineAndTheReapplier()
+    {
+        // Ticket 13: recover_diagnostic_case equals the engine's recovery and the checkpoint line the target wrote, and
+        // its refusals the engine's; reapply_diagnostic_case's `from` equals the reapplier's, origin included; the tool
+        // descriptions name the new origin and the `from` refusals.
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage is verified on Linux.");
+        using var root = new CaseRoot();
+        await using var terminal = await StartAttachedAppAsync(new DiagnosticCaseStartRequest
+        {
+            Directory = root.Path,
+            Authorizations = [DiagnosticAuthorization.ReapplicationData],
+        });
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var sessionId = await ConnectAttachedAsync(client);
+        var engine = new TerminalDiagnostics(terminal, "McpRecover");
+
+        var unknown = await CallAsync(client, "recover_diagnostic_case", new() { ["sessionId"] = "no-such-session" });
+        Assert.AreEqual("session-not-found", unknown.GetProperty("recovery").GetProperty("problem").GetProperty("code").GetString());
+        var tooLong = new string('x', 65);
+        var invalid = await CallAsync(client, "recover_diagnostic_case", new() { ["sessionId"] = sessionId, ["label"] = tooLong });
+        AssertJsonEquals(engine.RecoverCase(tooLong), invalid.GetProperty("recovery"), "invalid label");
+        var mark = await CallAsync(client, "mark_diagnostic_case", new() { ["sessionId"] = sessionId, ["label"] = "mcp-mark" });
+        Assert.IsTrue(mark.GetProperty("success").GetBoolean(), mark.ToString());
+        // A model event between the mark and the recovery, so the mark is before the recovery's interval.
+        var marked = terminal.CurrentModelSequence;
+        terminal.Resize(42, 6);
+        for (var i = 0; i < 500 && terminal.CurrentModelSequence == marked; i++)
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        Assert.AreNotEqual(marked, terminal.CurrentModelSequence, "fixture: the resize raised no model event");
+        var recovery = await CallAsync(client, "recover_diagnostic_case", new() { ["sessionId"] = sessionId, ["label"] = "mcp-recover" });
+        Assert.IsTrue(recovery.GetProperty("success").GetBoolean(), recovery.ToString());
+        StringAssert.Contains(recovery.GetProperty("message").GetString(), "a new origin");
+        var recorder = terminal.DiagnosticCase!;
+        var stop = await CallAsync(client, "stop_diagnostic_case", new() { ["sessionId"] = sessionId });
+        var path = stop.GetProperty("case").GetProperty("path").GetString()!;
+        var none = await CallAsync(client, "recover_diagnostic_case", new() { ["sessionId"] = sessionId });
+        AssertJsonEquals(engine.RecoverCase(), none.GetProperty("recovery"), "recover without a case");
+        var line = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path, Limit = 4096 }).Events
+            .Single(e => e.Checkpoint?.Label == "mcp-recover");
+        Assert.AreEqual("recovery", line.Checkpoint!.Trigger);
+        AssertJsonEquals(new DiagnosticCaseRecoverResult
+        {
+            Outcome = DiagnosticOutcome.Captured,
+            CaseId = recorder.CaseId,
+            Label = "mcp-recover",
+            CheckpointOrdinal = line.Checkpoint.Ordinal,
+            ModelSequence = line.ModelSequence,
+            Status = "complete",
+        }, recovery.GetProperty("recovery"), "recovery");
+
+        foreach (var (arguments, request, code, origin) in new (Dictionary<string, object?>, DiagnosticCaseReapplyRequest, string?, string?)[]
+        {
+            (new() { ["path"] = path, ["to"] = "stop" }, new() { Path = path, ToLabel = "stop" }, null, "start"),
+            (new() { ["path"] = path, ["to"] = "stop", ["from"] = "mcp-recover" }, new() { Path = path, ToLabel = "stop", From = "mcp-recover" }, null, "mcp-recover"),
+            (new() { ["path"] = path, ["to"] = "stop", ["from"] = $"case:{line.CaseSequence}" }, new() { Path = path, ToLabel = "stop", From = $"case:{line.CaseSequence}" }, null, "mcp-recover"),
+            (new() { ["path"] = path, ["to"] = "stop", ["from"] = "mcp-mark" }, new() { Path = path, ToLabel = "stop", From = "mcp-mark" }, "not-an-origin", null),
+            (new() { ["path"] = path, ["to"] = "stop", ["from"] = "nobody" }, new() { Path = path, ToLabel = "stop", From = "nobody" }, "unknown-origin", null),
+            (new() { ["path"] = path, ["to"] = "mcp-mark", ["from"] = "mcp-recover" }, new() { Path = path, ToLabel = "mcp-mark", From = "mcp-recover" }, "beyond-interval", null),
+        })
+        {
+            var result = await CallAsync(client, "reapply_diagnostic_case", arguments);
+            var expected = DiagnosticCaseReapplier.Reapply(request);
+            Assert.AreEqual((code, origin), (expected.Problem?.Code, expected.Origin?.Label ?? expected.Origin?.Trigger), $"fixture: {string.Join(" ", arguments.Values)}: {expected.Problem?.Message}");
+            Assert.AreEqual(expected.Outcome == DiagnosticOutcome.Captured, result.GetProperty("success").GetBoolean(), result.ToString());
+            AssertJsonEquals(expected, result.GetProperty("reapplication"), string.Join(" ", arguments.Values), "runPath");
+        }
+
+        var tools = await client.ListToolsAsync();
+        StringAssert.Contains(tools.Single(t => t.Name == "recover_diagnostic_case").Description!, "new origin", "the recover description");
+        var fromParameter = tools.Single(t => t.Name == "reapply_diagnostic_case").JsonSchema.GetProperty("properties").GetProperty("from").GetProperty("description").GetString()!;
+        foreach (var term in new[] { "start", "not-an-origin", "unknown-origin", "beyond-interval" })
+            StringAssert.Contains(fromParameter, term, "the from description");
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task Case_PendingInputFaults()
     {
         // A bash session prints the first byte of a scalar, pauses, then the rest; start_diagnostic_case runs during

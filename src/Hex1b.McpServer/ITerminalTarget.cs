@@ -116,6 +116,9 @@ public interface ITerminalTarget : IAsyncDisposable
     /// <summary>Marks a boundary in the target's active case (a checkpoint at its current model sequence).</summary>
     Task<DiagnosticCaseMarkResult> MarkCaseAsync(string? label, CancellationToken ct = default);
 
+    /// <summary>Takes a recovery checkpoint in the target's active case: a new origin after recording loss.</summary>
+    Task<DiagnosticCaseRecoverResult> RecoverCaseAsync(string? label, CancellationToken ct = default);
+
     /// <summary>
     /// Describes the target's diagnostic capabilities and their limits.
     /// </summary>

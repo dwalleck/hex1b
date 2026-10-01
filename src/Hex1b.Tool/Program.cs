@@ -57,6 +57,7 @@ public class Program
         builder.Services.AddTransient<Commands.Capture.CaptureCaseStatusCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureCaseInspectCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureCaseMarkCommand>();
+        builder.Services.AddTransient<Commands.Capture.CaptureCaseRecoverCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureCaseReapplyCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureCaseCommand>();
         builder.Services.AddTransient<Commands.Capture.CaptureRecordingStartCommand>();
