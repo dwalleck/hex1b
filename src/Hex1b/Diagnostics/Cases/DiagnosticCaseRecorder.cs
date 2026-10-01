@@ -202,11 +202,10 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     // stream's coverage is summarized as one range of unknown extent when the case closes.
     private readonly long?[] _undescribedFrom = new long?[StreamCount];
 
-    // Where re-applicable model coverage ends. Held outside the queue so overload cannot drop it, and
-    // written before any model event at or after it.
-    private long _intervalEnd = long.MaxValue;
-    private string? _intervalEndReason;
-    private bool _intervalEndWritten;
+    // Where re-applicable model coverage ends, per segment (the case's origin, then each complete recovery
+    // checkpoint). Held outside the queue so overload cannot drop it, and written before any model event at or
+    // after it.
+    private readonly CaseIntervalEnds _intervalEnds = new();
 
     // The last native delivery record already pulled (records up to it predate the case or are written).
     private long _deliverySince;
@@ -326,7 +325,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     internal bool IsRecording => Volatile.Read(ref _state) == Recording;
 
     /// <summary>The model sequence where re-applicable coverage ends, or <see cref="long.MaxValue"/>.</summary>
-    internal long IntervalEnd => Volatile.Read(ref _intervalEnd);
+    internal long IntervalEnd => _intervalEnds.CurrentEnd;
 
     /// <summary>The loss ledger, for tests that need more loss ranges than a real overload produces.</summary>
     internal CaseLossLedger LossForTesting => _loss;
@@ -434,15 +433,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
 
     /// <summary>
     /// Ends re-applicable coverage at <paramref name="modelSequence"/> (the first event that cannot be
-    /// reproduced). The first end wins. The caller holds the model lock.
+    /// reproduced). Within a segment the first end wins. The caller holds the model lock.
     /// </summary>
-    internal void EndInterval(long modelSequence, string reason)
-    {
-        if (modelSequence >= Volatile.Read(ref _intervalEnd))
-            return;
-        _intervalEndReason = reason;
-        Volatile.Write(ref _intervalEnd, modelSequence);
-    }
+    internal void EndInterval(long modelSequence, string reason) => _intervalEnds.End(modelSequence, reason);
 
     // The tracker calls these under its own lock from the application's threads: a failure here must end
     // only this stream, never reach the application.
@@ -614,6 +607,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// <summary>Bytes left in the tier the stop checkpoint is written in, so a stop can skip a state that cannot fit.</summary>
     internal long StopCheckpointRoom => RangeLimit - _writer.BytesWritten;
 
+    /// <summary>What the events tier leaves for a checkpoint line taken now: a recovery's state must fit it whole.</summary>
+    internal long CheckpointRoom => EventLimit - _writer.BytesWritten;
+
     /// <summary>
     /// Records the start checkpoint of a case armed on a model that had applied output, before any model event
     /// (the caller holds the model lock at arming). Only a complete <c>text-state/1</c> start is kept: its state is
@@ -638,6 +634,31 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         var ordinal = Interlocked.Increment(ref _checkpointsTaken);
         var name = label ?? $"mark-{ordinal}";
         _checkpoints.Enqueue(new PendingCheckpoint(modelSequence, Checkpoint(ordinal, name, "mark", capture), capture.StateBytes));
+        Interlocked.Decrement(ref _marksInProgress);
+        if (_signal.CurrentCount == 0)
+            _signal.Release();
+        return (ordinal, name);
+    }
+
+    /// <summary>
+    /// Records a recovery checkpoint taken under the model lock and classified as a start is: complete, with its state,
+    /// it begins a new segment of re-applicable coverage; otherwise the attempt is recorded without state, with the
+    /// status and reason. The caller reserved a mark's place; the checkpoint takes it.
+    /// </summary>
+    internal (long Ordinal, string Label) RecordRecovery(string? label, long modelSequence, CheckpointCapture capture, DiagnosticCaseCheckpoint described)
+    {
+        var ordinal = Interlocked.Increment(ref _checkpointsTaken);
+        var name = label ?? $"recovery-{ordinal}";
+        var complete = described.Status == DiagnosticCaseCheckpointStatus.Complete && capture.State is not null;
+        var checkpoint = complete
+            ? Checkpoint(ordinal, name, "recovery", capture)
+            : Checkpoint(ordinal, name, "recovery", new CheckpointCapture(null, null, "unsupported", described.Reason, 0));
+        if (complete)
+        {
+            Interlocked.Add(ref _pendingStateBytes, capture.StateBytes);
+            _intervalEnds.BeginSegment(modelSequence);
+        }
+        _checkpoints.Enqueue(new PendingCheckpoint(modelSequence, checkpoint, complete ? capture.StateBytes : 0));
         Interlocked.Decrement(ref _marksInProgress);
         if (_signal.CurrentCount == 0)
             _signal.Release();
@@ -939,6 +960,10 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         DeclareUnpulledDelivery("not-pulled");
         WriteIntervalEndIfPending(long.MaxValue);
         WriteLoss(final: true);
+        // Loss past the ledger's cap has an envelope (its first and last dropped ordinals, the ones between not
+        // enumerated): a recovery checkpoint after it can start a valid interval.
+        foreach (var envelope in _loss.Envelopes())
+            AppendCase("loss-envelope", null, envelope, RangeLimit);
         WriteStreamFailures();
         WriteRemainingCheckpoints();
         // Missing ranges that did not fit under the size bound: one range of unknown extent per stream. Their
@@ -1167,14 +1192,12 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         }
     }
 
-    // Writes the interval end before the first model event at or after it (or at the end of the case).
+    // Writes every interval end due before the next model event: each segment's end before the first model event at
+    // or after it, and all of them at the end of the case.
     private void WriteIntervalEndIfPending(long nextModelSequence)
     {
-        var end = Volatile.Read(ref _intervalEnd);
-        if (_intervalEndWritten || end == long.MaxValue || nextModelSequence < end)
-            return;
-        _intervalEndWritten = true;
-        AppendCase("interval-end", end, new DiagnosticCaseRecord { Stream = "model", Reason = _intervalEndReason ?? "unsupported" }, ClosingLimit);
+        foreach (var (end, reason) in _intervalEnds.TakeDue(nextModelSequence))
+            AppendCase("interval-end", end, new DiagnosticCaseRecord { Stream = "model", Reason = reason }, ClosingLimit);
     }
 
     // Ranges taken from the ledger stay pending until written, so a writer failure partway through keeps the

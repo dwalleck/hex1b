@@ -11,8 +11,9 @@ namespace Hex1b.Diagnostics.Cases;
 internal static class StartCheckpoint
 {
     /// <summary>
-    /// The manifest checkpoint of a start taken at <paramref name="modelSequence"/>: complete when its state holds
-    /// only restorable surfaces; otherwise unsupported, naming the surfaces or why no state was taken.
+    /// The manifest checkpoint of a start, or the classification of a recovery checkpoint, taken at
+    /// <paramref name="modelSequence"/>: complete when its state holds only restorable surfaces; otherwise unsupported,
+    /// naming the surfaces or why no state was taken.
     /// </summary>
     internal static DiagnosticCaseCheckpoint Describe(DiagnosticCaseModelConfiguration configuration, long modelSequence,
         DiagnosticCaseRecorder.CheckpointCapture start)
@@ -35,7 +36,7 @@ internal static class StartCheckpoint
             ? described with
             {
                 Status = DiagnosticCaseCheckpointStatus.Unsupported,
-                Reason = $"unsupported-surfaces: the start held {string.Join(", ", surfaces)}, which this checkpoint cannot restore yet.",
+                Reason = $"unsupported-surfaces: the checkpoint held {string.Join(", ", surfaces)}, which it cannot restore yet.",
                 UnsupportedSurfaces = surfaces,
             }
             : described with { Status = DiagnosticCaseCheckpointStatus.Complete, CoveredSurfaces = FreshModelCheckpoint.CoveredSurfaces };

@@ -75,7 +75,7 @@ public sealed partial class Hex1bTerminal
                 : null;
             var fresh = _modelSequence == 0 && OutputBytesRead == 0;
             (long, DiagnosticCaseRecorder.CheckpointCapture)? start = !fresh && takeStart && unsupported is null
-                ? (_modelSequence, TakeStartCaptureUnsafe(startRoom))
+                ? (_modelSequence, TakeCompleteCaptureUnsafe(startRoom, "start", DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value))
                 : null;
             var recorder = create(fresh, unsupported, _caseConfiguration, start);
             if (start is var (sequence, capture))
@@ -216,33 +216,34 @@ public sealed partial class Hex1bTerminal
         }
     }
 
-    // The start projection, in the arming hold: refused, without projecting, inside an application, after
-    // unapplied output, when it could not fit the case, or past the pending-state budget; never failing the arming.
-    private DiagnosticCaseRecorder.CheckpointCapture TakeStartCaptureUnsafe(long startRoom)
+    // A checkpoint that must be complete to count (the start, in the arming hold, or a recovery): refused, without
+    // projecting, inside an application, after unapplied output, when it could not fit the case's remaining room, or
+    // past the pending-state budget; refused after projecting when its exact size does not fit; never failing the
+    // caller. Must hold _bufferLock.
+    private DiagnosticCaseRecorder.CheckpointCapture TakeCompleteCaptureUnsafe(long room, string subject, Action? beforeCapture)
     {
         if (_captureApplicationDepth > 0)
-            return new(null, null, "unavailable", "mid-application: the case was started inside an application that had not finished", 0);
+            return new(null, null, "unavailable", $"mid-application: the {subject} was taken inside an application that had not finished", 0);
         if (_continuationUncommitted)
             return new(null, null, "unavailable", "unapplied-output: output was tokenized without being applied since the last application, so its decoder continuation is not the committed one", 0);
-        // A start line that cannot be written whole would leave the case claiming a start it never wrote. The
-        // geometry's floor refuses, before projecting, only a start that cannot fit however small its cells; the
-        // projection's exact size decides every other (and the engine adds the manifest's own bytes when it describes
-        // the start).
-        const string TooLarge = "size-limit: the start state is larger than the case's size bound leaves for its events";
-        if (MinimumModelStateJsonBytesUnsafe() + DiagnosticCaseRecorder.StartLineAllowance > startRoom)
-            return new(null, null, "unavailable", TooLarge, 0);
+        // A line that cannot be written whole would leave the case claiming a checkpoint it never wrote. The geometry's
+        // floor refuses, before projecting, only a state that cannot fit however small its cells; the projection's exact
+        // size decides every other (and the engine adds the manifest's own bytes when it describes the start).
+        var tooLarge = $"size-limit: the {subject} state is larger than the case's size bound leaves for its events";
+        if (MinimumModelStateJsonBytesUnsafe() + DiagnosticCaseRecorder.StartLineAllowance > room)
+            return new(null, null, "unavailable", tooLarge, 0);
         var estimate = EstimateModelStateBytesUnsafe();
         if (estimate > DiagnosticCaseRecorder.PendingStateBudgetInEffect)
-            return new(null, null, "unavailable", "pending-state budget: the start state is larger than the state a case may hold awaiting its writer", 0);
+            return new(null, null, "unavailable", $"pending-state budget: the {subject} state is larger than the state a case may hold awaiting its writer", 0);
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
-            DiagnosticCaseRecorder.BeforeStartCaptureForTesting.Value?.Invoke();
+            beforeCapture?.Invoke();
             var state = CaptureModelState();
             var jsonBytes = SerializedBytes(state);
             var milliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-            if (jsonBytes + DiagnosticCaseRecorder.StartLineAllowance > startRoom)
-                return new(null, null, "unavailable", $"{TooLarge} ({jsonBytes} bytes; projected and measured in {milliseconds:0.###} ms)", 0);
+            if (jsonBytes + DiagnosticCaseRecorder.StartLineAllowance > room)
+                return new(null, null, "unavailable", $"{tooLarge} ({jsonBytes} bytes; projected and measured in {milliseconds:0.###} ms)", 0);
             return new(state, milliseconds, "recorded", null, estimate, jsonBytes);
         }
         catch (Exception error)
@@ -250,6 +251,61 @@ public sealed partial class Hex1bTerminal
             return new(null, null, "unavailable", DiagnosticCaseRecorder.Bounded($"capture-failed: {error.GetType().Name}: {error.Message}"), 0);
         }
     }
+
+    /// <summary>
+    /// Takes a recovery checkpoint in a recording case: a complete <c>text-state/1</c> checkpoint at the current model
+    /// sequence, in one hold of the model lock, classified by <paramref name="describe"/> as the engine classifies a
+    /// start. A refusal is recorded as a checkpoint line without state; the case keeps recording either way.
+    /// </summary>
+    internal DiagnosticCaseRecoverResult RecoverDiagnosticCase(DiagnosticCaseRecorder recorder, string? label,
+        Func<DiagnosticCaseModelConfiguration, long, DiagnosticCaseRecorder.CheckpointCapture, DiagnosticCaseCheckpoint> describe)
+    {
+        if (!recorder.IsRecording)
+            return RecoverProblem("no-active-case", "No case is recording this terminal.");
+        if (!recorder.IncludeModelPayloads)
+            return RecoverProblem("requires-reapplication-data", "A recovery checkpoint holds the model's state, which only reapplication-data authorizes.") with { CaseId = recorder.CaseId };
+        if (_workload is IHmp1TerminalOutputSource)
+            return RecoverProblem("hmp1-workload", "A remote workload's model is driven by state synchronization the case does not hold.") with { CaseId = recorder.CaseId };
+        if (!recorder.TryReserveMark())
+            return RecoverProblem("busy", $"{DiagnosticCaseRecorder.MaxPendingMarks} checkpoints already await the case's writer.") with { CaseId = recorder.CaseId };
+        lock (_bufferLock)
+        {
+            if (!recorder.IsRecording)
+            {
+                recorder.AbandonMark();
+                return RecoverProblem("no-active-case", "No case is recording this terminal.");
+            }
+
+            DiagnosticCaseRecorder.BeforeMarkCaptureForTesting.Value?.Invoke();
+            var sequence = _modelSequence;
+            var capture = TakeCompleteCaptureUnsafe(recorder.CheckpointRoom, "recovery", null);
+            var described = describe(_caseConfiguration, sequence, capture);
+            var (ordinal, name) = recorder.RecordRecovery(label, sequence, capture, described);
+            var complete = described.Status == DiagnosticCaseCheckpointStatus.Complete;
+            return new DiagnosticCaseRecoverResult
+            {
+                Outcome = complete ? DiagnosticOutcome.Captured : DiagnosticOutcome.Unavailable,
+                Problem = complete ? null : new DiagnosticProblem { Code = RefusalCode(described.Reason), Message = described.Reason ?? "unsupported" },
+                CaseId = recorder.CaseId,
+                Label = name,
+                CheckpointOrdinal = ordinal,
+                ModelSequence = sequence,
+                Status = complete ? "complete" : "unsupported",
+                Reason = complete ? null : described.Reason,
+                UnsupportedSurfaces = described.UnsupportedSurfaces is { Count: > 0 } surfaces ? surfaces : null,
+            };
+        }
+    }
+
+    // The refusal's kind, as a problem code: the reason's prefix before its colon, in kebab case.
+    private static string RefusalCode(string? reason) =>
+        reason is null ? "unsupported" : (reason.IndexOf(':') is > 0 and var colon ? reason[..colon] : reason).Replace(' ', '-');
+
+    private static DiagnosticCaseRecoverResult RecoverProblem(string code, string message) => new()
+    {
+        Outcome = DiagnosticOutcome.Unavailable,
+        Problem = new DiagnosticProblem { Code = code, Message = message },
+    };
 
     // The bytes a state serializes to in an event line (the writer's serializer and encoder), counted as the
     // serializer flushes its buffer to the stream, without keeping them.

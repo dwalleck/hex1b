@@ -61,6 +61,8 @@ public sealed class TerminalDiagnostics
 
     /// <summary>Operation name for marking a boundary in the active case (a checkpoint).</summary>
     public const string CaseMarkOperation = "case-mark";
+    /// <summary>The socket operation that takes a recovery checkpoint in the active case.</summary>
+    public const string CaseRecoverOperation = "case-recover";
 
     private static readonly IReadOnlyList<string> CaseLimitations =
     [
@@ -881,6 +883,33 @@ public sealed class TerminalDiagnostics
         return _terminal.DiagnosticCase is { } recorder
             ? _terminal.MarkDiagnosticCase(recorder, label)
             : new DiagnosticCaseMarkResult
+            {
+                Outcome = DiagnosticOutcome.Unavailable,
+                Problem = new DiagnosticProblem { Code = "no-active-case", Message = "No case is recording this terminal." },
+            };
+    }
+
+    /// <summary>
+    /// Takes a recovery checkpoint in the active case: a complete <c>text-state/1</c> checkpoint of the model at its
+    /// current model sequence, classified as a start is, from which a later re-application can begin after recording
+    /// loss (a new re-applicable interval). Needs <c>reapplication-data</c>. A refusal names why and is recorded in the
+    /// case as a checkpoint without state; earlier loss and the initial checkpoint are never changed.
+    /// </summary>
+    /// <param name="label">A label as for <see cref="MarkCase"/>; absent, <c>recovery-</c> and the checkpoint's ordinal.</param>
+    public DiagnosticCaseRecoverResult RecoverCase(string? label = null)
+    {
+        if (label is not null && !IsCaseLabel(label))
+        {
+            return new DiagnosticCaseRecoverResult
+            {
+                Outcome = DiagnosticOutcome.InvalidRequest,
+                Problem = new DiagnosticProblem { Code = "invalid-label", Message = "label must be 1 to 64 printable ASCII characters." },
+            };
+        }
+
+        return _terminal.DiagnosticCase is { } recorder
+            ? _terminal.RecoverDiagnosticCase(recorder, label, Diagnostics.Cases.StartCheckpoint.Describe)
+            : new DiagnosticCaseRecoverResult
             {
                 Outcome = DiagnosticOutcome.Unavailable,
                 Problem = new DiagnosticProblem { Code = "no-active-case", Message = "No case is recording this terminal." },
