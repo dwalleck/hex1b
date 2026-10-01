@@ -93,7 +93,7 @@ internal static class CaseReapplier
         checks.Producer((rawManifest?["identity"]?["hex1bBuild"] as JsonValue)?.GetValue<string>());
         if (rawManifest?["formatVersion"] is JsonValue declaredFormat && declaredFormat.TryGetValue<int>(out var format)
             && checks.FormatVersion(format) is { } formatProblem)
-            return Problem(DiagnosticOutcome.Unavailable, formatProblem) with { Path = path };
+            return Problem(DiagnosticOutcome.Unavailable, formatProblem) with { Path = path, Producer = ReadIdentity(rawManifest) };
 
         var inspection = CaseArtifactReader.Inspect(new DiagnosticCaseInspectRequest { Path = path });
         if (inspection.Outcome != DiagnosticOutcome.Captured)
@@ -592,6 +592,20 @@ internal static class CaseReapplier
         Outcome = outcome,
         Problem = problem,
     };
+
+    // The recording build's identity from a manifest the inspection has not read (a format this build does not read):
+    // best effort, so a refusal still names the producer when the identity's shape is the one this build knows.
+    private static DiagnosticObservationIdentity? ReadIdentity(JsonObject manifest)
+    {
+        try
+        {
+            return manifest["identity"] is { } identity ? identity.Deserialize(DiagnosticsJsonContext.Default.DiagnosticObservationIdentity) : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
 
     // The manifest as raw JSON, for the declarations the typed manifest does not keep (the configuration's field
     // names) and the format judged before the artifact is read: null when it is missing or damaged, which the

@@ -52,8 +52,10 @@ public partial class DiagnosticCaseTests
         };
         Assert.AreEqual((expectedOutcome, expectedCode), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
         AssertRecord(result.Compatibility, verdicts, shape);
-        // The manifest's build id is read with the raw manifest: before the inspection, so even the format refusal compares it.
+        // The manifest's build id is read with the raw manifest: before the inspection, so even the format refusal compares it,
+        // and the result names the recording build whenever the manifest was read (the E2E found the format refusal without it).
         Assert.AreEqual(shape is "no-manifest" or "storage-refused" ? null : true, result.Compatibility.SameBuild, shape);
+        Assert.AreEqual(shape is "no-manifest" or "storage-refused" ? null : TerminalDiagnostics.Hex1bBuild, result.Producer?.Hex1bBuild, $"{shape}: producer");
         if (shape != "captured")
             return;
 
