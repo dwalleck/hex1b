@@ -55,13 +55,13 @@ internal static class CaseReapplier
         var checks = CaseCompatibility.Begin();
         try
         {
-            return ReapplyCore(request, checks) with { Compatibility = checks.Record };
+            return checks.Stamp(ReapplyCore(request, checks));
         }
         catch (Exception error)
         {
             // Nothing a case holds may escape as an exception: whatever failed is a result.
-            return Problem(DiagnosticOutcome.Failed, "reapplication-failed",
-                DiagnosticCaseRecorder.Bounded($"{error.GetType().Name}: {error.Message}")) with { Path = request.Path, Compatibility = checks.Record };
+            return checks.Stamp(Problem(DiagnosticOutcome.Failed, "reapplication-failed",
+                DiagnosticCaseRecorder.Bounded($"{error.GetType().Name}: {error.Message}")) with { Path = request.Path });
         }
     }
 
@@ -90,6 +90,7 @@ internal static class CaseReapplier
         // The artifact's format, read raw before the artifact is read further: a format this build does not read is
         // incompatible whatever else the manifest holds (a missing or damaged manifest is the inspection's to describe).
         var rawManifest = ReadRawManifest(path);
+        checks.Producer((rawManifest?["identity"]?["hex1bBuild"] as JsonValue)?.GetValue<string>());
         if (rawManifest?["formatVersion"] is JsonValue declaredFormat && declaredFormat.TryGetValue<int>(out var format)
             && checks.FormatVersion(format) is { } formatProblem)
             return Problem(DiagnosticOutcome.Unavailable, formatProblem) with { Path = path };
@@ -106,7 +107,6 @@ internal static class CaseReapplier
             Checkpoint = manifest.Checkpoint,
             Coverage = Coverage,
             Producer = manifest.Identity,
-            ConsumerHex1bVersion = TerminalDiagnostics.Hex1bVersion,
         };
         DiagnosticCaseReapplyResult Refuse(DiagnosticOutcome outcome, string code, string message) =>
             described with { Outcome = outcome, Problem = new DiagnosticProblem { Code = code, Message = message } };
@@ -565,7 +565,7 @@ internal static class CaseReapplier
                 Write("faulted.json", JsonSerializer.SerializeToUtf8Bytes(faulted, DiagnosticsJsonContext.Default.DiagnosticModelState));
             foreach (var (name, content) in previews ?? new Dictionary<string, string>())
                 Write(name, System.Text.Encoding.UTF8.GetBytes(content));
-            var final = result with { Files = [.. files, "result.json"], Compatibility = checks.Record };
+            var final = checks.Stamp(result with { Files = [.. files, "result.json"] });
             Write("result.json", JsonSerializer.SerializeToUtf8Bytes(final, DiagnosticsJsonContext.Default.DiagnosticCaseReapplyResult));
             return final;
         }

@@ -34,6 +34,7 @@ namespace Hex1b.Diagnostics;
 [JsonSerializable(typeof(DiagnosticCaseReapplyRequest))]
 [JsonSerializable(typeof(DiagnosticCaseReapplyResult))]
 [JsonSerializable(typeof(DiagnosticCaseCompatibility))]
+[JsonSerializable(typeof(DiagnosticBuildIdentity))]
 [JsonSerializable(typeof(DiagnosticCompatibilityCheck))]
 [JsonSerializable(typeof(string))]
 [JsonSerializable(typeof(int))]

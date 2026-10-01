@@ -29,9 +29,13 @@ public sealed record DiagnosticCaseReapplyResult
     [JsonPropertyName("producer")]
     public DiagnosticObservationIdentity? Producer { get; init; }
 
-    /// <summary>The Hex1b build that re-applied it.</summary>
+    /// <summary>The Hex1b build that re-applied it (its version; <see cref="Consumer"/> adds its build id).</summary>
     [JsonPropertyName("consumerHex1bVersion")]
     public string? ConsumerHex1bVersion { get; init; }
+
+    /// <summary>The build that re-applied it: version and build id (ticket 14).</summary>
+    [JsonPropertyName("consumer")]
+    public DiagnosticBuildIdentity? Consumer { get; init; }
 
     /// <summary>
     /// What was compared between the case's declarations and this build (ticket 14): the seven checks in order with

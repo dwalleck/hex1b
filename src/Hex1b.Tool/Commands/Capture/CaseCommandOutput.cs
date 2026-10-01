@@ -104,12 +104,15 @@ internal static class CaseCommandOutput
             Failure(formatter, result.Outcome, result.Problem);
             if (!json && result.LastValidModelSequence is { } last)
                 formatter.WriteError($"Re-applicable through model sequence {last} (ends: {AppTreeCommand.Safe(result.IntervalEndReason)})");
+            if (!json && result.Compatibility.Checks.FirstOrDefault(c => c.Verdict == DiagnosticCaseCompatibility.Incompatible) is { } failed)
+                formatter.WriteError($"Incompatible: {AppTreeCommand.Safe(failed.Check)} (the case declares {AppTreeCommand.Safe(failed.Producer)}; this build {AppTreeCommand.Safe(failed.Consumer)})");
             return 1;
         }
         if (json)
             return result.Comparison == "matched" ? 0 : 2;
 
         var target = result.Target!;
+        formatter.WriteLine(Builds(result));
         if (result.Origin is { Trigger: "start", Profile: DiagnosticCaseCheckpointProfiles.TextState } start)
             formatter.WriteLine($"Restored from the {AppTreeCommand.Safe(start.Profile)} start at model sequence {start.ModelSequence}");
         else if (result.Origin is { } recovery && recovery.Trigger != "start")
@@ -137,6 +140,12 @@ internal static class CaseCommandOutput
         $"{AppTreeCommand.Safe(checkpoint.Profile)} {DiagnosticContractNames.Of(checkpoint.Status)}" +
         (checkpoint.ModelSequence is { } start ? $" at model sequence {start}" : "") +
         (checkpoint.UnsupportedSurfaces is { Count: > 0 } surfaces ? $"; unsupported surfaces: {string.Join(", ", surfaces.Select(AppTreeCommand.Safe))}" : "");
+
+    // The two builds a re-application met: the one that recorded the case and the one that re-applied it (ticket 14).
+    private static string Builds(DiagnosticCaseReapplyResult result) =>
+        $"Builds: recorded by {AppTreeCommand.Safe(result.Producer?.Hex1bVersion)} ({AppTreeCommand.Safe(result.Producer?.Hex1bBuild ?? "no build id")}); " +
+        $"re-applied by {AppTreeCommand.Safe(result.Consumer?.Hex1bVersion)} ({AppTreeCommand.Safe(result.Consumer?.Hex1bBuild)}): " +
+        (result.Compatibility.SameBuild switch { true => "same build", false => "different builds", null => "build ids not compared" });
 
     // An interval's origin: the case's start, or the recovery checkpoint it restores from.
     private static string Origin(DiagnosticCaseOrigin? origin) =>

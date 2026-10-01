@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Hex1b.Automation;
 using Hex1b.Diagnostics;
 using Hex1b.Nodes;
@@ -1050,7 +1051,18 @@ public class CaptureContractMcpTests : McpServerTestBase
             Assert.AreNotEqual("no-valid-interval", expected.Problem?.Code, "fixture: the case is not re-applicable");
             Assert.AreEqual(expected.Outcome == DiagnosticOutcome.Captured, result.GetProperty("success").GetBoolean(), result.ToString());
             AssertJsonEquals(expected, result.GetProperty("reapplication"), string.Join(" ", arguments.Values), "runPath");
+            if (expected.Outcome == DiagnosticOutcome.Captured)
+                StringAssert.Contains(result.GetProperty("message").GetString(), $"({TerminalDiagnostics.Hex1bBuild}), same build", result.ToString());
         }
+
+        // Ticket 14: a refusal's message names the failed check with the case's and this build's values.
+        var manifestFile = Path.Combine(path, "manifest.json");
+        var manifest = JsonNode.Parse(File.ReadAllText(manifestFile))!.AsObject();
+        manifest["formatVersion"] = 3;
+        File.WriteAllText(manifestFile, manifest.ToJsonString());
+        var incompatible = await CallAsync(client, "reapply_diagnostic_case", new() { ["path"] = path, ["to"] = "mcp-mark" });
+        Assert.IsFalse(incompatible.GetProperty("success").GetBoolean(), incompatible.ToString());
+        StringAssert.Contains(incompatible.GetProperty("message").GetString(), "[formatVersion: the case declares 3; this build 2]", incompatible.ToString());
 
         // A local session records from its first byte, marks, and re-applies to matched.
         var local = await CallAsync(client, "start_bash_terminal", new()

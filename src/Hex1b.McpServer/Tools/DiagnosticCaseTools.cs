@@ -140,7 +140,7 @@ public class DiagnosticCaseTools(TerminalSessionManager sessionManager)
     /// <summary>
     /// Re-applies a case artifact offline and compares it with a recorded checkpoint.
     /// </summary>
-    [McpServerTool, Description("Re-applies a recorded diagnostic case offline, without the process that wrote it: a detached terminal model rebuilt from the case's recorded configuration is restored from the case's origin (its start, or the earliest recovery checkpoint whose re-applicable interval covers the target, or the one 'from' names; the result's 'origin' says which) and applies the recorded events after it up to a target boundary (each output chunk through the raw output path, each resize, each synchronized-update timeout on a virtual clock), then compares its full text state with the checkpoint recorded there: 'matched', 'different' (typed differences by path, counted per surface), or 'unavailable' (no checkpoint, no state, or graphics). Refuses a target past the case's re-applicable interval, an old or unknown format, and a case directory that is not owner-only. Writes only its own run directory inside the case: result.json, reapplied.json, recorded.json and any previews.")]
+    [McpServerTool, Description("Re-applies a recorded diagnostic case offline, without the process that wrote it: a detached terminal model rebuilt from the case's recorded configuration is restored from the case's origin (its start, or the earliest recovery checkpoint whose re-applicable interval covers the target, or the one 'from' names; the result's 'origin' says which) and applies the recorded events after it up to a target boundary (each output chunk through the raw output path, each resize, each synchronized-update timeout on a virtual clock), then compares its full text state with the checkpoint recorded there: 'matched', 'different' (typed differences by path, counted per surface), or 'unavailable' (no checkpoint, no state, or graphics). Refuses a target past the case's re-applicable interval, an old or unknown format, and a case directory that is not owner-only. Any build that declares the same format and contract versions, checkpoint profiles with the same covered surfaces, and configuration and capability fields can re-apply the case: the result's 'compatibility' lists the seven checks with both sides' values and whether the two builds are the same ('sameBuild'), 'producer' and 'consumer' name them (version and build id), and a mismatch is 'incompatible' naming the check. Writes only its own run directory inside the case: result.json, reapplied.json, recorded.json and any previews.")]
     public CaseReapplyToolResult ReapplyDiagnosticCase(
         [Description("The case directory (the 'path' a start or stop returned).")] string path,
         [Description("Target: a model sequence (12), a case sequence (case:34), or a checkpoint label (label:name, or the bare name; 'stop' is the stop checkpoint, 'start' a live start's checkpoint; a label several checkpoints share is ambiguous, so name one by case sequence).")] string to,
@@ -159,8 +159,14 @@ public class DiagnosticCaseTools(TerminalSessionManager sessionManager)
                 ? $"Re-applied to model sequence {result.Target!.ModelSequence}: {result.Comparison}" +
                   (result.ComparisonReason is { } reason ? $" ({reason})" : "") +
                   (result.Differences is { Total: > 0 } differences ? $"; {differences.Total} differences" : "") +
-                  (result.FaultInjected ? "; fault injected" : "") + $". Run: {result.RunPath}."
-                : $"Reapply {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}",
+                  (result.FaultInjected ? "; fault injected" : "") +
+                  $"; re-applied by {result.Consumer?.Hex1bVersion} ({result.Consumer?.Hex1bBuild}) against the recording build {result.Producer?.Hex1bVersion} ({result.Producer?.Hex1bBuild ?? "no build id"}), " +
+                  (result.Compatibility.SameBuild switch { true => "same build", false => "different builds", null => "build ids not compared" }) +
+                  $". Run: {result.RunPath}."
+                : $"Reapply {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}" +
+                  (result.Compatibility.Checks.FirstOrDefault(c => c.Verdict == DiagnosticCaseCompatibility.Incompatible) is { } failed
+                      ? $" [{failed.Check}: the case declares {failed.Producer}; this build {failed.Consumer}]"
+                      : ""),
             Reapplication = JsonSerializer.SerializeToElement(result, DiagnosticsJsonContext.Default.DiagnosticCaseReapplyResult),
         };
     }

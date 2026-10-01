@@ -142,6 +142,13 @@ public sealed class TerminalDiagnostics
     internal static readonly string Hex1bVersion = ReadInformationalVersion(typeof(Hex1bTerminal).Assembly)
         ?? typeof(Hex1bTerminal).Assembly.GetName().Version?.ToString() ?? "unknown";
 
+    /// <summary>
+    /// This build's id: the Hex1b assembly's module version id, which a deterministic build derives from its inputs
+    /// (the same source, path and build inputs give the same id; any change another). Two builds with one version
+    /// string are told apart by it (ticket 14).
+    /// </summary>
+    internal static readonly string Hex1bBuild = typeof(Hex1bTerminal).Assembly.ManifestModule.ModuleVersionId.ToString("N");
+
     private static readonly Lazy<(DateTimeOffset? StartedAt, string? Reason)> ProcessStart = new(ReadProcessStart);
 
     private static readonly Lazy<string?> EntryAssemblyVersion =
@@ -1290,6 +1297,7 @@ public sealed class TerminalDiagnostics
             ApplicationName = _applicationName,
             ApplicationVersion = applicationVersion,
             Hex1bVersion = Hex1bVersion,
+            Hex1bBuild = Hex1bBuild,
             Configuration = new DiagnosticModelConfiguration
             {
                 Workload = workload switch

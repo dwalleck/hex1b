@@ -52,7 +52,8 @@ public partial class DiagnosticCaseTests
         };
         Assert.AreEqual((expectedOutcome, expectedCode), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
         AssertRecord(result.Compatibility, verdicts, shape);
-        Assert.IsNull(result.Compatibility.SameBuild, "no build ids are recorded yet");
+        // The manifest's build id is read with the raw manifest: before the inspection, so even the format refusal compares it.
+        Assert.AreEqual(shape is "no-manifest" or "storage-refused" ? null : true, result.Compatibility.SameBuild, shape);
         if (shape != "captured")
             return;
 
@@ -114,6 +115,44 @@ public partial class DiagnosticCaseTests
         StringAssert.Contains(failed.Consumer, consumerHas, $"{edit}: consumer {failed.Consumer}");
         Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), $"{edit}: an incompatible case was written to");
         CollectionAssert.AreEqual(before, HashCaseFiles(path), $"{edit}: the case's files changed");
+    }
+
+    [TestMethod]
+    [DataRow("same")]
+    [DataRow("edited")]
+    [DataRow("empty")]
+    [DataRow("removed")]
+    [DataRow("version-differs")]
+    public async Task Compatibility_IdentifiesBuilds(string shape)
+    {
+        using var root = new CaseRoot();
+        var path = await RecordCaseAsync(root, CompatibilityCorpus, new HeadlessPresentationAdapter(20, 4));
+        var build = typeof(Hex1bTerminal).Assembly.ManifestModule.ModuleVersionId.ToString("N");
+        var identity = JsonDocument.Parse(File.ReadAllText(Path.Combine(path, "manifest.json"))).RootElement.GetProperty("identity");
+        Assert.AreEqual(build, identity.GetProperty("hex1bBuild").GetString(), "the manifest's build id is this assembly's module version id");
+        Assert.AreEqual(TerminalDiagnostics.Hex1bVersion, identity.GetProperty("hex1bVersion").GetString());
+        switch (shape)
+        {
+            case "edited": EditManifest(path, m => m["identity"]!["hex1bBuild"] = "0123456789abcdef0123456789abcdef"); break;
+            case "empty": EditManifest(path, m => m["identity"]!["hex1bBuild"] = ""); break;
+            case "removed": EditManifest(path, m => m["identity"]!.AsObject().Remove("hex1bBuild")); break;
+            case "version-differs": EditManifest(path, m => m["identity"]!["hex1bVersion"] = "9.9.9+cafe"); break;
+        }
+
+        var result = Reapply(path, label: "m1");
+        AssertMatched(result, shape);
+        bool? expected = shape switch { "same" or "version-differs" => true, "edited" => false, _ => null };
+        Assert.AreEqual(expected, result.Compatibility.SameBuild, shape);
+        Assert.AreEqual((TerminalDiagnostics.Hex1bVersion, build), (result.Consumer!.Hex1bVersion, result.Consumer.Hex1bBuild), shape);
+        Assert.AreEqual(result.Consumer.Hex1bVersion, result.ConsumerHex1bVersion, "the existing field stays");
+        Assert.AreEqual(shape == "version-differs" ? "9.9.9+cafe" : TerminalDiagnostics.Hex1bVersion, result.Producer!.Hex1bVersion, shape);
+        var written = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(result.RunPath!, "result.json"))).RootElement;
+        Assert.AreEqual(build, written.GetProperty("consumer").GetProperty("hex1bBuild").GetString(), shape);
+        var compatibility = written.GetProperty("compatibility");
+        if (expected is { } sameBuild)
+            Assert.AreEqual(sameBuild, compatibility.GetProperty("sameBuild").GetBoolean(), shape);
+        else
+            Assert.IsFalse(compatibility.TryGetProperty("sameBuild", out _), $"{shape}: sameBuild is written although no id was compared");
     }
 
     [TestMethod]

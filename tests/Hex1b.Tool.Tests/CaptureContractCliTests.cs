@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Hex1b.Automation;
 using Hex1b.Diagnostics;
 using Hex1b.Flow;
@@ -943,6 +944,19 @@ public class CaptureContractCliTests
         Assert.AreEqual(1, beyondExit);
         StringAssert.Contains(beyond, "beyond-interval");
         StringAssert.Contains(beyond, "Re-applicable through model sequence");
+
+        // Ticket 14: the human output names both builds (the CLI's Hex1b is this build's copy), and a refusal names the
+        // failed check with the case's and this build's values.
+        var build = typeof(Hex1bTerminal).Assembly.ManifestModule.ModuleVersionId.ToString("N");
+        StringAssert.Contains(matched, $"({build}): same build", matched);
+        var manifestFile = Path.Combine(path, "manifest.json");
+        var manifest = JsonNode.Parse(File.ReadAllText(manifestFile))!.AsObject();
+        manifest["formatVersion"] = 3;
+        File.WriteAllText(manifestFile, manifest.ToJsonString());
+        var (incompatibleExit, _, incompatible) = await RunCliAsync("capture", "case", "reapply", path, "--to", "cli-mark");
+        Assert.AreEqual(1, incompatibleExit, incompatible);
+        StringAssert.Contains(incompatible, "unavailable (incompatible): formatVersion: the artifact declares 3; this build reads 2.", incompatible);
+        StringAssert.Contains(incompatible, "Incompatible: formatVersion (the case declares 3; this build 2)", incompatible);
     }
 
     [TestMethod]

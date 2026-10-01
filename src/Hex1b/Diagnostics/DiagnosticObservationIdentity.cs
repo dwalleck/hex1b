@@ -37,6 +37,13 @@ public sealed class DiagnosticObservationIdentity
     [JsonPropertyName("hex1bVersion")]
     public string Hex1bVersion { get; init; } = "";
 
+    /// <summary>
+    /// The Hex1b build's id (its assembly's module version id), so two builds with one version string are told
+    /// apart; absent in artifacts recorded before it was written (ticket 14).
+    /// </summary>
+    [JsonPropertyName("hex1bBuild")]
+    public string? Hex1bBuild { get; init; }
+
     /// <summary>Terminal configuration relevant to the observation.</summary>
     [JsonPropertyName("configuration")]
     public DiagnosticModelConfiguration Configuration { get; init; } = new();

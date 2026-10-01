@@ -22,7 +22,7 @@ internal static class CaseCompatibility
         /// <summary>This build's declarations.</summary>
         internal static readonly Consumer Build = new(CaseArtifactWriter.FormatVersion, TerminalDiagnostics.ContractVersion,
             [DiagnosticCaseCheckpointProfiles.FreshModel, DiagnosticCaseCheckpointProfiles.TextState], FreshModelCheckpoint.CoveredSurfaces,
-            TerminalDiagnostics.Hex1bVersion, null);
+            TerminalDiagnostics.Hex1bVersion, TerminalDiagnostics.Hex1bBuild);
 
         /// <summary>Another build's declarations, while a test has set them: the consumer-side fences' seam.</summary>
         internal static readonly AsyncLocal<Consumer?> CurrentForTesting = new();
@@ -42,6 +42,7 @@ internal static class CaseCompatibility
         private const int FormatIndex = 0, ContractIndex = 1, ProfileIndex = 2, SurfacesIndex = 3, ConfigurationIndex = 4, CapabilitiesIndex = 5, OriginIndex = 6;
 
         private readonly Consumer _consumer;
+        private string? _producerBuild;
         private readonly string?[] _producer = new string?[DiagnosticCaseCompatibility.CheckNames.Count];
         private readonly string?[] _consumerValue = new string?[DiagnosticCaseCompatibility.CheckNames.Count];
         private readonly string[] _verdict = [.. DiagnosticCaseCompatibility.CheckNames.Select(_ => DiagnosticCaseCompatibility.NotChecked)];
@@ -57,9 +58,20 @@ internal static class CaseCompatibility
             _consumerValue[CapabilitiesIndex] = Join(CaseConfiguration.KnownCapabilities);
         }
 
+        /// <summary>The recording build's id from the manifest, when it recorded one.</summary>
+        internal void Producer(string? build) => _producerBuild = string.IsNullOrEmpty(build) ? null : build;
+
+        /// <summary>This build, as the result names it.</summary>
+        internal DiagnosticBuildIdentity ConsumerIdentity => new() { Hex1bVersion = _consumer.Hex1bVersion, Hex1bBuild = _consumer.Hex1bBuild };
+
+        /// <summary>A result with the checks so far and this build's identity.</summary>
+        internal DiagnosticCaseReapplyResult Stamp(DiagnosticCaseReapplyResult result) =>
+            result with { Compatibility = Record, Consumer = ConsumerIdentity, ConsumerHex1bVersion = _consumer.Hex1bVersion };
+
         /// <summary>The checks so far, for any result.</summary>
         internal DiagnosticCaseCompatibility Record => new()
         {
+            SameBuild = _producerBuild is null || _consumer.Hex1bBuild is null ? null : _producerBuild == _consumer.Hex1bBuild,
             Checks = [.. DiagnosticCaseCompatibility.CheckNames.Select((name, i) => new DiagnosticCompatibilityCheck
             {
                 Check = name,
