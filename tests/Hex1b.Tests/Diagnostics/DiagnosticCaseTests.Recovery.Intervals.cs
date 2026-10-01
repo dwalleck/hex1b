@@ -840,6 +840,79 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
+    public async Task Recover_KeepsItsStateWhenLaterEventsCrossTheBound()
+    {
+        // A complete recovery's line is reserved in the case's size bound from the moment it is recorded: events offered
+        // after it, which the writer drains before its line, stop at the reduced bound (declared size-limit, as at the
+        // bound today) instead of displacing the state, so the line lands with its state at the close.
+        using var root = new CaseRoot();
+        using var gate = new ManualResetEventSlim(false);
+        DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1bTerminal terminal;
+        var workload = new ScriptedWorkload();
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, MaxBytes = DiagnosticCaseRecorder.MinMaxBytes, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+                .Build();
+        }
+        finally
+        {
+            DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+        }
+        await using (terminal)
+        {
+            var diagnostics = new TerminalDiagnostics(terminal);
+            var path = diagnostics.GetCaseStatus().Path!;
+            var recorder = terminal.DiagnosticCase!;
+            DiagnosticCaseRecoverResult result;
+            using (new Running(terminal))
+            {
+                try
+                {
+                    await FloodAsync(terminal, workload, 5);
+                    Mark(diagnostics, "pending");
+                    var stateBytes = recorder.PendingStateBytesForTesting;
+                    Assert.IsTrue(stateBytes > 0, "fixture: the mark holds no state");
+                    var chunk = new byte[2048];
+                    Array.Fill(chunk, (byte)'q');
+                    var total = terminal.OutputBytesRead;
+                    async Task EnqueueAsync()
+                    {
+                        workload.Enqueue(chunk);
+                        total += chunk.Length;
+                        await WaitAsync(() => terminal.OutputBytesRead == total, TimeSpan.FromSeconds(60));
+                    }
+                    // Near the bound, with room for the recovery: it is accepted.
+                    while (recorder.CheckpointRoom >= 4 * stateBytes + 32 * 1024)
+                        await EnqueueAsync();
+                    await Settle(terminal);
+                    result = diagnostics.RecoverCase("near-the-bound");
+                    Assert.AreEqual((DiagnosticOutcome.Captured, "complete"), (result.Outcome, result.Status), result.Problem?.Message);
+                    // More output than the room holds, offered after the recovery and written before its line.
+                    for (var bytes = 0L; bytes < 4 * stateBytes + 128 * 1024; bytes += chunk.Length)
+                        await EnqueueAsync();
+                    await Settle(terminal);
+                    gate.Set();
+                    await WaitAsync(() => File.Exists(Path.Combine(path, "completion.json")), TimeSpan.FromSeconds(30));
+                }
+                finally
+                {
+                    gate.Set();
+                }
+            }
+            var artifact = Artifact.Read(path);
+            Assert.AreEqual("size-limit", artifact.Completion!.Value.GetProperty("stopReason").GetString(), "fixture: the later events did not cross the bound");
+            var line = Recoveries(artifact).Single().GetProperty("checkpoint");
+            var hasState = line.TryGetProperty("state", out var state) && state.ValueKind == JsonValueKind.Object;
+            Assert.AreEqual(result.Status == "complete", hasState, $"a recovery reported {result.Status} has state in the artifact: {hasState} ({line.GetProperty("status")})");
+            Assert.AreEqual("recorded", line.GetProperty("status").GetString(), "the recovery line was written without its state");
+            Assert.IsTrue(artifact.Events.Any(e => e.GetProperty("kind").GetString() == "missing" && e.GetProperty("record").GetProperty("reason").GetString() == "size-limit"),
+                "the events that crossed the bound are not declared");
+        }
+    }
+
+    [TestMethod]
     public async Task Recover_ReservesItsPendingState()
     {
         // The recovery's state counts against the pending-state budget together with the marks already awaiting the

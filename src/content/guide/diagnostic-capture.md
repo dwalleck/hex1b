@@ -509,7 +509,10 @@ state at that model sequence (`checkpoint` line, trigger `recovery`, status `rec
 `size-limit`, a state that would not fit what the case's events tier leaves after the queued events
 and the checkpoint states already awaiting the writer; `pending-state budget`, counted with those
 states; `mid-application`; `unapplied-output`; `configuration: …`; `capture-failed`), in which case
-the line records the boundary only and starts nothing. A recovery never waits for the writer (`busy` past 64 pending checkpoints) and
+the line records the boundary only and starts nothing. A complete recovery's line is reserved in
+the case's size bound from the moment it is recorded, so it always lands with its state: output
+offered after it that would cross the reduced bound is declared `size-limit` and stops the case,
+as output does at the bound today. A recovery never waits for the writer (`busy` past 64 pending checkpoints) and
 never changes the loss already recorded or the case's initial checkpoint. The default label is
 `recovery-` and the checkpoint's ordinal.
 

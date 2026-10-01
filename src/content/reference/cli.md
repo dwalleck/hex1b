@@ -301,7 +301,9 @@ restores from it for targets after the gap. It needs `reapplication-data`, and i
 live start: `complete`, or `unsupported` with the reason (a DCS in progress or graphics; a state too
 large for what the case's events tier leaves after the queued events and pending checkpoint states;
 the pending-state budget, counted with the pending marks; a recovery inside an application;
-unapplied output; a configuration a re-application could not rebuild), recorded as a boundary only. Earlier loss and the case's initial checkpoint never
+unapplied output; a configuration a re-application could not rebuild), recorded as a boundary only.
+A complete recovery's line is reserved in the case's size bound until it is written, so it always
+lands with its state; later output that would cross the reduced bound is declared `size-limit`. Earlier loss and the case's initial checkpoint never
 change. `--label` is as for `mark`; the default is `recovery-` and the checkpoint's ordinal.
 
 `reapply` rebuilds the model offline from the case's recorded configuration, restores it from the
