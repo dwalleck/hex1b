@@ -201,7 +201,9 @@ public partial class DiagnosticCaseTests
                         break;
                 }
                 await workload.WriteAndWaitAsync(terminal, "after");
+                var recorder = terminal.DiagnosticCase!;
                 await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+                Assert.AreEqual(0L, recorder.ReservedRoomForTesting, "a refused recovery left or over-released its room reservation");
             }
         }
 
@@ -374,7 +376,9 @@ public partial class DiagnosticCaseTests
             result = diagnostics.RecoverCase("measured");
             Assert.AreEqual(captures + 1, terminal.ModelStateCapturesForTesting, $"fixture: the recovery was refused before projecting ({result.Reason}; room {room})");
             await workload.WriteAndWaitAsync(terminal, "after");
+            var recorder = terminal.DiagnosticCase!;
             await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+            Assert.AreEqual(0L, recorder.ReservedRoomForTesting, "a recovery refused after projecting left or over-released its room reservation");
         }
         Assert.AreEqual((DiagnosticOutcome.Unavailable, "unsupported", "size-limit"), (result.Outcome, result.Status, result.Problem?.Code), result.Problem?.Message);
         StringAssert.Contains(result.Reason, "projected and measured");

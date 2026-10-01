@@ -842,9 +842,9 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     public async Task Recover_KeepsItsStateWhenLaterEventsCrossTheBound()
     {
-        // A complete recovery's line is reserved in the case's size bound from the moment it is recorded: events offered
-        // after it, which the writer drains before its line, stop at the reduced bound (declared size-limit, as at the
-        // bound today) instead of displacing the state, so the line lands with its state at the close.
+        // A complete recovery's line is reserved in the case's size bound as it is accepted: events offered after it,
+        // which the writer drains before its line, stop at the reduced bound (declared size-limit, as at the bound
+        // today) instead of displacing the state, so the line lands with its state at the close.
         using var root = new CaseRoot();
         using var gate = new ManualResetEventSlim(false);
         DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;

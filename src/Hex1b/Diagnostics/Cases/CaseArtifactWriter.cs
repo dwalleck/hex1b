@@ -20,14 +20,18 @@ internal sealed class CaseArtifactWriter : IDisposable
     internal const string CompletionFile = "completion.json";
 
     private readonly string _directory;
+    private readonly CaseRoom _room;
     private ArrayBufferWriter<byte> _json = new(512);
     private FileStream? _events;
-    private long _bytesWritten;
 
-    internal CaseArtifactWriter(string directory) => _directory = directory;
+    internal CaseArtifactWriter(string directory, CaseRoom room)
+    {
+        _directory = directory;
+        _room = room;
+    }
 
-    /// <summary>Artifact bytes written so far.</summary>
-    internal long BytesWritten => Interlocked.Read(ref _bytesWritten);
+    /// <summary>Artifact bytes written so far (counted by the room as each line is claimed).</summary>
+    internal long BytesWritten => _room.BytesWritten;
 
     internal void WriteManifest(DiagnosticCaseManifest manifest)
     {
@@ -37,17 +41,15 @@ internal sealed class CaseArtifactWriter : IDisposable
             stream.Write(bytes);
             stream.Flush(flushToDisk: true);
         }
-        Interlocked.Add(ref _bytesWritten, bytes.Length);
+        _room.Count(bytes.Length);
         _events = CaseStorage.CreateFile(Path.Combine(_directory, EventsFile));
     }
 
-    /// <summary>Writes one event line; returns the bytes written.</summary>
     /// <summary>
     /// Writes one event line unless the artifact would then exceed the <paramref name="tier"/>'s limit; nothing is
-    /// written when it would. The line is announced to the room before the limit is read, so a reservation published
-    /// meanwhile either bounds it or counts it.
+    /// written when it would. The line's bytes are claimed from the room before it is written.
     /// </summary>
-    internal bool TryWriteEvent(DiagnosticCaseEvent item, CaseRoom room, CaseRoom.Tier tier)
+    internal bool TryWriteEvent(DiagnosticCaseEvent item, CaseRoom.Tier tier)
     {
         _json.Clear();
         using (var writer = new Utf8JsonWriter(_json))
@@ -55,12 +57,8 @@ internal sealed class CaseArtifactWriter : IDisposable
 
         var json = _json.WrittenSpan;
         var total = 9 + json.Length + 1;
-        room.BeginLine(total);
-        if (BytesWritten + total > room.Limit(tier))
-        {
-            room.EndLine();
+        if (!_room.TryClaim(tier, total))
             return false;
-        }
         Span<byte> prefix = stackalloc byte[9];
         CaseCrc32.Compute(json).TryFormat(prefix, out _, "x8");
         prefix[8] = (byte)'\t';
@@ -68,11 +66,8 @@ internal sealed class CaseArtifactWriter : IDisposable
         events.Write(prefix);
         events.Write(json);
         events.WriteByte((byte)'\n');
-        Interlocked.Add(ref _bytesWritten, total);
-        room.EndLine();
         return true;
     }
-
 
     internal void Flush() => _events?.Flush();
 
@@ -94,7 +89,7 @@ internal sealed class CaseArtifactWriter : IDisposable
             stream.Flush(flushToDisk: true);
         }
         File.Move(temporary, Path.Combine(_directory, CompletionFile));
-        Interlocked.Add(ref _bytesWritten, bytes.Length);
+        _room.Count(bytes.Length);
     }
 
     internal static string StreamName(CaseStream stream) => stream switch

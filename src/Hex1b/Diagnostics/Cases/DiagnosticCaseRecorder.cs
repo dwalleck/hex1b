@@ -306,8 +306,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         _timeProvider = timeProvider;
         _finished = finished;
         _sources = sources;
-        _writer = new CaseArtifactWriter(path);
-        _room = new CaseRoom(manifest.Bounds.MaxBytes, () => _writer.BytesWritten);
+        _room = new CaseRoom(manifest.Bounds.MaxBytes);
+        _writer = new CaseArtifactWriter(path, _room);
         IncludeModelPayloads = manifest.Authorizations.Contains(DiagnosticAuthorization.ReapplicationData);
         _rawInput = manifest.Authorizations.Contains(DiagnosticAuthorization.RawInput);
         _editorText = manifest.Authorizations.Contains(DiagnosticAuthorization.EditorText);
@@ -608,7 +608,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     internal void ReleaseStateBytes(long bytes) => Interlocked.Add(ref _pendingStateBytes, -bytes);
 
     /// <summary>Bytes left in the tier the stop checkpoint is written in, so a stop can skip a state that cannot fit.</summary>
-    internal long StopCheckpointRoom => _room.RangeLimit - _writer.BytesWritten;
+    internal long StopCheckpointRoom => _room.RoomIn(CaseRoom.Tier.Ranges);
 
     /// <summary>What the events tier leaves for a recovery's state taken now (<see cref="CaseRoom.RecoveryRoom"/>).</summary>
     internal long CheckpointRoom => _room.RecoveryRoom(QueuedWrittenBytes, UnreservedPendingStateBytes);
@@ -644,6 +644,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
 
     internal long QueuedBytesForTesting => _queue.Bytes;
     internal long PendingStateBytesForTesting => Volatile.Read(ref _pendingStateBytes);
+    internal long ReservedRoomForTesting => _room.Reserved;
 
     /// <summary>
     /// Records the start checkpoint of a case armed on a model that had applied output, before any model event
@@ -704,7 +705,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             Interlocked.Add(ref _reservedStateBytes, -estimate);
             ReleaseStateBytes(capture.StateBytes);
         }
-        _checkpoints.Enqueue(new PendingCheckpoint(modelSequence, checkpoint, complete ? capture.StateBytes : 0, reserved));
+        _checkpoints.Enqueue(new PendingCheckpoint(modelSequence, checkpoint, complete ? capture.StateBytes : 0, complete ? reserved : 0));
         Interlocked.Decrement(ref _marksInProgress);
         if (_signal.CurrentCount == 0)
             _signal.Release();
@@ -1141,7 +1142,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     private bool Append(CaseStream stream, DiagnosticCaseEvent item, CaseRoom.Tier limit)
     {
         var sequence = _caseSequence + 1;
-        if (!_writer.TryWriteEvent(item with { CaseSequence = sequence }, _room, limit))
+        if (!_writer.TryWriteEvent(item with { CaseSequence = sequence }, limit))
             return false;
         _caseSequence = sequence;
         Interlocked.Increment(ref _written[(int)stream]);

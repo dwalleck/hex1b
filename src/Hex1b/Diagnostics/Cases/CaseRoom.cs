@@ -1,76 +1,112 @@
 namespace Hex1b.Diagnostics.Cases;
 
 /// <summary>
-/// A case's size bound: the tiers lines are written under (events and running loss below <c>MaxBytes − 16 KiB</c>,
-/// ranges written as the case closes below <c>MaxBytes − 8 KiB</c>, each closing line below <c>MaxBytes − 2 KiB</c>, the
-/// completion record in the rest), net of the room reserved for the lines of complete recovery checkpoints awaiting
-/// the writer. A recovery reserves its room in the same step as its room check, before its state is projected, so every
-/// line the writer appends from then on respects the reduced bound. The line the writer is appending at that moment is
-/// announced before the writer reads its limit, and the reservation is published before the check reads the
-/// announcement, so one of the two always sees the other. A line takes its reservation back once, as it is written.
-/// The writer calls <see cref="BeginLine"/>, <see cref="Limit"/> and <see cref="EndLine"/> from its own thread, and
-/// <see cref="ReleaseLine"/> as it writes a checkpoint; recoveries call <see cref="TryReserveRecovery"/>,
-/// <see cref="TryKeep"/> and <see cref="Release"/> under the model lock.
+/// A case's size bound: the bytes written so far, the tiers lines are written under (events and running loss below
+/// <c>MaxBytes − 16 KiB</c>, ranges written as the case closes below <c>MaxBytes − 8 KiB</c>, each closing line below
+/// <c>MaxBytes − 2 KiB</c>, the completion record in the rest), and the room reserved for the lines of complete recovery
+/// checkpoints awaiting the writer, which every tier is net of. One lock covers the arithmetic alone, never a write:
+/// the writer claims a line's bytes under it before it writes the line (<see cref="TryClaim"/>), and a recovery
+/// reserves its room under it in the same step as its check (<see cref="TryReserveRecovery"/>), so a line is either
+/// claimed before the reservation and counted by it, or claimed after it under the reduced bound. A recovery holds the
+/// lock for a few comparisons under the model lock, never for the writer's I/O. A line takes its reservation back once,
+/// as it is written (<see cref="ReleaseLine"/>).
 /// </summary>
 internal sealed class CaseRoom
 {
     internal enum Tier { Events, Ranges, Closing }
 
+    private readonly object _sync = new();
     private readonly long _maxBytes;
-    private readonly Func<long> _bytesWritten;
+    // Counted as a line is claimed, before it is written, so the bound never admits two lines into the same room.
+    private long _bytesWritten;
     private long _reserved;
-    private long _inFlight;
     // Checkpoint ordinals whose reservation was taken back: the writer retries a line it could not write at the close.
     private readonly HashSet<long> _released = [];
 
-    internal CaseRoom(long maxBytes, Func<long> bytesWritten)
+    internal CaseRoom(long maxBytes) => _maxBytes = maxBytes;
+
+    /// <summary>Artifact bytes written (claimed) so far.</summary>
+    internal long BytesWritten
     {
-        _maxBytes = maxBytes;
-        _bytesWritten = bytesWritten;
+        get { lock (_sync) return _bytesWritten; }
     }
 
-    internal long EventLimit => _maxBytes - DiagnosticCaseRecorder.EventReserve - Volatile.Read(ref _reserved);
-
-    internal long RangeLimit => _maxBytes - DiagnosticCaseRecorder.RangeReserve - Volatile.Read(ref _reserved);
-
-    internal long ClosingLimit => _maxBytes - DiagnosticCaseRecorder.ClosingReserve - Volatile.Read(ref _reserved);
-
-    internal long Limit(Tier tier) => tier switch { Tier.Events => EventLimit, Tier.Ranges => RangeLimit, _ => ClosingLimit };
-
     /// <summary>The bytes reserved for pending recovery lines.</summary>
-    internal long Reserved => Volatile.Read(ref _reserved);
+    internal long Reserved
+    {
+        get { lock (_sync) return _reserved; }
+    }
+
+    internal long EventLimit
+    {
+        get { lock (_sync) return LimitUnsafe(Tier.Events); }
+    }
+
+    internal long RangeLimit
+    {
+        get { lock (_sync) return LimitUnsafe(Tier.Ranges); }
+    }
+
+    internal long ClosingLimit
+    {
+        get { lock (_sync) return LimitUnsafe(Tier.Closing); }
+    }
+
+    /// <summary>Claims a line's bytes under the tier's limit, before the line is written; false, nothing claimed, when it would cross.</summary>
+    internal bool TryClaim(Tier tier, long bytes)
+    {
+        lock (_sync)
+        {
+            if (_bytesWritten + bytes > LimitUnsafe(tier))
+                return false;
+            _bytesWritten += bytes;
+            return true;
+        }
+    }
+
+    /// <summary>Counts bytes written outside the tiers: the manifest first, the completion last.</summary>
+    internal void Count(long bytes)
+    {
+        lock (_sync)
+            _bytesWritten += bytes;
+    }
+
+    /// <summary>What the tier leaves now.</summary>
+    internal long RoomIn(Tier tier)
+    {
+        lock (_sync)
+            return LimitUnsafe(tier) - _bytesWritten;
+    }
 
     /// <summary>
-    /// What the events tier leaves for a recovery's state taken now: after the bytes written and in flight, the queued
-    /// events at their written size, the checkpoint states awaiting the writer, and the reserve a reservation adds.
+    /// What the events tier leaves for a recovery's state taken now: after the bytes written, the queued events at
+    /// their written size, the checkpoint states awaiting the writer, and the reserve a reservation adds.
     /// </summary>
-    internal long RecoveryRoom(long queuedBytes, long pendingStateBytes) =>
-        EventLimit - _bytesWritten() - Volatile.Read(ref _inFlight) - queuedBytes - pendingStateBytes - DiagnosticCaseRecorder.EventReserve;
+    internal long RecoveryRoom(long queuedBytes, long pendingStateBytes)
+    {
+        lock (_sync)
+            return LimitUnsafe(Tier.Events) - _bytesWritten - queuedBytes - pendingStateBytes - DiagnosticCaseRecorder.EventReserve;
+    }
 
     /// <summary>
     /// Reserves the room a recovery line may take: its state's estimate with a line's allowance and the events
-    /// reserve (so the line fits whichever tier writes it), or, when what is ahead of it leaves less, what is left
-    /// (the projected size then decides, in <see cref="TryKeep"/>); false, with nothing reserved, when not even a
-    /// line's overhead is left. The reservation is published before the check reads the writer's bytes and its line
-    /// in flight, so from then on the writer appends under the reduced bound.
+    /// reserve (so the line fits whichever tier writes it), or what is left when that is less (the projected size then
+    /// decides, in <see cref="TryKeep"/>); false, with nothing reserved, when not even a line's overhead is left.
     /// </summary>
     internal bool TryReserveRecovery(long estimate, long queuedBytes, long pendingStateBytes, out long reserved)
     {
-        const long overhead = DiagnosticCaseRecorder.StartLineAllowance + DiagnosticCaseRecorder.EventReserve;
-        reserved = estimate + overhead;
-        Interlocked.Add(ref _reserved, reserved);
-        var slack = EventLimit - _bytesWritten() - Volatile.Read(ref _inFlight) - queuedBytes - pendingStateBytes;
-        if (slack >= 0)
-            return true;
-        if (reserved + slack <= overhead)
+        lock (_sync)
         {
-            Interlocked.Add(ref _reserved, -reserved);
-            reserved = 0;
-            return false;
+            var left = LimitUnsafe(Tier.Events) - _bytesWritten - queuedBytes - pendingStateBytes;
+            if (left <= Overhead)
+            {
+                reserved = 0;
+                return false;
+            }
+            reserved = Math.Min(estimate + Overhead, left);
+            _reserved += reserved;
+            return true;
         }
-        Interlocked.Add(ref _reserved, slack);
-        reserved += slack;
-        return true;
     }
 
     /// <summary>
@@ -79,44 +115,44 @@ internal sealed class CaseRoom
     /// </summary>
     internal bool TryKeep(ref long reserved, long stateJsonBytes, long queuedBytes, long pendingStateBytes)
     {
-        var kept = stateJsonBytes + DiagnosticCaseRecorder.StartLineAllowance + DiagnosticCaseRecorder.EventReserve;
-        if (kept <= reserved)
+        var kept = stateJsonBytes + Overhead;
+        lock (_sync)
         {
-            Interlocked.Add(ref _reserved, kept - reserved);
+            var growth = kept - reserved;
+            if (growth > 0 && LimitUnsafe(Tier.Events) - _bytesWritten - queuedBytes - pendingStateBytes - growth < 0)
+                return false;
+            _reserved += growth;
             reserved = kept;
             return true;
         }
-        if (!Fits(kept - reserved, queuedBytes, pendingStateBytes))
-            return false;
-        reserved = kept;
-        return true;
     }
 
     /// <summary>Returns a reservation a refused recovery holds.</summary>
-    internal void Release(long reserved) => Interlocked.Add(ref _reserved, -reserved);
+    internal void Release(long reserved)
+    {
+        lock (_sync)
+            _reserved -= reserved;
+    }
 
     /// <summary>Takes a checkpoint line's reservation back, once, however many times its write is attempted.</summary>
     internal void ReleaseLine(long checkpointOrdinal, long reserved)
     {
-        if (reserved > 0 && _released.Add(checkpointOrdinal))
-            Interlocked.Add(ref _reserved, -reserved);
+        if (reserved <= 0)
+            return;
+        lock (_sync)
+        {
+            if (_released.Add(checkpointOrdinal))
+                _reserved -= reserved;
+        }
     }
 
-    /// <summary>The writer's announcement of the line it is about to append, before it reads its limit.</summary>
-    internal void BeginLine(long bytes) => Interlocked.Exchange(ref _inFlight, bytes);
+    private const long Overhead = DiagnosticCaseRecorder.StartLineAllowance + DiagnosticCaseRecorder.EventReserve;
 
-    /// <summary>The line is written (its bytes counted) or abandoned.</summary>
-    internal void EndLine() => Interlocked.Exchange(ref _inFlight, 0);
-
-    // Adds `bytes` to the reservations, then checks that what is ahead fits the events tier net of them; a reservation
-    // that does not fit is taken back. The add is a full fence, so a line announced before it is read here, and one
-    // announced after it reads the reduced limit.
-    private bool Fits(long bytes, long queuedBytes, long pendingStateBytes)
-    {
-        Interlocked.Add(ref _reserved, bytes);
-        if (EventLimit - _bytesWritten() - Volatile.Read(ref _inFlight) - queuedBytes - pendingStateBytes >= 0)
-            return true;
-        Interlocked.Add(ref _reserved, -bytes);
-        return false;
-    }
+    private long LimitUnsafe(Tier tier) =>
+        _maxBytes - tier switch
+        {
+            Tier.Events => DiagnosticCaseRecorder.EventReserve,
+            Tier.Ranges => DiagnosticCaseRecorder.RangeReserve,
+            _ => DiagnosticCaseRecorder.ClosingReserve,
+        } - _reserved;
 }
