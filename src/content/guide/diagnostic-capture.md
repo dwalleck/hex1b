@@ -458,13 +458,12 @@ refused `busy` before any state is taken. Problem codes: `invalid-label` (`inval
 A checkpoint costs one pass over the model's cells under its lock: about 0.1–0.25 s and 60 MiB for
 250 columns with 10,000 history rows. A case takes none until a mark or its stop.
 
-What arming a case costs is measured, not budgeted. A retained same-build armed-versus-unarmed
-report compares the output bytes and their order, the output timeline, the host's CPU time, the
-pump's time and allocation per chunk (`cd benchmarks/Hex1b.Benchmarks && dotnet run -c Release --
-diagnostics --filter '*'`) and the loss of a deliberately overloaded run. It sets no budget and
-claims nothing about physical display latency. The report and its reproduction scripts (`run.py`,
-`report.py`, `verify.py`) are kept with the diagnostics evidence, under
-`.scratch/hex1b-diagnostics/evidence/15-instrumentation-overhead-evidence/` in the Janet repository.
+What arming a case costs is measured, not budgeted: a retained same-build armed-versus-unarmed
+report (output bytes and order, timeline, host CPU, the pump per chunk from `cd
+benchmarks/Hex1b.Benchmarks && dotnet run -c Release -- diagnostics --filter '*'`, and the loss of
+an overloaded run) is kept with its reproduction scripts (`run.py`, `report.py`, `verify.py`) in the
+diagnostics evidence, `.scratch/hex1b-diagnostics/evidence/15-instrumentation-overhead-evidence/`
+of the Janet repository. It sets no budget and claims nothing about physical display latency.
 
 ### Bounds and losses
 

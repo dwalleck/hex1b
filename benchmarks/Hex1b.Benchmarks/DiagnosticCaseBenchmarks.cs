@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Text;
 using BenchmarkDotNet.Attributes;
 using Hex1b.Diagnostics;
+using Perfolizer.Mathematics.OutlierDetection;
 
 namespace Hex1b.Benchmarks;
 
@@ -13,13 +14,21 @@ namespace Hex1b.Benchmarks;
 /// </summary>
 /// <remarks>
 /// Each iteration builds a fresh headless terminal and drives its output pump directly on the calling thread through
-/// 1,000 prepared chunks that complete synchronously, as the allocation fence does. In the armed states the case
-/// records to a scratch directory (<c>HEX1B_BENCH_CASE_DIR</c>, or the temp path) with its writer running, so
-/// <see cref="MemoryDiagnoserAttribute"/> counts what the writer allocates too: armed recording owns retained data.
+/// 1,000 prepared chunks that complete synchronously, as the allocation fence does. The measured invocation is that
+/// pass alone for the first three benchmarks: in the armed states the case records to a scratch directory
+/// (<c>HEX1B_BENCH_CASE_DIR</c>, or the temp path), but the pump only queues its events (the queue holds 4,096), and
+/// the case is stopped and its queue written in the iteration's cleanup, outside the measured window; what the
+/// writer thread happens to do while the pump runs is all of its work that <see cref="MemoryDiagnoserAttribute"/>
+/// sees there. <see cref="ArmedWithEveryAuthorizationThroughStop"/> stops the case inside the invocation, so the
+/// writer's drain and the files' close are in its figures. One invocation per iteration (the terminal is fresh each
+/// time), a long warm-up so the pump's code is tiered up before measurement, and no outlier removal.
 /// </remarks>
 [MemoryDiagnoser]
 [JsonExporterAttribute.Full]
 [InvocationCount(1)]
+[WarmupCount(100)]
+[IterationCount(40)]
+[Outliers(OutlierMode.DontRemove)]
 public class DiagnosticCaseBenchmarks
 {
     private const int ChunksPerInvoke = 1000;
@@ -34,6 +43,7 @@ public class DiagnosticCaseBenchmarks
     private Hex1bTerminal _terminal = null!;
     private Func<CancellationToken, Task> _pump = null!;
     private bool _armed;
+    private bool _stopped;
 
     [GlobalSetup]
     public void PrepareCorpus()
@@ -65,16 +75,17 @@ public class DiagnosticCaseBenchmarks
     public void SetupUnarmed() => Build(authorizations: null);
 
     [IterationSetup(Target = nameof(ArmedWithoutReapplicationData))]
-    public void SetupArmedWithoutReapplicationData() => Build(authorizations: []);
+    public void SetupArmedWithoutReapplicationData() =>
+        Build([.. Enum.GetValues<DiagnosticAuthorization>().Where(a => a != DiagnosticAuthorization.ReapplicationData)]);
 
-    [IterationSetup(Target = nameof(ArmedWithEveryAuthorization))]
+    [IterationSetup(Targets = [nameof(ArmedWithEveryAuthorization), nameof(ArmedWithEveryAuthorizationThroughStop)])]
     public void SetupArmedWithEveryAuthorization() => Build(Enum.GetValues<DiagnosticAuthorization>());
 
     [IterationCleanup]
     public void StopAndDispose()
     {
-        if (_armed)
-            new TerminalDiagnostics(_terminal).StopCaseAsync().GetAwaiter().GetResult();
+        if (_armed && !_stopped)
+            StopCase();
         _terminal.DisposeAsync().AsTask().GetAwaiter().GetResult();
     }
 
@@ -82,13 +93,21 @@ public class DiagnosticCaseBenchmarks
     [Benchmark(Baseline = true, OperationsPerInvoke = ChunksPerInvoke)]
     public void Unarmed() => RunPump();
 
-    /// <summary>A case armed without <c>reapplication-data</c>: events are counted, no chunk is copied.</summary>
+    /// <summary>A case armed with every authorization but <c>reapplication-data</c>: events are queued, no chunk is copied.</summary>
     [Benchmark(OperationsPerInvoke = ChunksPerInvoke)]
     public void ArmedWithoutReapplicationData() => RunPump();
 
-    /// <summary>A case armed with every authorization: each chunk is copied, queued and written.</summary>
+    /// <summary>A case armed with every authorization: each chunk is copied and queued; the writing happens after the pass.</summary>
     [Benchmark(OperationsPerInvoke = ChunksPerInvoke)]
     public void ArmedWithEveryAuthorization() => RunPump();
+
+    /// <summary>The same, with the case stopped inside the invocation: the queue drained and written, the files closed.</summary>
+    [Benchmark(OperationsPerInvoke = ChunksPerInvoke)]
+    public void ArmedWithEveryAuthorizationThroughStop()
+    {
+        RunPump();
+        StopCase();
+    }
 
     private void Build(IReadOnlyList<DiagnosticAuthorization>? authorizations)
     {
@@ -103,6 +122,7 @@ public class DiagnosticCaseBenchmarks
             DeferStart = true,
         };
         _armed = authorizations is not null;
+        _stopped = false;
         if (authorizations is null)
         {
             _terminal = new Hex1bTerminal(options);
@@ -122,9 +142,21 @@ public class DiagnosticCaseBenchmarks
     {
         using var cts = new CancellationTokenSource();
         _workload.Load(_chunks, cts);
-        _pump(cts.Token).GetAwaiter().GetResult();
+        var run = _pump(cts.Token);
+        // Every read completes synchronously, so the pass runs on this thread and is what the invocation measures.
+        if (!run.IsCompleted)
+            throw new InvalidOperationException("The pump did not run synchronously.");
+        run.GetAwaiter().GetResult();
         if (_terminal.OutputBytesRead == 0)
             throw new InvalidOperationException("The pump read nothing.");
+    }
+
+    private void StopCase()
+    {
+        _stopped = true;
+        var stopped = new TerminalDiagnostics(_terminal).StopCaseAsync().GetAwaiter().GetResult();
+        if (stopped.Outcome != DiagnosticOutcome.Captured)
+            throw new InvalidOperationException($"The case did not stop: {stopped.Problem?.Code} {stopped.Problem?.Message}");
     }
 
     // Returns each prepared chunk synchronously; once they are exhausted it cancels the pump.
