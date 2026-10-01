@@ -322,6 +322,12 @@ writes its own directory, `reapplications/<n>`, inside the case.
 | `--preview` | string | | `text`, `ansi`, `svg`, `html` (repeatable or comma-separated) |
 
 `reapply` exits 0 when the comparison is `matched`, and 2 when it is `different` or `unavailable`.
+Any build whose declarations match the case's can re-apply it (the candidate's own `reapply` is
+the cross-build comparison): the result's `producer` and `consumer` name both builds (version and
+`hex1bBuild`, the assembly's module version id), `compatibility` lists the seven checks with both
+sides' values and `sameBuild`, and a mismatch is `incompatible` naming the check. The summary
+starts with `Builds: recorded by … ; re-applied by …: same build` (or `different builds`); a
+refusal adds `Incompatible: <check> (the case declares …; this build …)`.
 
 Without `--json` each command prints a summary. With `--json` it writes the full contract result.
 Refusals exit 1 with the problem code (`case-active`, `no-active-case`, `storage-refused`,

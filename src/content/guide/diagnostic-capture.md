@@ -646,8 +646,24 @@ The result also names what was compared and with what:
   loss](#recovery-after-loss) describes, or named by `--from` (`from`);
 - `coverage`: the profile, the surfaces compared, and what it leaves out (clock stamps, write
   sequences, text identities, caller anchors, graphics);
-- `producer`: the recording build and process;
-- `consumerHex1bVersion`: the build that re-applied it.
+- `producer`: the recording build and process (`hex1bVersion`, and `hex1bBuild`, the Hex1b
+  assembly's module version id, which a deterministic build derives from its inputs: the same
+  source, path and build inputs give the same id, any change another; absent in cases recorded
+  before it was written);
+- `consumer`: the build that re-applied it, `hex1bVersion` and `hex1bBuild` (`consumerHex1bVersion`
+  repeats the version);
+- `compatibility`: what was compared between the case's declarations and the re-applying build,
+  on every result, refused or captured. `sameBuild` is `true` when both ids are recorded and equal,
+  `false` when they differ, and absent when the case carries none; it is reported, never required.
+  `checks` lists, in the order they run, `formatVersion`, `contractVersion`, `checkpoint.profile`
+  (the start's and the target checkpoint's), `checkpoint.coveredSurfaces` (a complete start's
+  declared surfaces against the set this build's profile covers, as sets; an unsupported start
+  declares none), `configuration` (fields, values, graphics limits, reflow strategy),
+  `configuration.capabilities` and `origin` (the restored origin), each with `producer` (what the
+  artifact declares), `consumer` (what the build supports) and a `verdict`: `compatible`,
+  `incompatible`, or `not-checked` (an earlier check failed first, or the request was refused before
+  it ran). A check that fails refuses the re-application `incompatible`, naming it with both values
+  in the message; the checks after it stay `not-checked`.
 
 Each run writes a new owner-only directory, `reapplications/<n>` in the case, and never changes
 the case's own files. It holds `result.json`, the complete reconstructed state (`reapplied.json`),
@@ -669,8 +685,23 @@ capability or projection profile; each named in the message), `no-valid-interval
 a geometry-gated batch that was refused after its bytes were decoded (`unapplied-output`).
 
 Re-application streams the events file, so its memory is the model and one event, not the file: a
-119 MiB events file re-applies in about 133 MiB. It compares only at recorded checkpoints, and only
-on the build that recorded the case: a later build may render the same bytes differently.
+119 MiB events file re-applies in about 133 MiB. It compares only at recorded checkpoints.
+
+### Comparing a candidate build
+
+Any build whose declarations match the case's can re-apply it: the same artifact format and
+diagnostics contract versions, the same checkpoint profiles covering the same surfaces, and
+configuration and capability fields it can rebuild (a required field the case lacks, or a field
+the build does not know, is `incompatible` naming it). No build equality is required, and none is
+promised across versions: the record says what was checked. To compare a candidate build with the
+one that recorded a case, run the candidate's own `hex1b capture case reapply` (or its
+`reapply_diagnostic_case`) against the case directory: the result names both builds, whether they
+are the same build, and the checks; `matched` means the candidate's model reaches the recorded
+state from the same input, `different` lists the typed differences, and the recorded case is never
+modified (each run writes only its own `reapplications/<n>`). A fault-injected run is labelled
+`faultInjected` as always, and `--max-differences` caps the listing, never the count. The CLI
+prints the two builds first (`Builds: recorded by … ; re-applied by …: same build` or
+`different builds`), and a refusal adds `Incompatible: <check> (the case declares …; this build …)`.
 
 ## Capabilities
 

@@ -230,6 +230,27 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual((DiagnosticOutcome.Failed, "unsupported-format"), (inspection.Outcome, inspection.Problem?.Code), inspection.Problem?.Message);
     }
 
+    [TestMethod]
+    [DataRow("src/content/guide/diagnostic-capture.md")]
+    [DataRow("src/content/reference/cli.md")]
+    [DataRow("src/Hex1b.McpServer/SKILL.md")]
+    [DataRow("src/Hex1b.McpServer/README.md")]
+    public void DocsMentionCompatibility(string relativePath)
+    {
+        var root = AppContext.BaseDirectory;
+        while (!File.Exists(Path.Combine(root, "src/Hex1b/Hex1b.csproj")))
+            root = Path.GetDirectoryName(root) ?? throw new InvalidOperationException("repository root not found");
+        var text = File.ReadAllText(Path.Combine(root, relativePath));
+        foreach (var term in new[] { "`compatibility`", "`hex1bBuild`", "`sameBuild`", "`incompatible`", "`producer`", "`consumer`" })
+            StringAssert.Contains(text, term, relativePath);
+        if (relativePath.EndsWith("diagnostic-capture.md", StringComparison.Ordinal))
+        {
+            Assert.IsFalse(text.Contains("only" + Environment.NewLine + "on the build that recorded the case", StringComparison.Ordinal), "the guide still restricts re-application to the recording build");
+            foreach (var term in new[] { "### Comparing a candidate build", "`not-checked`", "`checkpoint.coveredSurfaces`", "`configuration.capabilities`" })
+                StringAssert.Contains(text, term, relativePath);
+        }
+    }
+
     private static void EditManifest(string path, Action<JsonObject> edit)
     {
         var file = Path.Combine(path, "manifest.json");
