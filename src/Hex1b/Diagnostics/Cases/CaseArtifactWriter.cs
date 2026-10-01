@@ -42,14 +42,12 @@ internal sealed class CaseArtifactWriter : IDisposable
     }
 
     /// <summary>Writes one event line; returns the bytes written.</summary>
-    internal int WriteEvent(DiagnosticCaseEvent item) =>
-        TryWriteEvent(item, long.MaxValue) ? _lastLineBytes : throw new InvalidOperationException("unreachable");
-
     /// <summary>
-    /// Writes one event line unless the artifact would then exceed <paramref name="limit"/> bytes; nothing
-    /// is written when it would.
+    /// Writes one event line unless the artifact would then exceed the <paramref name="tier"/>'s limit; nothing is
+    /// written when it would. The line is announced to the room before the limit is read, so a reservation published
+    /// meanwhile either bounds it or counts it.
     /// </summary>
-    internal bool TryWriteEvent(DiagnosticCaseEvent item, long limit)
+    internal bool TryWriteEvent(DiagnosticCaseEvent item, CaseRoom room, CaseRoom.Tier tier)
     {
         _json.Clear();
         using (var writer = new Utf8JsonWriter(_json))
@@ -57,8 +55,12 @@ internal sealed class CaseArtifactWriter : IDisposable
 
         var json = _json.WrittenSpan;
         var total = 9 + json.Length + 1;
-        if (BytesWritten + total > limit)
+        room.BeginLine(total);
+        if (BytesWritten + total > room.Limit(tier))
+        {
+            room.EndLine();
             return false;
+        }
         Span<byte> prefix = stackalloc byte[9];
         CaseCrc32.Compute(json).TryFormat(prefix, out _, "x8");
         prefix[8] = (byte)'\t';
@@ -67,11 +69,10 @@ internal sealed class CaseArtifactWriter : IDisposable
         events.Write(json);
         events.WriteByte((byte)'\n');
         Interlocked.Add(ref _bytesWritten, total);
-        _lastLineBytes = total;
+        room.EndLine();
         return true;
     }
 
-    private int _lastLineBytes;
 
     internal void Flush() => _events?.Flush();
 

@@ -227,8 +227,8 @@ public sealed partial class Hex1bTerminal
         if (_continuationUncommitted)
             return new(null, null, "unavailable", "unapplied-output: output was tokenized without being applied since the last application, so its decoder continuation is not the committed one", 0);
         // A line that cannot be written whole would leave the case claiming a checkpoint it never wrote. The geometry's
-        // floor refuses, before projecting, only a state that cannot fit however small its cells; the projection's exact
-        // size decides every other (and the engine adds the manifest's own bytes when it describes the start).
+        // floor refuses, before projecting, a state that cannot fit however small its cells; a recovery then reserves its
+        // room from its estimate (the writer bounds what it appends by it) and keeps it at the projected size.
         var tooLarge = $"size-limit: the {subject} state is larger than the case's size bound leaves for its events";
         if (MinimumModelStateJsonBytesUnsafe() + DiagnosticCaseRecorder.StartLineAllowance > room)
             return new(null, null, "unavailable", tooLarge, 0);
@@ -236,6 +236,8 @@ public sealed partial class Hex1bTerminal
         var estimate = EstimateModelStateBytesUnsafe();
         if (reserveWith is null ? estimate > DiagnosticCaseRecorder.PendingStateBudgetInEffect : !reserveWith.TryReserveStateBytes(estimate))
             return new(null, null, "unavailable", $"pending-state budget: the {subject} state is larger than the state a case may hold awaiting its writer", 0);
+        if (reserveWith is not null && !reserveWith.TryReserveRecoveryRoom(estimate))
+            return new(null, null, "unavailable", tooLarge, estimate);
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
@@ -243,7 +245,7 @@ public sealed partial class Hex1bTerminal
             var state = CaptureModelState();
             var jsonBytes = SerializedBytes(state);
             var milliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-            if (jsonBytes + DiagnosticCaseRecorder.StartLineAllowance > room)
+            if (reserveWith is null ? jsonBytes + DiagnosticCaseRecorder.StartLineAllowance > room : !reserveWith.TryKeepRecoveryRoom(jsonBytes))
                 return new(null, null, "unavailable", $"{tooLarge} ({jsonBytes} bytes; projected and measured in {milliseconds:0.###} ms)", estimate);
             return new(state, milliseconds, "recorded", null, estimate, jsonBytes);
         }

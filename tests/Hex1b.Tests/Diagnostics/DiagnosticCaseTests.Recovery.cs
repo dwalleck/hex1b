@@ -38,6 +38,8 @@ public partial class DiagnosticCaseTests
             {
                 // The writer writes the manifest before it waits at the gate.
                 await WaitAsync(() => File.Exists(Path.Combine(path, "manifest.json")));
+                // The manifest is the writer's first file: read once it parses, not while it is being written.
+                await WaitAsync(() => TryParse(Path.Combine(path, "manifest.json")), TimeSpan.FromSeconds(10));
                 manifestBefore = File.ReadAllBytes(Path.Combine(path, "manifest.json"));
                 await FloodAsync(terminal, workload, CaseEventQueueMax + 700);
                 gate.Set();
@@ -360,15 +362,17 @@ public partial class DiagnosticCaseTests
         await using (terminal)
         {
             // Rows of 100 wide glyphs: about 4,000 bytes a row serialized against a 2,800-byte floor, so the exact size
-            // (about 195 KiB plus the line allowance) exceeds the room left once about 850 KiB is written (about 182 KiB),
-            // while the floor (137 KiB plus the allowance) fits it.
+            // (about 195 KiB plus the line allowance) exceeds the room left once about 840 KiB is written (about 152 KiB
+            // after the events reserve a reservation adds, and the few rows still queued), while the floor (137 KiB plus
+            // the allowance) fits it.
             var row = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Repeat("\u6f22", 100)) + "\r\n");
-            while (diagnostics.GetCaseStatus() is { Outcome: DiagnosticOutcome.Captured, BytesWritten: < 850 * 1024 })
+            while (diagnostics.GetCaseStatus() is { Outcome: DiagnosticOutcome.Captured, BytesWritten: < 840 * 1024 })
                 await workload.WriteAndWaitAsync(terminal, row);
-            await WaitAsync(() => diagnostics.GetCaseStatus().BytesWritten >= 850 * 1024, TimeSpan.FromSeconds(30));
+            await WaitAsync(() => diagnostics.GetCaseStatus().BytesWritten >= 840 * 1024, TimeSpan.FromSeconds(30));
             var captures = terminal.ModelStateCapturesForTesting;
+            var room = terminal.DiagnosticCase!.CheckpointRoom;
             result = diagnostics.RecoverCase("measured");
-            Assert.AreEqual(captures + 1, terminal.ModelStateCapturesForTesting, "fixture: the recovery was refused before projecting (the room is under the floor)");
+            Assert.AreEqual(captures + 1, terminal.ModelStateCapturesForTesting, $"fixture: the recovery was refused before projecting ({result.Reason}; room {room})");
             await workload.WriteAndWaitAsync(terminal, "after");
             await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
         }
@@ -474,6 +478,19 @@ public partial class DiagnosticCaseTests
                 : ["`recover_diagnostic_case`", "`case-recover`", "`--from`", "`origin`", "`loss-envelope`", "`inside-loss`", "`not-an-origin`", "`unknown-label`", "`unknown-case-sequence`", "`unknown-checkpoint`", "`invalid-origin`", "`beyond-interval`"];
         foreach (var term in expected)
             StringAssert.Contains(text, term, relativePath);
+    }
+
+    private static bool TryParse(string path)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllBytes(path));
+            return true;
+        }
+        catch (Exception error) when (error is JsonException or IOException)
+        {
+            return false;
+        }
     }
 
     // The writer held, more chunks than the queue holds: real drop-newest overload, accounted outside the queue.

@@ -138,12 +138,13 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// <summary>How long a stop waits for queued events to reach the artifact (spec Q11).</summary>
     internal static readonly TimeSpan DrainTimeout = TimeSpan.FromSeconds(10);
 
-    // The size bound is kept in tiers, so what must be written always has room:
-    //   events and running loss ranges                 below MaxBytes - 16 KiB (EventLimit);
-    //   ranges written as the case closes (discards)   below MaxBytes - 8 KiB  (RangeLimit);
-    //   closing records: the interval end, at most one failure and one overflow summary per stream,
-    //   each a bounded line                             below MaxBytes - 2 KiB  (ClosingLimit);
+    // The size bound is kept in tiers (CaseRoom), so what must be written always has room:
+    //   events and running loss ranges                 below MaxBytes - 16 KiB (the events tier);
+    //   ranges written as the case closes (discards)   below MaxBytes - 8 KiB  (the ranges tier);
+    //   closing records: the interval ends, at most one failure and one overflow summary per stream,
+    //   each a bounded line                             below MaxBytes - 2 KiB  (the closing tier);
     //   the completion record                          in the rest.
+    // Each tier is net of the room reserved for the lines of complete recovery checkpoints awaiting the writer.
     internal const long EventReserve = 16 * 1024;
     internal const long RangeReserve = 8 * 1024;
     internal const long ClosingReserve = 2 * 1024;
@@ -174,6 +175,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     private readonly CaseEventQueue _queue = new();
     private readonly CaseLossLedger _loss = new();
     private readonly CaseArtifactWriter _writer;
+    private readonly CaseRoom _room;
     private readonly SemaphoreSlim _signal = new(0);
     private readonly TimeProvider _timeProvider;
     private readonly Action<DiagnosticCaseRecorder> _finished;
@@ -305,6 +307,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         _finished = finished;
         _sources = sources;
         _writer = new CaseArtifactWriter(path);
+        _room = new CaseRoom(manifest.Bounds.MaxBytes, () => _writer.BytesWritten);
         IncludeModelPayloads = manifest.Authorizations.Contains(DiagnosticAuthorization.ReapplicationData);
         _rawInput = manifest.Authorizations.Contains(DiagnosticAuthorization.RawInput);
         _editorText = manifest.Authorizations.Contains(DiagnosticAuthorization.EditorText);
@@ -605,10 +608,39 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     internal void ReleaseStateBytes(long bytes) => Interlocked.Add(ref _pendingStateBytes, -bytes);
 
     /// <summary>Bytes left in the tier the stop checkpoint is written in, so a stop can skip a state that cannot fit.</summary>
-    internal long StopCheckpointRoom => RangeLimit - _writer.BytesWritten;
+    internal long StopCheckpointRoom => _room.RangeLimit - _writer.BytesWritten;
 
-    /// <summary>What the events tier leaves for a recovery line taken now: after the queued events at their written size (base64 and an envelope), the checkpoint states awaiting the writer, and the reserve its own reservation adds.</summary>
-    internal long CheckpointRoom => EventLimit - _writer.BytesWritten - (_queue.Bytes * 4 / 3 + 128 * _queue.Count) - Volatile.Read(ref _pendingStateBytes) - EventReserve;
+    /// <summary>What the events tier leaves for a recovery's state taken now (<see cref="CaseRoom.RecoveryRoom"/>).</summary>
+    internal long CheckpointRoom => _room.RecoveryRoom(QueuedWrittenBytes, UnreservedPendingStateBytes);
+
+    // The queued events at their written size: base64 of the payload and an envelope, bounded from the queued estimate.
+    private long QueuedWrittenBytes => _queue.Bytes * 4 / 3 + 128 * _queue.Count;
+
+    // The pending checkpoint states written ahead of a recovery's line that no room reservation already covers: the
+    // marks'. A pending recovery's state is in its line's reservation, so its estimate is kept apart here.
+    private long _reservedStateBytes;
+    private long UnreservedPendingStateBytes => Volatile.Read(ref _pendingStateBytes) - Volatile.Read(ref _reservedStateBytes);
+
+    // A recovery's room reservation and state estimate between its check and its record, under the model lock.
+    private long _recoveryReservation;
+    private long _recoveryStateEstimate;
+
+    /// <summary>
+    /// Reserves the room a recovery's line may take, from its state's estimate (already reserved against the pending-state
+    /// budget), or what is left when that is less; false (nothing reserved) when not even a line's overhead is left ahead.
+    /// </summary>
+    internal bool TryReserveRecoveryRoom(long estimate)
+    {
+        if (!_room.TryReserveRecovery(estimate, QueuedWrittenBytes, UnreservedPendingStateBytes - estimate, out _recoveryReservation))
+            return false;
+        _recoveryStateEstimate = estimate;
+        Interlocked.Add(ref _reservedStateBytes, estimate);
+        return true;
+    }
+
+    /// <summary>Sets the reservation to the projected state's size; false when a state larger than estimated no longer fits.</summary>
+    internal bool TryKeepRecoveryRoom(long stateJsonBytes) =>
+        _room.TryKeep(ref _recoveryReservation, stateJsonBytes, QueuedWrittenBytes, UnreservedPendingStateBytes);
 
     internal long QueuedBytesForTesting => _queue.Bytes;
     internal long PendingStateBytesForTesting => Volatile.Read(ref _pendingStateBytes);
@@ -657,16 +689,21 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         var checkpoint = complete
             ? Checkpoint(ordinal, name, "recovery", capture)
             : Checkpoint(ordinal, name, "recovery", new CheckpointCapture(null, null, "unsupported", described.Reason, 0));
-        // A complete recovery reserves its line (state, a line's allowance and the events reserve: it fits whichever tier
-        // writes it) until the line is written; a refusal returns its state bytes.
-        var reserved = complete ? capture.StateJsonBytes + StartLineAllowance + EventReserve : 0;
+        // A complete recovery keeps the room its capture reserved until its line is written; a refusal returns it with
+        // its state bytes.
+        var reserved = _recoveryReservation;
+        var estimate = _recoveryStateEstimate;
+        (_recoveryReservation, _recoveryStateEstimate) = (0, 0);
         if (complete)
         {
-            Interlocked.Add(ref _reservedRoom, reserved);
             _intervalEnds.BeginSegment();
         }
         else
+        {
+            _room.Release(reserved);
+            Interlocked.Add(ref _reservedStateBytes, -estimate);
             ReleaseStateBytes(capture.StateBytes);
+        }
         _checkpoints.Enqueue(new PendingCheckpoint(modelSequence, checkpoint, complete ? capture.StateBytes : 0, reserved));
         Interlocked.Decrement(ref _marksInProgress);
         if (_signal.CurrentCount == 0)
@@ -1050,20 +1087,16 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             AppendCase("stream-failed", null, failure, ClosingLimit);
     }
 
-    // Bytes reserved for pending complete recovery lines: every tier is net of them; a line takes its own back as it is written.
-    private long _reservedRoom;
-
-    private long EventLimit => Manifest.Bounds.MaxBytes - EventReserve - Volatile.Read(ref _reservedRoom);
-
-    private long RangeLimit => Manifest.Bounds.MaxBytes - RangeReserve - Volatile.Read(ref _reservedRoom);
-
-    private long ClosingLimit => Manifest.Bounds.MaxBytes - ClosingReserve - Volatile.Read(ref _reservedRoom);
+    // The tiers (see CaseRoom); the writer reads each limit as it appends, net of the room reserved meanwhile.
+    private const CaseRoom.Tier EventLimit = CaseRoom.Tier.Events;
+    private const CaseRoom.Tier RangeLimit = CaseRoom.Tier.Ranges;
+    private const CaseRoom.Tier ClosingLimit = CaseRoom.Tier.Closing;
 
     // A missing range must fit below its tier. One that does not stops the case at its size bound, and its
     // stream's loss from there is summarized as one range of unknown extent when the case closes.
     // `declared` counts the range; it runs once the range is in the artifact: at once, or when the summary
     // that covers it is written.
-    private void WriteMissing(DiagnosticCaseRecord record, long limit, Action declared)
+    private void WriteMissing(DiagnosticCaseRecord record, CaseRoom.Tier limit, Action declared)
     {
         var index = StreamIndex(record.Stream);
         if (_undescribedFrom[index] is null && AppendCase("missing", null, record, limit))
@@ -1105,10 +1138,10 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     }
 
     // The one append path: assigns the next case sequence and counts the line only when it was written.
-    private bool Append(CaseStream stream, DiagnosticCaseEvent item, long limit)
+    private bool Append(CaseStream stream, DiagnosticCaseEvent item, CaseRoom.Tier limit)
     {
         var sequence = _caseSequence + 1;
-        if (!_writer.TryWriteEvent(item with { CaseSequence = sequence }, limit))
+        if (!_writer.TryWriteEvent(item with { CaseSequence = sequence }, _room, limit))
             return false;
         _caseSequence = sequence;
         Interlocked.Increment(ref _written[(int)stream]);
@@ -1117,7 +1150,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     }
 
     // Case records are numbered by the writer alone, and only when written.
-    private bool AppendCase(string kind, long? modelSequence, DiagnosticCaseRecord? record, long limit,
+    private bool AppendCase(string kind, long? modelSequence, DiagnosticCaseRecord? record, CaseRoom.Tier limit,
         DiagnosticCaseCheckpointEvent? checkpoint = null)
     {
         var ordinal = _ordinals[(int)CaseStream.Case] + 1;
@@ -1145,18 +1178,27 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             if (!WriteCheckpoint(pending, closing))
                 return false;
             _checkpoints.TryDequeue(out _);
-            ReleaseMarkSlot();
-            ReleaseStateBytes(pending.StateBytes);
+            ReleasePending(pending);
         }
         return true;
     }
 
+    // A dequeued checkpoint returns its mark's slot and its state bytes; a recovery's state estimate also leaves the
+    // reserved states (its line's reservation was taken back as it was written).
+    private void ReleasePending(in PendingCheckpoint pending)
+    {
+        ReleaseMarkSlot();
+        ReleaseStateBytes(pending.StateBytes);
+        if (pending.ReservedBytes > 0)
+            Interlocked.Add(ref _reservedStateBytes, -pending.StateBytes);
+    }
+
     // A checkpoint whose state does not fit is written without it (status missing, reason size-limit), so the
-    // boundary stays in the artifact; false when not even that fits. A reserved line takes its reservation back first.
+    // boundary stays in the artifact; false when not even that fits. A reserved line takes its reservation back first,
+    // once however many times its write is attempted, so the tier it is written in has its bytes free.
     private bool WriteCheckpoint(in PendingCheckpoint pending, bool closing)
     {
-        if (pending.ReservedBytes > 0)
-            Interlocked.Add(ref _reservedRoom, -pending.ReservedBytes);
+        _room.ReleaseLine(pending.Checkpoint.Ordinal, pending.ReservedBytes);
         var limit = closing ? RangeLimit : EventLimit;
         var written = AppendCase("checkpoint", pending.ModelSequence, null, limit, pending.Checkpoint)
             || (pending.Checkpoint.State is not null
@@ -1180,8 +1222,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         {
             if (!WriteCheckpoint(pending, closing: true))
                 unwritten.Add(pending.Checkpoint.Ordinal);
-            ReleaseMarkSlot();
-            ReleaseStateBytes(pending.StateBytes);
+            ReleasePending(pending);
         }
 
         if (!_stopCheckpointSettled && _stopCheckpoint is { } stop)
