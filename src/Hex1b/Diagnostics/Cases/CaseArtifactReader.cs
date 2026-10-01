@@ -145,11 +145,17 @@ internal static class CaseArtifactReader
         public readonly List<DiagnosticCaseRecord> Envelopes = [];
         private IReadOnlyList<DiagnosticCaseRecord>? _missing;
 
-        // Computed once, after the scan.
-        public IReadOnlyList<DiagnosticCaseRecord> Missing => _missing ??=
-            Recorded.Select(Bounded).Concat(Gaps.Where(g => !Recorded.Any(m => m.FromOrdinal <= g.From && (m.ToOrdinal is null || m.ToOrdinal >= g.To)))
+        // Computed once, after the scan: the declared ranges, each bounded by its envelope when it has one, then the
+        // gaps no bounded range explains (a gap past an envelope is loss of unknown cause).
+        public IReadOnlyList<DiagnosticCaseRecord> Missing => _missing ??= BoundedMissing();
+
+        private List<DiagnosticCaseRecord> BoundedMissing()
+        {
+            var declared = Recorded.Select(Bounded).ToList();
+            return declared.Concat(Gaps.Where(g => !declared.Any(m => m.FromOrdinal <= g.From && (m.ToOrdinal is null || m.ToOrdinal >= g.To)))
                 .Select(g => new DiagnosticCaseRecord { FromOrdinal = g.From, ToOrdinal = g.To, Reason = "unknown" }))
                 .OrderBy(m => m.FromOrdinal).ToList();
+        }
 
         // A range of unknown extent whose envelope was written is reported bounded by it: the ordinals between are
         // still not enumerated, but nothing after the envelope was lost to it.

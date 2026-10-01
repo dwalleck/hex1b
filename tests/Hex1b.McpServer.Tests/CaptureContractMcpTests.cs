@@ -805,7 +805,7 @@ public class CaptureContractMcpTests : McpServerTestBase
             (new() { ["path"] = path, ["to"] = "stop", ["from"] = "mcp-recover" }, new() { Path = path, ToLabel = "stop", From = "mcp-recover" }, null, "mcp-recover"),
             (new() { ["path"] = path, ["to"] = "stop", ["from"] = $"case:{line.CaseSequence}" }, new() { Path = path, ToLabel = "stop", From = $"case:{line.CaseSequence}" }, null, "mcp-recover"),
             (new() { ["path"] = path, ["to"] = "stop", ["from"] = "mcp-mark" }, new() { Path = path, ToLabel = "stop", From = "mcp-mark" }, "not-an-origin", null),
-            (new() { ["path"] = path, ["to"] = "stop", ["from"] = "nobody" }, new() { Path = path, ToLabel = "stop", From = "nobody" }, "unknown-origin", null),
+            (new() { ["path"] = path, ["to"] = "stop", ["from"] = "nobody" }, new() { Path = path, ToLabel = "stop", From = "nobody" }, "unknown-label", null),
             (new() { ["path"] = path, ["to"] = "mcp-mark", ["from"] = "mcp-recover" }, new() { Path = path, ToLabel = "mcp-mark", From = "mcp-recover" }, "beyond-interval", null),
         })
         {
@@ -819,7 +819,7 @@ public class CaptureContractMcpTests : McpServerTestBase
         var tools = await client.ListToolsAsync();
         StringAssert.Contains(tools.Single(t => t.Name == "recover_diagnostic_case").Description!, "new origin", "the recover description");
         var fromParameter = tools.Single(t => t.Name == "reapply_diagnostic_case").JsonSchema.GetProperty("properties").GetProperty("from").GetProperty("description").GetString()!;
-        foreach (var term in new[] { "start", "not-an-origin", "unknown-origin", "beyond-interval" })
+        foreach (var term in new[] { "start", "not-an-origin", "unknown-label", "unknown-case-sequence", "unknown-checkpoint", "beyond-interval" })
             StringAssert.Contains(fromParameter, term, "the from description");
     }
 

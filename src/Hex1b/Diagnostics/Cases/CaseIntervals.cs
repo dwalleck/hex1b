@@ -19,10 +19,10 @@ internal static class CaseIntervals
         {
             intervals.Add(new DiagnosticCaseInterval { Valid = false, EndReason = $"checkpoint {DiagnosticContractNames.Of(checkpoint.Status)}: {checkpoint.Reason}" });
         }
-        else if (checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState && !scan.StartRecorded)
+        else if (checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState && (scan.Start is not { } line || line.ModelSequence != modelStart))
         {
-            // A text-state/1 start re-applies only from its verified start line with state.
-            intervals.Add(new DiagnosticCaseInterval { Valid = false, EndReason = "start-missing: the start checkpoint line is not among the verified events, or holds no state" });
+            // A text-state/1 start re-applies only from its verified start line with state, at the manifest's sequence.
+            intervals.Add(new DiagnosticCaseInterval { Valid = false, EndReason = "start-missing: the start checkpoint line is not among the verified events at the manifest's model sequence, or holds no state" });
         }
         else
         {
@@ -80,7 +80,7 @@ internal static class CaseIntervals
         }
         foreach (var missing in scan.Streams["model"].Missing)
         {
-            var first = modelStart + Math.Max(1, missing.FromOrdinal ?? 1);
+            var first = modelStart + (missing.FromOrdinal ?? 1);
             var lastMissing = missing.ToOrdinal is { } to ? modelStart + to : long.MaxValue;
             // The origin's state follows its event: a range ending at or before it is before it, and one that
             // covers it (lost events after it, before any retained one) leaves nothing to re-apply from it.
@@ -101,6 +101,6 @@ internal static class CaseIntervals
             Consider(last, "interrupted");
 
         var (end_, endReason) = end ?? (last, $"case-stopped: {(completion is null ? "unknown" : DiagnosticContractNames.Of(completion.StopReason))}");
-        return new DiagnosticCaseInterval { Valid = true, Origin = origin, FromModelSequence = from, ToModelSequence = Math.Max(end_, from), EndReason = endReason };
+        return new DiagnosticCaseInterval { Valid = true, Origin = origin, FromModelSequence = from, ToModelSequence = end_, EndReason = endReason };
     }
 }

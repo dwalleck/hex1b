@@ -607,8 +607,14 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// <summary>Bytes left in the tier the stop checkpoint is written in, so a stop can skip a state that cannot fit.</summary>
     internal long StopCheckpointRoom => RangeLimit - _writer.BytesWritten;
 
-    /// <summary>What the events tier leaves for a checkpoint line taken now: a recovery's state must fit it whole.</summary>
-    internal long CheckpointRoom => EventLimit - _writer.BytesWritten;
+    /// <summary>
+    /// What the events tier leaves for a checkpoint line taken now, after the queued events and the checkpoint states
+    /// already awaiting the writer, which it writes first: a recovery's state must fit it whole.
+    /// </summary>
+    internal long CheckpointRoom => EventLimit - _writer.BytesWritten - _queue.Bytes - Volatile.Read(ref _pendingStateBytes);
+
+    internal long QueuedBytesForTesting => _queue.Bytes;
+    internal long PendingStateBytesForTesting => Volatile.Read(ref _pendingStateBytes);
 
     /// <summary>
     /// Records the start checkpoint of a case armed on a model that had applied output, before any model event
@@ -643,7 +649,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     /// <summary>
     /// Records a recovery checkpoint taken under the model lock and classified as a start is: complete, with its state,
     /// it begins a new segment of re-applicable coverage; otherwise the attempt is recorded without state, with the
-    /// status and reason. The caller reserved a mark's place; the checkpoint takes it.
+    /// status and reason. The caller reserved a mark's place, and the capture its state bytes; a complete checkpoint
+    /// keeps both until its line is written, a refusal returns the bytes.
     /// </summary>
     internal (long Ordinal, string Label) RecordRecovery(string? label, long modelSequence, CheckpointCapture capture, DiagnosticCaseCheckpoint described)
     {
@@ -654,10 +661,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
             ? Checkpoint(ordinal, name, "recovery", capture)
             : Checkpoint(ordinal, name, "recovery", new CheckpointCapture(null, null, "unsupported", described.Reason, 0));
         if (complete)
-        {
-            Interlocked.Add(ref _pendingStateBytes, capture.StateBytes);
-            _intervalEnds.BeginSegment(modelSequence);
-        }
+            _intervalEnds.BeginSegment();
+        else
+            ReleaseStateBytes(capture.StateBytes);
         _checkpoints.Enqueue(new PendingCheckpoint(modelSequence, checkpoint, complete ? capture.StateBytes : 0));
         Interlocked.Decrement(ref _marksInProgress);
         if (_signal.CurrentCount == 0)

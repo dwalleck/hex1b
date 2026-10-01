@@ -158,23 +158,28 @@ internal static class CaseReapplier
                 $"Model sequence {target} is past the case's last recorded model event, {resolution.LastModelSequence}.") with { Target = targetRecord };
 
         // The origin, and the interval it covers.
-        var selection = SelectOrigin(request.From, intervals, resolution.Checkpoints, target);
+        var selection = CaseOrigins.Select(request.From, intervals, resolution.Checkpoints, target);
         if (selection.Problem is { } originProblem)
-            return described with { Outcome = originProblem.Outcome, Problem = originProblem.Problem, Target = targetRecord };
+            return described with { Outcome = DiagnosticOutcome.InvalidRequest, Problem = originProblem, Target = targetRecord };
         if (selection.Interval is not { Valid: true, Origin: { } origin, FromModelSequence: { } originFrom, ToModelSequence: { } intervalEnd }
             || target < originFrom || target > intervalEnd)
         {
-            // Refused before anything is built: the nearest valid interval before the target says where coverage ends.
+            // Refused before anything is built. A named origin that is not re-applicable says so; otherwise the nearest
+            // valid interval before the target says where coverage ends, or, before every valid interval, the initial
+            // checkpoint says why it is not an origin.
+            var namedInvalid = selection.Interval is { Valid: false } ? selection.Interval : null;
             var nearest = selection.Interval is { Valid: true } named ? named
                 : intervals.Where(i => i.Valid && i.FromModelSequence <= target).OrderByDescending(i => i.ToModelSequence).FirstOrDefault();
-            var reason = selection.Interval is { Valid: false } refusedOrigin ? refusedOrigin.EndReason : nearest?.EndReason;
-            var message = selection.Interval is { Valid: false, Origin: { } invalidOrigin }
-                ? $"The origin '{invalidOrigin.Label ?? invalidOrigin.Trigger}' (checkpoint {invalidOrigin.CheckpointOrdinal}) is not re-applicable: {reason}."
-                : $"Model sequence {target} is beyond the case's re-applicable interval" + (nearest is { } n ? $" from model sequence {n.FromModelSequence}, which ends at {n.ToModelSequence}" : "") + $": {reason}.";
+            var reason = namedInvalid?.EndReason ?? nearest?.EndReason ?? intervals.FirstOrDefault(i => !i.Valid)?.EndReason;
+            var message = namedInvalid is { } notReapplicable
+                ? $"The origin {(notReapplicable.Origin is { } o ? $"'{o.Label ?? o.Trigger}'" + (o.CheckpointOrdinal is { } ordinal ? $" (checkpoint {ordinal})" : "") : "'start'")} is not re-applicable: {reason}."
+                : nearest is { } n
+                    ? $"Model sequence {target} is beyond the case's re-applicable interval from model sequence {n.FromModelSequence}, which ends at {n.ToModelSequence}: {reason}."
+                    : $"Model sequence {target} is before the case's first re-applicable interval, from model sequence {intervals.First(i => i.Valid).FromModelSequence}; the initial checkpoint is not re-applicable: {reason}.";
             return Refuse(DiagnosticOutcome.Unavailable, "beyond-interval", message) with
             {
                 Target = targetRecord,
-                LastValidModelSequence = nearest?.ToModelSequence,
+                LastValidModelSequence = namedInvalid is null ? nearest?.ToModelSequence : null,
                 IntervalEndReason = reason,
             };
         }
@@ -390,7 +395,7 @@ internal static class CaseReapplier
         return null;
     }
 
-    private sealed record CheckpointLine(long CaseSequence, long ModelSequence, long Ordinal, string Label, string Status, string Profile, string Trigger);
+    internal sealed record CheckpointLine(long CaseSequence, long ModelSequence, long Ordinal, string Label, string Status, string Profile, string Trigger);
 
     private sealed record Resolution(long ModelSequence, CheckpointLine? Checkpoint, DiagnosticCaseReapplyResult? Problem, long LastModelSequence = 0)
     {
@@ -399,48 +404,6 @@ internal static class CaseReapplier
 
         /// <summary>Every verified checkpoint line, for naming an origin.</summary>
         public List<CheckpointLine> Checkpoints { get; init; } = [];
-    }
-
-    private sealed record OriginSelection(DiagnosticCaseInterval? Interval, DiagnosticCaseReapplyResult? Problem);
-
-    // The interval to restore from: the earliest valid one covering the target, or the one `from` names (`start`, a
-    // label, `case:N` or `checkpoint:N`). A named checkpoint that is not an origin, or an unknown one, is refused.
-    private static OriginSelection SelectOrigin(string? from, IReadOnlyList<DiagnosticCaseInterval> intervals, List<CheckpointLine> checkpoints, long target)
-    {
-        if (from is null)
-            return new(intervals.Where(i => i.Valid && i.FromModelSequence <= target && target <= i.ToModelSequence).OrderBy(i => i.FromModelSequence).FirstOrDefault(), null);
-        if (from == "start")
-            return new(intervals.FirstOrDefault(), null);
-        Func<DiagnosticCaseOrigin, bool> matches;
-        Func<CheckpointLine, bool> exists;
-        string what;
-        if (from.StartsWith("case:", StringComparison.Ordinal) && long.TryParse(from.AsSpan(5), out var caseSequence))
-        {
-            matches = o => o.CaseSequence == caseSequence;
-            exists = c => c.CaseSequence == caseSequence;
-            what = $"case sequence {caseSequence}";
-        }
-        else if (from.StartsWith("checkpoint:", StringComparison.Ordinal) && long.TryParse(from.AsSpan(11), out var ordinal))
-        {
-            matches = o => o.CheckpointOrdinal == ordinal;
-            exists = c => c.Ordinal == ordinal;
-            what = $"checkpoint {ordinal}";
-        }
-        else
-        {
-            var label = from.StartsWith("label:", StringComparison.Ordinal) ? from[6..] : from;
-            matches = o => o.Label == label;
-            exists = c => c.Label == label;
-            what = $"label '{label}'";
-        }
-        var named = intervals.Where(i => i.Origin is { } o && matches(o)).ToList();
-        if (named.Count > 1)
-            return new(null, Problem(DiagnosticOutcome.InvalidRequest, "ambiguous-label", $"{named.Count} origins have {what}; name one by case sequence."));
-        if (named.Count == 1)
-            return new(named[0], null);
-        return new(null, checkpoints.Any(exists)
-            ? Problem(DiagnosticOutcome.InvalidRequest, "not-an-origin", $"The checkpoint with {what} is not an origin: only the case's start and its complete recovery checkpoints are.")
-            : Problem(DiagnosticOutcome.InvalidRequest, "unknown-origin", $"No checkpoint has {what}."));
     }
 
     // The start checkpoint's state: the first lines of the file, read until its line.

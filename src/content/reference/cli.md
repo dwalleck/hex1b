@@ -298,9 +298,10 @@ and the checkpoint's ordinal; labels need not be unique.
 range: the queue dropped the newest events). It holds the model's full text state at the current
 model sequence and is a new origin: a new re-applicable interval starts there, and `reapply`
 restores from it for targets after the gap. It needs `reapplication-data`, and is classified like a
-live start: `complete`, or `unsupported` with the reason (a DCS in progress or graphics, a state
-too large for the case's remaining room, the pending-state budget, a recovery inside an
-application), recorded as a boundary only. Earlier loss and the case's initial checkpoint never
+live start: `complete`, or `unsupported` with the reason (a DCS in progress or graphics; a state too
+large for what the case's events tier leaves after the queued events and pending checkpoint states;
+the pending-state budget, counted with the pending marks; a recovery inside an application;
+unapplied output; a configuration a re-application could not rebuild), recorded as a boundary only. Earlier loss and the case's initial checkpoint never
 change. `--label` is as for `mark`; the default is `recovery-` and the checkpoint's ordinal.
 
 `reapply` rebuilds the model offline from the case's recorded configuration, restores it from the
@@ -312,7 +313,7 @@ writes its own directory, `reapplications/<n>`, inside the case.
 | `reapply` option | Type | Default | Description |
 |------------------|------|---------|-------------|
 | `--to` | string | (required) | A model sequence (`12`), a case sequence (`case:34`), or a checkpoint label (`label:name`, or the bare name; `stop` is the stop checkpoint, `start` a live start's checkpoint; a label several checkpoints share is ambiguous, so name one by `case:<n>`) |
-| `--from` | string | | The origin to restore from: `start`, or a recovery checkpoint by label (`label:name`, or the bare name), case sequence (`case:34`) or ordinal (`checkpoint:2`). Default: the earliest origin whose re-applicable interval covers the target. A mark is `not-an-origin`, an unknown name `unknown-origin`, and a target outside the named origin's interval `beyond-interval` |
+| `--from` | string | | The origin to restore from: `start`, or a recovery checkpoint by label (`label:name`, or the bare name), case sequence (`case:34`) or ordinal (`checkpoint:2`). Default: the earliest origin whose re-applicable interval covers the target. A mark is `not-an-origin`; an unknown label, case sequence or ordinal is `unknown-label`, `unknown-case-sequence` or `unknown-checkpoint`; a numeric form without its number is `invalid-origin`; a target outside the named origin's interval is `beyond-interval` |
 | `--inject-fault` | string | | A declared fault to inject before comparing, as `kind` or `kind:target` (repeatable or comma-separated): `cell-text[:row/column]`, `cell-style[:row/column]`, `cursor`, `mode[:name]`, `title`, `charset`, `tab-stop`, `pending-input`, `history-row[:index]`, `history-rows`, `pending-wrap`, `last-printed`, `rendition`, `margins`, `saved-cursor`, `pending-grapheme`, `activity`, `synchronized-update`, `title-stack`, `command-mark`, `pending-escape`, `pending-ground-escape`, `pending-framer` (the `pending-*` faults drop one holder of a live start's pending input; target the start). The result is labelled `faultInjected` |
 | `--max-differences` | int | `1000` | Most differences listed (1–100000); every difference is counted |
 | `--preview` | string | | `text`, `ansi`, `svg`, `html` (repeatable or comma-separated) |
@@ -322,7 +323,7 @@ writes its own directory, `reapplications/<n>`, inside the case.
 Without `--json` each command prints a summary. With `--json` it writes the full contract result.
 Refusals exit 1 with the problem code (`case-active`, `no-active-case`, `storage-refused`,
 `invalid-bounds`, `busy`, `invalid-label`, `incompatible`, `beyond-interval`, `unknown-model-sequence`,
-`not-an-origin`, `unknown-origin`, …).
+`not-an-origin`, `unknown-checkpoint`, `invalid-origin`, …).
 
 ### `capture recording start`
 

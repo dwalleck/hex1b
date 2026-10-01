@@ -145,8 +145,13 @@ internal static class DiagnosticContractNames
             values?.SelectMany(value => value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)).ToArray() is { Length: > 0 } list
                 ? list
                 : null;
-        // The origin is named as a target is (start, a label, case:N, checkpoint:N); the reapplier resolves it.
-        return (request with { Faults = Split(faults), Previews = Split(previews), From = string.IsNullOrWhiteSpace(from) ? null : from.Trim() }, null);
+        // The origin is named as a target is (start, a label, case:N or checkpoint:N); the reapplier resolves it, and a
+        // numeric form that is not one is refused here as such a target is.
+        var origin = string.IsNullOrWhiteSpace(from) ? null : from.Trim();
+        if (origin is not null && (origin.StartsWith("case:", StringComparison.Ordinal) || origin.StartsWith("checkpoint:", StringComparison.Ordinal))
+            && !long.TryParse(origin.AsSpan(origin.IndexOf(':') + 1), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out _))
+            return (null, Invalid("invalid-origin", $"'{origin}' is not case: or checkpoint: followed by a number."));
+        return (request with { Faults = Split(faults), Previews = Split(previews), From = origin }, null);
     }
 
     private static bool TryParseAuthorizations(IEnumerable<string>? names, out List<DiagnosticAuthorization> parsed, out string unsupported)

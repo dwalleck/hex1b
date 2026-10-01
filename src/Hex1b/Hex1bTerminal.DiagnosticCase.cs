@@ -220,7 +220,7 @@ public sealed partial class Hex1bTerminal
     // projecting, inside an application, after unapplied output, when it could not fit the case's remaining room, or
     // past the pending-state budget; refused after projecting when its exact size does not fit; never failing the
     // caller. Must hold _bufferLock.
-    private DiagnosticCaseRecorder.CheckpointCapture TakeCompleteCaptureUnsafe(long room, string subject, Action? beforeCapture)
+    private DiagnosticCaseRecorder.CheckpointCapture TakeCompleteCaptureUnsafe(long room, string subject, Action? beforeCapture, DiagnosticCaseRecorder? reserveWith = null)
     {
         if (_captureApplicationDepth > 0)
             return new(null, null, "unavailable", $"mid-application: the {subject} was taken inside an application that had not finished", 0);
@@ -232,8 +232,9 @@ public sealed partial class Hex1bTerminal
         var tooLarge = $"size-limit: the {subject} state is larger than the case's size bound leaves for its events";
         if (MinimumModelStateJsonBytesUnsafe() + DiagnosticCaseRecorder.StartLineAllowance > room)
             return new(null, null, "unavailable", tooLarge, 0);
+        // A start reserves nothing (nothing is pending at arming); a recovery reserves its share with the pending marks'.
         var estimate = EstimateModelStateBytesUnsafe();
-        if (estimate > DiagnosticCaseRecorder.PendingStateBudgetInEffect)
+        if (reserveWith is null ? estimate > DiagnosticCaseRecorder.PendingStateBudgetInEffect : !reserveWith.TryReserveStateBytes(estimate))
             return new(null, null, "unavailable", $"pending-state budget: the {subject} state is larger than the state a case may hold awaiting its writer", 0);
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
@@ -243,12 +244,12 @@ public sealed partial class Hex1bTerminal
             var jsonBytes = SerializedBytes(state);
             var milliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             if (jsonBytes + DiagnosticCaseRecorder.StartLineAllowance > room)
-                return new(null, null, "unavailable", $"{tooLarge} ({jsonBytes} bytes; projected and measured in {milliseconds:0.###} ms)", 0);
+                return new(null, null, "unavailable", $"{tooLarge} ({jsonBytes} bytes; projected and measured in {milliseconds:0.###} ms)", estimate);
             return new(state, milliseconds, "recorded", null, estimate, jsonBytes);
         }
         catch (Exception error)
         {
-            return new(null, null, "unavailable", DiagnosticCaseRecorder.Bounded($"capture-failed: {error.GetType().Name}: {error.Message}"), 0);
+            return new(null, null, "unavailable", DiagnosticCaseRecorder.Bounded($"capture-failed: {error.GetType().Name}: {error.Message}"), estimate);
         }
     }
 
@@ -277,8 +278,8 @@ public sealed partial class Hex1bTerminal
             }
 
             DiagnosticCaseRecorder.BeforeMarkCaptureForTesting.Value?.Invoke();
-            var sequence = _modelSequence;
-            var capture = TakeCompleteCaptureUnsafe(recorder.CheckpointRoom, "recovery", null);
+            var sequence = recorder.ApplicationInProgress ? _modelSequence - 1 : _modelSequence;
+            var capture = TakeCompleteCaptureUnsafe(recorder.CheckpointRoom, "recovery", null, recorder);
             var described = describe(_caseConfiguration, sequence, capture);
             var (ordinal, name) = recorder.RecordRecovery(label, sequence, capture, described);
             var complete = described.Status == DiagnosticCaseCheckpointStatus.Complete;

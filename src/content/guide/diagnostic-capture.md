@@ -505,10 +505,11 @@ re-applied from the start. A **recovery checkpoint** (`hex1b capture case recove
 start is, in one hold of the model lock at an event boundary, and holds the model's full text
 state at that model sequence (`checkpoint` line, trigger `recovery`, status `recorded`, with its
 `state`). It needs `reapplication-data`, and is classified as a start is: `complete`, or
-`unsupported` with the reason (`unsupported-surfaces` naming `dcs-continuation` or `graphics`, a
-state that would not fit the case's remaining room (`size-limit`), the pending-state budget, or a
-recovery requested inside an application), in which case the line records the boundary only and
-starts nothing. A recovery never waits for the writer (`busy` past 64 pending checkpoints) and
+`unsupported` with the reason (`unsupported-surfaces` naming `dcs-continuation` or `graphics`;
+`size-limit`, a state that would not fit what the case's events tier leaves after the queued events
+and the checkpoint states already awaiting the writer; `pending-state budget`, counted with those
+states; `mid-application`; `unapplied-output`; `configuration: …`; `capture-failed`), in which case
+the line records the boundary only and starts nothing. A recovery never waits for the writer (`busy` past 64 pending checkpoints) and
 never changes the loss already recorded or the case's initial checkpoint. The default label is
 `recovery-` and the checkpoint's ordinal.
 
@@ -517,26 +518,32 @@ complete `text-state/1` start) and each complete recovery, in checkpoint order, 
 `origin` (`trigger`, `label`, `checkpointOrdinal`, `caseSequence`, `modelSequence`). An origin's
 interval runs from its model sequence to the earliest end at or after it (a loss range, a recorded
 `interval-end`, a gap in the model sequences, truncation or interruption, or the stop); a later
-origin never changes an earlier interval. A recovery taken while events were still being dropped
-(lost events after it, before any retained one) is `inside-loss` and starts nothing; one taken at
-the last lost event, once the queue has room again, is a valid origin. A recovery whose state was
-not recorded is an invalid entry with its reason.
+origin never changes an earlier interval. A recovery whose own event the queue lost, with the loss
+continuing past it (a lost range that includes its sequence and extends beyond it), is `inside-loss`
+and starts nothing; one taken at the last lost event, once the queue has room again, is a valid
+origin, as is one taken just before a later loss (its interval then ends at that loss, possibly at
+the recovery itself). A recovery whose state was not recorded is an invalid entry with its reason.
 
 Re-application restores from the earliest valid origin whose interval covers the target and applies
 only the events after it; the result's `origin` says which. `--from` (`from`) names one instead:
-`start`, or a recovery by label (`label:name`, or the bare name), case sequence (`case:34`) or
-ordinal (`checkpoint:2`). A mark is `not-an-origin`, an unknown name `unknown-origin`, a label
-several recoveries share `ambiguous-label`, and a target outside the named origin's interval (or a
-named origin that is not re-applicable) `beyond-interval`, with `lastValidModelSequence` and
-`intervalEndReason`. A target inside a gap, or retained after it but before the next origin, is
-`beyond-interval`; every refusal comes before anything is built, and writes no run.
+`start`, or a recovery by label (`label:name`, or the bare name; a recovery labelled `start` is
+named `label:start`), case sequence (`case:34`) or ordinal (`checkpoint:2`). A mark is
+`not-an-origin`; an unknown label, case sequence or ordinal is `unknown-label`,
+`unknown-case-sequence` or `unknown-checkpoint`; a `case:` or `checkpoint:` form not followed by a
+number is `invalid-origin`; a label several recoveries share is `ambiguous-label`; a target outside
+the named origin's interval, or a named origin that is not re-applicable, is `beyond-interval`, with
+`lastValidModelSequence` (none for an origin that is not re-applicable) and `intervalEndReason`. A
+target inside a gap, or retained after it but before the next origin, is `beyond-interval`; before
+the first valid interval, the refusal names why the initial checkpoint is not an origin. Every
+refusal comes before anything is built, and writes no run.
 
 Past 1,024 recorded ranges a stream's further loss is one range of unknown extent
 (`overload-unknown-extent`). When the case stops, it writes a `loss-envelope` line with the first
 and last ordinal that range lost, and inspection reports the range bounded by it (`extent:
-"envelope"`): a recovery inside the envelope is `inside-loss`, one after it a valid origin. An
-interrupted case keeps the range open-ended, so a recovery after it is invalid until the case is
-complete. The failure paths are unchanged: a writer failure, drain timeout, disposal, missing
+"envelope"`): a recovery inside the envelope is `inside-loss`, one after it a valid origin, and a
+gap in the events past the envelope is loss of unknown cause (`unknown`). A case interrupted before
+its closing records are written has no envelope, so the range stays open-ended and a recovery after
+it is invalid. The failure paths are unchanged: a writer failure, drain timeout, disposal, missing
 completion or truncation after a recovery ends its interval with the existing reason at the last
 verified event, and the earlier intervals stay as they were.
 
@@ -648,8 +655,9 @@ fault), and any previews:
 - `recorded.txt`: the recorded checkpoint's screen text (with a `text` preview).
 
 Problem codes: `invalid-path`, `invalid-target`, `invalid-max-differences`, `invalid-fault`,
-`invalid-preview`, `unknown-label`, `ambiguous-label`, `unknown-case-sequence`, `not-a-boundary`,
-`not-an-origin`, `unknown-origin` and `unknown-model-sequence` (`invalid-request`); `case-not-found`, `incompatible` (an old format;
+`invalid-preview`, `invalid-origin`, `unknown-label`, `ambiguous-label`, `unknown-case-sequence`,
+`unknown-checkpoint`, `not-a-boundary`, `not-an-origin` and `unknown-model-sequence`
+(`invalid-request`); `case-not-found`, `incompatible` (an old format;
 a missing or unknown configuration field; an impossible value; or an unknown reflow strategy,
 capability or projection profile; each named in the message), `no-valid-interval` and
 `beyond-interval` (with `lastValidModelSequence` and `intervalEndReason`) (`unavailable`);

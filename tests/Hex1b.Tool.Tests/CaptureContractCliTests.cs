@@ -1212,7 +1212,7 @@ public class CaptureContractCliTests
             (["--to", "stop", "--from", "cli-recover"], new() { Path = path, ToLabel = "stop", From = "cli-recover" }, null, "cli-recover"),
             (["--to", "stop", "--from", $"checkpoint:{line.Checkpoint.Ordinal}"], new() { Path = path, ToLabel = "stop", From = $"checkpoint:{line.Checkpoint.Ordinal}" }, null, "cli-recover"),
             (["--to", "stop", "--from", "cli-mark"], new() { Path = path, ToLabel = "stop", From = "cli-mark" }, "not-an-origin", null),
-            (["--to", "stop", "--from", "nobody"], new() { Path = path, ToLabel = "stop", From = "nobody" }, "unknown-origin", null),
+            (["--to", "stop", "--from", "nobody"], new() { Path = path, ToLabel = "stop", From = "nobody" }, "unknown-label", null),
             (["--to", "cli-mark", "--from", "cli-recover"], new() { Path = path, ToLabel = "cli-mark", From = "cli-recover" }, "beyond-interval", null),
         })
         {

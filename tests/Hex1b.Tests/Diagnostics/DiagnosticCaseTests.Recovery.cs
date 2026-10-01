@@ -17,8 +17,10 @@ public partial class DiagnosticCaseTests
     public async Task Recover_RecordsACompleteCheckpoint()
     {
         // Real overload (the writer held while the queue overflows), then a recovery: its line has trigger recovery,
-        // status recorded and the state, at the model sequence the result names; every later model event follows it
-        // once; the manifest and the loss ranges are unchanged.
+        // status recorded and the state, at the model sequence the result names; every model event at or before that
+        // sequence precedes the line, every later one is recorded once with a greater sequence (not necessarily after
+        // the line in the file: the writer drains the queue before a pending checkpoint); the manifest and the loss
+        // ranges are unchanged.
         using var root = new CaseRoot();
         using var gate = new ManualResetEventSlim(false);
         DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
@@ -146,10 +148,22 @@ public partial class DiagnosticCaseTests
             Height = height,
             ScrollbackCapacity = 100,
         };
-        var (terminal, started) = Hex1bTerminal.CreateWithDiagnosticCase(options,
-            new DiagnosticCaseStartRequest { Directory = root.Path, MaxBytes = maxBytes, Authorizations = [DiagnosticAuthorization.ReapplicationData] });
+        // The pending-state budget is the recorder's from its construction, as for marks.
+        DiagnosticCaseRecorder.PendingStateBudgetForTesting.Value = shape == "pending-state-budget" ? 1 : null;
+        Hex1bTerminal terminal;
+        DiagnosticCaseResult started;
+        try
+        {
+            (terminal, started) = Hex1bTerminal.CreateWithDiagnosticCase(options,
+                new DiagnosticCaseStartRequest { Directory = root.Path, MaxBytes = maxBytes, Authorizations = [DiagnosticAuthorization.ReapplicationData] });
+        }
+        finally
+        {
+            DiagnosticCaseRecorder.PendingStateBudgetForTesting.Value = null;
+        }
         var path = started.Path!;
         DiagnosticCaseRecoverResult? result = null;
+        long beforeTitle = -1;
         var diagnostics = new TerminalDiagnostics(terminal);
         await using (terminal)
         {
@@ -159,6 +173,7 @@ public partial class DiagnosticCaseTests
                 switch (shape)
                 {
                     case "mid-application":
+                        beforeTitle = terminal.CurrentModelSequence;
                         terminal.WindowTitleChanged += _ => result ??= diagnostics.RecoverCase("inside");
                         await workload.WriteAndWaitAsync(terminal, "\u001b]0;titled\u0007");
                         break;
@@ -179,17 +194,6 @@ public partial class DiagnosticCaseTests
                         await workload.WriteAndWaitAsync(terminal, "\u001bPq#0;2;100;0;0#0~~~~\u001b\\");
                         result = diagnostics.RecoverCase("sixel");
                         break;
-                    case "pending-state-budget":
-                        DiagnosticCaseRecorder.PendingStateBudgetForTesting.Value = 1;
-                        try
-                        {
-                            result = diagnostics.RecoverCase("budget");
-                        }
-                        finally
-                        {
-                            DiagnosticCaseRecorder.PendingStateBudgetForTesting.Value = null;
-                        }
-                        break;
                     default:
                         result = diagnostics.RecoverCase(shape);
                         break;
@@ -200,6 +204,8 @@ public partial class DiagnosticCaseTests
         }
 
         Assert.IsNotNull(result, "fixture: no recovery was requested");
+        if (shape == "mid-application")
+            Assert.AreEqual(beforeTitle, result.ModelSequence, "the boundary of a recovery refused inside an application is not the model sequence before it, as a mark's is");
         var code = shape.Split(':')[0];
         Assert.AreEqual((DiagnosticOutcome.Unavailable, "unsupported", code), (result.Outcome, result.Status, result.Problem?.Code), result.Problem?.Message);
         StringAssert.StartsWith(result.Reason, code.Replace("pending-state-budget", "pending-state budget"), shape);
@@ -462,10 +468,10 @@ public partial class DiagnosticCaseTests
             root = Path.GetDirectoryName(root) ?? throw new InvalidOperationException("repository root not found");
         var text = File.ReadAllText(Path.Combine(root, relativePath));
         string[] expected = relativePath.EndsWith("cli.md", StringComparison.Ordinal)
-            ? ["capture case recover", "`--from`", "origin", "envelope", "`not-an-origin`", "`unknown-origin`", "`beyond-interval`"]
+            ? ["capture case recover", "`--from`", "origin", "envelope", "`not-an-origin`", "`unknown-label`", "`beyond-interval`", "`invalid-origin`"]
             : relativePath.EndsWith("SKILL.md", StringComparison.Ordinal)
                 ? ["`recover_diagnostic_case`", "`from`", "origin", "envelope", "`beyond-interval`"]
-                : ["`recover_diagnostic_case`", "`case-recover`", "`--from`", "`origin`", "`loss-envelope`", "`inside-loss`", "`not-an-origin`", "`unknown-origin`", "`beyond-interval`"];
+                : ["`recover_diagnostic_case`", "`case-recover`", "`--from`", "`origin`", "`loss-envelope`", "`inside-loss`", "`not-an-origin`", "`unknown-label`", "`unknown-case-sequence`", "`unknown-checkpoint`", "`invalid-origin`", "`beyond-interval`"];
         foreach (var term in expected)
             StringAssert.Contains(text, term, relativePath);
     }

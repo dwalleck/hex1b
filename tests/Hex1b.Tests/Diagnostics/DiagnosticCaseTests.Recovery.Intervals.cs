@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Hex1b.Diagnostics;
@@ -19,6 +20,7 @@ public partial class DiagnosticCaseTests
     [DataRow("two losses, three recoveries")]
     [DataRow("origin inside loss")]
     [DataRow("ends per segment")]
+    [DataRow("origin at the first lost event")]
     public async Task Intervals_OnePerOrigin(string shape)
     {
         // One interval per origin, each ending at the earliest end at or after it; a later origin never changes an
@@ -118,6 +120,20 @@ public partial class DiagnosticCaseTests
                             expected.Add(new("recovery", "r1", true, r1.ModelSequence, secondEnd - 1, "application-without-ingress"));
                             break;
                         }
+                        case "origin at the first lost event":
+                        {
+                            // A range that begins at the origin's own event and continues past it covers the origin.
+                            await DrainAsync(gate, diagnostics);
+                            await FloodAsync(terminal, workload, 10);
+                            var r1 = Recover(diagnostics, "r1");
+                            var ledger = terminal.DiagnosticCase!.LossForTesting;
+                            ledger.Record(CaseStream.Model, r1.ModelSequence!.Value);
+                            ledger.Record(CaseStream.Model, r1.ModelSequence.Value + 1);
+                            await FloodAsync(terminal, workload, 5);
+                            expected.Add(new("start", null, true, 0, r1.ModelSequence - 1, "overload"));
+                            expected.Add(new("recovery", "r1", false, r1.ModelSequence, null, "inside-loss"));
+                            break;
+                        }
                     }
                     await Settle(terminal);
                     last = terminal.CurrentModelSequence;
@@ -203,6 +219,25 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual((null, null), (openRange.ToOrdinal, openRange.Extent), "an unbounded range was bounded");
         var reopened = open.Intervals.Single(i => i.Origin?.Label == "after");
         Assert.IsFalse(reopened.Valid, $"a recovery after an open-ended loss started an interval: {reopened.EndReason}");
+
+        // The envelope kept and a model event after it removed: the gap past the envelope is loss of unknown cause, not
+        // part of the bounded range.
+        var gapped = Path.Combine(root.Path, "gapped");
+        Directory.CreateDirectory(gapped);
+        foreach (var file in Directory.GetFiles(path))
+            File.Copy(file, Path.Combine(gapped, Path.GetFileName(file)));
+        var removed = envelopeEnd + 100;
+        var gappedEvents = Path.Combine(gapped, "events.jsonl");
+        File.WriteAllLines(gappedEvents, File.ReadAllLines(gappedEvents).Where(l => !IsModelOrdinal(l, removed)));
+        var unknownGap = Inspect(gapped).Streams.Single(s => s.Stream == "model").Missing.Where(m => m.Reason == "unknown").ToList();
+        Assert.AreEqual(1, unknownGap.Count, "the gap past the envelope is not reported as unknown loss");
+        Assert.AreEqual((removed, removed), (unknownGap[0].FromOrdinal, unknownGap[0].ToOrdinal));
+    }
+
+    private static bool IsModelOrdinal(string line, long ordinal)
+    {
+        using var document = System.Text.Json.JsonDocument.Parse(line[(line.IndexOf('\t') + 1)..]);
+        return document.RootElement.GetProperty("stream").GetString() == "model" && document.RootElement.GetProperty("ordinal").GetInt64() == ordinal;
     }
 
     [TestMethod]
@@ -258,11 +293,14 @@ public partial class DiagnosticCaseTests
     [DataRow("checkpoint:")]
     [DataRow("m")]
     [DataRow("nope")]
+    [DataRow("case:999999")]
+    [DataRow("checkpoint:99")]
     [DataRow("u")]
     public async Task Reapply_FromOverrides(string form)
     {
         // Every form of --from: the start (refused across the gap), the recovery by label, case sequence or ordinal
-        // (matched), a mark (not an origin), an unknown name, and an unsupported recovery (refused with its reason).
+        // (matched, a mark sharing the label notwithstanding), a mark (not an origin), an unknown label, case sequence
+        // or ordinal (each with its code), and an unsupported recovery (refused with its reason).
         using var root = new CaseRoot();
         var (terminal, workload, path, gate) = HeldCase(root);
         DiagnosticCaseRecoverResult r1, u;
@@ -277,6 +315,7 @@ public partial class DiagnosticCaseTests
                     await FloodAsync(terminal, workload, CaseEventQueueMax + 700);
                     await DrainAsync(gate, diagnostics);
                     r1 = Recover(diagnostics, "r1");
+                    Mark(diagnostics, "r1");
                     await workload.WriteAndWaitAsync(terminal, "after ");
                     Mark(diagnostics, "m");
                     await workload.WriteAndWaitAsync(terminal, "\u001bP$q");
@@ -308,8 +347,9 @@ public partial class DiagnosticCaseTests
             case "m":
                 Assert.AreEqual((DiagnosticOutcome.InvalidRequest, "not-an-origin"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
                 break;
-            case "nope":
-                Assert.AreEqual((DiagnosticOutcome.InvalidRequest, "unknown-origin"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
+            case "nope" or "case:999999" or "checkpoint:99":
+                var unknown = form switch { "nope" => "unknown-label", "case:999999" => "unknown-case-sequence", _ => "unknown-checkpoint" };
+                Assert.AreEqual((DiagnosticOutcome.InvalidRequest, unknown), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
                 break;
             default:
                 Assert.AreEqual((DiagnosticOutcome.Unavailable, "beyond-interval"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
@@ -538,7 +578,7 @@ public partial class DiagnosticCaseTests
         {
             Assert.AreEqual(DiagnosticCaseStopReason.CollectorFailed, inspection.Completion!.StopReason);
             var counts = inspection.Completion.Checkpoints!;
-            Assert.AreEqual((1L, counts.Offered), (counts.Offered, counts.Written + counts.Dropped), "the pending recovery is neither written nor declared");
+            Assert.AreEqual((1L, counts.Offered), (counts.Offered, counts.Written + counts.Dropped), "the pending recovery is not accounted as written or dropped");
             var failedInitial = intervals[0];
             Assert.AreEqual((true, 0L, 0L, "collector-failed"), (failedInitial.Valid, failedInitial.FromModelSequence, failedInitial.ToModelSequence, failedInitial.EndReason), Describe(intervals));
             var pending = intervals.Single(i => i.Origin is { Trigger: "recovery" });
@@ -624,6 +664,246 @@ public partial class DiagnosticCaseTests
             DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
         }
     }
+
+    [TestMethod]
+    public async Task Reapply_RecoveryAfterAnUnsupportedStart()
+    {
+        // A live start taken with a DCS in progress is unsupported, so the case has no re-applicable interval until a
+        // recovery: the recovery is the first valid origin; a target before it is refused naming the start's reason and
+        // no last valid sequence, as is --from start; targets after it re-apply from the recovery.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = HistoryTerminal(workload, null, 100);
+        var diagnostics = new TerminalDiagnostics(terminal);
+        string path;
+        DiagnosticCaseRecoverResult r1;
+        long between;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "before \u001bP$q");
+            path = StartLive(terminal, root);
+            await workload.WriteAndWaitAsync(terminal, "m\u001b\\ one");
+            between = terminal.CurrentModelSequence;
+            await workload.WriteAndWaitAsync(terminal, " two");
+            r1 = Recover(diagnostics, "r1");
+            await workload.WriteAndWaitAsync(terminal, " after");
+            Mark(diagnostics, "m");
+            await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+        var inspection = Inspect(path);
+        Assert.AreEqual(DiagnosticCaseCheckpointStatus.Unsupported, inspection.Manifest!.Checkpoint.Status, "fixture: the start is not unsupported");
+        var intervals = inspection.Intervals;
+        Assert.AreEqual(2, intervals.Count, Describe(intervals));
+        Assert.IsFalse(intervals[0].Valid, Describe(intervals));
+        StringAssert.StartsWith(intervals[0].EndReason, "checkpoint unsupported");
+        Assert.IsTrue(intervals[1].Valid && intervals[1].Origin is { Trigger: "recovery", Label: "r1" }, Describe(intervals));
+
+        var before = Reapply(path, modelSequence: between);
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "beyond-interval", (long?)null), (before.Outcome, before.Problem?.Code, before.LastValidModelSequence), before.Problem?.Message);
+        StringAssert.StartsWith(before.IntervalEndReason, "checkpoint unsupported", before.Problem?.Message);
+        StringAssert.Contains(before.Problem!.Message, "checkpoint unsupported");
+        var fromStart = Reapply(new DiagnosticCaseReapplyRequest { Path = path, ToLabel = "m", From = "start" });
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "beyond-interval", (long?)null), (fromStart.Outcome, fromStart.Problem?.Code, fromStart.LastValidModelSequence), fromStart.Problem?.Message);
+        StringAssert.StartsWith(fromStart.IntervalEndReason, "checkpoint unsupported", fromStart.Problem?.Message);
+        Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), "a refused re-application wrote a run");
+        foreach (var label in new[] { "r1", "m", "stop" })
+        {
+            var result = Reapply(path, label: label);
+            AssertMatched(result, label);
+            Assert.AreEqual("r1", result.Origin!.Label, label);
+        }
+    }
+
+    [TestMethod]
+    public void ReapplyRequest_FromForms()
+    {
+        // The parser trims and keeps an origin name, drops an empty one, and refuses a case: or checkpoint: form that
+        // is not followed by a number, as it refuses such a target.
+        static (DiagnosticCaseReapplyRequest? Request, DiagnosticCaseReapplyResult? Invalid) Parse(string? from) =>
+            DiagnosticContractNames.ParseCaseReapplyRequest("/case", "stop", null, null, null, from);
+        Assert.AreEqual("r1", Parse("r1").Request!.From);
+        Assert.AreEqual("label:r1", Parse(" label:r1 ").Request!.From);
+        Assert.AreEqual("checkpoint:2", Parse("checkpoint:2").Request!.From);
+        Assert.AreEqual("case:34", Parse("case:34").Request!.From);
+        Assert.IsNull(Parse("").Request!.From);
+        Assert.IsNull(Parse(null).Request!.From);
+        foreach (var bad in new[] { "case:abc", "checkpoint:x", "case:", "checkpoint:-1" })
+        {
+            var (request, invalid) = Parse(bad);
+            Assert.IsNull(request, bad);
+            Assert.AreEqual((DiagnosticOutcome.InvalidRequest, "invalid-origin"), (invalid!.Outcome, invalid.Problem?.Code), bad);
+        }
+    }
+
+    [TestMethod]
+    public async Task Recovery_OneEndPerSegment()
+    {
+        // With the writer running, a segment's first end is written once: a later end in the same segment, raised after
+        // the first was written, adds no line; a recovery opens a segment whose own first end is written.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+            .Build();
+        var diagnostics = new TerminalDiagnostics(terminal);
+        var path = diagnostics.GetCaseStatus().Path!;
+        long firstEnd, recoveredEnd;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "a");
+            terminal.EnterAlternateScreen();
+            firstEnd = terminal.CurrentModelSequence;
+            await workload.WriteAndWaitAsync(terminal, "b");
+            await WrittenAsync(diagnostics, 3);
+            terminal.ExitAlternateScreen();
+            await workload.WriteAndWaitAsync(terminal, "c");
+            await WrittenAsync(diagnostics, 5);
+            Recover(diagnostics, "r1");
+            await workload.WriteAndWaitAsync(terminal, "d");
+            terminal.EnterAlternateScreen();
+            recoveredEnd = terminal.CurrentModelSequence;
+            await workload.WriteAndWaitAsync(terminal, "e");
+            await WrittenAsync(diagnostics, 8);
+            terminal.ExitAlternateScreen();
+            await workload.WriteAndWaitAsync(terminal, "f");
+            await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+        var ends = Artifact.Read(path).Events.Where(e => e.GetProperty("kind").GetString() == "interval-end").Select(e => e.GetProperty("modelSequence").GetInt64()).ToList();
+        CollectionAssert.AreEqual(new[] { firstEnd, recoveredEnd }, ends, $"the interval ends written: {string.Join(",", ends)}");
+    }
+
+    [TestMethod]
+    public async Task Recover_RefusedWhenTheQueueLeavesNoRoom()
+    {
+        // The room a recovery's state must fit is what the events tier leaves after the queued events and the pending
+        // checkpoint states, which are written before its line: with the writer held, a mark pending and the queue
+        // holding most of a 1 MiB case, the recovery is refused size-limit, and a recovery reported complete always has
+        // its state in the artifact.
+        using var root = new CaseRoot();
+        using var gate = new ManualResetEventSlim(false);
+        DiagnosticCaseRecorder.WriterGateForTesting.Value = gate;
+        Hex1bTerminal terminal;
+        var workload = new ScriptedWorkload();
+        try
+        {
+            terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
+                .WithDiagnosticCase(new DiagnosticCaseStartRequest { Directory = root.Path, MaxBytes = DiagnosticCaseRecorder.MinMaxBytes, Authorizations = [DiagnosticAuthorization.ReapplicationData] })
+                .Build();
+        }
+        finally
+        {
+            DiagnosticCaseRecorder.WriterGateForTesting.Value = null;
+        }
+        await using (terminal)
+        {
+            var diagnostics = new TerminalDiagnostics(terminal);
+            var path = diagnostics.GetCaseStatus().Path!;
+            var recorder = terminal.DiagnosticCase!;
+            DiagnosticCaseRecoverResult result;
+            using (new Running(terminal))
+            {
+                try
+                {
+                    await FloodAsync(terminal, workload, 5);
+                    Mark(diagnostics, "pending");
+                    var stateBytes = recorder.PendingStateBytesForTesting;
+                    Assert.IsTrue(stateBytes > 0, "fixture: the mark holds no state");
+                    // What the tier leaves now, less half a state: once the queue holds that much, a recovery cannot fit
+                    // behind it.
+                    var target = recorder.CheckpointRoom + recorder.QueuedBytesForTesting + recorder.PendingStateBytesForTesting - stateBytes / 2;
+                    var chunk = new byte[2048];
+                    Array.Fill(chunk, (byte)'q');
+                    var total = terminal.OutputBytesRead;
+                    while (recorder.QueuedBytesForTesting < target)
+                    {
+                        workload.Enqueue(chunk);
+                        total += chunk.Length;
+                        await WaitAsync(() => terminal.OutputBytesRead == total, TimeSpan.FromSeconds(60));
+                    }
+                    await Settle(terminal);
+                    result = diagnostics.RecoverCase("behind-the-queue");
+                    Assert.AreEqual((DiagnosticOutcome.Unavailable, "unsupported", "size-limit"), (result.Outcome, result.Status, result.Problem?.Code), result.Problem?.Message);
+                    gate.Set();
+                    await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+                }
+                finally
+                {
+                    gate.Set();
+                }
+            }
+            var line = Recoveries(Artifact.Read(path)).Single().GetProperty("checkpoint");
+            var hasState = line.TryGetProperty("state", out var state) && state.ValueKind == JsonValueKind.Object;
+            Assert.AreEqual(result.Status == "complete", hasState, $"a recovery reported {result.Status} has state in the artifact: {hasState} ({line.GetProperty("status")}, {line.TryGetProperty("reason", out var why)})");
+            Assert.AreEqual("unsupported", line.GetProperty("status").GetString());
+            StringAssert.StartsWith(line.GetProperty("reason").GetString(), "size-limit");
+        }
+    }
+
+    [TestMethod]
+    public async Task Recover_ReservesItsPendingState()
+    {
+        // The recovery's state counts against the pending-state budget together with the marks already awaiting the
+        // writer, as a mark's does: with a budget of two and a half states and two marks pending, the recovery is
+        // refused (pending-state budget), the pending bytes never pass the budget, and the refusal holds nothing.
+        long stateBytes;
+        using (var probe = new CaseRoot())
+        {
+            var (terminal, workload, _, gate) = HeldCase(probe);
+            await using (terminal)
+            using (gate)
+            using (new Running(terminal))
+            {
+                await FloodAsync(terminal, workload, 5);
+                Mark(new TerminalDiagnostics(terminal), "m");
+                stateBytes = terminal.DiagnosticCase!.PendingStateBytesForTesting;
+                gate.Set();
+            }
+        }
+        Assert.IsTrue(stateBytes > 0, "fixture: a mark holds no state");
+        var budget = stateBytes * 5 / 2;
+        using var root = new CaseRoot();
+        DiagnosticCaseRecorder.PendingStateBudgetForTesting.Value = budget;
+        (Hex1bTerminal Terminal, ScriptedWorkload Workload, string Path, ManualResetEventSlim Gate) held;
+        try
+        {
+            held = HeldCase(root);
+        }
+        finally
+        {
+            DiagnosticCaseRecorder.PendingStateBudgetForTesting.Value = null;
+        }
+        var (terminal2, workload2, _, gate2) = held;
+        await using (terminal2)
+        using (gate2)
+        {
+            var diagnostics = new TerminalDiagnostics(terminal2);
+            var recorder = terminal2.DiagnosticCase!;
+            using (new Running(terminal2))
+            {
+                try
+                {
+                    await FloodAsync(terminal2, workload2, 5);
+                    Mark(diagnostics, "one");
+                    Mark(diagnostics, "two");
+                    Assert.AreEqual(2 * stateBytes, recorder.PendingStateBytesForTesting, "fixture: two marks pending");
+                    var result = diagnostics.RecoverCase("third");
+                    Assert.AreEqual((DiagnosticOutcome.Unavailable, "unsupported", "pending-state-budget"), (result.Outcome, result.Status, result.Problem?.Code), result.Problem?.Message);
+                    Assert.IsTrue(recorder.PendingStateBytesForTesting <= budget, $"the pending state {recorder.PendingStateBytesForTesting} passed the budget {budget}");
+                    gate2.Set();
+                    await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+                }
+                finally
+                {
+                    gate2.Set();
+                }
+            }
+            Assert.AreEqual(0L, recorder.PendingStateBytesForTesting, "the refused recovery kept a reservation");
+        }
+    }
+
+    // Waits until the case has written at least `events` model events.
+    private static Task WrittenAsync(TerminalDiagnostics diagnostics, long events) =>
+        WaitAsync(() => diagnostics.GetCaseStatus().Streams.Single(s => s.Stream == "model").Written >= events, TimeSpan.FromSeconds(30));
 
     // A fresh-model case started at construction with reapplication-data and its writer held at a gate the caller
     // releases (and may hold again); the gate is read when the recorder is created.

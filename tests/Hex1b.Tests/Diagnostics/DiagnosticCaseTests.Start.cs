@@ -496,6 +496,7 @@ public partial class DiagnosticCaseTests
         {
             ("no state", copy => EditEventLine(copy, IsStart, node => node["checkpoint"]!.AsObject().Remove("state"))),
             ("no line", copy => RemoveEventLine(copy, IsStart)),
+            ("wrong sequence", copy => EditEventLine(copy, IsStart, node => node["modelSequence"] = node["modelSequence"]!.GetValue<long>() + 1)),
         })
         {
             var copy = CopyCase(root, path, name.Replace(' ', '-'));
