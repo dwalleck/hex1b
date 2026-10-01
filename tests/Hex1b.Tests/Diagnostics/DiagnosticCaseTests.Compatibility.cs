@@ -23,12 +23,18 @@ public partial class DiagnosticCaseTests
     [DataRow("unknown-label")]
     [DataRow("no-manifest")]
     [DataRow("storage-refused")]
+    [DataRow("beyond-interval")]
+    [DataRow("reapplication-failed")]
+    [DataRow("damaged-manifest")]
+    [DataRow("identity-string")]
+    [DataRow("build-number")]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task Compatibility_RecordOnEveryResult(string shape)
     {
         using var root = new CaseRoot();
         var path = await RecordCaseAsync(root, CompatibilityCorpus, new HeadlessPresentationAdapter(20, 4));
         string? label = "m1";
+        long? modelSequence = null;
         switch (shape)
         {
             case "format-3": EditManifest(path, m => m["formatVersion"] = 3); break;
@@ -38,9 +44,23 @@ public partial class DiagnosticCaseTests
             case "storage-refused":
                 File.SetUnixFileMode(path, File.GetUnixFileMode(path) | UnixFileMode.GroupRead | UnixFileMode.GroupExecute);
                 break;
+            case "beyond-interval": File.Delete(Path.Combine(path, "completion.json")); label = null; modelSequence = 999_999; break;
+            case "reapplication-failed": CaseReapplier.AfterEventForTesting.Value = _ => throw new InvalidOperationException("injected"); break;
+            // Parseable manifests the inspection refuses (R2): the record and the producer are still filled.
+            case "damaged-manifest": EditManifest(path, m => m["checkpoint"] = null); break;
+            case "identity-string": EditManifest(path, m => m["identity"] = "not an object"); break;
+            case "build-number": EditManifest(path, m => m["identity"]!["hex1bBuild"] = 5); break;
         }
 
-        var result = Reapply(path, label: label);
+        DiagnosticCaseReapplyResult result;
+        try
+        {
+            result = Reapply(path, label: label, modelSequence: modelSequence);
+        }
+        finally
+        {
+            CaseReapplier.AfterEventForTesting.Value = null;
+        }
         var (expectedOutcome, expectedCode, verdicts) = shape switch
         {
             "captured" => (DiagnosticOutcome.Captured, null, "c c c c c c c"),
@@ -48,14 +68,20 @@ public partial class DiagnosticCaseTests
             "unknown-strategy" => (DiagnosticOutcome.Unavailable, "incompatible", "c c c c i n n"),
             "unknown-label" => (DiagnosticOutcome.InvalidRequest, "unknown-label", "c c c c c c n"),
             "no-manifest" => (DiagnosticOutcome.Failed, "invalid-artifact", "n n n n n n n"),
+            "beyond-interval" => (DiagnosticOutcome.Unavailable, "beyond-interval", "c c c c c c n"),
+            "reapplication-failed" => (DiagnosticOutcome.Failed, "reapplication-failed", "c c c c c c c"),
+            "damaged-manifest" or "identity-string" or "build-number" => (DiagnosticOutcome.Failed, "invalid-artifact", "c n n n n n n"),
             _ => (DiagnosticOutcome.Failed, "storage-refused", "n n n n n n n"),
         };
         Assert.AreEqual((expectedOutcome, expectedCode), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
         AssertRecord(result.Compatibility, verdicts, shape);
         // The manifest's build id is read with the raw manifest: before the inspection, so even the format refusal compares it,
-        // and the result names the recording build whenever the manifest was read (the E2E found the format refusal without it).
-        Assert.AreEqual(shape is "no-manifest" or "storage-refused" ? null : true, result.Compatibility.SameBuild, shape);
-        Assert.AreEqual(shape is "no-manifest" or "storage-refused" ? null : TerminalDiagnostics.Hex1bBuild, result.Producer?.Hex1bBuild, $"{shape}: producer");
+        // and the result names the recording build whenever a manifest with the identity's shape was read.
+        var unread = shape is "no-manifest" or "storage-refused";
+        var noId = unread || shape is "identity-string" or "build-number";
+        Assert.AreEqual(noId ? null : true, result.Compatibility.SameBuild, shape);
+        Assert.AreEqual(noId ? null : TerminalDiagnostics.Hex1bBuild, result.Producer?.Hex1bBuild, $"{shape}: producer");
+        Assert.AreEqual(TerminalDiagnostics.Hex1bBuild, result.Consumer?.Hex1bBuild, $"{shape}: consumer");
         if (shape != "captured")
             return;
 
@@ -73,14 +99,15 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     [DataRow("formatVersion", "format-3", "3", "2", "formatVersion: the artifact declares 3; this build reads 2.", "i n n n n n n")]
     [DataRow("contractVersion", "contract-2", "2", "1", "contractVersion: the artifact declares 2; this build speaks 1.", "c i n n n n n")]
-    [DataRow("checkpoint.profile", "start-profile", "start: fresh-model/9", "fresh-model/1, text-state/1", "checkpoint.profile: unknown profile 'fresh-model/9'; this build projects fresh-model/1, text-state/1.", "c c i n n n n")]
+    [DataRow("checkpoint.profile", "start-profile", "start: fresh-model/9", "fresh-model/1, text-state/1", "checkpoint.profile: unknown profile 'fresh-model/9'", "c c i n n n n")]
     [DataRow("checkpoint.coveredSurfaces", "surfaces-fewer", "geometry-and-text-buffers", "graphics-placements-and-resources", "missing: graphics-placements-and-resources.", "c c c i n n n")]
     [DataRow("checkpoint.coveredSurfaces", "surfaces-more", "selection-state", "command-marks", "unknown: selection-state.", "c c c i n n n")]
     [DataRow("checkpoint.coveredSurfaces", "surfaces-renamed", "selection-state", "command-marks", "missing: command-marks; unknown: selection-state.", "c c c i n n n")]
     [DataRow("configuration", "width-missing", "height", "width", "configuration.width: missing", "c c c c i n n")]
     [DataRow("configuration.capabilities", "mouse-missing", "supportsSixel", "supportsMouse", "capabilities.supportsMouse: missing", "c c c c c i n")]
     [DataRow("configuration.capabilities", "mouse-missing-holograms-unknown", "supportsHolograms", "supportsMouse", "capabilities.supportsMouse: missing", "c c c c c i n")]
-    [DataRow("checkpoint.profile", "target-profile", "start: fresh-model/1; target: text-state/9", "fresh-model/1, text-state/1", "checkpoint.profile: unknown projection profile 'text-state/9'; this build projects fresh-model/1, text-state/1.", "c c i c c c n")]
+    [DataRow("checkpoint.profile", "target-profile", "start: fresh-model/1; target: text-state/9", "fresh-model/1, text-state/1", "checkpoint.profile: unknown projection profile 'text-state/9'", "c c i c c c n")]
+    [DataRow("checkpoint.profile", "start-without-sequence", "start: text-state/1", "fresh-model/1, text-state/1", "checkpoint.modelSequence: a text-state/1 start names no model sequence", "c c i n n n n")]
     public async Task Compatibility_RefusesByArtifactDeclaration(string check, string edit, string producerHas, string consumerHas, string message, string verdicts)
     {
         using var root = new CaseRoot();
@@ -104,6 +131,7 @@ public partial class DiagnosticCaseTests
                 });
                 break;
             case "target-profile": EditEventLine(path, e => e["kind"]?.GetValue<string>() == "checkpoint", e => e["checkpoint"]!["profile"] = "text-state/9"); break;
+            case "start-without-sequence": EditManifest(path, m => { m["checkpoint"]!["profile"] = "text-state/1"; m["checkpoint"]!.AsObject().Remove("modelSequence"); }); break;
         }
         var before = HashCaseFiles(path);
 
@@ -115,8 +143,20 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual(check, failed.Check, edit);
         StringAssert.Contains(failed.Producer, producerHas, $"{edit}: producer {failed.Producer}");
         StringAssert.Contains(failed.Consumer, consumerHas, $"{edit}: consumer {failed.Consumer}");
+        // The message itself carries both values (R2: the record and the clients did, the message did not).
+        StringAssert.Contains(result.Problem.Message, failed.Producer, $"{edit}: the message lacks the case's value");
+        StringAssert.Contains(result.Problem.Message, failed.Consumer, $"{edit}: the message lacks this build's value");
         Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), $"{edit}: an incompatible case was written to");
         CollectionAssert.AreEqual(before, HashCaseFiles(path), $"{edit}: the case's files changed");
+    }
+
+    [TestMethod]
+    public async Task Compatibility_SurfacesDuplicatesAreIgnored()
+    {
+        using var root = new CaseRoot();
+        var path = await RecordCaseAsync(root, CompatibilityCorpus, new HeadlessPresentationAdapter(20, 4));
+        EditManifest(path, m => m["checkpoint"]!["coveredSurfaces"]!.AsArray().Add("command-marks"));
+        AssertMatched(Reapply(path, label: "m1"), "a duplicated surface");
     }
 
     [TestMethod]
@@ -176,8 +216,11 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     [DataRow("formatVersion", "format-3", "2", "3", "formatVersion: the artifact declares 2; this build reads 3.", "i n n n n n n")]
     [DataRow("contractVersion", "contract-2", "1", "2", "contractVersion: the artifact declares 1; this build speaks 2.", "c i n n n n n")]
-    [DataRow("checkpoint.profile", "fresh-only", "target: text-state/1", "fresh-model/1", "unknown projection profile 'text-state/1'; this build projects fresh-model/1.", "c c i c c c n")]
-    [DataRow("checkpoint.coveredSurfaces", "one-more-surface", "command-marks", "selection-state", "missing: selection-state.", "c c c i n n n")]
+    [DataRow("checkpoint.profile", "fresh-only", "target: text-state/1", "fresh-model/1", "unknown projection profile 'text-state/1'", "c c i c c c n")]
+    [DataRow("checkpoint.profile", "text-state-only", "start: fresh-model/1", "text-state/1", "unknown profile 'fresh-model/1'", "c c i n n n n")]
+    [DataRow("checkpoint.coveredSurfaces", "one-more-surface", "command-marks", "selection-state", "missing: selection-state", "c c c i n n n")]
+    [DataRow("configuration", "requires-tab-width", "height", "tabWidth", "configuration.tabWidth: missing", "c c c c i n n")]
+    [DataRow("configuration.capabilities", "requires-hyperlinks", "supportsMouse", "supportsHyperlinks", "capabilities.supportsHyperlinks: missing", "c c c c c i n")]
     public async Task Compatibility_RefusesByConsumerDeclaration(string check, string declaration, string producerHas, string consumerHas, string message, string verdicts)
     {
         using var root = new CaseRoot();
@@ -188,6 +231,9 @@ public partial class DiagnosticCaseTests
             "format-3" => build with { FormatVersion = 3 },
             "contract-2" => build with { ContractVersion = 2 },
             "fresh-only" => build with { Profiles = [DiagnosticCaseCheckpointProfiles.FreshModel] },
+            "text-state-only" => build with { Profiles = [DiagnosticCaseCheckpointProfiles.TextState] },
+            "requires-tab-width" => build with { RequiredFields = [.. build.RequiredFields, "tabWidth"] },
+            "requires-hyperlinks" => build with { RequiredCapabilities = [.. build.RequiredCapabilities, "supportsHyperlinks"] },
             _ => build with { Surfaces = [.. build.Surfaces, "selection-state"] },
         };
         try
@@ -200,6 +246,8 @@ public partial class DiagnosticCaseTests
             Assert.AreEqual(check, failed.Check, declaration);
             StringAssert.Contains(failed.Producer, producerHas, $"{declaration}: producer {failed.Producer}");
             StringAssert.Contains(failed.Consumer, consumerHas, $"{declaration}: consumer {failed.Consumer}");
+            StringAssert.Contains(result.Problem.Message, failed.Producer, $"{declaration}: the message lacks the case's value");
+            StringAssert.Contains(result.Problem.Message, failed.Consumer, $"{declaration}: the message lacks this build's value");
             Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), $"{declaration}: an incompatible case was written to");
         }
         finally
@@ -247,7 +295,8 @@ public partial class DiagnosticCaseTests
             StringAssert.Contains(text, term, relativePath);
         if (relativePath.EndsWith("diagnostic-capture.md", StringComparison.Ordinal))
         {
-            Assert.IsFalse(text.Contains("only" + Environment.NewLine + "on the build that recorded the case", StringComparison.Ordinal), "the guide still restricts re-application to the recording build");
+            var flat = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ");
+            Assert.IsFalse(flat.Contains("only on the build that recorded the case", StringComparison.Ordinal), "the guide still restricts re-application to the recording build");
             foreach (var term in new[] { "### Comparing a candidate build", "`not-checked`", "`checkpoint.coveredSurfaces`", "`configuration.capabilities`" })
                 StringAssert.Contains(text, term, relativePath);
         }

@@ -156,13 +156,12 @@ public class DiagnosticCaseTools(TerminalSessionManager sessionManager)
         {
             Success = result.Outcome == DiagnosticOutcome.Captured,
             Message = result.Outcome == DiagnosticOutcome.Captured
-                ? $"Re-applied to model sequence {result.Target!.ModelSequence}: {result.Comparison}" +
+                ? $"Re-applied by {result.Consumer?.Hex1bVersion} ({result.Consumer?.Hex1bBuild}) against the recording build {result.Producer?.Hex1bVersion} ({result.Producer?.Hex1bBuild ?? "no build id"}), " +
+                  (result.Compatibility.SameBuild switch { true => "same build", false => "different builds", null => "build ids not compared" }) +
+                  $", to model sequence {result.Target!.ModelSequence}: {result.Comparison}" +
                   (result.ComparisonReason is { } reason ? $" ({reason})" : "") +
                   (result.Differences is { Total: > 0 } differences ? $"; {differences.Total} differences" : "") +
-                  (result.FaultInjected ? "; fault injected" : "") +
-                  $"; re-applied by {result.Consumer?.Hex1bVersion} ({result.Consumer?.Hex1bBuild}) against the recording build {result.Producer?.Hex1bVersion} ({result.Producer?.Hex1bBuild ?? "no build id"}), " +
-                  (result.Compatibility.SameBuild switch { true => "same build", false => "different builds", null => "build ids not compared" }) +
-                  $". Run: {result.RunPath}."
+                  (result.FaultInjected ? "; fault injected" : "") + $". Run: {result.RunPath}."
                 : $"Reapply {DiagnosticContractNames.Of(result.Outcome)} ({result.Problem?.Code}): {result.Problem?.Message}" +
                   (result.Compatibility.Checks.FirstOrDefault(c => c.Verdict == DiagnosticCaseCompatibility.Incompatible) is { } failed
                       ? $" [{failed.Check}: the case declares {failed.Producer}; this build {failed.Consumer}]"

@@ -66,10 +66,10 @@ internal static class CaseConfiguration
 
     // Format 2 fields a model cannot be rebuilt without. Absent nullable fields (scrollbackCapacity,
     // customMarkerLimit, sixelCellMetrics) mean none, as they are written only when set.
-    private static readonly string[] RequiredFields =
+    internal static readonly IReadOnlyList<string> RequiredFields =
         ["width", "height", "commandMarkHistoryCapacity", "escapeSequenceTimeoutMs", "reflowEnabled", "reflowStrategy", "capabilities", "graphics"];
 
-    private static readonly string[] RequiredCapabilities =
+    internal static readonly IReadOnlyList<string> RequiredCapabilities =
     [
         "supportsDeltaProtocol", "supportsSixel", "sixelSupport", "supportsMouse", "supportsTrueColor", "supports256Colors",
         "supportsAlternateScreen", "handlesAlternateScreenNatively", "supportsBracketedPaste", "supportsKgp",
@@ -83,21 +83,20 @@ internal static class CaseConfiguration
         "maximumPlacementsPerScreen", "maximumHistoryPlacements", "maximumRetainedLogicalPixelsPerScreen", "maximumRetainedBytesPerScreen",
     ];
 
-    /// <summary>The configuration fields this build knows (format 2): the required ones and the optional ones written only when set.</summary>
-    internal static readonly IReadOnlyList<string> KnownFields =
-        [.. RequiredFields, "scrollbackCapacity", "customMarkerLimit", "presentation", "workload"];
+    /// <summary>The optional configuration fields (format 2), written only when set.</summary>
+    internal static readonly IReadOnlyList<string> OptionalFields = ["scrollbackCapacity", "customMarkerLimit", "presentation", "workload"];
 
-    /// <summary>The capability fields this build knows: the required ones and the optional cell metrics.</summary>
-    internal static readonly IReadOnlyList<string> KnownCapabilities = [.. RequiredCapabilities, "sixelCellMetrics"];
+    /// <summary>The optional capability fields: the cell metrics.</summary>
+    internal static readonly IReadOnlyList<string> OptionalCapabilities = ["sixelCellMetrics"];
 
     /// <summary>
-    /// Why a format 2 configuration's fields cannot rebuild a model, naming the field: one missing from the raw
-    /// manifest, one this build does not know, a value no model could be built with, or a reflow strategy this
-    /// build cannot rebuild. Null when they can. The capabilities are <see cref="CapabilitiesProblem"/>'s.
+    /// Why a format 2 configuration's fields cannot rebuild a model, naming the field: one of the <paramref name="required"/>
+    /// missing from the raw manifest, one this build does not know, a value no model could be built with, or a reflow
+    /// strategy this build cannot rebuild. Null when they can. The capabilities are <see cref="CapabilitiesProblem"/>'s.
     /// </summary>
-    internal static string? FieldProblem(System.Text.Json.Nodes.JsonObject raw, DiagnosticCaseModelConfiguration configuration)
+    internal static string? FieldProblem(System.Text.Json.Nodes.JsonObject raw, DiagnosticCaseModelConfiguration configuration, IReadOnlyList<string> required)
     {
-        foreach (var field in RequiredFields)
+        foreach (var field in required)
         {
             if (raw[field] is null)
                 return $"configuration.{field}: missing";
@@ -132,12 +131,15 @@ internal static class CaseConfiguration
     /// Why recorded capabilities cannot rebuild a model, naming the field: one missing from the raw manifest, one
     /// this build does not know, or an unknown value. Null, with the rebuilt capabilities, when they can.
     /// </summary>
-    internal static string? CapabilitiesProblem(System.Text.Json.Nodes.JsonObject? raw, DiagnosticCaseCapabilities? recorded, out TerminalCapabilities? capabilities)
+    internal static string? CapabilitiesProblem(System.Text.Json.Nodes.JsonObject? raw, DiagnosticCaseCapabilities? recorded, IReadOnlyList<string> required,
+        out TerminalCapabilities? capabilities)
     {
         capabilities = null;
+        // A guard for a caller that did not run FieldProblem first; the reapplier and the start never reach it, as
+        // "capabilities" is a required field and a non-object value fails the typed read before either.
         if (raw is null || recorded is null)
             return "configuration.capabilities: missing";
-        foreach (var field in RequiredCapabilities)
+        foreach (var field in required)
         {
             if (raw[field] is null)
                 return $"capabilities.{field}: missing";
@@ -160,7 +162,8 @@ internal static class CaseConfiguration
     /// judges each as its own compatibility check; a live start that this names is never complete.
     /// </summary>
     internal static string? RebuildProblem(System.Text.Json.Nodes.JsonObject raw, DiagnosticCaseModelConfiguration configuration) =>
-        FieldProblem(raw, configuration) ?? CapabilitiesProblem(raw["capabilities"] as System.Text.Json.Nodes.JsonObject, configuration.Capabilities, out _);
+        FieldProblem(raw, configuration, RequiredFields)
+        ?? CapabilitiesProblem(raw["capabilities"] as System.Text.Json.Nodes.JsonObject, configuration.Capabilities, RequiredCapabilities, out _);
 
     internal static DiagnosticCaseCapabilities Capabilities(TerminalCapabilities capabilities) => new()
     {

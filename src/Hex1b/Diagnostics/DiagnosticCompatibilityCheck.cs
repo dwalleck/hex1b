@@ -12,7 +12,7 @@ public sealed record DiagnosticCompatibilityCheck
     [JsonPropertyName("check")]
     public string Check { get; init; } = "";
 
-    /// <summary>What the artifact declares; absent until the check ran.</summary>
+    /// <summary>What the artifact declares; absent until the check ran (the origin's is recorded as the origin is selected, before its verdict).</summary>
     [JsonPropertyName("producer")]
     public string? Producer { get; init; }
 

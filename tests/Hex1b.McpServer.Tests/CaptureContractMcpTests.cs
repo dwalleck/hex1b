@@ -1055,9 +1055,15 @@ public class CaptureContractMcpTests : McpServerTestBase
                 StringAssert.Contains(result.GetProperty("message").GetString(), $"({TerminalDiagnostics.Hex1bBuild}), same build", result.ToString());
         }
 
-        // Ticket 14: a refusal's message names the failed check with the case's and this build's values.
+        // Ticket 14: the message names a different recording build; a refusal's message names the failed check with the
+        // case's and this build's values.
         var manifestFile = Path.Combine(path, "manifest.json");
         var manifest = JsonNode.Parse(File.ReadAllText(manifestFile))!.AsObject();
+        manifest["identity"]!["hex1bBuild"] = "0123456789abcdef0123456789abcdef";
+        File.WriteAllText(manifestFile, manifest.ToJsonString());
+        var other = await CallAsync(client, "reapply_diagnostic_case", new() { ["path"] = path, ["to"] = "mcp-mark" });
+        Assert.IsTrue(other.GetProperty("success").GetBoolean(), other.ToString());
+        StringAssert.Contains(other.GetProperty("message").GetString(), "(0123456789abcdef0123456789abcdef), different builds", other.ToString());
         manifest["formatVersion"] = 3;
         File.WriteAllText(manifestFile, manifest.ToJsonString());
         var incompatible = await CallAsync(client, "reapply_diagnostic_case", new() { ["path"] = path, ["to"] = "mcp-mark" });

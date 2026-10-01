@@ -663,7 +663,10 @@ The result also names what was compared and with what:
   artifact declares), `consumer` (what the build supports) and a `verdict`: `compatible`,
   `incompatible`, or `not-checked` (an earlier check failed first, or the request was refused before
   it ran). A check that fails refuses the re-application `incompatible`, naming it with both values
-  in the message; the checks after it stay `not-checked`.
+  in the message; the checks that had not yet run stay `not-checked` (`checkpoint.profile` is
+  judged for the start, then again for the target, so it can fail with later checks already
+  compatible; `configuration` can fail again when the model is built, and `origin` when its
+  state is restored).
 
 Each run writes a new owner-only directory, `reapplications/<n>` in the case, and never changes
 the case's own files. It holds `result.json`, the complete reconstructed state (`reapplied.json`),

@@ -308,6 +308,10 @@ public partial class DiagnosticCaseTests
             AssertMatched(result, $"raw {label}");
             Assert.AreEqual((DiagnosticCaseCheckpointProfiles.TextState, (long?)start), (result.Checkpoint!.Profile, result.Checkpoint.ModelSequence),
                 $"{label}: the result does not name the start it restored");
+            // Ticket 14 (R2): a complete text-state/1 start's record.
+            AssertRecord(result.Compatibility, "c c c c c c c", label);
+            Assert.AreEqual("start: text-state/1; target: text-state/1", result.Compatibility.Checks[2].Producer, label);
+            Assert.AreEqual(($"text-state/1 at model sequence {start}", "restored"), (result.Compatibility.Checks[6].Producer, result.Compatibility.Checks[6].Consumer), label);
         }
     }
 
@@ -548,6 +552,16 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual((DiagnosticOutcome.Unavailable, code), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
         StringAssert.Contains(result.Problem!.Message, surface);
         Assert.IsFalse(Directory.Exists(Path.Combine(copy, "reapplications")), "a refused re-application wrote a run");
+        // Ticket 14 (R2): a restore the build cannot make is the origin check's refusal, named with both values; an
+        // unsupported start keeps its own code with the origin never judged.
+        AssertRecord(result.Compatibility, code == "incompatible" ? "c c c c c c i" : "c c c c c c n", surface);
+        if (code == "incompatible")
+        {
+            StringAssert.StartsWith(result.Problem.Message, "origin: ", surface);
+            var failed = result.Compatibility.Checks.Single(c => c.Verdict == "incompatible");
+            StringAssert.Contains(result.Problem.Message, failed.Producer!, surface);
+            StringAssert.StartsWith(failed.Producer, "text-state/1 at model sequence ", surface);
+        }
     }
 
     [TestMethod]

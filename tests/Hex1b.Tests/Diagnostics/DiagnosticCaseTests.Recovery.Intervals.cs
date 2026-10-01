@@ -719,6 +719,44 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
+    public async Task Reapply_RecoveryWithAForeignProfileIsIncompatible()
+    {
+        // Ticket 14 (R2): a recovery line declares its profile; a build that does not project it refuses to restore from
+        // it (the origin check), before anything is read or built, even though the start and the target are this build's.
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = HistoryTerminal(workload, null, 100);
+        var diagnostics = new TerminalDiagnostics(terminal);
+        string path;
+        using (new Running(terminal))
+        {
+            await workload.WriteAndWaitAsync(terminal, "before \u001bP$q");
+            path = StartLive(terminal, root);
+            await workload.WriteAndWaitAsync(terminal, "m\u001b\\ one two");
+            Recover(diagnostics, "r1");
+            await workload.WriteAndWaitAsync(terminal, " after");
+            Mark(diagnostics, "m");
+            await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+        AssertMatched(Reapply(path, label: "m"), "fixture: the recovery is this build's");
+        EditEventLine(path, e => e["checkpoint"]?["trigger"]?.GetValue<string>() == "recovery", e => e["checkpoint"]!["profile"] = "text-state/9");
+        var hashes = HashCaseFiles(path);
+
+        var result = Reapply(path, label: "m");
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "incompatible"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
+        var failed = result.Compatibility.Checks.Single(c => c.Verdict == "incompatible");
+        Assert.AreEqual("origin", failed.Check, result.Problem!.Message);
+        StringAssert.StartsWith(failed.Producer, "text-state/9 at model sequence ", result.Problem.Message);
+        StringAssert.Contains(result.Problem.Message, failed.Producer!);
+        StringAssert.Contains(result.Problem.Message, failed.Consumer!);
+        CollectionAssert.AreEqual(new[] { "compatible", "compatible", "compatible", "compatible", "compatible", "compatible", "incompatible" },
+            result.Compatibility.Checks.Select(c => c.Verdict).ToArray(), string.Join(" ", result.Compatibility.Checks.Select(c => $"{c.Check}={c.Verdict}")));
+        CollectionAssert.AreEqual(hashes, HashCaseFiles(path), "the case's files changed");
+        Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")) && Directory.GetDirectories(Path.Combine(path, "reapplications")).Length > 1,
+            "the refused re-application wrote a run");
+    }
+
+    [TestMethod]
     public void ReapplyRequest_FromForms()
     {
         // The parser trims and keeps an origin name, drops an empty one, and refuses a case: or checkpoint: form that

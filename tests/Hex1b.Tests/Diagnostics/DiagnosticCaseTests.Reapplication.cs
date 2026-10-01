@@ -114,6 +114,11 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual((DiagnosticOutcome.Unavailable, "incompatible"), (result.Outcome, result.Problem?.Code));
         StringAssert.StartsWith(result.Problem!.Message, "formatVersion");
         Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), "an incompatible case was written to");
+        // Ticket 14 (R2): the refusal keeps the shape it had (the checkpoint and the coverage), names the recording build and carries the record.
+        AssertRecord(result.Compatibility, "i n n n n n n", "format 1");
+        Assert.AreEqual(TerminalDiagnostics.Hex1bBuild, result.Producer?.Hex1bBuild, "the format-1 refusal names the recording build");
+        Assert.IsNotNull(result.Checkpoint, "the format-1 refusal lost its checkpoint");
+        Assert.IsNotNull(result.Coverage, "the format-1 refusal lost its coverage");
         Assert.AreEqual(DiagnosticOutcome.Captured, DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }).Outcome,
             "a format 1 case is no longer inspectable");
     }

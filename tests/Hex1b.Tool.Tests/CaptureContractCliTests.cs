@@ -945,12 +945,25 @@ public class CaptureContractCliTests
         StringAssert.Contains(beyond, "beyond-interval");
         StringAssert.Contains(beyond, "Re-applicable through model sequence");
 
-        // Ticket 14: the human output names both builds (the CLI's Hex1b is this build's copy), and a refusal names the
-        // failed check with the case's and this build's values.
+        // Ticket 14: the human output names both builds (the CLI's Hex1b is this build's copy: one compilation of a
+        // single-TFM library, so its module version id is the test host's; a multi-targeted Hex1b would break this
+        // assumption, not the product), and a refusal names the failed check with the case's and this build's values.
         var build = typeof(Hex1bTerminal).Assembly.ManifestModule.ModuleVersionId.ToString("N");
         StringAssert.Contains(matched, $"({build}): same build", matched);
         var manifestFile = Path.Combine(path, "manifest.json");
         var manifest = JsonNode.Parse(File.ReadAllText(manifestFile))!.AsObject();
+        manifest["identity"]!["hex1bBuild"] = "0123456789abcdef0123456789abcdef";
+        File.WriteAllText(manifestFile, manifest.ToJsonString());
+        var (otherExit, other, _) = await RunCliAsync("capture", "case", "reapply", path, "--to", "cli-mark");
+        Assert.AreEqual(0, otherExit, other);
+        StringAssert.Contains(other, "(0123456789abcdef0123456789abcdef); re-applied by", other);
+        StringAssert.Contains(other, $"({build}): different builds", other);
+        manifest["identity"]!.AsObject().Remove("hex1bBuild");
+        File.WriteAllText(manifestFile, manifest.ToJsonString());
+        var (noneExit2, none2, _) = await RunCliAsync("capture", "case", "reapply", path, "--to", "cli-mark");
+        Assert.AreEqual(0, noneExit2, none2);
+        StringAssert.Contains(none2, "(no build id); re-applied by", none2);
+        StringAssert.Contains(none2, "build ids not compared", none2);
         manifest["formatVersion"] = 3;
         File.WriteAllText(manifestFile, manifest.ToJsonString());
         var (incompatibleExit, _, incompatible) = await RunCliAsync("capture", "case", "reapply", path, "--to", "cli-mark");

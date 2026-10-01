@@ -527,6 +527,12 @@ public partial class DiagnosticCaseTests
             var result = Reapply(path, label: "stop");
             Assert.AreEqual((DiagnosticOutcome.Unavailable, "incompatible"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
             Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), "a refused replica wrote a run");
+            // Ticket 14 (R2): the configuration's verdict flips after its check passed; the origin was selected but never restored.
+            AssertRecord(result.Compatibility, "c c c c i c n", "oom");
+            var failed = result.Compatibility.Checks.Single(c => c.Verdict == "incompatible");
+            StringAssert.StartsWith(result.Problem!.Message, "configuration: injected allocation failure");
+            StringAssert.Contains(result.Problem.Message, failed.Producer!, "the message lacks the case's fields");
+            StringAssert.Contains(result.Problem.Message, failed.Consumer!, "the message lacks this build's fields");
         }
         finally
         {

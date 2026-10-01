@@ -90,14 +90,14 @@ internal static class CaseReapplier
         // The artifact's format, read raw before the artifact is read further: a format this build does not read is
         // incompatible whatever else the manifest holds (a missing or damaged manifest is the inspection's to describe).
         var rawManifest = ReadRawManifest(path);
-        checks.Producer((rawManifest?["identity"]?["hex1bBuild"] as JsonValue)?.GetValue<string>());
+        checks.Producer(rawManifest?["identity"] is JsonObject identity && identity["hex1bBuild"] is JsonValue id && id.TryGetValue<string>(out var build) ? build : null);
         if (rawManifest?["formatVersion"] is JsonValue declaredFormat && declaredFormat.TryGetValue<int>(out var format)
-            && checks.FormatVersion(format) is { } formatProblem)
-            return Problem(DiagnosticOutcome.Unavailable, formatProblem) with { Path = path, Producer = ReadIdentity(rawManifest) };
+            && format != CaseArtifactWriter.LegacyFormatVersion && checks.FormatVersion(format) is { } formatProblem)
+            return Problem(DiagnosticOutcome.Unavailable, formatProblem) with { Path = path, Producer = ReadIdentity(rawManifest), Coverage = Coverage };
 
         var inspection = CaseArtifactReader.Inspect(new DiagnosticCaseInspectRequest { Path = path });
         if (inspection.Outcome != DiagnosticOutcome.Captured)
-            return new DiagnosticCaseReapplyResult { Outcome = inspection.Outcome, Problem = inspection.Problem, Path = path };
+            return new DiagnosticCaseReapplyResult { Outcome = inspection.Outcome, Problem = inspection.Problem, Path = path, Producer = rawManifest is null ? null : ReadIdentity(rawManifest) };
         var manifest = inspection.Manifest!;
 
         // What is compared, with what: every later result carries it.
@@ -112,7 +112,11 @@ internal static class CaseReapplier
             described with { Outcome = outcome, Problem = new DiagnosticProblem { Code = code, Message = message } };
         DiagnosticCaseReapplyResult Refused(DiagnosticProblem problem) => described with { Outcome = DiagnosticOutcome.Unavailable, Problem = problem };
 
-        // The declarations, judged in order before anything is built (CaseCompatibility; the format was judged above).
+        // The declarations, judged in order before anything is built (CaseCompatibility). A newer format was refused
+        // above, before the artifact was read; the legacy format the reader still inspects is refused here, with the
+        // checkpoint and coverage the refusal has always carried.
+        if (checks.FormatVersion(manifest.FormatVersion) is { } legacyProblem)
+            return Refused(legacyProblem);
         if (checks.ContractVersion(manifest.ContractVersion) is { } contractProblem)
             return Refused(contractProblem);
         if (checks.StartProfile(manifest.Checkpoint.Profile, manifest.Checkpoint.ModelSequence) is { } profileProblem)
@@ -194,7 +198,11 @@ internal static class CaseReapplier
             };
         }
 
-        // The origin's state, read and checked before anything is built or written.
+        // The origin under the profile its line declares, then its state, read and checked before anything is built or written.
+        var declaredProfile = origin.Trigger == "start" ? manifest.Checkpoint.Profile
+            : resolution.Checkpoints.FirstOrDefault(c => c.CaseSequence == origin.CaseSequence)?.Profile ?? origin.Profile;
+        if (checks.Origin(origin, declaredProfile) is { } foreignOrigin)
+            return Refused(foreignOrigin);
         DiagnosticModelState? originState = null;
         if (origin.Profile == DiagnosticCaseCheckpointProfiles.TextState)
         {
@@ -208,7 +216,6 @@ internal static class CaseReapplier
         }
 
         // The detached model is built before anything is written: a configuration it refuses writes nothing.
-        checks.Origin(origin);
         var clock = new ReapplicationClock(manifest.StartedAt);
         Hex1bTerminal replica;
         try
