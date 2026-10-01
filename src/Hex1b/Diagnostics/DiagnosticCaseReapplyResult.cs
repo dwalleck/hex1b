@@ -33,6 +33,14 @@ public sealed record DiagnosticCaseReapplyResult
     [JsonPropertyName("consumerHex1bVersion")]
     public string? ConsumerHex1bVersion { get; init; }
 
+    /// <summary>
+    /// What was compared between the case's declarations and this build (ticket 14): the seven checks in order with
+    /// both sides' values and verdicts, and whether the two builds are the same. Every result carries it; a result
+    /// refused before any check ran carries every check <c>not-checked</c>.
+    /// </summary>
+    [JsonPropertyName("compatibility")]
+    public DiagnosticCaseCompatibility Compatibility { get; init; } = DiagnosticCaseCompatibility.Unchecked;
+
     /// <summary>The case directory.</summary>
     [JsonPropertyName("path")]
     public string? Path { get; init; }

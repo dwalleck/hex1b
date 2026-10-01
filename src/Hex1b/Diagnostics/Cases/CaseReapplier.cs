@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Hex1b.Automation;
 
 namespace Hex1b.Diagnostics.Cases;
@@ -50,19 +51,21 @@ internal static class CaseReapplier
     internal static DiagnosticCaseReapplyResult Reapply(DiagnosticCaseReapplyRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+        // Every result carries the compatibility checks, however far they got (ticket 14).
+        var checks = CaseCompatibility.Begin();
         try
         {
-            return ReapplyCore(request);
+            return ReapplyCore(request, checks) with { Compatibility = checks.Record };
         }
         catch (Exception error)
         {
             // Nothing a case holds may escape as an exception: whatever failed is a result.
             return Problem(DiagnosticOutcome.Failed, "reapplication-failed",
-                DiagnosticCaseRecorder.Bounded($"{error.GetType().Name}: {error.Message}")) with { Path = request.Path };
+                DiagnosticCaseRecorder.Bounded($"{error.GetType().Name}: {error.Message}")) with { Path = request.Path, Compatibility = checks.Record };
         }
     }
 
-    private static DiagnosticCaseReapplyResult ReapplyCore(DiagnosticCaseReapplyRequest request)
+    private static DiagnosticCaseReapplyResult ReapplyCore(DiagnosticCaseReapplyRequest request, CaseCompatibility.Checks checks)
     {
         if (ValidateRequest(request) is { } invalid)
             return invalid;
@@ -84,6 +87,13 @@ internal static class CaseReapplier
         if (CaseStorage.CheckCaseDirectory(path) is { } refused)
             return Problem(DiagnosticOutcome.Failed, "storage-refused", refused) with { Path = path };
 
+        // The artifact's format, read raw before the artifact is read further: a format this build does not read is
+        // incompatible whatever else the manifest holds (a missing or damaged manifest is the inspection's to describe).
+        var rawManifest = ReadRawManifest(path);
+        if (rawManifest?["formatVersion"] is JsonValue declaredFormat && declaredFormat.TryGetValue<int>(out var format)
+            && checks.FormatVersion(format) is { } formatProblem)
+            return Problem(DiagnosticOutcome.Unavailable, formatProblem) with { Path = path };
+
         var inspection = CaseArtifactReader.Inspect(new DiagnosticCaseInspectRequest { Path = path });
         if (inspection.Outcome != DiagnosticOutcome.Captured)
             return new DiagnosticCaseReapplyResult { Outcome = inspection.Outcome, Problem = inspection.Problem, Path = path };
@@ -100,19 +110,17 @@ internal static class CaseReapplier
         };
         DiagnosticCaseReapplyResult Refuse(DiagnosticOutcome outcome, string code, string message) =>
             described with { Outcome = outcome, Problem = new DiagnosticProblem { Code = code, Message = message } };
+        DiagnosticCaseReapplyResult Refused(DiagnosticProblem problem) => described with { Outcome = DiagnosticOutcome.Unavailable, Problem = problem };
 
-        // Format and configuration: refused before anything is built.
-        if (manifest.FormatVersion != CaseArtifactWriter.FormatVersion)
-            return Refuse(DiagnosticOutcome.Unavailable, "incompatible",
-                $"formatVersion: format {manifest.FormatVersion} does not record its configuration structurally; re-application needs format {CaseArtifactWriter.FormatVersion}.");
-        if (manifest.Checkpoint.Profile is not (DiagnosticCaseCheckpointProfiles.FreshModel or DiagnosticCaseCheckpointProfiles.TextState))
-            return Refuse(DiagnosticOutcome.Unavailable, "incompatible", $"checkpoint.profile: unknown profile '{manifest.Checkpoint.Profile}'.");
+        // The declarations, judged in order before anything is built (CaseCompatibility; the format was judged above).
+        if (checks.ContractVersion(manifest.ContractVersion) is { } contractProblem)
+            return Refused(contractProblem);
+        if (checks.StartProfile(manifest.Checkpoint.Profile, manifest.Checkpoint.ModelSequence) is { } profileProblem)
+            return Refused(profileProblem);
         // The initial origin: a fresh model at model sequence 0, or a case started on a model that had applied output
         // at its text-state/1 start's sequence. The complete recovery checkpoints are the later origins; the inspection
         // lists one interval per origin, and the one restored from is the earliest valid one covering the target, or
         // the one the request names.
-        if (manifest.Checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState && manifest.Checkpoint.ModelSequence is not >= 0)
-            return Refuse(DiagnosticOutcome.Unavailable, "incompatible", "checkpoint.modelSequence: a text-state/1 start names no model sequence.");
         var start = manifest.Checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState ? manifest.Checkpoint.ModelSequence!.Value : 0;
         var intervals = inspection.Intervals;
         if (manifest.Checkpoint.Configuration is not { } configuration || !intervals.Any(i => i.Valid))
@@ -121,12 +129,14 @@ internal static class CaseReapplier
             return Refuse(DiagnosticOutcome.Unavailable, "no-valid-interval",
                 $"The case has no re-applicable interval: {first?.EndReason ?? manifest.Checkpoint.Reason}.") with { IntervalEndReason = first?.EndReason };
         }
-        var raw = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllBytes(System.IO.Path.Combine(path, CaseArtifactWriter.ManifestFile)))?["checkpoint"]?["configuration"]
-            as System.Text.Json.Nodes.JsonObject;
-        if ((raw is null ? "configuration: missing" : CaseConfiguration.RebuildProblem(raw, configuration)) is { } configurationProblem)
-            return Refuse(DiagnosticOutcome.Unavailable, "incompatible", configurationProblem);
+        if (checks.CoveredSurfaces(manifest.Checkpoint.CoveredSurfaces, manifest.Checkpoint.Status == DiagnosticCaseCheckpointStatus.Complete) is { } surfacesProblem)
+            return Refused(surfacesProblem);
+        var raw = rawManifest?["checkpoint"]?["configuration"] as JsonObject;
+        if (checks.Configuration(raw, configuration) is { } configurationProblem)
+            return Refused(configurationProblem);
+        if (checks.Capabilities(raw?["capabilities"] as JsonObject, configuration.Capabilities, out var capabilities) is { } capabilitiesProblem)
+            return Refused(capabilitiesProblem);
         var strategy = CaseConfiguration.CreateReflowStrategy(configuration.ReflowStrategy)!;
-        var capabilities = CaseConfiguration.TerminalCapabilities(configuration.Capabilities!, out _)!;
 
         // The target, resolved from the verified events without applying any (and without reading any state).
         var eventsPath = System.IO.Path.Combine(path, CaseArtifactWriter.EventsFile);
@@ -135,8 +145,8 @@ internal static class CaseReapplier
             return described with { Outcome = targetProblem.Outcome, Problem = targetProblem.Problem };
         var target = resolution.ModelSequence;
         var chosen = resolution.Checkpoint;
-        if (chosen is { Profile: var profile } && profile != DiagnosticCaseCheckpointProfiles.TextState)
-            return Refuse(DiagnosticOutcome.Unavailable, "incompatible", $"checkpoint.profile: unknown projection profile '{profile}'.");
+        if (chosen is { Profile: var profile } && checks.TargetProfile(profile) is { } projectionProblem)
+            return Refused(projectionProblem);
         if (target < start)
             return Refuse(DiagnosticOutcome.InvalidRequest, "unknown-model-sequence",
                 $"Model sequence {target} is before the case's start, at model sequence {start}: the case recorded nothing before it.");
@@ -198,15 +208,16 @@ internal static class CaseReapplier
         }
 
         // The detached model is built before anything is written: a configuration it refuses writes nothing.
+        checks.Origin(origin);
         var clock = new ReapplicationClock(manifest.StartedAt);
         Hex1bTerminal replica;
         try
         {
-            replica = BuildReplica(configuration, strategy, capabilities, clock);
+            replica = BuildReplica(configuration, strategy, capabilities!, clock);
         }
         catch (Exception error) when (error is ArgumentException or InvalidOperationException or OverflowException or OutOfMemoryException)
         {
-            return Refuse(DiagnosticOutcome.Unavailable, "incompatible", DiagnosticCaseRecorder.Bounded($"configuration: {error.Message}"));
+            return Refused(checks.Rebuilt(error));
         }
 
         if (originState is not null)
@@ -217,9 +228,10 @@ internal static class CaseReapplier
             }
             catch (Exception error) when (error is InvalidOperationException or ArgumentException or FormatException or OverflowException or IndexOutOfRangeException)
             {
-                return Refuse(DiagnosticOutcome.Unavailable, "incompatible", DiagnosticCaseRecorder.Bounded($"origin: {error.Message}"));
+                return Refused(checks.Restored(error));
             }
         }
+        checks.Restored(fresh: originState is null);
 
         string run;
         try
@@ -246,7 +258,7 @@ internal static class CaseReapplier
                 if (item.Stream == "model" && item.ModelSequence is { } sequence && sequence > originFrom && sequence <= target)
                 {
                     if (Apply(replica, clock, item, sequence) is { } divergence)
-                        return Finish(result with { AppliedThrough = applied, Comparison = "different", ComparisonReason = divergence }, run);
+                        return Finish(checks, result with { AppliedThrough = applied, Comparison = "different", ComparisonReason = divergence }, run);
                     applied = sequence;
                     if (AppliedEventsForTesting.Value is { } counter)
                         Interlocked.Increment(ref counter.Value);
@@ -258,7 +270,7 @@ internal static class CaseReapplier
             }
 
             if (applied != target)
-                return Finish(result with { AppliedThrough = applied, Comparison = "different", ComparisonReason = $"The verified events end at model sequence {applied}, before the target {target}." }, run);
+                return Finish(checks, result with { AppliedThrough = applied, Comparison = "different", ComparisonReason = $"The verified events end at model sequence {applied}, before the target {target}." }, run);
 
             var reconstructed = replica.CaptureModelState();
             ReconstructedForTesting.Value?.Invoke(replica);
@@ -272,7 +284,7 @@ internal static class CaseReapplier
             {
                 if (ModelStateFault.Apply(compared, fault, out var faultPath, out var faultProblem) is not { } faulted)
                 {
-                    return Finish(result with { Comparison = "unavailable", ComparisonReason = $"fault-not-applicable: {faultProblem}" },
+                    return Finish(checks, result with { Comparison = "unavailable", ComparisonReason = $"fault-not-applicable: {faultProblem}" },
                         run, reconstructed, null, null, previews);
                 }
                 compared = faulted;
@@ -300,11 +312,11 @@ internal static class CaseReapplier
             // The recorded checkpoint's preview is its text, rendered from its projection (approval item 3).
             if (recordedState is not null && previews.ContainsKey("reapplied.txt"))
                 previews["recorded.txt"] = ProjectionText(recordedState);
-            return Finish(result, run, reconstructed, recordedState, injected.Count > 0 ? compared : null, previews);
+            return Finish(checks, result, run, reconstructed, recordedState, injected.Count > 0 ? compared : null, previews);
         }
         catch (Exception error)
         {
-            return Finish(result with
+            return Finish(checks, result with
             {
                 Outcome = DiagnosticOutcome.Failed,
                 Problem = new DiagnosticProblem
@@ -530,7 +542,7 @@ internal static class CaseReapplier
     // Writes the run's files: the complete reconstructed, recorded and (with faults) compared states, any previews,
     // and the result. Best effort: a write that fails makes the result `failed` (naming what was written) rather
     // than an exception.
-    private static DiagnosticCaseReapplyResult Finish(DiagnosticCaseReapplyResult result, string run, DiagnosticModelState? reconstructed = null,
+    private static DiagnosticCaseReapplyResult Finish(CaseCompatibility.Checks checks, DiagnosticCaseReapplyResult result, string run, DiagnosticModelState? reconstructed = null,
         DiagnosticModelState? recorded = null, DiagnosticModelState? faulted = null, IReadOnlyDictionary<string, string>? previews = null)
     {
         var files = new List<string>();
@@ -553,7 +565,7 @@ internal static class CaseReapplier
                 Write("faulted.json", JsonSerializer.SerializeToUtf8Bytes(faulted, DiagnosticsJsonContext.Default.DiagnosticModelState));
             foreach (var (name, content) in previews ?? new Dictionary<string, string>())
                 Write(name, System.Text.Encoding.UTF8.GetBytes(content));
-            var final = result with { Files = [.. files, "result.json"] };
+            var final = result with { Files = [.. files, "result.json"], Compatibility = checks.Record };
             Write("result.json", JsonSerializer.SerializeToUtf8Bytes(final, DiagnosticsJsonContext.Default.DiagnosticCaseReapplyResult));
             return final;
         }
@@ -572,11 +584,29 @@ internal static class CaseReapplier
         }
     }
 
-    private static DiagnosticCaseReapplyResult Problem(DiagnosticOutcome outcome, string code, string message) => new()
+    private static DiagnosticCaseReapplyResult Problem(DiagnosticOutcome outcome, string code, string message) =>
+        Problem(outcome, new DiagnosticProblem { Code = code, Message = message });
+
+    private static DiagnosticCaseReapplyResult Problem(DiagnosticOutcome outcome, DiagnosticProblem problem) => new()
     {
         Outcome = outcome,
-        Problem = new DiagnosticProblem { Code = code, Message = message },
+        Problem = problem,
     };
+
+    // The manifest as raw JSON, for the declarations the typed manifest does not keep (the configuration's field
+    // names) and the format judged before the artifact is read: null when it is missing or damaged, which the
+    // inspection describes.
+    private static JsonObject? ReadRawManifest(string path)
+    {
+        try
+        {
+            return JsonNode.Parse(File.ReadAllBytes(System.IO.Path.Combine(path, CaseArtifactWriter.ManifestFile))) as JsonObject;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
+        {
+            return null;
+        }
+    }
 
     // The detached model's workload: its pumps never start, so nothing reads it or writes input to it. Those
     // calls are counted, so a test can show none was made.

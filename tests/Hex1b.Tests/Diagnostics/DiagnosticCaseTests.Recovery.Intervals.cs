@@ -711,6 +711,10 @@ public partial class DiagnosticCaseTests
             var result = Reapply(path, label: label);
             AssertMatched(result, label);
             Assert.AreEqual("r1", result.Origin!.Label, label);
+            // Ticket 14: the unsupported start declares no surfaces; the record says so and the recovery's profile is what was judged.
+            var surfaces = result.Compatibility.Checks.Single(c => c.Check == "checkpoint.coveredSurfaces");
+            Assert.AreEqual(("compatible", "(none declared: the start is not complete)"), (surfaces.Verdict, surfaces.Producer), label);
+            Assert.AreEqual("text-state/1 at model sequence " + result.Origin.ModelSequence, result.Compatibility.Checks[6].Producer, label);
         }
     }
 

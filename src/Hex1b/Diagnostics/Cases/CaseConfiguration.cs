@@ -83,34 +83,29 @@ internal static class CaseConfiguration
         "maximumPlacementsPerScreen", "maximumHistoryPlacements", "maximumRetainedLogicalPixelsPerScreen", "maximumRetainedBytesPerScreen",
     ];
 
+    /// <summary>The configuration fields this build knows (format 2): the required ones and the optional ones written only when set.</summary>
+    internal static readonly IReadOnlyList<string> KnownFields =
+        [.. RequiredFields, "scrollbackCapacity", "customMarkerLimit", "presentation", "workload"];
+
+    /// <summary>The capability fields this build knows: the required ones and the optional cell metrics.</summary>
+    internal static readonly IReadOnlyList<string> KnownCapabilities = [.. RequiredCapabilities, "sixelCellMetrics"];
+
     /// <summary>
-    /// Why a format 2 configuration cannot be rebuilt, naming the field: one missing from the raw manifest, one
-    /// this build does not know, or a value no model could be built with. Null when it can be.
+    /// Why a format 2 configuration's fields cannot rebuild a model, naming the field: one missing from the raw
+    /// manifest, one this build does not know, a value no model could be built with, or a reflow strategy this
+    /// build cannot rebuild. Null when they can. The capabilities are <see cref="CapabilitiesProblem"/>'s.
     /// </summary>
-    internal static string? Problem(System.Text.Json.Nodes.JsonObject raw, DiagnosticCaseModelConfiguration configuration)
+    internal static string? FieldProblem(System.Text.Json.Nodes.JsonObject raw, DiagnosticCaseModelConfiguration configuration)
     {
         foreach (var field in RequiredFields)
         {
             if (raw[field] is null)
                 return $"configuration.{field}: missing";
         }
-        foreach (var field in RequiredCapabilities)
-        {
-            if (raw["capabilities"]?[field] is null)
-                return $"capabilities.{field}: missing";
-        }
         foreach (var field in RequiredGraphics)
         {
             if (raw["graphics"]?[field] is null)
                 return $"graphics.{field}: missing";
-        }
-        if (raw["capabilities"]?["sixelCellMetrics"] is System.Text.Json.Nodes.JsonObject metrics)
-        {
-            foreach (var field in new[] { "width", "height", "source", "reliability" })
-            {
-                if (metrics[field] is null)
-                    return $"capabilities.sixelCellMetrics.{field}: missing";
-            }
         }
         if (configuration.Unknown is { Count: > 0 } unknown)
             return $"configuration.{unknown.Keys.Order(StringComparer.Ordinal).First()}: unknown field";
@@ -128,21 +123,44 @@ internal static class CaseConfiguration
             return $"configuration.customMarkerLimit: {configuration.CustomMarkerLimit} is negative";
         if (!double.IsFinite(configuration.EscapeSequenceTimeoutMs) || configuration.EscapeSequenceTimeoutMs is < 0 or > 86_400_000)
             return $"configuration.escapeSequenceTimeoutMs: {configuration.EscapeSequenceTimeoutMs} is not 0 to 86,400,000";
+        if (CreateReflowStrategy(configuration.ReflowStrategy) is null)
+            return $"reflowStrategy: '{configuration.ReflowStrategy}' is not a strategy this build can rebuild.";
         return null;
     }
 
     /// <summary>
-    /// Why a recorded configuration cannot rebuild a model, or null: its fields (<see cref="Problem"/>), its reflow
-    /// strategy, then its capabilities. The reapplier refuses with it, and a live start that it names is never complete.
+    /// Why recorded capabilities cannot rebuild a model, naming the field: one missing from the raw manifest, one
+    /// this build does not know, or an unknown value. Null, with the rebuilt capabilities, when they can.
     /// </summary>
-    internal static string? RebuildProblem(System.Text.Json.Nodes.JsonObject raw, DiagnosticCaseModelConfiguration configuration)
+    internal static string? CapabilitiesProblem(System.Text.Json.Nodes.JsonObject? raw, DiagnosticCaseCapabilities? recorded, out TerminalCapabilities? capabilities)
     {
-        if (Problem(raw, configuration) is { } problem)
-            return problem;
-        if (CreateReflowStrategy(configuration.ReflowStrategy) is null)
-            return $"reflowStrategy: '{configuration.ReflowStrategy}' is not a strategy this build can rebuild.";
-        return TerminalCapabilities(configuration.Capabilities!, out var capabilitiesProblem) is null ? capabilitiesProblem : null;
+        capabilities = null;
+        if (raw is null || recorded is null)
+            return "configuration.capabilities: missing";
+        foreach (var field in RequiredCapabilities)
+        {
+            if (raw[field] is null)
+                return $"capabilities.{field}: missing";
+        }
+        if (raw["sixelCellMetrics"] is System.Text.Json.Nodes.JsonObject metrics)
+        {
+            foreach (var field in new[] { "width", "height", "source", "reliability" })
+            {
+                if (metrics[field] is null)
+                    return $"capabilities.sixelCellMetrics.{field}: missing";
+            }
+        }
+        capabilities = TerminalCapabilities(recorded, out var problem);
+        return problem;
     }
+
+    /// <summary>
+    /// Why a recorded configuration cannot rebuild a model, or null: its fields and reflow strategy
+    /// (<see cref="FieldProblem"/>), then its capabilities (<see cref="CapabilitiesProblem"/>). The reapplier
+    /// judges each as its own compatibility check; a live start that this names is never complete.
+    /// </summary>
+    internal static string? RebuildProblem(System.Text.Json.Nodes.JsonObject raw, DiagnosticCaseModelConfiguration configuration) =>
+        FieldProblem(raw, configuration) ?? CapabilitiesProblem(raw["capabilities"] as System.Text.Json.Nodes.JsonObject, configuration.Capabilities, out _);
 
     internal static DiagnosticCaseCapabilities Capabilities(TerminalCapabilities capabilities) => new()
     {
