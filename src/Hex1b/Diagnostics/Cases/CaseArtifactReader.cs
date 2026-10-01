@@ -98,7 +98,7 @@ internal static class CaseArtifactReader
             TruncatedAtLine = scan.TruncatedAtLine,
             LastCaseSequence = scan.LastCaseSequence,
             Streams = DescribeStreams(manifest, scan, completion),
-            Intervals = DescribeIntervals(manifest, completion, state, scan),
+            Intervals = CaseIntervals.Describe(manifest, completion, state, scan),
             Checkpoints = DescribeCheckpoints(scan, completion),
             Events = scan.Page,
         };
@@ -131,7 +131,7 @@ internal static class CaseArtifactReader
         Problem = new DiagnosticProblem { Code = code, Message = message },
     };
 
-    private sealed class StreamScan
+    internal sealed class StreamScan
     {
         public long Events;
         public long? First;
@@ -141,16 +141,25 @@ internal static class CaseArtifactReader
         public readonly List<DiagnosticCaseRecord> Recorded = [];
         public readonly List<(long From, long To)> Gaps = [];
         public DiagnosticCaseRecord? Failure;
+        // Loss envelopes the recorder wrote at close: the first and last ordinal lost past the ledger's cap.
+        public readonly List<DiagnosticCaseRecord> Envelopes = [];
         private IReadOnlyList<DiagnosticCaseRecord>? _missing;
 
         // Computed once, after the scan.
         public IReadOnlyList<DiagnosticCaseRecord> Missing => _missing ??=
-            Recorded.Concat(Gaps.Where(g => !Recorded.Any(m => m.FromOrdinal <= g.From && (m.ToOrdinal is null || m.ToOrdinal >= g.To)))
+            Recorded.Select(Bounded).Concat(Gaps.Where(g => !Recorded.Any(m => m.FromOrdinal <= g.From && (m.ToOrdinal is null || m.ToOrdinal >= g.To)))
                 .Select(g => new DiagnosticCaseRecord { FromOrdinal = g.From, ToOrdinal = g.To, Reason = "unknown" }))
                 .OrderBy(m => m.FromOrdinal).ToList();
+
+        // A range of unknown extent whose envelope was written is reported bounded by it: the ordinals between are
+        // still not enumerated, but nothing after the envelope was lost to it.
+        private DiagnosticCaseRecord Bounded(DiagnosticCaseRecord missing) =>
+            missing.ToOrdinal is null && missing.Reason == "overload-unknown-extent" && Envelopes.FirstOrDefault(e => e.FromOrdinal == missing.FromOrdinal) is { ToOrdinal: { } to }
+                ? missing with { ToOrdinal = to, Extent = "envelope" }
+                : missing;
     }
 
-    private sealed class ScanResult
+    internal sealed class ScanResult
     {
         public readonly Dictionary<string, StreamScan> Streams = Streams_();
         public readonly List<DiagnosticCaseEvent> Page = [];
@@ -158,12 +167,19 @@ internal static class CaseArtifactReader
         public long? LastCaseSequence;
         public long? LastModelSequence;
         public readonly StreamScan Checkpoints = new();
-        public long? ModelGapAfter;
+        // Every discontinuity in the model sequences (the last sequence before each gap), every interval end the
+        // recorder wrote, the start line and every recovery line: the origins and ends the intervals are built from.
+        public readonly List<long> ModelGaps = [];
+        public readonly List<(long Sequence, string Reason)> IntervalEnds = [];
         public bool StartRecorded;
-        public (long Sequence, string Reason)? IntervalEnd;
+        public CheckpointLine? Start;
+        public readonly List<CheckpointLine> Recoveries = [];
 
         private static Dictionary<string, StreamScan> Streams_() => StreamNames.ToDictionary(s => s, _ => new StreamScan());
     }
+
+    /// <summary>A checkpoint line the scan keeps: the start, or a recovery (its state skipped, its presence noted).</summary>
+    internal sealed record CheckpointLine(long CaseSequence, long ModelSequence, long Ordinal, string Label, string Status, string? Reason, bool HasState);
 
     // A case started on a model that had applied output records model events from after its start's sequence
     // (modelStart); a fresh case from 1.
@@ -193,7 +209,12 @@ internal static class CaseArtifactReader
                 result.Checkpoints.Events++;
                 // A text-state/1 start is the case's first checkpoint line, written with its state (skipped here).
                 if (result.Checkpoints.First is null && written.Trigger == "start" && written.Status == "recorded" && stateOmitted)
+                {
                     result.StartRecorded = true;
+                    result.Start = new CheckpointLine(item.CaseSequence, item.ModelSequence ?? 0, written.Ordinal, written.Label, written.Status, written.Reason, true);
+                }
+                if (written.Trigger == "recovery" && item.ModelSequence is { } recoveryAt)
+                    result.Recoveries.Add(new CheckpointLine(item.CaseSequence, recoveryAt, written.Ordinal, written.Label, written.Status, written.Reason, stateOmitted));
                 result.Checkpoints.First ??= written.Ordinal;
                 result.Checkpoints.Last = Math.Max(result.Checkpoints.Last ?? 0, written.Ordinal);
             }
@@ -204,10 +225,12 @@ internal static class CaseArtifactReader
 
             if (item.Stream == "case")
             {
-                if (item.Kind == "interval-end" && item.ModelSequence is { } end && result.IntervalEnd is null)
-                    result.IntervalEnd = (end, item.Record?.Reason ?? "unsupported");
+                if (item.Kind == "interval-end" && item.ModelSequence is { } end)
+                    result.IntervalEnds.Add((end, item.Record?.Reason ?? "unsupported"));
                 else if (item.Kind == "missing" && item.Record is { } missing && result.Streams.TryGetValue(missing.Stream, out var target))
                     target.Recorded.Add(missing);
+                else if (item.Kind == "loss-envelope" && item.Record is { } envelope && result.Streams.TryGetValue(envelope.Stream, out var enveloped))
+                    enveloped.Envelopes.Add(envelope);
                 else if (item.Kind == "stream-failed" && item.Record is { } failure && result.Streams.TryGetValue(failure.Stream, out var failed))
                     failed.Failure ??= failure;
                 continue;
@@ -225,8 +248,8 @@ internal static class CaseArtifactReader
             if (item.Stream == "model" && item.ModelSequence is { } modelSequence)
             {
                 var next = (result.LastModelSequence ?? modelStart) + 1;
-                if (modelSequence != next && result.ModelGapAfter is null)
-                    result.ModelGapAfter = next - 1;
+                if (modelSequence != next)
+                    result.ModelGaps.Add(next - 1);
                 result.LastModelSequence = modelSequence;
             }
         }
@@ -398,53 +421,5 @@ internal static class CaseArtifactReader
             State = missing.Count == 0 ? "complete" : "incomplete",
             Missing = missing,
         };
-    }
-
-    private static IReadOnlyList<DiagnosticCaseInterval> DescribeIntervals(DiagnosticCaseManifest manifest, DiagnosticCaseCompletion? completion,
-        DiagnosticCaseCompletionState state, ScanResult scan)
-    {
-        if (manifest.Checkpoint.Status != DiagnosticCaseCheckpointStatus.Complete)
-        {
-            return
-            [
-                new DiagnosticCaseInterval
-                {
-                    Valid = false,
-                    EndReason = $"checkpoint {DiagnosticContractNames.Of(manifest.Checkpoint.Status)}: {manifest.Checkpoint.Reason}",
-                },
-            ];
-        }
-
-        // A text-state/1 start re-applies only from its verified start line with state.
-        if (manifest.Checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState && !scan.StartRecorded)
-            return [new DiagnosticCaseInterval { Valid = false, EndReason = "start-missing: the start checkpoint line is not among the verified events, or holds no state" }];
-
-        // The interval runs from the checkpoint's model sequence (0 for a fresh model; a start's for a case started
-        // on a model that had applied output) to the first event it cannot cover. Model events are recorded from the
-        // next sequence, so a model-stream ordinal n is model sequence from + n.
-        var from = manifest.Checkpoint.ModelSequence ?? 0;
-        var last = scan.LastModelSequence ?? from;
-        var model = scan.Streams["model"];
-        (long To, string Reason)? end = null;
-        void Consider(long to, string reason)
-        {
-            if (end is null || to < end.Value.To)
-                end = (to, reason);
-        }
-
-        // On a tie the first reason considered is reported: a recorded cause before an inferred gap.
-        if (scan.IntervalEnd is { } intervalEnd)
-            Consider(intervalEnd.Sequence - 1, intervalEnd.Reason);
-        foreach (var missing in model.Missing)
-            Consider(from + Math.Max(0, (missing.FromOrdinal ?? 1) - 1), missing.Reason == "unknown" ? "model-events-missing" : missing.Reason);
-        if (scan.ModelGapAfter is { } gap)
-            Consider(gap, "model-events-missing");
-        if (state == DiagnosticCaseCompletionState.Truncated)
-            Consider(last, "truncated");
-        else if (state == DiagnosticCaseCompletionState.Interrupted)
-            Consider(last, "interrupted");
-
-        var (to, reason) = end ?? (last, $"case-stopped: {(completion is null ? "unknown" : DiagnosticContractNames.Of(completion.StopReason))}");
-        return [new DiagnosticCaseInterval { Valid = true, FromModelSequence = from, ToModelSequence = to, EndReason = reason }];
     }
 }

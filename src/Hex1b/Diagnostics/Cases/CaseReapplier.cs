@@ -107,18 +107,19 @@ internal static class CaseReapplier
                 $"formatVersion: format {manifest.FormatVersion} does not record its configuration structurally; re-application needs format {CaseArtifactWriter.FormatVersion}.");
         if (manifest.Checkpoint.Profile is not (DiagnosticCaseCheckpointProfiles.FreshModel or DiagnosticCaseCheckpointProfiles.TextState))
             return Refuse(DiagnosticOutcome.Unavailable, "incompatible", $"checkpoint.profile: unknown profile '{manifest.Checkpoint.Profile}'.");
-        // A fresh model starts at model sequence 0; a case started on a model that had applied output starts from its
-        // text-state/1 start checkpoint, restored, at the start's model sequence.
-        var restored = manifest.Checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState;
-        if (restored && manifest.Checkpoint.ModelSequence is not >= 0)
+        // The initial origin: a fresh model at model sequence 0, or a case started on a model that had applied output
+        // at its text-state/1 start's sequence. The complete recovery checkpoints are the later origins; the inspection
+        // lists one interval per origin, and the one restored from is the earliest valid one covering the target, or
+        // the one the request names.
+        if (manifest.Checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState && manifest.Checkpoint.ModelSequence is not >= 0)
             return Refuse(DiagnosticOutcome.Unavailable, "incompatible", "checkpoint.modelSequence: a text-state/1 start names no model sequence.");
-        var start = restored ? manifest.Checkpoint.ModelSequence!.Value : 0;
-        var interval = inspection.Intervals.FirstOrDefault();
-        if (manifest.Checkpoint.Status != DiagnosticCaseCheckpointStatus.Complete || manifest.Checkpoint.Configuration is not { } configuration
-            || interval is not { Valid: true, ToModelSequence: { } intervalEnd })
+        var start = manifest.Checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState ? manifest.Checkpoint.ModelSequence!.Value : 0;
+        var intervals = inspection.Intervals;
+        if (manifest.Checkpoint.Configuration is not { } configuration || !intervals.Any(i => i.Valid))
         {
+            var first = intervals.FirstOrDefault();
             return Refuse(DiagnosticOutcome.Unavailable, "no-valid-interval",
-                $"The case has no re-applicable interval: {interval?.EndReason ?? manifest.Checkpoint.Reason}.") with { IntervalEndReason = interval?.EndReason };
+                $"The case has no re-applicable interval: {first?.EndReason ?? manifest.Checkpoint.Reason}.") with { IntervalEndReason = first?.EndReason };
         }
         var raw = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllBytes(System.IO.Path.Combine(path, CaseArtifactWriter.ManifestFile)))?["checkpoint"]?["configuration"]
             as System.Text.Json.Nodes.JsonObject;
@@ -140,20 +141,6 @@ internal static class CaseReapplier
             return Refuse(DiagnosticOutcome.InvalidRequest, "unknown-model-sequence",
                 $"Model sequence {target} is before the case's start, at model sequence {start}: the case recorded nothing before it.");
 
-        // The start's state, read and checked before anything is built or written.
-        DiagnosticModelState? startState = null;
-        if (restored)
-        {
-            if (resolution.Start is not { } startLine || startLine.ModelSequence != start || startLine.Status != "recorded"
-                || ReadStartState(eventsPath, startLine.CaseSequence) is not { } state)
-                return Refuse(DiagnosticOutcome.Unavailable, "missing-start",
-                    $"The case's start checkpoint at model sequence {start} is missing from its verified events, or holds no state.");
-            if (StartCheckpoint.Unsupported(state) is { Count: > 0 } surfaces)
-                return Refuse(DiagnosticOutcome.Unavailable, "unsupported-start",
-                    $"The case's start holds {string.Join(", ", surfaces)}, which this build cannot restore.");
-            startState = state;
-        }
-
         var targetRecord = new DiagnosticCaseReapplyTarget
         {
             ModelSequence = target,
@@ -169,15 +156,40 @@ internal static class CaseReapplier
             && target > resolution.LastModelSequence)
             return Refuse(DiagnosticOutcome.InvalidRequest, "unknown-model-sequence",
                 $"Model sequence {target} is past the case's last recorded model event, {resolution.LastModelSequence}.") with { Target = targetRecord };
-        if (target > intervalEnd)
+
+        // The origin, and the interval it covers.
+        var selection = SelectOrigin(request.From, intervals, resolution.Checkpoints, target);
+        if (selection.Problem is { } originProblem)
+            return described with { Outcome = originProblem.Outcome, Problem = originProblem.Problem, Target = targetRecord };
+        if (selection.Interval is not { Valid: true, Origin: { } origin, FromModelSequence: { } originFrom, ToModelSequence: { } intervalEnd }
+            || target < originFrom || target > intervalEnd)
         {
-            return Refuse(DiagnosticOutcome.Unavailable, "beyond-interval",
-                $"Model sequence {target} is beyond the case's re-applicable interval, which ends at {intervalEnd}: {interval.EndReason}.") with
+            // Refused before anything is built: the nearest valid interval before the target says where coverage ends.
+            var nearest = selection.Interval is { Valid: true } named ? named
+                : intervals.Where(i => i.Valid && i.FromModelSequence <= target).OrderByDescending(i => i.ToModelSequence).FirstOrDefault();
+            var reason = selection.Interval is { Valid: false } refusedOrigin ? refusedOrigin.EndReason : nearest?.EndReason;
+            var message = selection.Interval is { Valid: false, Origin: { } invalidOrigin }
+                ? $"The origin '{invalidOrigin.Label ?? invalidOrigin.Trigger}' (checkpoint {invalidOrigin.CheckpointOrdinal}) is not re-applicable: {reason}."
+                : $"Model sequence {target} is beyond the case's re-applicable interval" + (nearest is { } n ? $" from model sequence {n.FromModelSequence}, which ends at {n.ToModelSequence}" : "") + $": {reason}.";
+            return Refuse(DiagnosticOutcome.Unavailable, "beyond-interval", message) with
             {
                 Target = targetRecord,
-                LastValidModelSequence = intervalEnd,
-                IntervalEndReason = interval.EndReason,
+                LastValidModelSequence = nearest?.ToModelSequence,
+                IntervalEndReason = reason,
             };
+        }
+
+        // The origin's state, read and checked before anything is built or written.
+        DiagnosticModelState? originState = null;
+        if (origin.Profile == DiagnosticCaseCheckpointProfiles.TextState)
+        {
+            if (origin.CaseSequence is not { } originLine || ReadStartState(eventsPath, originLine) is not { } state)
+                return Refuse(DiagnosticOutcome.Unavailable, "missing-start",
+                    $"The case's origin '{origin.Label}' at model sequence {originFrom} is missing from its verified events, or holds no state.");
+            if (StartCheckpoint.Unsupported(state) is { Count: > 0 } surfaces)
+                return Refuse(DiagnosticOutcome.Unavailable, "unsupported-start",
+                    $"The case's origin '{origin.Label}' holds {string.Join(", ", surfaces)}, which this build cannot restore.");
+            originState = state;
         }
 
         // The detached model is built before anything is written: a configuration it refuses writes nothing.
@@ -192,15 +204,15 @@ internal static class CaseReapplier
             return Refuse(DiagnosticOutcome.Unavailable, "incompatible", DiagnosticCaseRecorder.Bounded($"configuration: {error.Message}"));
         }
 
-        if (startState is not null)
+        if (originState is not null)
         {
             try
             {
-                replica.RestoreModelState(startState);
+                replica.RestoreModelState(originState);
             }
             catch (Exception error) when (error is InvalidOperationException or ArgumentException or FormatException or OverflowException or IndexOutOfRangeException)
             {
-                return Refuse(DiagnosticOutcome.Unavailable, "incompatible", DiagnosticCaseRecorder.Bounded($"start: {error.Message}"));
+                return Refuse(DiagnosticOutcome.Unavailable, "incompatible", DiagnosticCaseRecorder.Bounded($"origin: {error.Message}"));
             }
         }
 
@@ -216,9 +228,9 @@ internal static class CaseReapplier
 
         // The replica is never started and never disposed: disposal writes terminal-control sequences to its
         // presentation. It holds no process, file or real timer, so the collector releases it.
-        var result = described with { Outcome = DiagnosticOutcome.Captured, RunPath = run, Target = targetRecord };
+        var result = described with { Outcome = DiagnosticOutcome.Captured, RunPath = run, Target = targetRecord, Origin = origin };
         DiagnosticCaseCheckpointEvent? recorded = null;
-        long applied = start;
+        long applied = originFrom;
         try
         {
             ReplicaForTesting.Value?.Invoke(replica);
@@ -226,7 +238,7 @@ internal static class CaseReapplier
             {
                 if (chosen is not null && item.CaseSequence == chosen.CaseSequence)
                     recorded = item.Checkpoint;
-                if (item.Stream == "model" && item.ModelSequence is { } sequence && sequence > start && sequence <= target)
+                if (item.Stream == "model" && item.ModelSequence is { } sequence && sequence > originFrom && sequence <= target)
                 {
                     if (Apply(replica, clock, item, sequence) is { } divergence)
                         return Finish(result with { AppliedThrough = applied, Comparison = "different", ComparisonReason = divergence }, run);
@@ -384,6 +396,51 @@ internal static class CaseReapplier
     {
         /// <summary>The start checkpoint line (trigger <c>start</c>), when the case has one.</summary>
         public CheckpointLine? Start { get; init; }
+
+        /// <summary>Every verified checkpoint line, for naming an origin.</summary>
+        public List<CheckpointLine> Checkpoints { get; init; } = [];
+    }
+
+    private sealed record OriginSelection(DiagnosticCaseInterval? Interval, DiagnosticCaseReapplyResult? Problem);
+
+    // The interval to restore from: the earliest valid one covering the target, or the one `from` names (`start`, a
+    // label, `case:N` or `checkpoint:N`). A named checkpoint that is not an origin, or an unknown one, is refused.
+    private static OriginSelection SelectOrigin(string? from, IReadOnlyList<DiagnosticCaseInterval> intervals, List<CheckpointLine> checkpoints, long target)
+    {
+        if (from is null)
+            return new(intervals.Where(i => i.Valid && i.FromModelSequence <= target && target <= i.ToModelSequence).OrderBy(i => i.FromModelSequence).FirstOrDefault(), null);
+        if (from == "start")
+            return new(intervals.FirstOrDefault(), null);
+        Func<DiagnosticCaseOrigin, bool> matches;
+        Func<CheckpointLine, bool> exists;
+        string what;
+        if (from.StartsWith("case:", StringComparison.Ordinal) && long.TryParse(from.AsSpan(5), out var caseSequence))
+        {
+            matches = o => o.CaseSequence == caseSequence;
+            exists = c => c.CaseSequence == caseSequence;
+            what = $"case sequence {caseSequence}";
+        }
+        else if (from.StartsWith("checkpoint:", StringComparison.Ordinal) && long.TryParse(from.AsSpan(11), out var ordinal))
+        {
+            matches = o => o.CheckpointOrdinal == ordinal;
+            exists = c => c.Ordinal == ordinal;
+            what = $"checkpoint {ordinal}";
+        }
+        else
+        {
+            var label = from.StartsWith("label:", StringComparison.Ordinal) ? from[6..] : from;
+            matches = o => o.Label == label;
+            exists = c => c.Label == label;
+            what = $"label '{label}'";
+        }
+        var named = intervals.Where(i => i.Origin is { } o && matches(o)).ToList();
+        if (named.Count > 1)
+            return new(null, Problem(DiagnosticOutcome.InvalidRequest, "ambiguous-label", $"{named.Count} origins have {what}; name one by case sequence."));
+        if (named.Count == 1)
+            return new(named[0], null);
+        return new(null, checkpoints.Any(exists)
+            ? Problem(DiagnosticOutcome.InvalidRequest, "not-an-origin", $"The checkpoint with {what} is not an origin: only the case's start and its complete recovery checkpoints are.")
+            : Problem(DiagnosticOutcome.InvalidRequest, "unknown-origin", $"No checkpoint has {what}."));
     }
 
     // The start checkpoint's state: the first lines of the file, read until its line.
@@ -424,7 +481,7 @@ internal static class CaseReapplier
             if (matches.Count > 1)
                 return new Resolution(0, null, Problem(DiagnosticOutcome.InvalidRequest, "ambiguous-label",
                     $"{matches.Count} checkpoints are labelled '{label}', at case sequences {string.Join(", ", matches.Select(m => m.CaseSequence))}; name one by case sequence."));
-            return new Resolution(matches[0].ModelSequence, matches[0], null, last) { Start = startLine };
+            return new Resolution(matches[0].ModelSequence, matches[0], null, last) { Start = startLine, Checkpoints = checkpoints };
         }
 
         if (request.ToCaseSequence is { } caseSequence)
@@ -432,15 +489,15 @@ internal static class CaseReapplier
             if (named is null)
                 return new Resolution(0, null, Problem(DiagnosticOutcome.InvalidRequest, "unknown-case-sequence", $"No verified event has case sequence {caseSequence}."));
             if (checkpoints.FirstOrDefault(c => c.CaseSequence == caseSequence) is { } line)
-                return new Resolution(line.ModelSequence, line, null, last) { Start = startLine };
+                return new Resolution(line.ModelSequence, line, null, last) { Start = startLine, Checkpoints = checkpoints };
             if (named.Stream != "model" || named.ModelSequence is not { } modelSequence)
                 return new Resolution(0, null, Problem(DiagnosticOutcome.InvalidRequest, "not-a-boundary",
                     $"Case sequence {caseSequence} is a {named.Stream} {named.Kind} event, not a model event or a checkpoint."));
-            return new Resolution(modelSequence, AtSequence(checkpoints, modelSequence), null, last) { Start = startLine };
+            return new Resolution(modelSequence, AtSequence(checkpoints, modelSequence), null, last) { Start = startLine, Checkpoints = checkpoints };
         }
 
         var target = request.ToModelSequence!.Value;
-        return new Resolution(target, AtSequence(checkpoints, target), null, last) { Start = startLine };
+        return new Resolution(target, AtSequence(checkpoints, target), null, last) { Start = startLine, Checkpoints = checkpoints };
     }
 
     // The checkpoint compared at a model sequence: the first with state, else the first.

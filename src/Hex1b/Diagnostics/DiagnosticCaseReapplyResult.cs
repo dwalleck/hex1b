@@ -45,6 +45,10 @@ public sealed record DiagnosticCaseReapplyResult
     [JsonPropertyName("target")]
     public DiagnosticCaseReapplyTarget? Target { get; init; }
 
+    /// <summary>The checkpoint the replica was restored from (or, for a fresh model, started from).</summary>
+    [JsonPropertyName("origin")]
+    public DiagnosticCaseOrigin? Origin { get; init; }
+
     /// <summary>The last model sequence the reconstructed model applied.</summary>
     [JsonPropertyName("appliedThrough")]
     public long? AppliedThrough { get; init; }

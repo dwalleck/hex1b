@@ -28,4 +28,11 @@ public sealed record DiagnosticCaseRecord
     /// </summary>
     [JsonPropertyName("reason")]
     public string Reason { get; init; } = "";
+
+    /// <summary>
+    /// <c>envelope</c> when a range of unknown extent is bounded by its loss envelope in the inspection: its first and last
+    /// ordinal are known, the ordinals between are not enumerated. Absent otherwise.
+    /// </summary>
+    [JsonPropertyName("extent")]
+    public string? Extent { get; init; }
 }

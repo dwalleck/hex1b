@@ -25,6 +25,14 @@ public sealed record DiagnosticCaseReapplyRequest
     [JsonPropertyName("toCaseSequence")]
     public long? ToCaseSequence { get; init; }
 
+    /// <summary>
+    /// The origin to restore from: <c>start</c> (the case's initial checkpoint), a recovery checkpoint's label,
+    /// <c>case:N</c> (its case sequence) or <c>checkpoint:N</c> (its ordinal). Absent, the earliest valid interval that
+    /// covers the target chooses it. A named origin whose interval does not cover the target is refused.
+    /// </summary>
+    [JsonPropertyName("from")]
+    public string? From { get; init; }
+
     /// <summary>Faults to inject into the reconstructed state before comparing; the result is labelled.</summary>
     [JsonPropertyName("faults")]
     public IReadOnlyList<string>? Faults { get; init; }
