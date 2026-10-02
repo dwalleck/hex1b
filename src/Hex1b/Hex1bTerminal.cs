@@ -3196,6 +3196,12 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             }
         }
 
+        // History-only hyperlinks must stay alive while the old ring is cleared
+        // and replacement rows acquire their references, just like screen cells.
+        foreach (var entry in scrollbackEntries)
+            foreach (var cell in entry.Row.Cells)
+                cell.TrackedHyperlink?.AddRef();
+
         ScrollbackReplacementResult replacement;
         if (_inAlternateScreen)
         {
@@ -3232,6 +3238,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         // their replacements, including cells moving between the two.
         foreach (var cell in _screenBuffer)
             cell.TrackedHyperlink?.Release();
+        foreach (var entry in scrollbackEntries)
+            foreach (var cell in entry.Row.Cells)
+                cell.TrackedHyperlink?.Release();
         _screenBuffer = newBuffer;
         _width = newWidth;
         _height = newHeight;
@@ -3377,8 +3386,16 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     // === Screen Buffer Parsing ===
 
     /// <summary>
-    /// Sets a cell in the screen buffer, properly managing tracked object references.
-    /// Releases the old cell's tracked object (if any) and adds a reference for the new one (if any).
+    /// Copies a borrowed cell, acquiring its reference before replacing the destination.
+    /// </summary>
+    private void CopyCell(int y, int x, TerminalCell cell, List<CellImpact>? impacts = null, bool damageSixel = true)
+    {
+        cell.TrackedHyperlink?.AddRef();
+        SetCell(y, x, cell, impacts, damageSixel);
+    }
+
+    /// <summary>
+    /// Sets a cell by consuming its already-owned reference and releasing the old cell's reference.
     /// </summary>
     /// <param name="y">The row position (0-based).</param>
     /// <param name="x">The column position (0-based).</param>
@@ -3392,10 +3409,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         // Release old hyperlink data reference
         oldCell.TrackedHyperlink?.Release();
         
-        // Note: new cell's tracked object already has a reference from GetOrCreateSixel/GetOrCreateHyperlink
-        // or was explicitly AddRef'd by the caller before creating the cell
-        // No need to AddRef here - the caller is responsible for getting the object
-        // with the correct refcount
+        // The caller supplies an owned reference: acquired while printing,
+        // acquired by CopyCell, or transferred from the saved main-screen buffer.
         
         oldCell = newCell;
 
@@ -6428,7 +6443,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             for (int x = leftCol; x <= rightCol; x++)
             {
                 var cellFromBelow = _screenBuffer[y + 1, x];
-                SetCell(y, x, cellFromBelow, impacts, damageSixel: false);
+                CopyCell(y, x, cellFromBelow, impacts, damageSixel: false);
             }
         }
         
@@ -6497,7 +6512,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             for (int x = leftCol; x <= rightCol; x++)
             {
                 var cellFromAbove = _screenBuffer[y - 1, x];
-                SetCell(y, x, cellFromAbove, impacts, damageSixel: false);
+                CopyCell(y, x, cellFromAbove, impacts, damageSixel: false);
             }
         }
         
@@ -6598,7 +6613,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 for (int x = leftCol; x <= rightCol; x++)
                 {
                     var cellFromAbove = _screenBuffer[y - 1, x];
-                    SetCell(y, x, cellFromAbove, impacts);
+                    CopyCell(y, x, cellFromAbove, impacts);
                 }
             }
             
@@ -6644,7 +6659,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 for (int x = leftCol; x <= rightCol; x++)
                 {
                     var cellFromBelow = _screenBuffer[y + 1, x];
-                    SetCell(y, x, cellFromBelow, impacts);
+                    CopyCell(y, x, cellFromBelow, impacts);
                 }
             }
             
@@ -6728,7 +6743,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         for (var y = _scrollTop; y <= _scrollBottom; y++)
         {
             for (var x = rightCol; x >= leftCol + count; x--)
-                SetCell(y, x, _screenBuffer[y, x - count], impacts);
+                CopyCell(y, x, _screenBuffer[y, x - count], impacts);
 
             for (var x = leftCol; x < leftCol + count; x++)
                 SetCell(y, x, eraseCell, impacts);
@@ -6752,7 +6767,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         for (var y = _scrollTop; y <= _scrollBottom; y++)
         {
             for (var x = leftCol; x <= rightCol - count; x++)
-                SetCell(y, x, _screenBuffer[y, x + count], impacts);
+                CopyCell(y, x, _screenBuffer[y, x + count], impacts);
 
             for (var x = rightCol - count + 1; x <= rightCol; x++)
                 SetCell(y, x, eraseCell, impacts);
@@ -6825,7 +6840,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         for (int x = _cursorX; x < rightEdge - count; x++)
         {
             var cellFromRight = _screenBuffer[_cursorY, x + count];
-            SetCell(_cursorY, x, cellFromRight, impacts);
+            CopyCell(_cursorY, x, cellFromRight, impacts);
         }
         
         // Fill the right edge with blanks
@@ -6922,7 +6937,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         for (int x = rightEdge - 1; x >= _cursorX + count; x--)
         {
             var cellFromLeft = _screenBuffer[_cursorY, x - count];
-            SetCell(_cursorY, x, cellFromLeft, impacts);
+            CopyCell(_cursorY, x, cellFromLeft, impacts);
         }
         
         // Insert blanks at cursor position
