@@ -14,7 +14,12 @@ public class UnixPtyEnvironmentTests
         if (!OperatingSystem.IsLinux() && !OperatingSystem.IsMacOS())
             Assert.Inconclusive("Requires a Unix PTY.");
 
-        var environment = new Dictionary<string, string> { ["HEX1B_MARKER"] = "space = \u03bb" };
+        // GNU env quotes values when stdout is a terminal; observe the values, not that display format.
+        var environment = new Dictionary<string, string>
+        {
+            ["HEX1B_MARKER"] = "space = \u03bb",
+            ["QUOTING_STYLE"] = "literal"
+        };
         if (overrideTerm)
             environment["TERM"] = "vt100";
         await using var process = new Hex1bTerminalChildProcess(
@@ -26,12 +31,13 @@ public class UnixPtyEnvironmentTests
         Assert.AreEqual(0, await process.WaitForExitAsync(cts.Token));
 
         var lines = output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
-        Assert.AreEqual(4, lines.Length, "The child must not inherit the host's environment.");
+        Assert.AreEqual(5, lines.Length, "The child must not inherit the host's environment.");
         var variables = lines.Select(line => line.Split('=', 2)).ToDictionary(parts => parts[0], parts => parts[1]);
         Assert.AreEqual(overrideTerm ? "vt100" : "xterm-256color", variables["TERM"]);
         Assert.AreEqual("space = \u03bb", variables["HEX1B_MARKER"]);
         Assert.AreEqual("argument", variables["HEX1B_ARG"]);
         Assert.AreEqual("1", variables["HEX1B_NESTING_LEVEL"]);
+        Assert.AreEqual("literal", variables["QUOTING_STYLE"]);
     }
 
     [TestMethod]
