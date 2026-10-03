@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Hex1b.Diagnostics;
 using Hex1b.Diagnostics.Cases;
+using Hex1b.Input;
 using Hex1b.Reflow;
 using Microsoft.Extensions.Time.Testing;
 
@@ -37,20 +38,6 @@ public partial class DiagnosticCaseTests
         }
         AssertStopCheckpoint(Artifact.Read(path), "time-limit", "time limit");
 
-        // Size limit: a small model's state fits in the tier written as the case closes.
-        workload = new ScriptedWorkload();
-        (terminal, path) = Checkpointed(root, workload, width: 10, height: 2, scrollback: null, maxBytes: 1024 * 1024);
-        await using (terminal)
-        {
-            var chunk = Enumerable.Repeat((byte)'s', 16 * 1024).ToArray();
-            for (var i = 0; i < 128 && new TerminalDiagnostics(terminal).GetCaseStatus().Outcome == DiagnosticOutcome.Captured; i++)
-                await workload.WriteAndWaitAsync(terminal, chunk);
-            await WaitAsync(() => File.Exists(Path.Combine(path, "completion.json")), TimeSpan.FromSeconds(30));
-        }
-        var sized = Artifact.Read(path);
-        AssertStopCheckpoint(sized, "size-limit", "ssssssssss");
-        Assert.IsLessThanOrEqualTo(1024L * 1024, Directory.GetFiles(path).Sum(f => new FileInfo(f).Length));
-
         // A collector failure takes none.
         DiagnosticCaseRecorder.WriterFaultForTesting.Value = new IOException("injected storage failure");
         try
@@ -71,6 +58,89 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual("collector-failed", failed.Completion!.Value.GetProperty("stopReason").GetString());
         Assert.IsEmpty(Checkpoints(failed), "a collector failure recorded a checkpoint");
         Assert.AreEqual(0, failed.Completion.Value.GetProperty("checkpoints").GetProperty("offered").GetInt64());
+    }
+
+    [TestMethod]
+    [DataRow("fits", 40, 8, 1)]
+    [DataRow("floor", 80, 20, 0)]
+    [DataRow("exact overflow", 40, 8, 1)]
+    public async Task Checkpoint_SizeLimitUsesExactFit(string shape, int width, int height, int projections)
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        const long maxBytes = 1024 * 1024;
+        Hex1bTerminal? observedTerminal = null;
+        long stopRoom = 0, minimumBytes = 0;
+        DiagnosticCaseRecorder.AfterLockedStopCheckForTesting.Value = () =>
+        {
+            stopRoom = observedTerminal!.DiagnosticCase!.StopCheckpointRoom;
+            minimumBytes = observedTerminal.MinimumModelStateJsonBytesUnsafe();
+        };
+        Hex1bTerminal terminal;
+        string path;
+        try
+        {
+            (terminal, path) = Checkpointed(root, workload, width: width, height: height,
+                scrollback: null, maxBytes: maxBytes, rawInput: true);
+            observedTerminal = terminal;
+        }
+        finally
+        {
+            DiagnosticCaseRecorder.AfterLockedStopCheckForTesting.Value = null;
+        }
+
+        long captures;
+        int stateBytes;
+        await using (terminal)
+        {
+            await workload.WriteAndWaitAsync(terminal, "\u001b[32mfit\u001b[m"
+                + (shape == "exact overflow" ? "\u001b]2;" + new string('<', 1_200) + "\u0007" : ""));
+            var diagnostics = new TerminalDiagnostics(terminal);
+            await WrittenAsync(diagnostics, terminal.CurrentModelSequence);
+            stateBytes = JsonSerializer.SerializeToUtf8Bytes(terminal.CaptureModelState(), DiagnosticsJsonContext.Default.DiagnosticModelState).Length;
+            captures = terminal.ModelStateCapturesForTesting;
+            var recorder = terminal.DiagnosticCase!;
+            var input = (IDiagnosticStreamObserver)recorder;
+            var large = new Hex1bKeyEvent(Hex1bKey.X, new string('x', 16 * 1024), Hex1bModifiers.None);
+            var small = new Hex1bKeyEvent(Hex1bKey.X, new string('x', 1024), Hex1bModifiers.None);
+            // Wait for each input to be written before offering another. Input loss at the bound does not
+            // remove a model event, so the unchanged model can still be re-applied through the stop.
+            for (long id = 1; id <= 1024 && recorder.IsRecording; id++)
+            {
+                input.OnInputAccepted(id, "key", "test", recorder.StopCheckpointRoom > 64 * 1024 ? large : small);
+                await WaitAsync(() => !recorder.IsRecording
+                    || diagnostics.GetCaseStatus().Streams.Single(s => s.Stream == "input").Written == id, TimeSpan.FromSeconds(30));
+            }
+            await recorder.Completion.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+            captures = terminal.ModelStateCapturesForTesting - captures;
+        }
+
+        var artifact = Artifact.Read(path);
+        Assert.AreEqual("size-limit", artifact.Completion!.Value.GetProperty("stopReason").GetString());
+        var line = StopCheckpoint(artifact);
+        var checkpoint = line.GetProperty("checkpoint");
+        if (shape == "fits")
+        {
+            Assert.IsGreaterThan(stopRoom, (long)width * height * 24 + 4 * 1024, "fixture: the former rough estimate would fit");
+            Assert.AreEqual("recorded", checkpoint.GetProperty("status").GetString(), checkpoint.ToString());
+            Assert.IsLessThanOrEqualTo(stopRoom, System.Text.Encoding.UTF8.GetByteCount(line.GetRawText()) + 10L,
+                "the complete checksummed checkpoint line must fit, not only its state");
+            Assert.IsGreaterThanOrEqualTo(0.0, checkpoint.GetProperty("captureMilliseconds").GetDouble());
+            AssertMatched(Reapply(path, label: "stop"), "a fitting size-limit stop");
+        }
+        else
+        {
+            Assert.AreEqual("missing", checkpoint.GetProperty("status").GetString());
+            Assert.AreEqual("size-limit", checkpoint.GetProperty("reason").GetString());
+            Assert.IsFalse(checkpoint.TryGetProperty("state", out _));
+            Assert.IsGreaterThan(stopRoom, (long)stateBytes, "fixture: the serialized state would fit");
+        }
+        if (shape == "floor")
+            Assert.IsGreaterThan(stopRoom, minimumBytes, "fixture: the minimum would fit");
+        else
+            Assert.IsLessThanOrEqualTo(stopRoom, minimumBytes, "fixture: the minimum must admit projection");
+        Assert.AreEqual((long)projections, captures, "only an impossible minimum may skip the stop projection");
+        Assert.IsLessThanOrEqualTo(maxBytes, Directory.GetFiles(path).Sum(f => new FileInfo(f).Length));
     }
 
     [TestMethod]
@@ -383,7 +453,8 @@ public partial class DiagnosticCaseTests
     }
 
     private static (Hex1bTerminal Terminal, string Path) Checkpointed(CaseRoot root, ScriptedWorkload workload, bool authorized = true,
-        int width = 40, int height = 10, int? scrollback = 100, long? maxBytes = null, int? maxSeconds = null, TimeProvider? clock = null)
+        int width = 40, int height = 10, int? scrollback = 100, long? maxBytes = null, int? maxSeconds = null, TimeProvider? clock = null,
+        bool rawInput = false)
     {
         var options = new Hex1bTerminalOptions
         {
@@ -399,7 +470,8 @@ public partial class DiagnosticCaseTests
             Directory = root.Path,
             MaxBytes = maxBytes,
             MaxSeconds = maxSeconds,
-            Authorizations = authorized ? [DiagnosticAuthorization.ReapplicationData] : [],
+            Authorizations = rawInput ? [DiagnosticAuthorization.ReapplicationData, DiagnosticAuthorization.RawInput]
+                : authorized ? [DiagnosticAuthorization.ReapplicationData] : [],
         });
         Assert.AreEqual(DiagnosticOutcome.Captured, started.Outcome, started.Problem?.Message);
         return (terminal, started.Path!);

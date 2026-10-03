@@ -423,9 +423,11 @@ taken in one hold of the model lock, between two model events, at the model sequ
 - Without it, the checkpoint records the boundary only (`status: unavailable`,
   `reason: requires reapplication-data`).
 - A state too large for the case's size bound is written without it (`status: missing`,
-  `reason: size-limit`), and the case keeps recording. A size-limit stop estimates the state's size
-  first and does not take one that cannot fit. A checkpoint that cannot be written at all is declared
-  by a `missing` range of stream `checkpoint` (checkpoint ordinals).
+  `reason: size-limit`); at a mark, the case keeps recording. A size-limit stop first checks a
+  minimum JSON size and skips projection only when even that cannot fit the remaining room.
+  Otherwise, subject to the authorization and pending-state bound, it projects once and lets
+  the writer check the exact size of the complete serialized checkpoint line. A checkpoint that
+  cannot be written at all is declared by a `missing` range of stream `checkpoint` (checkpoint ordinals).
 - State awaiting the writer is bounded at 256 MiB, estimated from the model's geometry before any
   state is taken. A checkpoint past that budget records the boundary only (`unavailable`,
   `pending-state budget`).
@@ -455,8 +457,12 @@ the artifact once the line is written. At most 64 marks can await the writer; a 
 refused `busy` before any state is taken. Problem codes: `invalid-label` (`invalid-request`);
 `no-active-case` and `busy` (`unavailable`).
 
-A checkpoint costs one pass over the model's cells under its lock: about 0.1–0.25 s and 60 MiB for
-250 columns with 10,000 history rows. A case takes none until a mark or its stop.
+A checkpoint projection reads the model's cells under its lock: about 0.1–0.25 s and 60 MiB for
+250 columns with 10,000 history rows in the measured example, not a timing guarantee. A size-limit
+stop whose minimum fits can pay this projection cost even when the writer subsequently rejects
+the exact serialized line. The 256 MiB pending-state bound still applies before projection; it is
+not a bound on lock-held time. Full-state projections occur at eligible live starts, recoveries,
+marks and stops, not at each model event.
 
 What arming a case costs is measured, not budgeted: a retained same-build armed-versus-unarmed
 report (output bytes and order, timeline, host CPU, the pump per chunk from `cd

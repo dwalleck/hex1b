@@ -179,9 +179,9 @@ public sealed partial class Hex1bTerminal
     };
 
     // Must hold _bufferLock. The state only with reapplication-data and within the pending-state budget,
-    // both judged from geometry before any state is read. A size-limit stop skips a state that could not fit
-    // what is left of the case. A projection that fails leaves the boundary without state rather than
-    // failing the stop or the mark.
+    // estimated before any state is read. A size-limit stop skips projection only when the JSON floor
+    // cannot fit what is left of the case; otherwise the writer measures the complete checkpoint line.
+    // A projection that fails leaves the boundary without state rather than failing the stop or the mark.
     // Returns the checkpoint's model sequence with it: the current one, or, when the checkpoint is re-entered
     // from inside an application (a callback), the boundary only, at the sequence before the application the
     // case has not yet recorded, or at the current one when there is none.
@@ -198,7 +198,7 @@ public sealed partial class Hex1bTerminal
                 new(null, null, "unavailable", "mid-application: taken inside an application that had not finished", 0));
         if (!recorder.IncludeModelPayloads)
             return (_modelSequence, new(null, null, "unavailable", "requires reapplication-data", 0));
-        if (forSizeLimitStop && EstimateModelStateJsonBytesUnsafe() > recorder.StopCheckpointRoom)
+        if (forSizeLimitStop && MinimumModelStateJsonBytesUnsafe() > recorder.StopCheckpointRoom)
             return (_modelSequence, new(null, null, "missing", "size-limit", 0));
         var estimate = EstimateModelStateBytesUnsafe();
         if (!recorder.TryReserveStateBytes(estimate))
