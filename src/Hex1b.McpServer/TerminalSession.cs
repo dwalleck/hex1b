@@ -17,8 +17,6 @@ public sealed class TerminalSession : IAsyncDisposable
     private readonly AsciinemaRecorder _asciinemaRecorder;
     private readonly CancellationTokenSource _cts = new();
     private bool _disposed;
-    private int _width;
-    private int _height;
 
     /// <summary>
     /// Gets the unique identifier for this session.
@@ -28,12 +26,12 @@ public sealed class TerminalSession : IAsyncDisposable
     /// <summary>
     /// Gets the terminal width in columns.
     /// </summary>
-    public int Width => _width;
+    public int Width => _terminal.Width;
 
     /// <summary>
     /// Gets the terminal height in rows.
     /// </summary>
-    public int Height => _height;
+    public int Height => _terminal.Height;
 
     /// <summary>
     /// Gets when this session was started.
@@ -100,17 +98,15 @@ public sealed class TerminalSession : IAsyncDisposable
         string command,
         IReadOnlyList<string> arguments,
         string? workingDirectory,
-        string? initialAsciinemaFilePath,
-        int width,
-        int height)
+        string? initialAsciinemaFilePath)
     {
         Id = id;
         _process = process;
         _terminal = terminal;
+        // This session awaits model resizing before mirroring presentation dimensions.
+        _terminal.TakePresentationResizeOwnership();
         _presentation = presentation;
         _asciinemaRecorder = asciinemaRecorder;
-        _width = width;
-        _height = height;
         Command = command;
         Arguments = arguments;
         WorkingDirectory = workingDirectory;
@@ -205,7 +201,7 @@ public sealed class TerminalSession : IAsyncDisposable
                     throw new DiagnosticCaseStartException(started);
             }
 
-            return new TerminalSession(id, process, terminal, presentation, asciinemaRecorder, command, arguments, workingDirectory, asciinemaFilePath, width, height);
+            return new TerminalSession(id, process, terminal, presentation, asciinemaRecorder, command, arguments, workingDirectory, asciinemaFilePath);
         }
         catch (Exception startupError)
         {
@@ -290,19 +286,25 @@ public sealed class TerminalSession : IAsyncDisposable
 
 
     /// <summary>
-    /// Resizes the terminal.
+    /// Resizes the terminal model and its workload, including the retained model after process exit.
     /// </summary>
     /// <param name="width">New width in columns.</param>
     /// <param name="height">New height in rows.</param>
     /// <param name="ct">Cancellation token.</param>
     public async Task ResizeAsync(int width, int height, CancellationToken ct = default)
     {
-        if (_disposed || _process.HasExited)
+        if (_disposed)
             return;
 
-        _width = width;
-        _height = height;
-        await _process.ResizeAsync(width, height, ct);
+        try
+        {
+            await _terminal.ResizeForAutomationAsync(width, height, ct);
+        }
+        finally
+        {
+            // Mirror the authoritative model even if workload/filter notification failed.
+            _presentation.Resize(_terminal.Width, _terminal.Height);
+        }
     }
 
     /// <summary>
@@ -404,10 +406,10 @@ public sealed class TerminalSession : IAsyncDisposable
     {
         using var snapshot = _terminal.CreateSnapshot();
         var sb = new StringBuilder();
-        
+
         // Clear screen and move cursor to home
         sb.Append("\x1b[2J\x1b[H");
-        
+
         for (int y = 0; y < snapshot.Height; y++)
         {
             // Position cursor at start of each row
@@ -415,14 +417,14 @@ public sealed class TerminalSession : IAsyncDisposable
             {
                 sb.Append($"\x1b[{y + 1};1H");
             }
-            
+
             for (int x = 0; x < snapshot.Width; x++)
             {
                 var cell = snapshot.GetCell(x, y);
-                
+
                 // Build SGR sequence for this cell
                 sb.Append("\x1b[0"); // Reset
-                
+
                 // Add attributes
                 if ((cell.Attributes & CellAttributes.Bold) != 0) sb.Append(";1");
                 if ((cell.Attributes & CellAttributes.Dim) != 0) sb.Append(";2");
@@ -432,30 +434,30 @@ public sealed class TerminalSession : IAsyncDisposable
                 if ((cell.Attributes & CellAttributes.Reverse) != 0) sb.Append(";7");
                 if ((cell.Attributes & CellAttributes.Hidden) != 0) sb.Append(";8");
                 if ((cell.Attributes & CellAttributes.Strikethrough) != 0) sb.Append(";9");
-                
+
                 // Add foreground color
                 if (cell.Foreground is { } fg && !fg.IsDefault)
                 {
                     sb.Append($";38;2;{fg.R};{fg.G};{fg.B}");
                 }
-                
+
                 // Add background color
                 if (cell.Background is { } bg && !bg.IsDefault)
                 {
                     sb.Append($";48;2;{bg.R};{bg.G};{bg.B}");
                 }
-                
+
                 sb.Append('m');
-                
+
                 // Print the character (or space if empty)
                 var ch = string.IsNullOrEmpty(cell.Character) ? " " : cell.Character;
                 sb.Append(ch);
             }
         }
-        
+
         // Reset attributes at the end
         sb.Append("\x1b[0m");
-        
+
         return sb.ToString();
     }
 

@@ -477,15 +477,22 @@ public class CaptureContractMcpTests : McpServerTestBase
 
         var processed = await CallAsync(client, "capture_terminal_screen", new()
         {
-            ["sessionId"] = sessionId, ["milestone"] = "input-processed", ["inputId"] = inputId,
+            ["sessionId"] = sessionId,
+            ["milestone"] = "input-processed",
+            ["inputId"] = inputId,
         });
         var framed = await CallAsync(client, "capture_application_frame", new()
         {
-            ["sessionId"] = sessionId, ["milestone"] = "frame-published", ["inputId"] = inputId,
+            ["sessionId"] = sessionId,
+            ["milestone"] = "frame-published",
+            ["inputId"] = inputId,
         });
         var applied = await CallAsync(client, "capture_terminal_screen", new()
         {
-            ["sessionId"] = sessionId, ["milestone"] = "model-applied", ["inputId"] = inputId, ["authorize"] = "raw-input",
+            ["sessionId"] = sessionId,
+            ["milestone"] = "model-applied",
+            ["inputId"] = inputId,
+            ["authorize"] = "raw-input",
         });
 
         Assert.IsTrue(processed.GetProperty("capture").GetProperty("milestone").GetProperty("met").GetBoolean(), processed.ToString());
@@ -521,11 +528,15 @@ public class CaptureContractMcpTests : McpServerTestBase
             var inputId = accepted.GetProperty("lastId").GetInt64();
             var processed = await CallAsync(client, "capture_terminal_screen", new()
             {
-                ["sessionId"] = local, ["milestone"] = "input-processed", ["inputId"] = inputId,
+                ["sessionId"] = local,
+                ["milestone"] = "input-processed",
+                ["inputId"] = inputId,
             });
             var acceptedCapture = await CallAsync(client, "capture_terminal_screen", new()
             {
-                ["sessionId"] = local, ["milestone"] = "input-accepted", ["inputId"] = inputId,
+                ["sessionId"] = local,
+                ["milestone"] = "input-accepted",
+                ["inputId"] = inputId,
             });
 
             StringAssert.Contains(accepted.GetProperty("meaning").GetString(), "child process");
@@ -688,6 +699,140 @@ public class CaptureContractMcpTests : McpServerTestBase
             var bytes = model.Where(e => e.Data is not null).SelectMany(e => Convert.FromBase64String(e.Data!)).ToArray();
             StringAssert.Contains(Encoding.UTF8.GetString(bytes), "CASE-MCP-42");
             Assert.AreEqual((DiagnosticCaseCompletionState.Complete, true), (inspection.CompletionState, inspection.Intervals.Single().Valid));
+        }
+        finally
+        {
+            await CallAsync(client, "remove_session", new() { ["sessionId"] = sessionId });
+        }
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task ResizeTerminal_LocalSessionUpdatesCaptureAndPtyAndReappliesCase()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("Owner-only case storage and PTY geometry are verified on Linux.");
+        using var root = new CaseRoot();
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var start = await CallAsync(client, "start_bash_terminal", new()
+        {
+            ["width"] = 60,
+            ["height"] = 10,
+            ["workingDirectory"] = Path.GetTempPath(),
+            ["recordCase"] = true,
+            ["caseDirectory"] = root.Path,
+            ["caseAuthorize"] = "reapplication-data",
+        });
+        Assert.IsTrue(start.GetProperty("success").GetBoolean(), start.ToString());
+        var sessionId = start.GetProperty("sessionId").GetString()!;
+        try
+        {
+            var resize = await CallAsync(client, "resize_terminal", new()
+            {
+                ["sessionId"] = sessionId,
+                ["width"] = 45,
+                ["height"] = 8,
+            });
+            Assert.IsTrue(resize.GetProperty("success").GetBoolean(), resize.ToString());
+
+            // Completion of resize_terminal must include the model resize, without waiting for child output.
+            var capture = await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = sessionId });
+            Assert.IsTrue(capture.GetProperty("success").GetBoolean(), capture.ToString());
+            var geometry = capture.GetProperty("capture").GetProperty("geometry");
+            Assert.AreEqual((45, 8), (geometry.GetProperty("columns").GetInt32(), geometry.GetProperty("rows").GetInt32()),
+                capture.ToString());
+            var listed = await CallAsync(client, "list_terminals", new());
+            var session = TestSeq.Single(listed.GetProperty("sessions").EnumerateArray(),
+                s => s.GetProperty("sessionId").GetString() == sessionId);
+            Assert.AreEqual((45, 8), (session.GetProperty("width").GetInt32(), session.GetProperty("height").GetInt32()),
+                listed.ToString());
+
+            // The complete marker is computed by bash, so echoed command text cannot satisfy the wait.
+            var nonce = Guid.NewGuid().ToString("N")[..8];
+            var input = await CallAsync(client, "send_terminal_input", new()
+            {
+                ["sessionId"] = sessionId,
+                ["text"] = $"printf '\\nPTY-{nonce}-%s:%s\\n' \"$((20+22))\" \"$(stty size)\"\r",
+            });
+            Assert.IsTrue(input.GetProperty("success").GetBoolean(), input.ToString());
+            var wait = await CallAsync(client, "wait_for_terminal_text", new()
+            {
+                ["sessionId"] = sessionId,
+                ["text"] = $"PTY-{nonce}-42:8 45",
+                ["timeoutSeconds"] = 10,
+            });
+            Assert.IsTrue(wait.GetProperty("found").GetBoolean(), wait.ToString());
+
+            var mark = await CallAsync(client, "mark_diagnostic_case", new()
+            {
+                ["sessionId"] = sessionId,
+                ["label"] = "resized",
+            });
+            Assert.IsTrue(mark.GetProperty("success").GetBoolean(), mark.ToString());
+            var stop = await CallAsync(client, "stop_diagnostic_case", new() { ["sessionId"] = sessionId });
+            Assert.IsTrue(stop.GetProperty("success").GetBoolean(), stop.ToString());
+            var path = stop.GetProperty("case").GetProperty("path").GetString()!;
+            var inspect = await CallAsync(client, "inspect_diagnostic_case", new() { ["path"] = path, ["limit"] = 4096 });
+            Assert.IsTrue(inspect.GetProperty("success").GetBoolean(), inspect.ToString());
+            var modelResize = TestSeq.Single(inspect.GetProperty("inspection").GetProperty("events").EnumerateArray(),
+                e => e.GetProperty("stream").GetString() == "model" && e.GetProperty("kind").GetString() == "resize");
+            Assert.AreEqual((45, 8), (modelResize.GetProperty("width").GetInt32(), modelResize.GetProperty("height").GetInt32()),
+                modelResize.ToString());
+            var reapplied = await CallAsync(client, "reapply_diagnostic_case", new() { ["path"] = path, ["to"] = "resized" });
+            Assert.IsTrue(reapplied.GetProperty("success").GetBoolean(), reapplied.ToString());
+            Assert.AreEqual("matched", reapplied.GetProperty("reapplication").GetProperty("comparison").GetString(), reapplied.ToString());
+        }
+        finally
+        {
+            await CallAsync(client, "remove_session", new() { ["sessionId"] = sessionId });
+        }
+    }
+
+    [TestMethod]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    public async Task ResizeTerminal_ExitedSessionUpdatesCaptureAndReportedGeometry()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Inconclusive("The local bash session is verified on Linux.");
+        await StartServerAsync();
+        await using var client = await CreateClientAsync();
+        var sessionId = await StartLocalSessionAsync(client);
+        try
+        {
+            var liveResize = await CallAsync(client, "resize_terminal", new()
+            {
+                ["sessionId"] = sessionId,
+                ["width"] = 45,
+                ["height"] = 8,
+            });
+            Assert.IsTrue(liveResize.GetProperty("success").GetBoolean(), liveResize.ToString());
+            var retained = SessionManager.GetSession(sessionId);
+            Assert.IsNotNull(retained);
+            var exit = await CallAsync(client, "send_terminal_input", new() { ["sessionId"] = sessionId, ["text"] = "exit 0\r" });
+            Assert.IsTrue(exit.GetProperty("success").GetBoolean(), exit.ToString());
+            using var exitTimeout = CancellationTokenSource.CreateLinkedTokenSource(TestCancellationToken);
+            exitTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+            Assert.AreEqual(0, await retained.WaitForExitAsync(exitTimeout.Token));
+
+            var resize = await CallAsync(client, "resize_terminal", new()
+            {
+                ["sessionId"] = sessionId,
+                ["width"] = 40,
+                ["height"] = 7,
+            });
+            Assert.IsTrue(resize.GetProperty("success").GetBoolean(), resize.ToString());
+            var capture = await CallAsync(client, "capture_terminal_screen", new() { ["sessionId"] = sessionId });
+            Assert.IsTrue(capture.GetProperty("success").GetBoolean(), capture.ToString());
+            var geometry = capture.GetProperty("capture").GetProperty("geometry");
+            Assert.AreEqual((40, 7), (geometry.GetProperty("columns").GetInt32(), geometry.GetProperty("rows").GetInt32()),
+                capture.ToString());
+            var listed = await CallAsync(client, "list_terminals", new());
+            var session = TestSeq.Single(listed.GetProperty("sessions").EnumerateArray(),
+                s => s.GetProperty("sessionId").GetString() == sessionId);
+            Assert.IsTrue(session.GetProperty("hasExited").GetBoolean(), listed.ToString());
+            Assert.AreEqual((40, 7), (session.GetProperty("width").GetInt32(), session.GetProperty("height").GetInt32()),
+                listed.ToString());
         }
         finally
         {

@@ -29,7 +29,7 @@ The server communicates via stdio using the MCP protocol.
 - **stop_terminal** - Stop a terminal session's process
 - **remove_session** - Remove a terminal session and dispose resources
 - **list_terminals** - List all active terminal sessions
-- **resize_terminal** - Resize a terminal session
+- **resize_terminal** - Resize a local session's terminal model and live PTY before returning, so subsequent captures and `list_terminals` report the new geometry. An active diagnostic case records one model resize event for reapplication. After the child exits, the retained model remains resizable until `remove_session`.
 
 ### Input
 
