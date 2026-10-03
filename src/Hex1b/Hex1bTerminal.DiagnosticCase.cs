@@ -35,7 +35,7 @@ public sealed partial class Hex1bTerminal
         return (terminal, started);
     }
 
-    private void CaptureCaseConfiguration(Hex1bTerminalOptions options)
+    private void CaptureCaseConfiguration(Hex1bTerminalOptions options, Sixel.SixelCompatibilityPolicy dcsPolicy)
     {
         _caseConfiguration = new DiagnosticCaseModelConfiguration
         {
@@ -51,6 +51,11 @@ public sealed partial class Hex1bTerminal
             Workload = _workload.GetType().FullName ?? "",
             Capabilities = CaseConfiguration.Capabilities(_presentation.Capabilities),
             Graphics = CaseConfiguration.Graphics(options.Graphics),
+            DcsFraming = new DiagnosticCaseDcsFramingConfiguration
+            {
+                MaximumHeaderParameters = dcsPolicy.MaximumDcsHeaderParameters,
+                MaximumNumericValue = dcsPolicy.MaximumNumericValue,
+            },
         };
     }
 
@@ -256,7 +261,7 @@ public sealed partial class Hex1bTerminal
     }
 
     /// <summary>
-    /// Takes a recovery checkpoint in a recording case: a complete <c>text-state/2</c> checkpoint at the current model
+    /// Takes a recovery checkpoint in a recording case: a complete <c>text-state/3</c> checkpoint at the current model
     /// sequence, in one hold of the model lock, classified by <paramref name="describe"/> as the engine classifies a
     /// start. A refusal is recorded as a checkpoint line without state; the case keeps recording either way.
     /// </summary>
@@ -395,8 +400,8 @@ public sealed partial class Hex1bTerminal
 
     // Must hold _bufferLock, at the end of an application: graphics resources or placements are state
     // the text checkpoint cannot represent, so re-applicable coverage ends at this application.
-    private void NotifyCaseApplicationEndUnsafe() =>
-        _diagnosticCase?.EndApplication(_kgpGraphicsState.HasResidentState || _sixelGraphicsState.HasResidentState);
+    private void NotifyCaseApplicationEndUnsafe(bool sixelIdentified) =>
+        _diagnosticCase?.EndApplication(_kgpGraphicsState.HasResidentState || _sixelGraphicsState.HasResidentState, sixelIdentified);
 
     // Must hold _bufferLock, right after the model sequence advanced for this event.
     private void NotifyCaseModelEventUnsafe(string kind, int width, int height) =>

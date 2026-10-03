@@ -1,12 +1,11 @@
 namespace Hex1b.Diagnostics.Cases;
 
 /// <summary>
-/// The <c>text-state/2</c> start checkpoint of a case started on a terminal that has already applied output:
+/// The <c>text-state/3</c> start checkpoint of a case started on a terminal that has already applied output:
 /// which state surfaces a start may hold. The active text buffer, its continuation, the retained history, titles and
-/// the title stack, command marks, pending input (an unfinished escape sequence or UTF-8 scalar, a held ESC) and, on the
-/// alternate screen, the saved main screen are restored; a DCS in progress and graphics are refused while present (a DCS
-/// in progress until its ticket extends the surface; graphics are outside the text profile). A start whose configuration
-/// cannot be rebuilt is never complete.
+/// the title stack, command marks, pending input (including intact non-Sixel DCS continuation) and, on the alternate
+/// screen, the saved main screen are restored. Identified Sixel, discarded DCS content and graphics remain explicitly
+/// unsupported. A start whose configuration cannot be rebuilt is never complete.
 /// </summary>
 internal static class StartCheckpoint
 {
@@ -63,8 +62,7 @@ internal static class StartCheckpoint
     /// </summary>
     internal static IReadOnlyList<string> Unsupported(DiagnosticModelState state)
     {
-        // Pending input is restored since ticket 12; the projection names the remaining surfaces itself (a DCS in
-        // progress, graphics).
+        // The projection names the remaining refused surfaces: identified Sixel, lost DCS content and graphics.
         return state.Unsupported;
     }
 }

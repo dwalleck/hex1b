@@ -4,7 +4,7 @@ using Hex1b.Tokens;
 namespace Hex1b.Tests.Sixel;
 
 [TestClass]
-public class DcsByteStreamParserTests
+public partial class DcsByteStreamParserTests
 {
     [TestMethod]
     [DataRow(false)]
@@ -271,6 +271,7 @@ public class DcsByteStreamParserTests
             TestSeq.AreEqual(expectedFrame.RetainedContent.ToArray(), actualFrame.RetainedContent.ToArray(), message);
             Assert.AreEqual(expectedFrame.ByteCount, actualFrame.ByteCount, message);
             Assert.AreEqual(expectedFrame.RetentionLimitExceeded, actualFrame.RetentionLimitExceeded, message);
+            TestSeq.AreEqual(expectedFrame.ContentHash, actualFrame.ContentHash, message);
         }
     }
 

@@ -20,6 +20,8 @@ internal static class ModelStateFault
         "title-stack", "command-mark",
         // Pending input a start restores (ticket 12): each holder dropped, refused when the start holds none.
         "pending-escape", "pending-ground-escape", "pending-framer",
+        // Non-Sixel DCS continuation (ticket 25): content and substate omissions are independently declared.
+        "dcs-bytes", "dcs-state",
     ];
 
     // Kinds that take a target, and its form.
@@ -175,6 +177,22 @@ internal static class ModelStateFault
                 }
                 path = "pendingInput.framerUtf8Remaining";
                 return state with { PendingInput = state.PendingInput with { FramerUtf8Remaining = 0 } };
+            case "dcs-bytes":
+                if (state.PendingInput.Dcs is not { RetainedBytes.Length: > 0 } dcsBytes)
+                {
+                    problem = $"fault '{fault}': the reconstructed state holds no retained DCS content bytes.";
+                    return null;
+                }
+                path = "pendingInput.dcs.retainedBytes";
+                return state with { PendingInput = state.PendingInput with { Dcs = dcsBytes with { RetainedBytes = "" } } };
+            case "dcs-state":
+                if (state.PendingInput.Dcs is not { State.Length: > 0 } dcsState)
+                {
+                    problem = $"fault '{fault}': the reconstructed state holds no DCS parser substate.";
+                    return null;
+                }
+                path = "pendingInput.dcs.state";
+                return state with { PendingInput = state.PendingInput with { Dcs = dcsState with { State = "" } } };
             case "history-row":
             {
                 // A history row's text: its first cell's.

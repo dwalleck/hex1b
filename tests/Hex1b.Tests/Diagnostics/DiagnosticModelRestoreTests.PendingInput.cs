@@ -56,10 +56,8 @@ public partial class DiagnosticModelRestoreTests
                 var original = Detached(new FakeTimeProvider());
                 original.ApplyRecordedOutput(chunks[0]);
                 var state = original.CaptureModelState();
-                if (state.Unsupported.Contains("dcs-continuation"))
-                    continue;
                 var p = state.PendingInput;
-                if (p.EscapePrefix.Length > 0 || p.Utf8.Length > 0 || p.GroundEscape || p.FramerUtf8Remaining != 0)
+                if (p.EscapePrefix.Length > 0 || p.Utf8.Length > 0 || p.GroundEscape || p.FramerUtf8Remaining != 0 || p.Dcs is not null)
                     pendingStarts++;
                 var replica = Detached(new FakeTimeProvider());
                 replica.RestoreModelState(state);

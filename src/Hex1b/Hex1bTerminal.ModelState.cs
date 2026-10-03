@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using Hex1b.Diagnostics;
 using Hex1b.Sixel;
 using Hex1b.Theming;
+using Hex1b.Tokens;
 
 namespace Hex1b;
 
@@ -23,10 +24,10 @@ public sealed partial class Hex1bTerminal
     private int _committedUtf8Length;
     private bool _committedGroundEscape;
     private int _committedFramerUtf8;
-    private bool _committedInDcs;
+    private DcsParserCheckpoint _committedDcs;
 
     // Must hold _bufferLock, at an application's start: the chunk it applies has been tokenized, and no later
-    // chunk has (the pump tokenizes one chunk at a time). Copies without allocating.
+    // chunk has (the pump tokenizes one chunk at a time). The DCS retained prefix is an append-only stable view.
     private void CommitOutputContinuationUnsafe()
     {
         _committedEscapePrefix = _incompleteSequenceBuffer;
@@ -34,7 +35,7 @@ public sealed partial class Hex1bTerminal
         _committedUtf8Length = _pendingUtf8OutputLength;
         _committedGroundEscape = _dcsByteStreamParser.HasPendingGroundEscape;
         _committedFramerUtf8 = _dcsByteStreamParser.PendingUtf8ContinuationBytes;
-        _committedInDcs = _dcsByteStreamParser.IsInDcs;
+        _committedDcs = _dcsByteStreamParser.CaptureCheckpoint();
         _continuationUncommitted = false;
     }
 
@@ -87,7 +88,7 @@ public sealed partial class Hex1bTerminal
     internal long ModelStateCapturesForTesting { get { lock (_bufferLock) return _modelStateCaptures; } }
 
     /// <summary>
-    /// Reads the model's full text state (profile <c>text-state/2</c>) in one hold of the model lock.
+    /// Reads the model's full text state (profile <c>text-state/3</c>) in one hold of the model lock.
     /// It never changes the model; lazily assigned text identities are left unassigned.
     /// </summary>
     internal DiagnosticModelState CaptureModelState()
@@ -157,8 +158,7 @@ public sealed partial class Hex1bTerminal
                 : null;
 
             var unsupported = new List<string>(2);
-            if (_committedInDcs)
-                unsupported.Add("dcs-continuation");
+            AddPendingInputUnsupportedUnsafe(unsupported);
             if (HoldsGraphicsState())
                 unsupported.Add("graphics");
             unsupported.Sort(StringComparer.Ordinal);
@@ -231,6 +231,7 @@ public sealed partial class Hex1bTerminal
                     Utf8 = Convert.ToBase64String(_committedUtf8, 0, _committedUtf8Length),
                     GroundEscape = _committedGroundEscape,
                     FramerUtf8Remaining = _committedFramerUtf8,
+                    Dcs = ProjectDcsContinuationUnsafe(),
                 },
                 SynchronizedUpdate = new DiagnosticSynchronizedUpdate
                 {
@@ -534,9 +535,9 @@ public sealed partial class Hex1bTerminal
             "_hasLastPrintedCell", "_lastPrintedCell", "_lastPrintedCellX", "_lastPrintedCellY", "_lastPrintedCellWidth",
             "_pendingGraphemeCombine", "_synchronizedOutputCompletion", "_synchronizedOutputStartedSequence",
             "_committedEscapePrefix", "_committedUtf8", "_committedUtf8Length", "_committedGroundEscape", "_committedFramerUtf8",
-            "_committedInDcs");
-        // The live continuation is projected through the copy each application commits (a DCS in progress is
-        // named unsupported); the decoder's held bytes are the ones _pendingUtf8Output tracks.
+            "_committedDcs");
+        // Live continuation is projected through the stable value each application commits;
+        // the decoder's held bytes are the ones _pendingUtf8Output tracks.
         Set("committed: projected through the copy each application commits", "_incompleteSequenceBuffer", "_pendingUtf8Output",
             "_pendingUtf8OutputLength", "_utf8Decoder", "_dcsByteStreamParser");
         Set(Graphics, "_sixelGraphicsState", "_kgpGraphicsState", "_sixelColorRegisters", "_sixelPlacementSequence");

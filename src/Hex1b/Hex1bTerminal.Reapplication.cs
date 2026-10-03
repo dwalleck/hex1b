@@ -11,6 +11,6 @@ public sealed partial class Hex1bTerminal
     internal void ApplyRecordedOutput(ReadOnlySpan<byte> data)
     {
         var tokenization = TokenizeRawWorkloadOutput(data);
-        ApplyTokens(tokenization.Tokens, tokenization.FramedDcs);
+        ApplyTokens(tokenization.Tokens, tokenization.FramedDcs, tokenization.SixelIdentified);
     }
 }

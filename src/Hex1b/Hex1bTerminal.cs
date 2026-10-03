@@ -125,7 +125,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     private readonly byte[] _pendingUtf8Output = new byte[3];
     private int _pendingUtf8OutputLength;
     private readonly Decoder _inputUtf8Decoder = Encoding.UTF8.GetDecoder(); // Handles incomplete UTF-8 sequences across presentation input reads
-    private readonly DcsByteStreamParser _dcsByteStreamParser;
+    private DcsByteStreamParser _dcsByteStreamParser;
     private List<TerminalGraphicsImpact>? _currentGraphicsImpacts;
 
     // On browser-wasm (specifically with the Mono interpreter that
@@ -417,7 +417,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         _dcsByteStreamParser = new DcsByteStreamParser(sixelPolicy);
         _escapeTimeout = options.EscapeSequenceTimeout ?? TimeSpan.FromMilliseconds(50);
         ResetSixelModes();
-        CaptureCaseConfiguration(options);
+        CaptureCaseConfiguration(options, sixelPolicy);
 
         // Managed presentations apply and await resize through their lifecycle attachment.
         if (!_presentationOwnsResize)
@@ -1464,6 +1464,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     {
         IReadOnlyList<AnsiToken> tokens;
         IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs = null;
+        var sixelIdentified = false;
 
         if (preTokenizedTokens != null &&
             !_dcsByteStreamParser.HasPendingInput &&
@@ -1476,6 +1477,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             var tokenization = TokenizeRawWorkloadOutput(data.Span);
             tokens = tokenization.Tokens;
             framedDcs = tokenization.FramedDcs;
+            sixelIdentified = tokenization.SixelIdentified;
         }
 
         _metrics.TerminalOutputTokens.Record(tokens.Count);
@@ -1484,11 +1486,11 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
         if (_presentationFilters.Count == 0)
         {
-            ApplyTokens(tokens, framedDcs);
+            ApplyTokens(tokens, framedDcs, sixelIdentified);
         }
         else
         {
-            var appliedTokens = ApplyTokensWithImpacts(tokens, framedDcs);
+            var appliedTokens = ApplyTokensWithImpacts(tokens, framedDcs, sixelIdentified: sixelIdentified);
             var observedTokens = await NotifyPresentationFiltersOutputAsync(appliedTokens)
                 .ConfigureAwait(false);
             VerifyObserversPreservedOutput(appliedTokens, observedTokens);
@@ -1755,6 +1757,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
                 IReadOnlyList<AnsiToken> tokens;
                 IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs = null;
+                var sixelIdentified = false;
 
                 if (preTokenizedTokens != null &&
                     !_dcsByteStreamParser.HasPendingInput &&
@@ -1767,6 +1770,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     var tokenization = TokenizeRawWorkloadOutput(data.Span);
                     tokens = tokenization.Tokens;
                     framedDcs = tokenization.FramedDcs;
+                    sixelIdentified = tokenization.SixelIdentified;
                 }
                 
                 _metrics.TerminalOutputTokens.Record(tokens.Count);
@@ -1786,6 +1790,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                             false,
                             rawGated.ExpectedWidth,
                             rawGated.ExpectedHeight,
+                            sixelIdentified,
                             out _,
                             out var geometryChangedDuringApplication);
                         if (geometryChangedDuringApplication)
@@ -1839,7 +1844,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     }
 
                     // Still apply tokens to internal buffer so CreateSnapshot() works.
-                    ApplyTokens(tokens, framedDcs);
+                    ApplyTokens(tokens, framedDcs, sixelIdentified);
                     continue;
                 }
                 
@@ -1858,6 +1863,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         PresentationRequiresAppliedTokens,
                         gated.ExpectedWidth,
                         gated.ExpectedHeight,
+                        sixelIdentified,
                         out appliedTokens,
                         out var geometryChangedDuringApplication);
                     if (geometryChangedDuringApplication)
@@ -1890,7 +1896,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 else
                 {
                     appliedTokens = ApplyTokensWithImpacts(tokens, framedDcs,
-                        collectImpacts: PresentationRequiresAppliedTokens);
+                        collectImpacts: PresentationRequiresAppliedTokens, sixelIdentified: sixelIdentified);
                 }
 
                 if (_disposed)
@@ -2090,7 +2096,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         }
 
         AppendDecodedTokens(batch.TextBytes.Span[textOffset..], tokens);
-        return new RawOutputTokenization(tokens, framedDcs);
+        return new RawOutputTokenization(tokens, framedDcs, batch.SixelIdentified);
     }
 
     private void AppendDecodedTokens(
@@ -2230,9 +2236,10 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         }
     }
 
-    private sealed record RawOutputTokenization(
+    private readonly record struct RawOutputTokenization(
         IReadOnlyList<AnsiToken> Tokens,
-        IReadOnlyDictionary<DcsToken, DcsFrame>? FramedDcs);
+        IReadOnlyDictionary<DcsToken, DcsFrame>? FramedDcs,
+        bool SixelIdentified);
 
     private void ReportPumpFault(string pumpName, Exception error)
     {
@@ -3610,35 +3617,45 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     /// </remarks>
     /// <param name="tokens">The tokens to apply.</param>
     /// <param name="framedDcs">Structured DCS frames already parsed from raw bytes.</param>
+    /// <param name="sixelIdentified">Whether raw framing identified Sixel anywhere in this application chunk.</param>
     internal void ApplyTokens(
         IReadOnlyList<AnsiToken> tokens,
-        IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs = null)
+        IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs = null,
+        bool sixelIdentified = false)
     {
         lock (_bufferLock)
         {
             if (_disposed)
                 return;
 
-            using var application = new CaptureApplication(this);
-            foreach (var token in tokens)
+            var application = new CaptureApplication(this);
+            try
             {
-                if (_disposed)
-                    break;
-
-                int cursorXBefore = _cursorX;
-                int cursorYBefore = _cursorY;
-                if (!ApplyToken(token, null, framedDcs))
+                foreach (var token in tokens)
                 {
-                    if (_captures is not null)
-                        FailCapturesUnsafe(new InvalidOperationException("Output application was interrupted during capture."));
-                    RestoreValidCursorAfterAbortedScroll(cursorXBefore, cursorYBefore);
-                    break;
-                }
-            }
+                    if (_disposed)
+                        break;
 
-            CollectExpiredTextAnchors();
-            RefreshKgpAnimationTimerUnsafe();
-            PublishCaptureOutputUnsafe(tokens, framedDcs);
+                    int cursorXBefore = _cursorX;
+                    int cursorYBefore = _cursorY;
+                    var applied = ApplyToken(token, null, framedDcs, ref sixelIdentified);
+                    if (!applied)
+                    {
+                        if (_captures is not null)
+                            FailCapturesUnsafe(new InvalidOperationException("Output application was interrupted during capture."));
+                        RestoreValidCursorAfterAbortedScroll(cursorXBefore, cursorYBefore);
+                        break;
+                    }
+                }
+
+                CollectExpiredTextAnchors();
+                RefreshKgpAnimationTimerUnsafe();
+                PublishCaptureOutputUnsafe(tokens, framedDcs);
+            }
+            finally
+            {
+                application.Dispose(sixelIdentified);
+            }
         }
         PresentationInvalidated?.Invoke();
     }
@@ -3657,11 +3674,13 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     /// <param name="tokens">The tokens to apply.</param>
     /// <param name="framedDcs">Structured DCS frames already parsed from raw bytes.</param>
     /// <param name="collectImpacts">Whether to collect impacts. Active captures always enable collection.</param>
+    /// <param name="sixelIdentified">Whether raw framing identified Sixel anywhere in this application chunk.</param>
     /// <returns>Applied tokens with impacts and cursor changes, or an empty list when collection is disabled.</returns>
     internal IReadOnlyList<AppliedToken> ApplyTokensWithImpacts(
         IReadOnlyList<AnsiToken> tokens,
         IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs = null,
-        bool collectImpacts = true)
+        bool collectImpacts = true,
+        bool sixelIdentified = false)
     {
         lock (_bufferLock)
         {
@@ -3673,6 +3692,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 framedDcs,
                 collectImpacts,
                 expectedGeometryVersion: null,
+                sixelIdentified,
                 out _);
             return result;
         }
@@ -3694,6 +3714,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         bool collectImpacts,
         int expectedWidth,
         int expectedHeight,
+        bool sixelIdentified,
         out IReadOnlyList<AppliedToken> appliedTokens,
         out bool geometryChangedDuringApplication)
     {
@@ -3719,6 +3740,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 framedDcs,
                 collectImpacts,
                 expectedGeometryVersion,
+                sixelIdentified,
                 out geometryChangedDuringApplication);
             return NativeDeliveryOutcome.Applied;
         }
@@ -3729,77 +3751,85 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs,
         bool collectImpacts,
         long? expectedGeometryVersion,
+        bool sixelIdentified,
         out bool geometryChangedDuringApplication)
     {
         geometryChangedDuringApplication = false;
-        using var application = new CaptureApplication(this);
-        // Capture publication uses the successfully applied prefix, not the input batch.
-        collectImpacts |= _captures is not null;
-        var result = new List<AppliedToken>(collectImpacts ? tokens.Count : 0);
-
-        foreach (var token in tokens)
+        var application = new CaptureApplication(this);
+        try
         {
-            if (_disposed)
-                break;
+            // Capture publication uses the successfully applied prefix, not the input batch.
+            collectImpacts |= _captures is not null;
+            var result = new List<AppliedToken>(collectImpacts ? tokens.Count : 0);
 
-            int cursorXBefore = _cursorX;
-            int cursorYBefore = _cursorY;
+            foreach (var token in tokens)
+            {
+                if (_disposed)
+                    break;
 
-            var impacts = collectImpacts ? new List<CellImpact>() : null;
-            var graphicsImpacts = collectImpacts ? new List<TerminalGraphicsImpact>() : null;
-            _currentGraphicsImpacts = graphicsImpacts;
-            bool applied;
-            try
-            {
-                applied = ApplyToken(token, impacts, framedDcs);
-            }
-            finally
-            {
-                _currentGraphicsImpacts = null;
-            }
+                int cursorXBefore = _cursorX;
+                int cursorYBefore = _cursorY;
 
-            if (!applied)
-            {
-                if (_captures is not null)
-                    FailCapturesUnsafe(new InvalidOperationException("Output application was interrupted during capture."));
-                RestoreValidCursorAfterAbortedScroll(cursorXBefore, cursorYBefore);
-                break;
-            }
-
-            if (impacts is not null && graphicsImpacts is not null)
-            {
-                result.Add(new AppliedToken(
-                    token,
-                    impacts,
-                    cursorXBefore, cursorYBefore,
-                    _cursorX, _cursorY)
+                var impacts = collectImpacts ? new List<CellImpact>() : null;
+                var graphicsImpacts = collectImpacts ? new List<TerminalGraphicsImpact>() : null;
+                _currentGraphicsImpacts = graphicsImpacts;
+                bool applied;
+                try
                 {
-                    GraphicsImpacts = graphicsImpacts
-                });
+                    applied = ApplyToken(token, impacts, framedDcs, ref sixelIdentified);
+                }
+                finally
+                {
+                    _currentGraphicsImpacts = null;
+                }
+
+                if (!applied)
+                {
+                    if (_captures is not null)
+                        FailCapturesUnsafe(new InvalidOperationException("Output application was interrupted during capture."));
+                    RestoreValidCursorAfterAbortedScroll(cursorXBefore, cursorYBefore);
+                    break;
+                }
+
+                if (impacts is not null && graphicsImpacts is not null)
+                {
+                    result.Add(new AppliedToken(
+                        token,
+                        impacts,
+                        cursorXBefore, cursorYBefore,
+                        _cursorX, _cursorY)
+                    {
+                        GraphicsImpacts = graphicsImpacts
+                    });
+                }
+                if (expectedGeometryVersion is { } version
+                    && _bufferGeometryVersion != version)
+                {
+                    geometryChangedDuringApplication = true;
+                    break;
+                }
+
             }
-            if (expectedGeometryVersion is { } version
-                && _bufferGeometryVersion != version)
+
+            CollectExpiredTextAnchors();
+            RefreshKgpAnimationTimerUnsafe();
+            if (_captures is not null)
+                PublishCaptureOutputUnsafe(result.Select(item => item.Token).ToArray(), framedDcs);
+            // Keep capture/application state alive through invalidation callbacks. A callback can
+            // re-enter Resize() while this lock is held; the gated caller checks the version after
+            // the callback and faults instead of forwarding an uncertain suffix.
+            PresentationInvalidated?.Invoke();
+            if (expectedGeometryVersion is { } finalVersion
+                && _bufferGeometryVersion != finalVersion)
             {
                 geometryChangedDuringApplication = true;
-                break;
             }
-
+            return result;
         }
-
-        CollectExpiredTextAnchors();
-        RefreshKgpAnimationTimerUnsafe();
-        if (_captures is not null)
-            PublishCaptureOutputUnsafe(result.Select(item => item.Token).ToArray(), framedDcs);
-        // Keep capture/application state alive through invalidation callbacks. A callback can
-        // re-enter Resize() while this lock is held; the gated caller checks the version after
-        // the callback and faults instead of forwarding an uncertain suffix.
-        PresentationInvalidated?.Invoke();
-        if (expectedGeometryVersion is { } finalVersion
-            && _bufferGeometryVersion != finalVersion)
+        finally
         {
-            geometryChangedDuringApplication = true;
+            application.Dispose(sixelIdentified);
         }
-        return result;
     }
 
     /// <summary>
@@ -3808,10 +3838,12 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     /// <param name="token">The token to apply.</param>
     /// <param name="impacts">Optional list to record cell impacts for delta tracking.</param>
     /// <param name="framedDcs">Structured DCS frames already parsed from raw bytes.</param>
+    /// <param name="sixelIdentified">The application's Sixel disposition, including pre-tokenized DCS classification.</param>
     private bool ApplyToken(
         AnsiToken token,
         List<CellImpact>? impacts,
-        IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs)
+        IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs,
+        ref bool sixelIdentified)
     {
         switch (token)
         {
@@ -4047,7 +4079,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 break;
                 
             case DcsToken dcsToken:
-                ProcessDcsToken(dcsToken, impacts, framedDcs);
+                ProcessDcsToken(dcsToken, impacts, framedDcs, ref sixelIdentified);
                 break;
                 
             case ScrollRegionToken scrollRegionToken:
@@ -7159,11 +7191,13 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     private void ProcessDcsToken(
         DcsToken token,
         List<CellImpact>? impacts,
-        IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs)
+        IReadOnlyDictionary<DcsToken, DcsFrame>? framedDcs,
+        ref bool sixelIdentified)
     {
         if (framedDcs is not null && framedDcs.TryGetValue(token, out var framed))
         {
-            if (framed.SixelResult.Outcome is
+            sixelIdentified |= framed.Introducer.IsSixel;
+            if (framed.Introducer.IsSixel && framed.SixelResult.Outcome is
                     SixelParseOutcome.Complete or
                     SixelParseOutcome.LimitDowngraded)
             {
@@ -7190,8 +7224,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             payloadBytes,
             _sixelColorRegisters.Policy);
         RecordDcsFrame(frame);
+        sixelIdentified |= frame.Introducer.IsSixel;
 
-        if (frame.SixelResult.Outcome is
+        if (frame.Introducer.IsSixel && frame.SixelResult.Outcome is
                 SixelParseOutcome.Complete or
                 SixelParseOutcome.LimitDowngraded)
         {

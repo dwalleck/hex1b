@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 namespace Hex1b.Diagnostics;
 
 /// <summary>
-/// A typed projection of a terminal model's text state (profile <c>text-state/2</c>), read in one
+/// A typed projection of a terminal model's text state (profile <c>text-state/3</c>), read in one
 /// hold of the model lock. It covers every model field: each is projected here, or is excluded as a
 /// clock, identity, configuration or infrastructure field, or is named in <see cref="Unsupported"/>
 /// when it holds state the profile cannot represent.
@@ -108,6 +108,7 @@ public sealed record DiagnosticModelState
 
     /// <summary>Output bytes and text held between chunks.</summary>
     [JsonPropertyName("pendingInput")]
+    [JsonRequired]
     public DiagnosticModelPendingInput PendingInput { get; init; } = new();
 
     /// <summary>Whether a synchronized update was in progress.</summary>
@@ -115,8 +116,8 @@ public sealed record DiagnosticModelState
     public DiagnosticSynchronizedUpdate SynchronizedUpdate { get; init; } = new();
 
     /// <summary>
-    /// State surfaces the profile cannot represent that hold state (<c>graphics</c>,
-    /// <c>dcs-continuation</c>), in name order. A projection naming any is not comparable.
+    /// State surfaces the profile cannot represent that hold state (<c>graphics</c>, <c>sixel-continuation</c>,
+    /// <c>dcs-retention-limit</c>), in name order. A projection naming any is not comparable.
     /// </summary>
     [JsonPropertyName("unsupported")]
     public IReadOnlyList<string> Unsupported { get; init; } = [];

@@ -119,6 +119,10 @@ internal static class CaseCompatibility
                 : $"checkpoint.profile: unknown projection profile '{profile}'; the case declares {producer}; this build knows {Join(_consumer.Profiles)}.");
         }
 
+        /// <summary>The target's required state cannot be read or represented under its declared profile.</summary>
+        internal DiagnosticProblem TargetState(Exception error) => Judge(ProfileIndex, _producer[ProfileIndex],
+            $"checkpoint.state: {DiagnosticCaseRecorder.Bounded(error.Message)}; the case declares {_producer[ProfileIndex]}; this build knows {_consumerValue[ProfileIndex]} and cannot compare the required state.")!;
+
         /// <summary>
         /// The complete start's declared surfaces against the set this build's profile covers (as sets: a profile names a
         /// set). A start that is not complete declares none (its case is re-applicable only from a recovery, whose
@@ -135,12 +139,19 @@ internal static class CaseCompatibility
                   + (missing.Count > 0 ? $"; missing: {Join(missing)}" : "") + (unknown.Count > 0 ? $"; unknown: {Join(unknown)}" : "") + ".");
         }
 
-        /// <summary>The configuration's fields, values, graphics limits and reflow strategy, as this build rebuilds them.</summary>
+        /// <summary>The configuration's fields, values, graphics and DCS limits, and reflow strategy, as this build rebuilds them.</summary>
         internal DiagnosticProblem? Configuration(JsonObject? raw, DiagnosticCaseModelConfiguration configuration)
         {
             var producer = raw is null ? "(none)" : Keys(raw);
             return Judge(ConfigurationIndex, producer, Fields(ConfigurationIndex, producer,
                 raw is null ? "configuration: missing" : CaseConfiguration.FieldProblem(raw, configuration, _consumer.RequiredFields)));
+        }
+
+        /// <summary>A required DCS configuration shape could not be deserialized in the typed manifest.</summary>
+        internal DiagnosticProblem InvalidDcsFraming(JsonObject raw, string problem)
+        {
+            var producer = Keys(raw);
+            return Judge(ConfigurationIndex, producer, Fields(ConfigurationIndex, producer, problem))!;
         }
 
         /// <summary>The recorded capabilities, as this build rebuilds them.</summary>

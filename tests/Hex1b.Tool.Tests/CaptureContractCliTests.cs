@@ -20,7 +20,7 @@ namespace Hex1b.Tool.Tests;
 /// </summary>
 [DoNotParallelize]
 [TestClass]
-public class CaptureContractCliTests
+public partial class CaptureContractCliTests
 {
     private static readonly Hex1bColor Styled = Hex1bColor.FromRgb(200, 30, 40);
 
@@ -980,7 +980,7 @@ public class CaptureContractCliTests
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task CaseLiveStart_InspectAndReapplyFromTheStart()
     {
-        // Ticket 09: a case started through the CLI on a running application owns a text-state/2 start (the
+        // Ticket 09: a case started through the CLI on a running application owns a cumulative text-state/3 start (the
         // application is on the alternate screen), and re-applies from it to matched.
         if (!OperatingSystem.IsLinux())
             Assert.Inconclusive("Owner-only case storage is verified on Linux.");
@@ -990,7 +990,7 @@ public class CaptureContractCliTests
             "--authorize", "reapplication-data", "--json");
         Assert.AreEqual(0, startExit, startErr);
         var checkpoint = JsonDocument.Parse(start).RootElement.GetProperty("checkpoint");
-        Assert.AreEqual(("text-state/2", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()),
+        Assert.AreEqual(("text-state/3", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()),
             checkpoint.ToString());
         var startSequence = checkpoint.GetProperty("modelSequence").GetInt64();
         target.Resize(30, 6);
@@ -1009,7 +1009,7 @@ public class CaptureContractCliTests
             DiagnosticsJsonContext.Default.DiagnosticCaseInspection);
         Assert.IsTrue(JsonElement.DeepEquals(expected, JsonDocument.Parse(inspect).RootElement), "CLI inspect differs from the inspector");
         var (_, inspectText, _) = await RunCliAsync("capture", "case", "inspect", path);
-        StringAssert.Contains(inspectText, $"checkpoint text-state/2 complete at model sequence {startSequence}");
+        StringAssert.Contains(inspectText, $"checkpoint text-state/3 complete at model sequence {startSequence}");
         StringAssert.Contains(inspectText, $"Re-applicable: model {startSequence}..");
 
         foreach (var label in new[] { "start", "resized", "stop" })
@@ -1022,7 +1022,7 @@ public class CaptureContractCliTests
         }
         var (textExit, text, _) = await RunCliAsync("capture", "case", "reapply", path, "--to", "stop");
         Assert.AreEqual(0, textExit);
-        StringAssert.Contains(text, $"Restored from the text-state/2 start at model sequence {startSequence}");
+        StringAssert.Contains(text, $"Restored from the text-state/3 start at model sequence {startSequence}");
 
         // A start that held refused surfaces: the text names them.
         var refused = Path.Combine(root.Path, "refused");
@@ -1357,9 +1357,6 @@ public class CaptureContractCliTests
             Assert.AreEqual("unavailable", refusal.GetProperty("comparison").GetString(), refused);
             StringAssert.StartsWith(refusal.GetProperty("comparisonReason").GetString(), "fault-not-applicable", fault);
         }
-        var (_, help, _) = await RunCliAsync("capture", "case", "reapply", "--help");
-        foreach (var fault in new[] { "pending-input", "pending-escape", "pending-ground-escape", "pending-framer" })
-            StringAssert.Contains(help, fault, "the --inject-fault description");
     }
 
     [TestMethod]
@@ -1443,13 +1440,13 @@ public class CaptureContractCliTests
         Assert.IsTrue(System.Text.Json.Nodes.JsonNode.DeepEquals(expected, actual), $"CLI {operation} differs from the engine's.\nengine: {expected}\ncli:    {actual}");
     }
 
-    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     private sealed class CaseRoot : IDisposable
     {
         public CaseRoot()
         {
             Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "hex1b-cli-case-" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(Path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            if (!OperatingSystem.IsWindows())
+                Directory.CreateDirectory(Path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 
         public string Path { get; }

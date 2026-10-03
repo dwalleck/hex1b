@@ -313,7 +313,7 @@ Start a case in one of two ways:
 - **On a running target**: `hex1b capture case start <id>`, the MCP tool `start_diagnostic_case`,
   or the socket method `case-start`. With `reapplication-data`, a model that has already applied
   output is projected at the arming, in the same hold of the model lock. The case owns a
-  `text-state/2` start checkpoint (a `checkpoint` line labelled `start`, at the arming model
+  `text-state/3` start checkpoint (a `checkpoint` line labelled `start`, at the arming model
   sequence), and every later model event is recorded after it. The start is `complete` when the
   model holds only what its restore can represent: the active screen and its continuation, the
   retained history, the window title, icon name and title stack, the OSC 133 command marks and,
@@ -326,16 +326,18 @@ Start a case in one of two ways:
   while its recorded position stays where the model left it. Markers a browser viewer places
   (HWT1 custom markers) are view state and are not recorded. Output held between chunks at the
   start (an unfinished escape sequence as the model's decoded text, the bytes of an unfinished
-  UTF-8 scalar, an ESC held until the next byte shows
-  whether a DCS begins, and the continuation bytes the byte framer still expects) is owned by the
-  start and restored before the first recorded chunk, so the rest of a split scalar or sequence is
-  handled as in the original. Otherwise it is `unsupported`, and `unsupportedSurfaces` names each
-  surface found: `dcs-continuation` (a device control string in progress) and `graphics`. A start
-  too large for the case's `maxBytes` (`size-limit`; an unfinished sequence counts toward it),
-  one larger than the 256 MiB pending-state budget, one taken inside an application, or one on a
-  terminal whose configuration a re-application could not rebuild (`configuration:`, for example a
-  custom reflow strategy), is `unsupported` with that reason; no history is ever truncated to fit.
-  The case records either way.
+  UTF-8 scalar, an ESC held until the next byte shows whether a DCS begins, the continuation
+  bytes the byte framer still expects, and intact bounded non-Sixel DCS continuation) is owned
+  by the start and restored before the first recorded chunk, so a split scalar, sequence or
+  DCS continues as in the original. Otherwise it is `unsupported`, and `unsupportedSurfaces`
+  names each surface found: `sixel-continuation` (an identified unfinished Sixel),
+  `dcs-retention-limit` (required DCS content the parser has discarded), and `graphics`.
+  A start too large for the case's `maxBytes` (`size-limit`; retained continuation and its
+  serialized metadata count toward it), one larger than the 256 MiB pending-state budget,
+  one taken inside an application, or one on a terminal whose configuration a re-application
+  could not rebuild (`configuration:`, for example a custom reflow strategy), is `unsupported`
+  with that reason. History and pending DCS content are never truncated to fit. The case
+  records either way.
 
 A local terminal retains history only when started with a scrollback: `hex1b terminal start
 --scrollback <rows>`, or `scrollback` on the MCP `start_bash_terminal` / `start_pwsh_terminal`
@@ -373,7 +375,7 @@ relative directory against their own working directory, not the target's. Withou
 
 - `caseId`, `path`, `state` (`recording`, `stopping`, `stopped`), `startPath` (`construction`,
   `live`);
-- `bounds`, the granted `authorizations`, and the `checkpoint`: `fresh-model/1`, or `text-state/2`
+- `bounds`, the granted `authorizations`, and the `checkpoint`: `fresh-model/1`, or `text-state/3`
   for a start on a model that had applied output, with its `modelSequence` and
   `unsupportedSurfaces`. Its status is `complete`, `unsupported` or `excluded`, with the reason and
   the recorded model configuration;
@@ -394,7 +396,7 @@ A case directory holds three files:
   coverage (`included`, or `unavailable` with why). Format 2 records the model configuration
   structurally: dimensions, scrollback and command-mark capacity, the reflow strategy by name
   (`none`, `kitty`, `xterm`, ...; `custom:` and a type for one this build cannot name), every
-  capability field, and the graphics limits;
+  capability field, the graphics limits, and the required `dcsFraming` header/numeric limits;
 - `events.jsonl`: one event per line, prefixed by its CRC-32 in hex and a tab;
 - `completion.json`: written last, by rename. It holds the stop reason, the last case sequence,
   bytes written, per-stream counts, and checkpoint counts (`checkpoints`: taken, written, and
@@ -414,6 +416,42 @@ Events are numbered by `caseSequence` in file order. Each stream also numbers it
 Streams a target cannot observe are declared `unavailable` in the manifest. For example, frames
 are unavailable for PTY workloads, and delivery for headless terminals.
 
+### Pending DCS continuation
+
+The cumulative `text-state/3` profile includes intact, bounded non-Sixel device control
+strings (DCS), including DECRQSS requests and DCS the model ignores. A checkpoint can own
+an unfinished introducer, payload, malformed introducer, or ESC held inside the DCS. Restore
+uses only that checkpoint and subsequent original chunks, preserving their order and the
+parser's existing standard/C1 framing, termination, cancellation and end-of-input semantics.
+It does not synthesize an end-of-input event.
+
+`pendingInput.dcs` is required in the checkpoint JSON: `null` means no open DCS; an object
+with empty retained content still means an open DCS. When present, the object has these members:
+
+| Member | Contract |
+|--------|----------|
+| `state` | Required: `introducer`, `payload`, `malformed-introducer`, or `escape`. |
+| `stateBeforeEscape` | Required when `state` is `escape`: one of the first three states; otherwise absent or `null`. |
+| `retainedBytes` | Required base64 string containing the exact retained introducer/payload prefix, excluding the outer DCS introducer, terminator and a still-held ESC. |
+| `byteCount` | Required content-byte count, excluding a still-held ESC. |
+| `retentionLimitExceeded` | Required boolean; `true` means required content was discarded and the checkpoint is not complete. |
+
+The recorded `configuration.dcsFraming` object is also required, with positive integer
+`maximumHeaderParameters` and `maximumNumericValue` limits from the producer. The retained-content
+limit remains `configuration.graphics.maximumRetainedInputBytesPerImage`. Re-application rebuilds
+these policies rather than using consumer defaults; missing or invalid framing configuration is
+`incompatible`. Missing required DCS state is rejected, not treated as an empty holder.
+
+A not-yet-classified header is supported while its required prefix is intact. If a later
+header final `q` identifies Sixel, even when it cancels or finishes in that same chunk, the affected
+interval ends before that model event with `sixel-continuation` unless an existing graphics or
+no-ingress refusal already applies. Ordinary recording and original bytes remain.
+Finished/resident graphics and residual graphics effects still refuse with `graphics`. A later
+complete supported recovery may open a new interval; a mark alone does not reopen the old one.
+Parser-discarded content refuses with `dcs-retention-limit`. Retained bytes, base64 expansion and
+metadata count toward pending-state and serialization budgets and the case's `maxBytes`; a case
+budget failure is `size-limit`, never a usable truncated checkpoint.
+
 ### Checkpoints and marks
 
 A case records a `checkpoint` when it stops (requested, time limit, size limit, or disposal, before
@@ -421,11 +459,12 @@ disposal resets anything) and at each mark, but not after a collector failure. A
 taken in one hold of the model lock, between two model events, at the model sequence it names.
 
 - With `reapplication-data` it carries the model's full text state (`state`, profile
-  `text-state/2`): both screens, retained history, styles, the cursor and saved cursors, modes,
+  `text-state/3`): both screens, retained history, styles, the cursor and saved cursors, modes,
   margins, tab stops, character sets, rendition, titles and the title stack, activity, command
   marks with the positions of their text (`buffer`, `row` over retained history then the screen,
-  and `column`), grapheme continuation, and output held between chunks. Graphics state or a DCS in
-  progress is named in `state.unsupported`; such a checkpoint is never compared.
+  and `column`), grapheme continuation, and output held between chunks, including supported DCS.
+  `state.unsupported` names `sixel-continuation`, `dcs-retention-limit` or `graphics` when present;
+  such a checkpoint is never compared.
 - Without it, the checkpoint records the boundary only (`status: unavailable`,
   `reason: requires reapplication-data`).
 - A state too large for the case's size bound is written without it (`status: missing`,
@@ -434,9 +473,9 @@ taken in one hold of the model lock, between two model events, at the model sequ
   Otherwise, subject to the authorization and pending-state bound, it projects once and lets
   the writer check the exact size of the complete serialized checkpoint line. A checkpoint that
   cannot be written at all is declared by a `missing` range of stream `checkpoint` (checkpoint ordinals).
-- State awaiting the writer is bounded at 256 MiB, estimated from the model's geometry before any
-  state is taken. A checkpoint past that budget records the boundary only (`unavailable`,
-  `pending-state budget`).
+- State awaiting the writer is bounded at 256 MiB, estimated from the model's geometry and
+  pending continuation, including retained DCS bytes, before any state is taken. A checkpoint
+  past that budget records the boundary only (`unavailable`, `pending-state budget`).
 - A stop waits at most 2 s for the model lock. When the lock is held longer, the case stops anyway,
   and its stop checkpoint is `unavailable: model-lock-busy`.
 - A checkpoint records the model as of its model sequence. A chunk the output pump has read and
@@ -507,6 +546,8 @@ of the Janet repository. It sets no budget and claims nothing about physical dis
   reproduce:
   - an application without recorded bytes;
   - graphics state the case does not hold;
+  - an application that identifies Sixel (`sixel-continuation`), including transient classification
+    from a supported partial introducer;
   - a model event raised in the middle of an application (`reentrant-model-event`, for example a
     title handler that resizes), or a nested application (`reentrant-application`);
   - a missing model event;
@@ -524,7 +565,8 @@ re-applied from the start. A **recovery checkpoint** (`hex1b capture case recove
 start is, in one hold of the model lock at an event boundary, and holds the model's full text
 state at that model sequence (`checkpoint` line, trigger `recovery`, status `recorded`, with its
 `state`). It needs `reapplication-data`, and is classified as a start is: `complete`, or
-`unsupported` with the reason (`unsupported-surfaces` naming `dcs-continuation` or `graphics`;
+`unsupported` with the reason (`unsupported-surfaces` naming `sixel-continuation`,
+`dcs-retention-limit` or `graphics`;
 `size-limit`, a state that would not fit what the case's events tier leaves after the queued events
 and the checkpoint states already awaiting the writer; `pending-state budget`, counted with those
 states; `mid-application`; `unapplied-output`; `configuration: …`; `capture-failed`), in which case
@@ -536,7 +578,7 @@ never changes the loss already recorded or the case's initial checkpoint. The de
 `recovery-` and the checkpoint's ordinal.
 
 Inspection then lists one interval per **origin**: the initial checkpoint (`fresh-model/1`, or a
-complete `text-state/2` start) and each complete recovery, in checkpoint order, each naming its
+complete `text-state/3` start) and each complete recovery, in checkpoint order, each naming its
 `origin` (`trigger`, `label`, `checkpointOrdinal`, `caseSequence`, `modelSequence`). An origin's
 interval runs from its model sequence to the earliest end at or after it (a loss range, a recorded
 `interval-end`, a gap in the model sequences, truncation or interruption, or the stop); a later
@@ -602,9 +644,12 @@ Re-application reads a case offline and needs nothing from the process that wrot
 everything first: the case directory must be owner-only, the artifact is verified as inspection
 does, and the format must be 2. The configuration must hold every field (a missing or unknown one
 is refused, named), with values a model can be built with, and the target must be one this build
-can rebuild. Nothing is written until all of that holds. Then it builds a detached model from the recorded configuration, whose pumps never
-start and whose presentation is never written, on a virtual clock. It streams the verified
-events to that model one line at a time, up to the target:
+can rebuild. Nothing is written until all of that holds. Then it builds a detached model from the
+recorded configuration, whose pumps never start and whose presentation is never written, on a
+virtual clock. Checkpoint continuation is original terminal output/control state authorized by
+`reapplication-data`, not raw keyboard input. Re-application executes no application code and
+produces no native-terminal, clipboard or upload side effects. It streams the verified events
+to that model one line at a time, up to the target:
 
 - each `application` as one raw chunk through the output pump's own path (the model's decoder,
   escape prefix and DCS framer carry across chunks, as they did live);
@@ -620,7 +665,7 @@ the target, field by field:
 |--------------|---------|
 | `matched` | every field equal |
 | `different` | typed `differences`: paths such as `screen[3][5].text`, `history.rows[12][0].style.foreground` or `modes.wraparound`, in the projection's order, counted per surface (`bySurface`), listed up to `maxDifferences` (default 1,000) |
-| `unavailable` | no checkpoint at the target, one without state, or one naming `graphics` or `dcs-continuation` (`comparisonReason` says which) |
+| `unavailable` | no checkpoint at the target, one without state, or one naming `graphics`, `sixel-continuation` or `dcs-retention-limit` (`comparisonReason` says which) |
 
 The target is a model sequence (`12`; `0` is the fresh model), a case sequence (`case:34`, of a
 checkpoint or a model event), or a checkpoint label (`label:name`, or the bare name; a label that is
@@ -648,6 +693,22 @@ event is `unknown-model-sequence`. In an interrupted or truncated case, whose ta
   reconstructed at the target, so target a checkpoint taken while that input was pending: a live
   start (`--to start`), or a mark or stop taken mid-sequence. A state without that holder makes
   the fault not applicable.
+- `dcs-bytes` omits nonempty retained content (`pendingInput.dcs.retainedBytes`), and `dcs-state`
+  omits the present parser substate (`pendingInput.dcs.state`); neither takes a target. Use an
+  in-progress DCS checkpoint (`--to start`, or a mark/stop taken while the DCS is pending), not
+  only one after completion. A missing DCS holder makes either fault not applicable; empty
+  retained content makes `dcs-bytes` not applicable even when the holder is present.
+
+For example, against a case whose live start holds nonempty DCS content, run the two omissions
+separately:
+
+```bash
+hex1b capture case reapply <path> --to start --inject-fault dcs-bytes --json
+hex1b capture case reapply <path> --to start --inject-fault dcs-state --json
+```
+
+Each applicable run reports `different` at its exact path above. Faults change only the comparison
+copy; `reapplied.json` retains the unmodified reconstruction.
 
 Such a result is labelled `faultInjected`, and is never the recorded path's outcome. A fault the
 state has nothing to change for (a history fault without history) makes the comparison
@@ -655,7 +716,7 @@ state has nothing to change for (a history fault without history) makes the comp
 
 The result also names what was compared and with what:
 - `checkpoint`: the case's initial checkpoint, with the configuration the model was rebuilt from. For
-  `fresh-model/1`, re-application starts from the fresh model. For a `text-state/2` start, it
+  `fresh-model/1`, re-application starts from the fresh model. For a `text-state/3` start, it
   restores the start's state and applies only the model events recorded after it; a target before
   the start is `invalid-request` (`unknown-model-sequence`), and a start line that is missing or
   holds a surface this build cannot restore is `unavailable` (`missing-start`,
@@ -677,7 +738,7 @@ The result also names what was compared and with what:
   `checks` lists, in the order they run, `formatVersion`, `contractVersion`, `checkpoint.profile`
   (the start's and the target checkpoint's), `checkpoint.coveredSurfaces` (a complete start's
   declared surfaces against the set this build's profile covers, as sets; an unsupported start
-  declares none), `configuration` (fields, values, graphics limits, reflow strategy),
+  declares none), `configuration` (fields, values, graphics and DCS framing limits, reflow strategy),
   `configuration.capabilities` and `origin` (the restored origin), each with `producer` (what the
   artifact declares), `consumer` (what the build supports) and a `verdict`: `compatible`,
   `incompatible`, or `not-checked` (an earlier check failed first, or the request was refused before
@@ -711,7 +772,7 @@ Re-application streams the events file, so its memory is the model and one event
 
 ### Buffer-cell write equality and profile compatibility
 
-`text-state/2` preserves which buffer cells share a nonzero write sequence, including glyph
+`text-state/3` preserves which buffer cells share a nonzero write sequence, including glyph
 halves that are currently separated, have lost their soft-wrap link, or live in different buffers.
 Every member of a repeated written class carries `q` (`WriteClass`), a positive projection-local
 label. A single class domain covers retained history, main (or saved main), and alternate screen;
@@ -726,11 +787,12 @@ ownership and command-mark positions. `lastPrinted.cell` is outside the buffer-c
 Comparison checks the global equality relation: consistent label renumbering matches, while
 splitting or merging classes differs at the affected cells' `writeClass` paths.
 
-This is a clean profile cutover: the current consumer refuses `text-state/1` starts, targets and
-recovery origins as `incompatible`, and older consumers decline `text-state/2`. Artifact format
-`2` and diagnostics socket contract `1` are unchanged; `fresh-model/1` remains supported.
+This is a clean cumulative profile cutover: the current consumer refuses `text-state/1` and
+`text-state/2` starts, targets and recovery origins as `incompatible`, and older consumers
+decline `text-state/3`. Artifact format `2` and diagnostics socket contract `1` are unchanged;
+`fresh-model/1` remains supported with the required recorded configuration, including `dcsFraming`.
 Historical captures are not rewritten and require their recording-era build for re-application.
-There is no `/1` legacy reader and missing equality metadata is not silently upgraded.
+There is no legacy reader: missing equality metadata or required DCS state is not silently upgraded.
 
 ### Comparing a candidate build
 
@@ -795,8 +857,9 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
 - Capture and capability requests to an attached target time out after 10 seconds with a
   `timeout` failure. Input, resize, and recording requests are not timed out by the client, and
   neither are case start and stop. Case status is timed out like capture.
-- A case started on a running target re-applies from its `text-state/2` start checkpoint, not
-  from the first byte: only a case started at construction holds the output before it. A start
-  holding a surface the restore cannot represent yet (a DCS in progress, graphics) is
-  `unsupported`, and names it. Output held between chunks is restored; the bytes of an unfinished
-  escape sequence read before the start are owned as the model's decoded text, not as input.
+- A case started on a running target re-applies from its cumulative `text-state/3` start
+  checkpoint, not from the first byte: only a case started at construction holds the output before
+  it. Intact bounded non-Sixel DCS continuation is supported; refused surfaces are named
+  `sixel-continuation`, `dcs-retention-limit` and `graphics`. Output held between chunks is restored;
+  the bytes of an unfinished escape sequence read before the start are owned as the model's
+  decoded text, not as input. Budget refusal never supplies a truncated complete checkpoint.

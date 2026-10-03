@@ -103,13 +103,13 @@ public sealed partial class Hex1bTerminal
                 }
                 if (fastPath)
                 {
-                    ApplyTokens(tokens, tokenization.FramedDcs);
+                    ApplyTokens(tokens, tokenization.FramedDcs, tokenization.SixelIdentified);
                     applied = [];
                 }
                 else
                 {
                     applied = ApplyTokensWithImpacts(tokens, tokenization.FramedDcs,
-                        collectImpacts: PresentationRequiresAppliedTokens);
+                        collectImpacts: PresentationRequiresAppliedTokens, sixelIdentified: tokenization.SixelIdentified);
                 }
                 ObjectDisposedException.ThrowIf(_disposed, this);
                 RestoreHmp1Scrollback(scrollback);

@@ -1,3 +1,5 @@
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Hex1b.Diagnostics;
@@ -28,7 +30,6 @@ public partial class DiagnosticCaseTests
     [DataRow("damaged-manifest")]
     [DataRow("identity-string")]
     [DataRow("build-number")]
-    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task Compatibility_RecordOnEveryResult(string shape)
     {
         using var root = new CaseRoot();
@@ -42,7 +43,19 @@ public partial class DiagnosticCaseTests
             case "unknown-label": label = "nothing"; break;
             case "no-manifest": File.Delete(Path.Combine(path, "manifest.json")); break;
             case "storage-refused":
-                File.SetUnixFileMode(path, File.GetUnixFileMode(path) | UnixFileMode.GroupRead | UnixFileMode.GroupExecute);
+                if (OperatingSystem.IsWindows())
+                {
+                    var directory = new DirectoryInfo(path);
+                    var security = directory.GetAccessControl();
+                    security.AddAccessRule(new FileSystemAccessRule(
+                        new SecurityIdentifier(WellKnownSidType.WorldSid, null),
+                        FileSystemRights.ReadAndExecute,
+                        InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                        PropagationFlags.None, AccessControlType.Allow));
+                    directory.SetAccessControl(security);
+                }
+                else
+                    File.SetUnixFileMode(path, File.GetUnixFileMode(path) | UnixFileMode.GroupRead | UnixFileMode.GroupExecute);
                 break;
             case "beyond-interval": File.Delete(Path.Combine(path, "completion.json")); label = null; modelSequence = 999_999; break;
             case "reapplication-failed": CaseReapplier.AfterEventForTesting.Value = _ => throw new InvalidOperationException("injected"); break;
@@ -92,24 +105,24 @@ public partial class DiagnosticCaseTests
         Assert.IsTrue(checks.All(c => c.GetProperty("verdict").GetString() == "compatible"), "result.json: a check is not compatible");
         Assert.IsTrue(checks.All(c => c.TryGetProperty("producer", out _) && c.TryGetProperty("consumer", out _)), "result.json: a check lacks a side's value");
         Assert.AreEqual("2", checks[0].GetProperty("producer").GetString());
-        Assert.AreEqual("fresh-model/1; target: text-state/2", checks[2].GetProperty("producer").GetString()[7..]);
+        Assert.AreEqual("fresh-model/1; target: " + DiagnosticCaseCheckpointProfiles.TextState, checks[2].GetProperty("producer").GetString()[7..]);
         Assert.AreEqual("rebuilt", checks[6].GetProperty("consumer").GetString());
     }
 
     [TestMethod]
     [DataRow("formatVersion", "format-3", "3", "2", "formatVersion: the artifact declares 3; this build reads 2.", "i n n n n n n")]
     [DataRow("contractVersion", "contract-2", "2", "1", "contractVersion: the artifact declares 2; this build speaks 1.", "c i n n n n n")]
-    [DataRow("checkpoint.profile", "start-profile", "start: fresh-model/9", "fresh-model/1, text-state/2", "checkpoint.profile: unknown profile 'fresh-model/9'", "c c i n n n n")]
+    [DataRow("checkpoint.profile", "start-profile", "start: fresh-model/9", "fresh-model/1, " + DiagnosticCaseCheckpointProfiles.TextState, "checkpoint.profile: unknown profile 'fresh-model/9'", "c c i n n n n")]
     [DataRow("checkpoint.coveredSurfaces", "surfaces-fewer", "geometry-and-text-buffers", "graphics-placements-and-resources", "missing: graphics-placements-and-resources.", "c c c i n n n")]
     [DataRow("checkpoint.coveredSurfaces", "surfaces-more", "selection-state", "command-marks", "unknown: selection-state.", "c c c i n n n")]
     [DataRow("checkpoint.coveredSurfaces", "surfaces-renamed", "selection-state", "command-marks", "missing: command-marks; unknown: selection-state.", "c c c i n n n")]
     [DataRow("configuration", "width-missing", "height", "width", "configuration.width: missing", "c c c c i n n")]
     [DataRow("configuration.capabilities", "mouse-missing", "supportsSixel", "supportsMouse", "capabilities.supportsMouse: missing", "c c c c c i n")]
     [DataRow("configuration.capabilities", "mouse-missing-holograms-unknown", "supportsHolograms", "supportsMouse", "capabilities.supportsMouse: missing", "c c c c c i n")]
-    [DataRow("checkpoint.profile", "target-profile", "start: fresh-model/1; target: text-state/9", "fresh-model/1, text-state/2", "checkpoint.profile: unknown projection profile 'text-state/9'", "c c i c c c n")]
-    [DataRow("checkpoint.profile", "legacy-start", "start: text-state/1", "fresh-model/1, text-state/2", "checkpoint.profile: unknown profile 'text-state/1'", "c c i n n n n")]
-    [DataRow("checkpoint.profile", "legacy-target", "start: fresh-model/1; target: text-state/1", "fresh-model/1, text-state/2", "checkpoint.profile: unknown projection profile 'text-state/1'", "c c i c c c n")]
-    [DataRow("checkpoint.profile", "start-without-sequence", "start: text-state/2", "fresh-model/1, text-state/2", "checkpoint.modelSequence: a text-state/2 start names no model sequence", "c c i n n n n")]
+    [DataRow("checkpoint.profile", "target-profile", "start: fresh-model/1; target: text-state/9", "fresh-model/1, " + DiagnosticCaseCheckpointProfiles.TextState, "checkpoint.profile: unknown projection profile 'text-state/9'", "c c i c c c n")]
+    [DataRow("checkpoint.profile", "legacy-start", "start: text-state/1", "fresh-model/1, " + DiagnosticCaseCheckpointProfiles.TextState, "checkpoint.profile: unknown profile 'text-state/1'", "c c i n n n n")]
+    [DataRow("checkpoint.profile", "legacy-target", "start: fresh-model/1; target: text-state/1", "fresh-model/1, " + DiagnosticCaseCheckpointProfiles.TextState, "checkpoint.profile: unknown projection profile 'text-state/1'", "c c i c c c n")]
+    [DataRow("checkpoint.profile", "start-without-sequence", "start: " + DiagnosticCaseCheckpointProfiles.TextState, "fresh-model/1, " + DiagnosticCaseCheckpointProfiles.TextState, "checkpoint.modelSequence:", "c c i n n n n")]
     public async Task Compatibility_RefusesByArtifactDeclaration(string check, string edit, string producerHas, string consumerHas, string message, string verdicts)
     {
         using var root = new CaseRoot();
@@ -228,10 +241,10 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     [DataRow("formatVersion", "format-3", "2", "3", "formatVersion: the artifact declares 2; this build reads 3.", "i n n n n n n")]
     [DataRow("contractVersion", "contract-2", "1", "2", "contractVersion: the artifact declares 1; this build speaks 2.", "c i n n n n n")]
-    [DataRow("checkpoint.profile", "fresh-only", "target: text-state/2", "fresh-model/1", "unknown projection profile 'text-state/2'", "c c i c c c n")]
-    [DataRow("checkpoint.profile", "text-state-only", "start: fresh-model/1", "text-state/2", "unknown profile 'fresh-model/1'", "c c i n n n n")]
-    [DataRow("checkpoint.profile", "legacy-text-state", "target: text-state/2", "fresh-model/1, text-state/1", "unknown projection profile 'text-state/2'", "c c i c c c n")]
-    [DataRow("checkpoint.profile", "legacy-text-state-start", "start: text-state/2", "fresh-model/1, text-state/1", "unknown profile 'text-state/2'", "c c i n n n n")]
+    [DataRow("checkpoint.profile", "fresh-only", "target: " + DiagnosticCaseCheckpointProfiles.TextState, "fresh-model/1", "unknown projection profile", "c c i c c c n")]
+    [DataRow("checkpoint.profile", "text-state-only", "start: fresh-model/1", DiagnosticCaseCheckpointProfiles.TextState, "unknown profile 'fresh-model/1'", "c c i n n n n")]
+    [DataRow("checkpoint.profile", "legacy-text-state", "target: " + DiagnosticCaseCheckpointProfiles.TextState, "fresh-model/1, text-state/1", "unknown projection profile", "c c i c c c n")]
+    [DataRow("checkpoint.profile", "legacy-text-state-start", "start: " + DiagnosticCaseCheckpointProfiles.TextState, "fresh-model/1, text-state/1", "unknown profile", "c c i n n n n")]
     [DataRow("checkpoint.coveredSurfaces", "one-more-surface", "command-marks", "selection-state", "missing: selection-state", "c c c i n n n")]
     [DataRow("configuration", "requires-tab-width", "height", "tabWidth", "configuration.tabWidth: missing", "c c c c i n n")]
     [DataRow("configuration.capabilities", "requires-hyperlinks", "supportsMouse", "supportsHyperlinks", "capabilities.supportsHyperlinks: missing", "c c c c c i n")]

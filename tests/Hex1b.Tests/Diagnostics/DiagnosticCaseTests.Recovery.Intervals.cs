@@ -67,12 +67,17 @@ public partial class DiagnosticCaseTests
                         case "unsupported recovery":
                         {
                             await DrainAsync(gate, diagnostics);
-                            await workload.WriteAndWaitAsync(terminal, "x\u001bP$q");
+                            var beforeSixel = terminal.CurrentModelSequence;
+                            await WriteAndWaitForModelAsync(workload, terminal, "x\u001bPq");
                             var u = diagnostics.RecoverCase("u");
                             Assert.AreEqual("unsupported", u.Status, $"fixture: {u.Problem?.Message}");
-                            await workload.WriteAndWaitAsync(terminal, "m\u001b\\");
-                            expected.Add(new("start", null, true, 0, null, "case-stopped: requested"));
+                            CollectionAssert.Contains(u.UnsupportedSurfaces!.ToArray(), "sixel-continuation");
+                            await WriteAndWaitForModelAsync(workload, terminal, "\u0018 ground");
+                            var ground = Recover(diagnostics, "ground");
+                            await WriteAndWaitForModelAsync(workload, terminal, " tail");
+                            expected.Add(new("start", null, true, 0, beforeSixel, "sixel-continuation"));
                             expected.Add(new("recovery", "u", false, null, null, "checkpoint unsupported: unsupported-surfaces"));
+                            expected.Add(new("recovery", "ground", true, ground.ModelSequence, null, "case-stopped: requested"));
                             break;
                         }
                         case "two losses, three recoveries":
@@ -211,8 +216,7 @@ public partial class DiagnosticCaseTests
         foreach (var file in Directory.GetFiles(path))
             File.Copy(file, Path.Combine(interrupted, Path.GetFileName(file)));
         File.Delete(Path.Combine(interrupted, "completion.json"));
-        var events = Path.Combine(interrupted, "events.jsonl");
-        File.WriteAllLines(events, File.ReadAllLines(events).Where(l => !l.Contains("\"loss-envelope\"", StringComparison.Ordinal)));
+        RemoveEventLine(interrupted, e => e["kind"]?.GetValue<string>() == "loss-envelope");
         var open = Inspect(interrupted);
         Assert.AreEqual(DiagnosticCaseCompletionState.Interrupted, open.CompletionState);
         var openRange = open.Streams.Single(s => s.Stream == "model").Missing.Single(m => m.Reason == "overload-unknown-extent");
@@ -228,7 +232,7 @@ public partial class DiagnosticCaseTests
             File.Copy(file, Path.Combine(gapped, Path.GetFileName(file)));
         var removed = envelopeEnd + 100;
         var gappedEvents = Path.Combine(gapped, "events.jsonl");
-        File.WriteAllLines(gappedEvents, File.ReadAllLines(gappedEvents).Where(l => !IsModelOrdinal(l, removed)));
+        File.WriteAllText(gappedEvents, string.Join("\n", File.ReadAllLines(gappedEvents).Where(l => !IsModelOrdinal(l, removed))) + "\n");
         var unknownGap = Inspect(gapped).Streams.Single(s => s.Stream == "model").Missing.Where(m => m.Reason == "unknown").ToList();
         Assert.AreEqual(1, unknownGap.Count, "the gap past the envelope is not reported as unknown loss");
         Assert.AreEqual((removed, removed), (unknownGap[0].FromOrdinal, unknownGap[0].ToOrdinal));
@@ -298,9 +302,9 @@ public partial class DiagnosticCaseTests
     [DataRow("u")]
     public async Task Reapply_FromOverrides(string form)
     {
-        // Every form of --from: the start (refused across the gap), the recovery by label, case sequence or ordinal
-        // (matched, a mark sharing the label notwithstanding), a mark (not an origin), an unknown label, case sequence
-        // or ordinal (each with its code), and an unsupported recovery (refused with its reason).
+        // Every form of --from: the start (refused across the gap), the clean recovery after cancelled Sixel by label,
+        // case sequence or ordinal (matched, a mark sharing the label notwithstanding), a mark (not an origin), an
+        // unknown label, case sequence or ordinal (each with its code), and an unsupported recovery (refused with its reason).
         using var root = new CaseRoot();
         var (terminal, workload, path, gate) = HeldCase(root);
         DiagnosticCaseRecoverResult r1, u;
@@ -314,13 +318,13 @@ public partial class DiagnosticCaseTests
                 {
                     await FloodAsync(terminal, workload, CaseEventQueueMax + 700);
                     await DrainAsync(gate, diagnostics);
+                    await WriteAndWaitForModelAsync(workload, terminal, "\u001bPq");
+                    u = diagnostics.RecoverCase("u");
+                    await WriteAndWaitForModelAsync(workload, terminal, "\u0018 ground ");
                     r1 = Recover(diagnostics, "r1");
                     Mark(diagnostics, "r1");
-                    await workload.WriteAndWaitAsync(terminal, "after ");
+                    await WriteAndWaitForModelAsync(workload, terminal, "after ");
                     Mark(diagnostics, "m");
-                    await workload.WriteAndWaitAsync(terminal, "\u001bP$q");
-                    u = diagnostics.RecoverCase("u");
-                    await workload.WriteAndWaitAsync(terminal, "m\u001b\\ tail");
                     await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
                 }
                 finally
@@ -330,6 +334,7 @@ public partial class DiagnosticCaseTests
             }
         }
         Assert.AreEqual("unsupported", u.Status, $"fixture: {u.Problem?.Message}");
+        CollectionAssert.Contains(u.UnsupportedSurfaces!.ToArray(), "sixel-continuation");
         var r1Line = Recoveries(Artifact.Read(path)).Single(r => r.GetProperty("checkpoint").GetProperty("label").GetString() == "r1").GetProperty("caseSequence").GetInt64();
         var from = form switch { "case:" => $"case:{r1Line}", "checkpoint:" => $"checkpoint:{r1.CheckpointOrdinal}", _ => form };
 
@@ -668,7 +673,7 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     public async Task Reapply_RecoveryAfterAnUnsupportedStart()
     {
-        // A live start taken with a DCS in progress is unsupported, so the case has no re-applicable interval until a
+        // A live start taken with identified Sixel in progress is unsupported, so the case has no re-applicable interval until a
         // recovery: the recovery is the first valid origin; a target before it is refused naming the start's reason and
         // no last valid sequence, as is --from start; targets after it re-apply from the recovery.
         using var root = new CaseRoot();
@@ -680,13 +685,13 @@ public partial class DiagnosticCaseTests
         long between;
         using (new Running(terminal))
         {
-            await workload.WriteAndWaitAsync(terminal, "before \u001bP$q");
+            await WriteAndWaitForModelAsync(workload, terminal, "before \u001bPq");
             path = StartLive(terminal, root);
-            await workload.WriteAndWaitAsync(terminal, "m\u001b\\ one");
+            await WriteAndWaitForModelAsync(workload, terminal, "\u0018 one");
             between = terminal.CurrentModelSequence;
-            await workload.WriteAndWaitAsync(terminal, " two");
+            await WriteAndWaitForModelAsync(workload, terminal, " two");
             r1 = Recover(diagnostics, "r1");
-            await workload.WriteAndWaitAsync(terminal, " after");
+            await WriteAndWaitForModelAsync(workload, terminal, " after");
             Mark(diagnostics, "m");
             await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
         }
@@ -714,17 +719,18 @@ public partial class DiagnosticCaseTests
             // Ticket 14: the unsupported start declares no surfaces; the record says so and the recovery's profile is what was judged.
             var surfaces = result.Compatibility.Checks.Single(c => c.Check == "checkpoint.coveredSurfaces");
             Assert.AreEqual(("compatible", "(none declared: the start is not complete)"), (surfaces.Verdict, surfaces.Producer), label);
-            Assert.AreEqual("text-state/2 at model sequence " + result.Origin.ModelSequence, result.Compatibility.Checks[6].Producer, label);
+            Assert.AreEqual(DiagnosticCaseCheckpointProfiles.TextState + " at model sequence " + result.Origin.ModelSequence, result.Compatibility.Checks[6].Producer, label);
         }
     }
 
     [TestMethod]
     [DataRow("text-state/9")]
     [DataRow("text-state/1")]
+    [DataRow("text-state/2")]
     public async Task Reapply_RecoveryWithAForeignProfileIsIncompatible(string profile)
     {
-        // Ticket 14 (R2): a recovery line declares its profile; a build that does not project it refuses to restore from
-        // it (the origin check), before anything is read or built, even though the start and the target are this build's.
+        // Ticket 14 (R2): an unsupported Sixel start forces selection of the clean recovery. A build that does not
+        // project its declared profile refuses that origin before replay, even though the target is this build's.
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
         await using var terminal = HistoryTerminal(workload, null, 100);
@@ -732,22 +738,39 @@ public partial class DiagnosticCaseTests
         string path;
         using (new Running(terminal))
         {
-            await workload.WriteAndWaitAsync(terminal, "before \u001bP$q");
+            await WriteAndWaitForModelAsync(workload, terminal, "before \u001bPq");
             path = StartLive(terminal, root);
-            await workload.WriteAndWaitAsync(terminal, "m\u001b\\ one two");
+            await WriteAndWaitForModelAsync(workload, terminal, "\u0018 one two");
             Recover(diagnostics, "r1");
-            await workload.WriteAndWaitAsync(terminal, " after");
+            await WriteAndWaitForModelAsync(workload, terminal, " after");
             Mark(diagnostics, "m");
             await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
         }
-        AssertMatched(Reapply(path, label: "m"), "fixture: the recovery is this build's");
-        EditEventLine(path, e => e["checkpoint"]?["trigger"]?.GetValue<string>() == "recovery", e => e["checkpoint"]!["profile"] = profile);
+        var original = Reapply(path, label: "m");
+        AssertMatched(original, "fixture: the recovery is this build's");
+        Assert.AreEqual("r1", original.Origin!.Label, "fixture: the recovery must be the selected origin");
+        EditEventLine(path, e => e["checkpoint"]?["trigger"]?.GetValue<string>() == "recovery", e =>
+        {
+            Assert.AreEqual(DiagnosticCaseCheckpointProfiles.TextState, e["checkpoint"]!["profile"]!.GetValue<string>());
+            e["checkpoint"]!["profile"] = profile;
+        });
         var hashes = HashCaseFiles(path);
 
         var inspectedOrigin = Inspect(path).Intervals.Single(i => i.Origin is { Trigger: "recovery", Label: "r1" }).Origin!;
         Assert.AreEqual(profile, inspectedOrigin.Profile, "inspection relabeled the recovery checkpoint instead of retaining its declared profile");
 
-        var result = Reapply(path, label: "m");
+        var applied = new StrongBox<int>(0);
+        DiagnosticCaseReapplyResult result;
+        CaseReapplier.AppliedEventsForTesting.Value = applied;
+        try
+        {
+            result = Reapply(path, label: "m");
+        }
+        finally
+        {
+            CaseReapplier.AppliedEventsForTesting.Value = null;
+        }
+        Assert.AreEqual(0, applied.Value, "an incompatible recovery applied events");
         Assert.AreEqual((DiagnosticOutcome.Unavailable, "incompatible"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
         var failed = result.Compatibility.Checks.Single(c => c.Verdict == "incompatible");
         Assert.AreEqual("origin", failed.Check, result.Problem!.Message);
@@ -863,9 +886,13 @@ public partial class DiagnosticCaseTests
                     var total = terminal.OutputBytesRead;
                     while (recorder.QueuedBytesForTesting < target)
                     {
+                        // OutputBytesRead moves before the chunk is applied and queued: wait for the queue itself, or a
+                        // slow host overshoots the target and the refused recovery's line no longer fits at close.
+                        var queuedBefore = recorder.QueuedBytesForTesting;
                         workload.Enqueue(chunk);
                         total += chunk.Length;
-                        await WaitAsync(() => terminal.OutputBytesRead == total, TimeSpan.FromSeconds(60));
+                        await WaitAsync(() => terminal.OutputBytesRead == total && recorder.QueuedBytesForTesting > queuedBefore,
+                            TimeSpan.FromSeconds(60));
                     }
                     await Settle(terminal);
                     result = diagnostics.RecoverCase("behind-the-queue");

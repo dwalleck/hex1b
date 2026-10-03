@@ -8,7 +8,7 @@ using Microsoft.Extensions.Time.Testing;
 namespace Hex1b.Tests.Diagnostics;
 
 /// <summary>
-/// Restoring a <c>text-state/2</c> projection into a detached model (ticket 09): the restored model projects
+/// Restoring a <c>text-state/3</c> projection into a detached model (ticket 09): the restored model projects
 /// back equal, interprets later input as the original does, owns its hyperlinks and its synchronized-update
 /// timer, and a start state's unsupported surfaces are named.
 /// </summary>
@@ -428,7 +428,8 @@ public partial class DiagnosticModelRestoreTests
     // Pending input is restored since ticket 12: controls, held but not named.
     [DataRow("", "ok \u001b[", "_incompleteSequenceBuffer")]
     [DataRow("", "ok æ", "_pendingUtf8OutputLength")]
-    [DataRow("dcs-continuation", "ok \u001bP1$r", "_dcsByteStreamParser")]
+    [DataRow("", "ok \u001bP1$r", "_dcsByteStreamParser")]
+    [DataRow("sixel-continuation", "ok \u001bPq", "_dcsByteStreamParser")]
     [DataRow("graphics", "\u001bPq#0;2;100;0;0#0~~~~\u001b\\", "_sixelGraphicsState")]
     public void StartCheckpoint_RefusesEachSurface(string surface, string bytes, string field)
     {
@@ -446,21 +447,20 @@ public partial class DiagnosticModelRestoreTests
     public void StartCheckpoint_NamesEverySurfacePresent()
     {
         var model = Detached(new FakeTimeProvider());
-        model.ApplyRecordedOutput([.. Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(1, 14).Select(i => $"{i}\r\n")) + "\u001b]2;T\u0007ok "), 0xe6, 0xbc, .. "\u001bP$q"u8]);
-        // Retained history (ticket 10), titles (ticket 11) and pending input (ticket 12) are restored; a DCS in
-        // progress is still named (issue 25).
-        Assert.AreEqual("dcs-continuation", string.Join(",", StartCheckpoint.Unsupported(model.CaptureModelState())));
+        model.ApplyRecordedOutput([.. Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(1, 14).Select(i => $"{i}\r\n")) + "\u001b]2;T\u0007ok "), 0xe6, 0xbc, .. "\u001bPq"u8]);
+        // History, titles, decoder continuation and supported DCS remain cumulative; identified Sixel is refused.
+        Assert.AreEqual("sixel-continuation", string.Join(",", StartCheckpoint.Unsupported(model.CaptureModelState())));
     }
 
     [TestMethod]
     public void ModelRestore_RefusesStateItCannotRepresent()
     {
-        // Titles, command marks (ticket 11) and pending input (ticket 12) are restored; a DCS in progress is not (issue 25).
+        // Identified unfinished Sixel remains outside the cumulative text profile.
         var model = Detached(new FakeTimeProvider());
-        model.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b]2;T\u0007ok \u001bP$q"));
+        model.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b]2;T\u0007ok \u001bPq"));
         var replica = Detached(new FakeTimeProvider());
         var error = Assert.ThrowsExactly<InvalidOperationException>(() => replica.RestoreModelState(model.CaptureModelState()));
-        StringAssert.Contains(error.Message, "dcs-continuation");
+        StringAssert.Contains(error.Message, "sixel-continuation");
         Assert.AreEqual(0, replica.CurrentModelSequence, "a refused restore changed the model");
     }
 

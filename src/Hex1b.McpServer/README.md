@@ -62,7 +62,7 @@ Both return `applicationFrame`, the shared [application-frame result](https://he
 
 ### Diagnostic cases
 
-- **start_diagnostic_case** - Start recording a bounded diagnostic case on a target: model events (with the original input bytes under `authorize` `reapplication-data`), input, application frames and native delivery, written by the target to an owner-only local directory; optional `maxBytes`, `maxSeconds`, `authorize`, `directory`. A case started on a running target owns a `text-state/2` start checkpoint with `reapplication-data`, and re-applies from it unless the target holds a surface it cannot restore yet (named in `unsupportedSurfaces`); `recordCase` records from the first byte.
+- **start_diagnostic_case** - Start recording a bounded diagnostic case on a target: model events (with the original input bytes under `authorize` `reapplication-data`), input, application frames and native delivery, written by the target to an owner-only local directory; optional `maxBytes`, `maxSeconds`, `authorize`, `directory`. A case started on a running target owns a cumulative `text-state/3` start checkpoint with `reapplication-data`, including intact bounded non-Sixel DCS continuation, and re-applies from it unless the target holds a refused surface (named in `unsupportedSurfaces`); `recordCase` records from the first byte.
 - **stop_diagnostic_case** - Stop the active case (at most 10 s of draining) and return its final state and stop reason.
 - **get_diagnostic_case_status** - The active case's state, bounds, progress and per-stream counts.
 - **mark_diagnostic_case** - Mark a boundary in the active case: a checkpoint of the model's full text state at its current model sequence (with `reapplication-data`; otherwise the boundary only); optional `label`. At most 64 marks await the writer (`busy` beyond).
@@ -70,10 +70,30 @@ Both return `applicationFrame`, the shared [application-frame result](https://he
 - **inspect_diagnostic_case** - Read a case artifact offline: `complete`, `interrupted` or `truncated`, coverage and missing ranges, the re-applicable intervals (one per origin), and a page of events. See [diagnostic cases](https://hex1b.dev/guide/diagnostic-capture#diagnostic-cases).
 - **reapply_diagnostic_case** - Re-apply a case offline to a target (`to`: a model sequence, `case:<n>`, or a checkpoint label) in a detached model rebuilt from its recorded configuration (and, for a live start, restored from its start checkpoint), and compare it with the checkpoint recorded there: `matched`, `different` (typed differences by path) or `unavailable`; optional `injectFault`, `maxDifferences`, `preview`. Writes only `reapplications/<n>` inside the case. Restores from the earliest origin (the start, or a recovery checkpoint) whose interval covers the target, or the one `from` names; the result's `origin` says which. Any build whose declarations match the case's can re-apply it: the result's `producer` and `consumer` name both builds (version and `hex1bBuild`), `compatibility` lists the seven checks with both sides' values and `sameBuild`, and a mismatch is `incompatible` naming the check.
 
-Text-state checkpoints use `text-state/2`, preserving repeated buffer-cell write equality even
-when glyph halves are apart. Re-application refuses `text-state/1` starts, targets and recovery
-origins as `incompatible`; older consumers likewise decline `/2`. Artifact format `2` and the
-diagnostics contract `1` are unchanged. Historical cases require their recording-era build.
+Text-state checkpoints use `text-state/3`, retaining earlier text, history, metadata and continuation
+behavior, including repeated buffer-cell write equality when glyph halves are apart. Re-application
+refuses `text-state/1` and `text-state/2` starts, targets and recovery origins as `incompatible`;
+older consumers decline `/3`. Artifact format `2` and diagnostics contract `1` are unchanged.
+Required `pendingInput.dcs` state and `configuration.dcsFraming` producer header/numeric limits
+cannot be ignored or replaced with consumer defaults. Historical cases require their recording-era build.
+
+DECRQSS and ignored non-Sixel DCS can continue from introducer, payload, malformed-introducer
+and held-ESC checkpoints. An identified unfinished Sixel refuses with `sixel-continuation`,
+parser-discarded required content with `dcs-retention-limit`, and graphics with `graphics`.
+Retained content and serialized metadata count toward the budgets; case-budget refusal is
+`size-limit`, never a truncated checkpoint. A partial header is supported until later input identifies
+Sixel and ends that interval; a later complete supported recovery can open a new one.
+
+For `injectFault`, `dcs-bytes` omits nonempty `pendingInput.dcs.retainedBytes` and `dcs-state`
+omits the present `pendingInput.dcs.state`. Target an in-progress DCS checkpoint (`to: "start"`,
+or a mark/stop taken while pending), and run them separately to get `different` at each exact path.
+An absent holder makes either fault `unavailable` / `fault-not-applicable`; empty retained content
+makes `dcs-bytes` not applicable. The result is labelled `faultInjected`; only the comparison copy
+changes, and `reapplied.json` remains the unmodified reconstruction.
+
+Checkpoint bytes are authorized original terminal output, not raw keyboard input. Offline
+re-application executes no application code and produces no native-terminal, clipboard or upload
+side effects. See the [checkpoint contract](https://hex1b.dev/guide/diagnostic-capture#pending-dcs-continuation).
 
 ### Recording
 

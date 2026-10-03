@@ -346,9 +346,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
 
     /// <summary>
     /// Begins an output application: copies its original input bytes (only under <c>reapplication-data</c>)
-    /// while they are valid. The event is offered by <see cref="EndApplication"/>, once the application's
-    /// effect on graphics state is known, so an interval end it causes precedes it in the artifact. The caller
-    /// holds the model lock for the whole application.
+    /// while they are valid. The event is offered by <see cref="EndApplication"/>, once its graphics state and
+    /// Sixel-identification disposition are known, so an interval end it causes precedes it in the artifact.
+    /// The caller holds the model lock for the whole application.
     /// </summary>
     internal void BeginApplication(long modelSequence, int width, int height, bool hasIngress, ReadOnlySpan<byte> ingress)
     {
@@ -375,9 +375,9 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
 
     /// <summary>
     /// Offers the application begun by <see cref="BeginApplication"/>. Graphics state the checkpoint cannot
-    /// hold, or an application without input bytes, ends re-applicable coverage at it.
+    /// hold, Sixel identified anywhere in the application, or an application without input bytes ends coverage.
     /// </summary>
-    internal void EndApplication(bool graphics)
+    internal void EndApplication(bool graphicsPresent, bool sixelIdentified)
     {
         if (_application is not { } application)
             return;
@@ -385,8 +385,10 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         // A model change the case holds no input for cannot be reproduced: coverage ends here.
         if (!application.HasIngress)
             EndInterval(application.ModelSequence, "application-without-ingress");
-        if (graphics)
+        if (graphicsPresent)
             EndInterval(application.ModelSequence, "graphics");
+        if (sixelIdentified)
+            EndInterval(application.ModelSequence, "sixel-continuation");
         OfferModel(application.HasIngress ? "application" : "application-without-ingress", application.ModelSequence,
             application.Width, application.Height, application.Length, application.Payload);
     }
@@ -648,7 +650,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
 
     /// <summary>
     /// Records the start checkpoint of a case armed on a model that had applied output, before any model event
-    /// (the caller holds the model lock at arming). Only a complete <c>text-state/2</c> start is kept: its state is
+    /// (the caller holds the model lock at arming). Only a complete <c>text-state/3</c> start is kept: its state is
     /// the restore's source. It holds a mark's place and its state bytes until written, as a mark does.
     /// </summary>
     internal void RecordStartCheckpoint(long modelSequence, CheckpointCapture capture)
@@ -686,7 +688,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     {
         var ordinal = Interlocked.Increment(ref _checkpointsTaken);
         var name = label ?? $"recovery-{ordinal}";
-        var complete = described.Status == DiagnosticCaseCheckpointStatus.Complete && capture.State is not null;
+        var complete = described.Status == DiagnosticCaseCheckpointStatus.Complete && capture.State is { Unsupported.Count: 0 };
         var checkpoint = complete
             ? Checkpoint(ordinal, name, "recovery", capture)
             : Checkpoint(ordinal, name, "recovery", new CheckpointCapture(null, null, "unsupported", described.Reason, 0));

@@ -25,6 +25,8 @@ public class ModelStateComparerTests
         var same = await ProjectAsync(corpus, tail: [0xe6]);
         var escState = await ProjectAsync(corpus[..^4] + "\u001b");
         var escSame = await ProjectAsync(corpus[..^4] + "\u001b");
+        var dcsState = await ProjectAsync("before \u001bPzignored\u001b");
+        var dcsSame = await ProjectAsync("before \u001bPzignored\u001b");
         Assert.IsTrue(state.PendingInput.Utf8.Length > 0 && state.PendingInput.EscapePrefix.Length > 0 && escState.PendingInput.GroundEscape, "fixture: pending input");
         var identical = ModelStateComparer.Compare(state, same, ModelStateComparer.DefaultMaxDifferences);
         Assert.AreEqual(0, identical.Total, string.Join("; ", identical.Differences.Select(d => d.Path)));
@@ -33,7 +35,8 @@ public class ModelStateComparerTests
         // Every declared fault differs at the path it declares.
         foreach (var kind in ModelStateFault.Kinds)
         {
-            var (reference, subject) = kind == "pending-ground-escape" ? (escState, escSame) : (state, same);
+            var (reference, subject) = kind.StartsWith("dcs-", StringComparison.Ordinal) ? (dcsState, dcsSame)
+                : kind == "pending-ground-escape" ? (escState, escSame) : (state, same);
             var faulted = ModelStateFault.Apply(subject, kind, out var path, out var problem);
             Assert.IsNotNull(faulted, $"{kind}: {problem}");
             var comparison = ModelStateComparer.Compare(reference, faulted, ModelStateComparer.DefaultMaxDifferences);
@@ -58,6 +61,24 @@ public class ModelStateComparerTests
         var changed = await ProjectAsync(string.Concat(Enumerable.Range(1, 12).Select(i => i == 2 ? "rOw 2\r\n" : $"row {i}\r\n")));
         Assert.AreEqual(history.History!.Rows.Count, changed.History!.Rows.Count, "fixture: row counts differ");
         AssertOnly(history, changed, "history.rows[1][1].text");
+    }
+
+    [TestMethod]
+    public async Task Compare_DcsContinuationIsFieldAndContentSensitiveEvenWhenIgnored()
+    {
+        var state = await ProjectAsync("before \u001bPzignored\u001b");
+        var dcs = state.PendingInput.Dcs!;
+        var changes = new (DiagnosticModelDcsContinuation Dcs, string Path)[]
+        {
+            (dcs with { State = "payload" }, "pendingInput.dcs.state"),
+            (dcs with { StateBeforeEscape = "introducer" }, "pendingInput.dcs.stateBeforeEscape"),
+            (dcs with { RetainedBytes = Convert.ToBase64String("zIgnoreD"u8) }, "pendingInput.dcs.retainedBytes"),
+            (dcs with { ByteCount = dcs.ByteCount + 1 }, "pendingInput.dcs.byteCount"),
+            (dcs with { RetentionLimitExceeded = true }, "pendingInput.dcs.retentionLimitExceeded"),
+        };
+        foreach (var (changed, path) in changes)
+            AssertOnly(state, state with { PendingInput = state.PendingInput with { Dcs = changed } }, path);
+        AssertOnly(state, state with { PendingInput = state.PendingInput with { Dcs = null } }, "pendingInput.dcs");
     }
 
     [TestMethod]

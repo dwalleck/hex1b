@@ -20,11 +20,11 @@ internal static class FreshModelCheckpoint
 
     /// <summary>
     /// The checkpoint of a case armed on a fresh model, or of one that may not hold state (unauthorized, or an HMP1
-    /// workload). A model that had applied output takes a <c>text-state/2</c> start instead (<see cref="StartCheckpoint"/>).
+    /// workload). A model that had applied output takes a <c>text-state/3</c> start instead (<see cref="StartCheckpoint"/>).
     /// </summary>
     internal static DiagnosticCaseCheckpoint Describe(bool fresh, bool authorized, string? unsupported, DiagnosticCaseModelConfiguration configuration)
     {
-        // A model that is not fresh, authorized and not HMP1 is a text-state/2 start; this cannot describe it.
+        // A model that is not fresh, authorized and not HMP1 is a text-state/3 start; this cannot describe it.
         if (!fresh && authorized && unsupported is null)
             throw new ArgumentException($"A model that has applied output takes a {DiagnosticCaseCheckpointProfiles.TextState} start, not a fresh-model/1 checkpoint.", nameof(fresh));
         if (!authorized)

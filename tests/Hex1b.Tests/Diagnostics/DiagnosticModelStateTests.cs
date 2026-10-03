@@ -9,7 +9,7 @@ using Microsoft.Extensions.Time.Testing;
 namespace Hex1b.Tests.Diagnostics;
 
 /// <summary>
-/// The model-state projection (<c>text-state/2</c>) covers every model field, is deterministic,
+/// The model-state projection (<c>text-state/3</c>) covers every model field, is deterministic,
 /// names what it cannot represent, and is read coherently under the model lock.
 /// </summary>
 [TestClass]
@@ -163,7 +163,7 @@ public class DiagnosticModelStateTests
             "a trailing ESC was not projected");
 
         await using var dcs = await FeedAsync([new("a\u001bP0;0;0q#0;2;1")]);
-        CollectionAssert.Contains(dcs.Terminal.CaptureModelState().Unsupported.ToArray(), "dcs-continuation");
+        CollectionAssert.Contains(dcs.Terminal.CaptureModelState().Unsupported.ToArray(), "sixel-continuation");
     }
 
     [TestMethod]

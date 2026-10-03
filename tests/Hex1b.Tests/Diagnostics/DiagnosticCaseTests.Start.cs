@@ -8,7 +8,7 @@ using Microsoft.Extensions.Time.Testing;
 
 namespace Hex1b.Tests.Diagnostics;
 
-// Ticket 09: a case started on a terminal that has already applied output owns a text-state/2 start checkpoint,
+// Ticket 09: a case started on a terminal that has already applied output owns a cumulative text start checkpoint,
 // taken in the arming hold, or names why it cannot.
 public partial class DiagnosticCaseTests
 {
@@ -46,7 +46,7 @@ public partial class DiagnosticCaseTests
 
         var artifact = Artifact.Read(path);
         var checkpoint = artifact.Manifest.GetProperty("checkpoint");
-        Assert.AreEqual(("text-state/2", "complete", armedAt), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString(),
+        Assert.AreEqual((DiagnosticCaseCheckpointProfiles.TextState, "complete", armedAt), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString(),
             checkpoint.GetProperty("modelSequence").GetInt64()));
         Assert.AreEqual(0, checkpoint.GetProperty("unsupportedSurfaces").GetArrayLength());
         Assert.AreEqual(FreshModelCheckpoint.CoveredSurfaces.Count, checkpoint.GetProperty("coveredSurfaces").GetArrayLength());
@@ -66,8 +66,7 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     public async Task Start_UnsupportedSurfaceStillRecords()
     {
-        // Retained rows (ticket 10), a title (ticket 11) and a DCS in progress at once (the scalar before it is complete):
-        // the one refused surface is named, and the case records.
+        // Retained rows, a title and identified Sixel in progress at once: the refused surface is named and recording continues.
         using var root = new CaseRoot();
         var workload = new ScriptedWorkload();
         await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(40, 10)
@@ -76,16 +75,16 @@ public partial class DiagnosticCaseTests
         using (new Running(terminal))
         {
             await workload.WriteAndWaitAsync(terminal, string.Concat(Enumerable.Range(1, 14).Select(i => $"{i}\r\n")) + "\u001b]2;T\u0007");
-            await workload.WriteAndWaitAsync(terminal, [.. "ok \u6f22\u001bP$q"u8]);
+            await workload.WriteAndWaitAsync(terminal, [.. "ok \u6f22\u001bPq"u8]);
             path = StartLive(terminal, root);
-            await workload.WriteAndWaitAsync(terminal, "m\u001b\\ after");
+            await workload.WriteAndWaitAsync(terminal, "\u0018 after");
             await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
         }
 
         var artifact = Artifact.Read(path);
         var checkpoint = artifact.Manifest.GetProperty("checkpoint");
-        Assert.AreEqual(("text-state/2", "unsupported"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()));
-        Assert.AreEqual("dcs-continuation",
+        Assert.AreEqual((DiagnosticCaseCheckpointProfiles.TextState, "unsupported"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()));
+        Assert.AreEqual("sixel-continuation",
             string.Join(",", checkpoint.GetProperty("unsupportedSurfaces").EnumerateArray().Select(s => s.GetString())));
         StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "unsupported-surfaces:");
         Assert.IsFalse(artifact.Events.Any(e => e.GetProperty("kind").GetString() == "checkpoint"
@@ -95,7 +94,7 @@ public partial class DiagnosticCaseTests
         // Re-application of an unsupported start is refused before anything is written.
         var refused = Reapply(path, label: "stop");
         Assert.AreEqual((DiagnosticOutcome.Unavailable, "no-valid-interval"), (refused.Outcome, refused.Problem?.Code), refused.Problem?.Message);
-        StringAssert.Contains(refused.Problem!.Message, "dcs-continuation");
+        StringAssert.Contains(refused.Problem!.Message, "sixel-continuation");
         Assert.IsFalse(Directory.Exists(Path.Combine(path, "reapplications")), "a refused re-application wrote a run");
     }
 
@@ -308,10 +307,10 @@ public partial class DiagnosticCaseTests
             AssertMatched(result, $"raw {label}");
             Assert.AreEqual((DiagnosticCaseCheckpointProfiles.TextState, (long?)start), (result.Checkpoint!.Profile, result.Checkpoint.ModelSequence),
                 $"{label}: the result does not name the start it restored");
-            // Ticket 14 (R2): a complete text-state/2 start's record.
+            // A complete cumulative text start's compatibility record.
             AssertRecord(result.Compatibility, "c c c c c c c", label);
-            Assert.AreEqual("start: text-state/2; target: text-state/2", result.Compatibility.Checks[2].Producer, label);
-            Assert.AreEqual(($"text-state/2 at model sequence {start}", "restored"), (result.Compatibility.Checks[6].Producer, result.Compatibility.Checks[6].Consumer), label);
+            Assert.AreEqual($"start: {DiagnosticCaseCheckpointProfiles.TextState}; target: {DiagnosticCaseCheckpointProfiles.TextState}", result.Compatibility.Checks[2].Producer, label);
+            Assert.AreEqual(($"{DiagnosticCaseCheckpointProfiles.TextState} at model sequence {start}", "restored"), (result.Compatibility.Checks[6].Producer, result.Compatibility.Checks[6].Consumer), label);
         }
     }
 
@@ -519,13 +518,13 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     [DataRow("titles", "titles", "incompatible")]
     [DataRow("pending input", "pendingInput", "incompatible")]
-    [DataRow("dcs-continuation", "unsupported", "unsupported-start")]
+    [DataRow("sixel-continuation", "unsupported", "unsupported-start")]
     [DataRow("command mark", "commandMarks", "incompatible")]
     public async Task Reapply_OutOfSurfaceStartRefused(string surface, string field, string code)
     {
         // A start state the restore cannot represent, in a manifest that claims it complete: refused before anything.
-        // Titles, marks (ticket 11) and pending input (ticket 12) are restorable, so their rows are malformed ones,
-        // refused as incompatible; a DCS in progress is still an unsupported surface.
+        // Titles, marks and pending input are restorable: their rows are malformed, refused as incompatible.
+        // Identified Sixel remains an unsupported surface.
         using var root = new CaseRoot();
         var copy = CopyCase(root, await RecordLiveAsync(root), surface);
         EditEventLine(copy, IsStart, node =>
@@ -540,7 +539,7 @@ public partial class DiagnosticCaseTests
                     state["commandMarks"] = JsonNode.Parse("""[{"anchor":"1","phase":"prompt-start","rawParameters":"A"}]""");
                     break;
                 case "unsupported":
-                    state["unsupported"] = JsonNode.Parse("""["dcs-continuation"]""");
+                    state["unsupported"] = JsonNode.Parse("""["sixel-continuation"]""");
                     break;
                 default:
                     // Not an unfinished sequence: no ESC introduces it.
@@ -560,7 +559,7 @@ public partial class DiagnosticCaseTests
             StringAssert.StartsWith(result.Problem.Message, "origin: ", surface);
             var failed = result.Compatibility.Checks.Single(c => c.Verdict == "incompatible");
             StringAssert.Contains(result.Problem.Message, failed.Producer!, surface);
-            StringAssert.StartsWith(failed.Producer, "text-state/2 at model sequence ", surface);
+            StringAssert.StartsWith(failed.Producer, DiagnosticCaseCheckpointProfiles.TextState + " at model sequence ", surface);
         }
     }
 
@@ -799,16 +798,6 @@ public partial class DiagnosticCaseTests
         var fitting = Artifact.Read(fittingPath);
         Assert.AreEqual("complete", fitting.Manifest.GetProperty("checkpoint").GetProperty("status").GetString(), "fixture: the control's start does not fit");
         Assert.AreEqual("recorded", fitting.Events[0].GetProperty("checkpoint").GetProperty("status").GetString());
-    }
-
-    [TestMethod]
-    public void StartCheckpoint_FitsAtTheBoundary()
-    {
-        // The manifest, the line's allowance and the state's exact bytes are subtracted once from the events tier.
-        const long maxBytes = 1024 * 1024;
-        var room = maxBytes - DiagnosticCaseRecorder.EventReserve - DiagnosticCaseRecorder.StartLineAllowance - 5_000;
-        Assert.IsTrue(StartCheckpoint.Fits(5_000, new DiagnosticCaseRecorder.CheckpointCapture(null, null, "recorded", null, 0, room), maxBytes));
-        Assert.IsFalse(StartCheckpoint.Fits(5_000, new DiagnosticCaseRecorder.CheckpointCapture(null, null, "recorded", null, 0, room + 1), maxBytes));
     }
 
     private static bool IsStart(JsonNode node) => node["checkpoint"]?["trigger"]?.GetValue<string>() == "start";

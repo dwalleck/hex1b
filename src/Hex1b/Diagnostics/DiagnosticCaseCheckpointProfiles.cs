@@ -10,7 +10,7 @@ public static class DiagnosticCaseCheckpointProfiles
     public const string FreshModel = "fresh-model/1";
 
     /// <summary>
-    /// A typed projection of the model's full text state, including buffer-cell write equality (<see cref="DiagnosticModelState"/>).
+    /// A typed projection of the model's full text state, including buffer-cell write equality and non-Sixel DCS continuation (<see cref="DiagnosticModelState"/>).
     /// </summary>
-    public const string TextState = "text-state/2";
+    public const string TextState = "text-state/3";
 }

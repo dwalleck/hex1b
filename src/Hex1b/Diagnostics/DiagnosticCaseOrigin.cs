@@ -4,11 +4,11 @@ namespace Hex1b.Diagnostics;
 
 /// <summary>
 /// The checkpoint a re-applicable interval starts from, and a re-application restores: the case's initial checkpoint
-/// (a fresh model, or a <c>text-state/2</c> start), or a complete recovery checkpoint taken during the case.
+/// (a fresh model, or a <c>text-state/3</c> start), or a complete recovery checkpoint taken during the case.
 /// </summary>
 public sealed record DiagnosticCaseOrigin
 {
-    /// <summary>The checkpoint's profile: <c>fresh-model/1</c> or <c>text-state/2</c>.</summary>
+    /// <summary>The checkpoint's profile: <c>fresh-model/1</c> or <c>text-state/3</c>.</summary>
     [JsonPropertyName("profile")]
     public string Profile { get; init; } = "";
 

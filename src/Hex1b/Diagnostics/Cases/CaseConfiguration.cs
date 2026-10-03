@@ -5,7 +5,7 @@ namespace Hex1b.Diagnostics.Cases;
 
 /// <summary>
 /// Maps the model configuration a case records (manifest format 2) to and from the terminal's types:
-/// the reflow strategy's name, the capabilities field by field, and the graphics limits.
+/// the reflow strategy's name, the capabilities field by field, the graphics limits and DCS framing policy.
 /// </summary>
 internal static class CaseConfiguration
 {
@@ -67,7 +67,7 @@ internal static class CaseConfiguration
     // Format 2 fields a model cannot be rebuilt without. Absent nullable fields (scrollbackCapacity,
     // customMarkerLimit, sixelCellMetrics) mean none, as they are written only when set.
     internal static readonly IReadOnlyList<string> RequiredFields =
-        ["width", "height", "commandMarkHistoryCapacity", "escapeSequenceTimeoutMs", "reflowEnabled", "reflowStrategy", "capabilities", "graphics"];
+        ["width", "height", "commandMarkHistoryCapacity", "escapeSequenceTimeoutMs", "reflowEnabled", "reflowStrategy", "capabilities", "graphics", "dcsFraming"];
 
     internal static readonly IReadOnlyList<string> RequiredCapabilities =
     [
@@ -82,6 +82,8 @@ internal static class CaseConfiguration
         "maximumRetainedInputBytesPerImage", "maximumRasterPixelsPerImage", "maximumRasterOperationsPerImage", "maximumImagesPerScreen",
         "maximumPlacementsPerScreen", "maximumHistoryPlacements", "maximumRetainedLogicalPixelsPerScreen", "maximumRetainedBytesPerScreen",
     ];
+
+    private static readonly string[] RequiredDcsFraming = ["maximumHeaderParameters", "maximumNumericValue"];
 
     /// <summary>The optional configuration fields (format 2), written only when set.</summary>
     internal static readonly IReadOnlyList<string> OptionalFields = ["scrollbackCapacity", "customMarkerLimit", "presentation", "workload"];
@@ -101,15 +103,22 @@ internal static class CaseConfiguration
             if (raw[field] is null)
                 return $"configuration.{field}: missing";
         }
+        // The required policy cannot be ignored by an older consumer declaration, including a fresh-model start.
+        if (raw.ContainsKey("dcsFraming") && !required.Contains("dcsFraming"))
+            return "configuration.dcsFraming: unknown field";
         foreach (var field in RequiredGraphics)
         {
             if (raw["graphics"]?[field] is null)
                 return $"graphics.{field}: missing";
         }
+        if (DcsFramingProblem(raw["dcsFraming"]) is { } framingProblem)
+            return framingProblem;
         if (configuration.Unknown is { Count: > 0 } unknown)
             return $"configuration.{unknown.Keys.Order(StringComparer.Ordinal).First()}: unknown field";
         if (configuration.Graphics?.Unknown is { Count: > 0 } unknownGraphics)
             return $"graphics.{unknownGraphics.Keys.Order(StringComparer.Ordinal).First()}: unknown field";
+        if (configuration.DcsFraming?.Unknown is { Count: > 0 } unknownFraming)
+            return $"configuration.dcsFraming.{unknownFraming.Keys.Order(StringComparer.Ordinal).First()}: unknown field";
         if (configuration.Width is < 1 or > 10_000)
             return $"configuration.width: {configuration.Width} is not 1 to 10,000";
         if (configuration.Height is < 1 or > 10_000)
@@ -124,6 +133,23 @@ internal static class CaseConfiguration
             return $"configuration.escapeSequenceTimeoutMs: {configuration.EscapeSequenceTimeoutMs} is not 0 to 86,400,000";
         if (CreateReflowStrategy(configuration.ReflowStrategy) is null)
             return $"reflowStrategy: '{configuration.ReflowStrategy}' is not a strategy this build can rebuild.";
+        return null;
+    }
+
+    /// <summary>Checks the required DCS policy directly, so absent, malformed and invalid fields cannot read as defaults.</summary>
+    internal static string? DcsFramingProblem(System.Text.Json.Nodes.JsonNode? raw)
+    {
+        if (raw is null)
+            return "configuration.dcsFraming: missing";
+        if (raw is not System.Text.Json.Nodes.JsonObject framing)
+            return "configuration.dcsFraming: not an object";
+        foreach (var field in RequiredDcsFraming)
+        {
+            if (framing[field] is null)
+                return $"configuration.dcsFraming.{field}: missing";
+            if (framing[field] is not System.Text.Json.Nodes.JsonValue value || !value.TryGetValue<int>(out var limit) || limit < 1)
+                return $"configuration.dcsFraming.{field}: not a positive integer";
+        }
         return null;
     }
 

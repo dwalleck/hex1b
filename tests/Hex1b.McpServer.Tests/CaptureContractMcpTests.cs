@@ -19,7 +19,7 @@ namespace Hex1b.McpServer.Tests;
 /// </summary>
 [DoNotParallelize]
 [TestClass]
-public class CaptureContractMcpTests : McpServerTestBase
+public partial class CaptureContractMcpTests : McpServerTestBase
 {
     private static readonly Hex1bColor Styled = Hex1bColor.FromRgb(20, 180, 90);
 
@@ -1032,16 +1032,6 @@ public class CaptureContractMcpTests : McpServerTestBase
         Assert.AreEqual("unavailable", refused.GetProperty("comparison").GetString(), refused.ToString());
         StringAssert.StartsWith(refused.GetProperty("comparisonReason").GetString(), "fault-not-applicable");
 
-        // The tool descriptions: the reapply tool names the faults, and the start tool no longer lists pending input among
-        // the surfaces a start cannot restore (review XR#1).
-        var tools = await client.ListToolsAsync();
-        var reapplyTool = tools.Single(t => t.Name == "reapply_diagnostic_case");
-        var faultParameter = reapplyTool.JsonSchema.GetProperty("properties").GetProperty("injectFault").GetProperty("description").GetString()!;
-        foreach (var fault in new[] { "pending-input", "pending-escape", "pending-ground-escape", "pending-framer" })
-            StringAssert.Contains(faultParameter, fault, "the injectFault description");
-        var startDescription = tools.Single(t => t.Name == "start_diagnostic_case").Description!;
-        StringAssert.Contains(startDescription, "a DCS in progress, graphics", "the start description's unsupported surfaces");
-        Assert.IsFalse(startDescription.Contains("pending input, a DCS", StringComparison.Ordinal), "the start description still lists pending input as unsupported");
     }
 
     [TestMethod]
@@ -1096,7 +1086,7 @@ public class CaptureContractMcpTests : McpServerTestBase
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task CaseLiveStart_ReapplyFromTheStartMatchesTheReapplier()
     {
-        // Ticket 09: a case started over MCP on a running application owns a text-state/2 start, and re-applies from
+        // Ticket 09: a case started over MCP on a running application owns a cumulative text-state/3 start, and re-applies from
         // it to matched through reapply_diagnostic_case, equal to the reapplier's own result.
         if (!OperatingSystem.IsLinux())
             Assert.Inconclusive("Owner-only case storage is verified on Linux.");
@@ -1113,7 +1103,7 @@ public class CaptureContractMcpTests : McpServerTestBase
         });
         Assert.IsTrue(start.GetProperty("success").GetBoolean(), start.ToString());
         var checkpoint = start.GetProperty("case").GetProperty("checkpoint");
-        Assert.AreEqual(("text-state/2", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()),
+        Assert.AreEqual(("text-state/3", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()),
             checkpoint.ToString());
         terminal.Resize(30, 6);
         await new Hex1bTerminalInputSequenceBuilder()
@@ -1273,13 +1263,13 @@ public class CaptureContractMcpTests : McpServerTestBase
         Assert.IsTrue(System.Text.Json.Nodes.JsonNode.DeepEquals(expected, actual), $"MCP {operation} differs from the engine's.\nengine: {expected}\nmcp:    {actual}");
     }
 
-    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     private sealed class CaseRoot : IDisposable
     {
         public CaseRoot()
         {
             Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "hex1b-mcp-case-" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(Path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            if (!OperatingSystem.IsWindows())
+                Directory.CreateDirectory(Path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         }
 
         public string Path { get; }

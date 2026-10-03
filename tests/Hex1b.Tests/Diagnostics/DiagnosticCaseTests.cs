@@ -115,11 +115,11 @@ public partial class DiagnosticCaseTests
 
         Assert.AreEqual("complete", untouched.Artifact.Manifest.GetProperty("checkpoint").GetProperty("status").GetString());
         Assert.AreEqual("live", untouched.Artifact.Manifest.GetProperty("startPath").GetString());
-        // A model that has applied output owns a text-state/2 start instead (ticket 09).
+        // A model that has applied output owns a cumulative text start instead (ticket 09).
         foreach (var (name, result) in new[] { ("applied batch", applied), ("same-size resize", resized) })
         {
             var checkpoint = result.Artifact.Manifest.GetProperty("checkpoint");
-            Assert.AreEqual(("text-state/2", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()), name);
+            Assert.AreEqual((DiagnosticCaseCheckpointProfiles.TextState, "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()), name);
             Assert.IsFalse(result.Artifact.Manifest.GetProperty("fresh").GetBoolean(), name);
         }
     }
@@ -454,7 +454,7 @@ public partial class DiagnosticCaseTests
         Assert.IsFalse(artifact.Manifest.GetProperty("fresh").GetBoolean(), "a model that had read bytes is not fresh");
         // It had applied nothing: its start (ticket 09) is at model sequence 0, and the held chunk is recorded after it.
         var checkpoint = artifact.Manifest.GetProperty("checkpoint");
-        Assert.AreEqual(("text-state/2", "complete", 0L), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString(),
+        Assert.AreEqual((DiagnosticCaseCheckpointProfiles.TextState, "complete", 0L), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString(),
             checkpoint.GetProperty("modelSequence").GetInt64()));
     }
 
@@ -1019,12 +1019,13 @@ public partial class DiagnosticCaseTests
         }
 
         // Remove the third model event's line, keeping every remaining line intact and verified.
+        // Retain the artifact's LF framing on every host; a CR would become part of the checksum-covered JSON.
         var events = Path.Combine(stopped.Path!, "events.jsonl");
         var lines = File.ReadAllLines(events).ToList();
-        var third = lines.FindIndex(l => l.Contains("\"stream\":\"model\"", StringComparison.Ordinal) && l.Contains("\"ordinal\":3,", StringComparison.Ordinal));
+        var third = lines.FindIndex(l => IsModelOrdinal(l, 3));
         Assert.IsGreaterThanOrEqualTo(0, third, "fixture: no third model event");
         lines.RemoveAt(third);
-        File.WriteAllLines(events, lines);
+        File.WriteAllText(events, string.Join("\n", lines) + "\n");
 
         var inspection = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = stopped.Path! });
         var model = inspection.Streams.Single(s => s.Stream == "model");
@@ -1378,7 +1379,7 @@ public partial class DiagnosticCaseTests
         var at = edited[middle].IndexOf("\"data\":\"", StringComparison.Ordinal) + 8;
         Assert.IsGreaterThan(8, at, "fixture: the middle line has no payload");
         edited[middle] = edited[middle][..at] + (edited[middle][at] == 'A' ? 'B' : 'A') + edited[middle][(at + 1)..];
-        File.WriteAllLines(Path.Combine(flipped, "events.jsonl"), edited);
+        File.WriteAllText(Path.Combine(flipped, "events.jsonl"), string.Join("\n", edited) + "\n");
         var flippedInspection = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = flipped, Limit = 100 });
         Assert.AreEqual((DiagnosticCaseCompletionState.Truncated, (long?)(middle + 1)), (flippedInspection.CompletionState, flippedInspection.TruncatedAtLine),
             "a corrupt line was accepted");
@@ -2864,7 +2865,7 @@ public partial class DiagnosticCaseTests
         {
             Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "hex1b-case-tests-" + Guid.NewGuid().ToString("N"));
             if (OperatingSystem.IsWindows())
-                Directory.CreateDirectory(Path);
+                WindowsPtySocketPaths.EnsureSocketDirectoryExists(Path);
             else
                 Directory.CreateDirectory(Path, OwnerDirectory);
         }

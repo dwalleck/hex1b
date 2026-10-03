@@ -25,7 +25,7 @@ internal sealed class CaptureCaseReapplyCommand : BaseCommand
     };
     private static readonly Option<string[]> s_faultOption = new("--inject-fault")
     {
-        Description = "Inject a declared fault into the reconstructed state before comparing, as kind or kind:target (cell-text:3/5, mode:wraparound, history-row:12, title-stack, command-mark, pending-input, pending-escape, pending-ground-escape, pending-framer; repeatable or comma-separated); the result is labelled"
+        Description = "Inject a declared fault into the comparison copy, as kind or kind:target (cell-text:3/5, mode:wraparound, history-row:12, title-stack, command-mark, pending-input, pending-escape, pending-ground-escape, pending-framer, dcs-bytes, dcs-state; repeatable or comma-separated). dcs-bytes omits nonempty pendingInput.dcs.retainedBytes; dcs-state omits the present pendingInput.dcs.state. Target an in-progress checkpoint (a live start, mark or stop) for different at those paths; an absent holder makes either fault unavailable / fault-not-applicable, and empty retained content makes dcs-bytes not applicable. The result is labelled faultInjected; reapplied.json stays unmodified"
     };
     private static readonly Option<int?> s_maxDifferencesOption = new("--max-differences")
     {

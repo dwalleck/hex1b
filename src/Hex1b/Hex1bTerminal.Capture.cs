@@ -194,7 +194,7 @@ public sealed partial class Hex1bTerminal
             throw new InvalidOperationException("Capture boundaries cannot run reentrantly during output application.");
     }
 
-    private readonly struct CaptureApplication : IDisposable
+    private readonly struct CaptureApplication
     {
         private readonly Hex1bTerminal _terminal;
 
@@ -208,10 +208,10 @@ public sealed partial class Hex1bTerminal
             terminal.NotifyCaseApplicationUnsafe();
         }
 
-        public void Dispose()
+        public void Dispose(bool sixelIdentified)
         {
             _terminal._captureApplicationDepth--;
-            _terminal.NotifyCaseApplicationEndUnsafe();
+            _terminal.NotifyCaseApplicationEndUnsafe(sixelIdentified);
         }
     }
 }

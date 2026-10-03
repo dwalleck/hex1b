@@ -4,7 +4,7 @@ using System.Text.Json;
 namespace Hex1b.Diagnostics.Cases;
 
 /// <summary>
-/// Compares two <c>text-state/2</c> projections field by field: every cell of every screen and history row,
+/// Compares two <c>text-state/3</c> projections field by field: every cell of every screen and history row,
 /// with styles resolved and write classes matched globally by their equality relation, and every other surface.
 /// Every difference is counted per surface, and the first ones (up to the cap) are listed in the projection's order.
 /// </summary>
@@ -365,6 +365,14 @@ internal static class ModelStateComparer
             String("pendingInput", "pendingInput.utf8", recorded.Utf8, reapplied.Utf8);
             Bool("pendingInput", "pendingInput.groundEscape", recorded.GroundEscape, reapplied.GroundEscape);
             Number("pendingInput", "pendingInput.framerUtf8Remaining", recorded.FramerUtf8Remaining, reapplied.FramerUtf8Remaining);
+            if (Presence("pendingInput", "pendingInput.dcs", recorded.Dcs, reapplied.Dcs))
+            {
+                String("pendingInput", "pendingInput.dcs.state", recorded.Dcs!.State, reapplied.Dcs!.State);
+                String("pendingInput", "pendingInput.dcs.stateBeforeEscape", recorded.Dcs.StateBeforeEscape, reapplied.Dcs.StateBeforeEscape);
+                String("pendingInput", "pendingInput.dcs.retainedBytes", recorded.Dcs.RetainedBytes, reapplied.Dcs.RetainedBytes);
+                Number("pendingInput", "pendingInput.dcs.byteCount", recorded.Dcs.ByteCount, reapplied.Dcs.ByteCount);
+                Bool("pendingInput", "pendingInput.dcs.retentionLimitExceeded", recorded.Dcs.RetentionLimitExceeded, reapplied.Dcs.RetentionLimitExceeded);
+            }
         }
     }
 }

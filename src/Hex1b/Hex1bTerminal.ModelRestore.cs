@@ -7,7 +7,7 @@ namespace Hex1b;
 public sealed partial class Hex1bTerminal
 {
     /// <summary>
-    /// Restores a <c>text-state/2</c> projection into this model: the inverse of the model-state projection
+    /// Restores a <c>text-state/3</c> projection into this model: the inverse of the model-state projection
     /// for the active text buffer, the retained history (each row with its cells, original width and identity, and the
     /// next identity; rows are stamped with this model's clock) and, on the alternate screen, the saved main screen.
     /// Only the case reapplier calls
@@ -45,130 +45,139 @@ public sealed partial class Hex1bTerminal
                 throw new InvalidOperationException($"The state cannot be restored: it holds {marksProblem}.");
         }
 
-        var cells = new TerminalCell[state.Styles.Count];
-        var built = new bool[state.Styles.Count];
-        if (state.SavedMainScreen is { } savedMain)
+        var restoredDcs = PrepareDcsRestore(state.PendingInput);
+        try
         {
-            var savedHeight = savedMain.Count;
-            var savedWidth = savedHeight == 0 ? 0 : savedMain[0].Cells.Count;
-            if (savedWidth != _width || savedHeight != _height)
-                Resize(savedWidth, savedHeight);
+            var cells = new TerminalCell[state.Styles.Count];
+            var built = new bool[state.Styles.Count];
+            if (state.SavedMainScreen is { } savedMain)
+            {
+                var savedHeight = savedMain.Count;
+                var savedWidth = savedHeight == 0 ? 0 : savedMain[0].Cells.Count;
+                if (savedWidth != _width || savedHeight != _height)
+                    Resize(savedWidth, savedHeight);
+                lock (_bufferLock)
+                {
+                    RestoreScreenUnsafe(savedMain, state.Styles, cells, built, writeClasses);
+                    DoEnterAlternateScreen();
+                }
+            }
+
+            if (state.Width != _width || state.Height != _height)
+                Resize(state.Width, state.Height);
+
             lock (_bufferLock)
             {
-                RestoreScreenUnsafe(savedMain, state.Styles, cells, built, writeClasses);
-                DoEnterAlternateScreen();
+                // The resizes of an empty model move no text into history; the model is still otherwise fresh. The
+                // retained rows are restored in order with their identities, and the next identity continues past
+                // cleared or evicted rows.
+                _scrollbackBuffer?.Clear();
+                if (state.History is { } history && _scrollbackBuffer is { } scrollback)
+                {
+                    var rows = new (TerminalCell[] Cells, int OriginalWidth, long RowId)[history.Rows.Count];
+                    for (var row = 0; row < rows.Length; row++)
+                    {
+                        var projected = history.Rows[row];
+                        var rowCells = new TerminalCell[projected.Cells.Count];
+                        var run = 0;
+                        for (var column = 0; column < rowCells.Length; column++)
+                            rowCells[column] = RestoreCell(projected.Cells[column], state.Styles, cells, built,
+                                RestoredSequenceUnsafe(projected.Cells[column], UnwrittenAt(projected.Unwritten, column, ref run), writeClasses));
+                        rows[row] = (rowCells, projected.OriginalWidth ?? rowCells.Length, projected.Id ?? 0);
+                    }
+                    scrollback.RestoreRows(rows, history.NextRowId, _timeProvider.GetUtcNow());
+                }
+                RestoreScreenUnsafe(state.Screen, state.Styles, cells, built, writeClasses);
+
+                _cursorX = state.Cursor.X;
+                _cursorY = state.Cursor.Y;
+                _pendingWrap = state.Cursor.PendingWrap;
+                _cursorVisible = state.Cursor.Visible;
+                _cursorShape = state.Cursor.Shape;
+                _cursorProtected = state.Cursor.Protected;
+                _cursorSaved = state.SavedCursor is not null;
+                if (state.SavedCursor is { } saved)
+                {
+                    _savedCursorX = saved.X;
+                    _savedCursorY = saved.Y;
+                    _savedPendingWrap = saved.PendingWrap;
+                    _savedCursorProtected = saved.Protected ?? false;
+                }
+                _alternateScreenSavedCursorX = state.AlternateSavedCursor.X;
+                _alternateScreenSavedCursorY = state.AlternateSavedCursor.Y;
+                _alternateScreenSavedPendingWrap = state.AlternateSavedCursor.PendingWrap;
+
+                foreach (var (name, value) in state.Modes)
+                    RestoreMode(name, value);
+                _protectedMode = ParseName<ProtectedMode>(state.ProtectedMode);
+                _scrollTop = state.Margins.Top;
+                _scrollBottom = state.Margins.Bottom;
+                _marginLeft = state.Margins.Left;
+                _marginRight = state.Margins.Right;
+                _tabStops = new bool[state.TabStops.Width];
+                foreach (var column in state.TabStops.Columns)
+                    _tabStops[column] = true;
+                _charsetG0 = state.Charsets.G0[0];
+                _charsetG1 = state.Charsets.G1[0];
+                _charsetG2 = state.Charsets.G2[0];
+                _charsetG3 = state.Charsets.G3[0];
+                _activeCharsetSlot = state.Charsets.Active;
+
+                var rendition = state.Rendition;
+                _currentForeground = ParseColor(rendition.Foreground);
+                _currentBackground = ParseColor(rendition.Background);
+                _currentAttributes = ParseAttributes(rendition.Attributes);
+                _currentUnderlineColor = ParseColor(rendition.UnderlineColor);
+                _currentUnderlineStyle = ParseName<UnderlineStyle>(rendition.UnderlineStyle);
+                _currentHyperlink?.Release();
+                _currentHyperlink = rendition.HyperlinkUri is { } uri
+                    ? _trackedObjects.GetOrCreateHyperlink(uri, rendition.HyperlinkParameters ?? "")
+                    : null;
+
+                var activity = state.Activity;
+                SetActivityState(new TerminalActivityState(
+                    new TerminalProgress(ParseName<TerminalProgressState>(activity.ProgressState), activity.ProgressPercentage),
+                    new TerminalShellIntegration(ParseName<TerminalShellIntegrationPhase>(activity.ShellPhase), activity.LastExitCode),
+                    new TerminalWorkingDirectory(activity.WorkingDirectoryUri, activity.WorkingDirectoryHost, activity.WorkingDirectoryPath)));
+
+                // Titles as projected (already normalized); the projection lists the stack top first.
+                _windowTitle = state.Titles.Window;
+                _iconName = state.Titles.Icon;
+                _titleStack.Clear();
+                for (var i = state.Titles.Stack.Count - 1; i >= 0; i--)
+                    _titleStack.Push((state.Titles.Stack[i].Window, state.Titles.Stack[i].Icon));
+                // Marks last: their positions are in the screens and history restored above.
+                RestoreCommandMarksUnsafe(state.CommandMarks, state.LastCommandAnchorId);
+
+                _hasLastPrintedCell = state.LastPrinted is not null;
+                if (state.LastPrinted is { } last)
+                {
+                    _lastPrintedCellX = last.X;
+                    _lastPrintedCellY = last.Y;
+                    _lastPrintedCellWidth = last.Width;
+                    // The original holds the cell as a copy, not a counted reference: the restored one does too.
+                    var cell = RestoreCell(last.Cell, state.Styles, cells, built);
+                    cell.TrackedHyperlink?.Release();
+                    _lastPrintedCell = cell;
+                }
+                _pendingGraphemeCombine = state.PendingGraphemeCombine;
+
+                _modelSequence = state.ModelSequence;
+                // Install the preflighted parser without replaying checkpoint bytes as another application.
+                RestorePendingInputUnsafe(state.PendingInput, restoredDcs);
+                restoredDcs = null;
+                CommitOutputContinuationUnsafe();
+                if (state.SynchronizedUpdate.Active)
+                {
+                    // Re-entered on this model's clock, so the timeout fires only when that clock reaches it.
+                    SetSynchronizedOutputMode(true);
+                    _synchronizedOutputStartedSequence = state.SynchronizedUpdate.StartedAtSequence ?? state.ModelSequence;
+                }
             }
         }
-
-        if (state.Width != _width || state.Height != _height)
-            Resize(state.Width, state.Height);
-
-        lock (_bufferLock)
+        finally
         {
-            // The resizes of an empty model move no text into history; the model is still otherwise fresh. The
-            // retained rows are restored in order with their identities, and the next identity continues past
-            // cleared or evicted rows.
-            _scrollbackBuffer?.Clear();
-            if (state.History is { } history && _scrollbackBuffer is { } scrollback)
-            {
-                var rows = new (TerminalCell[] Cells, int OriginalWidth, long RowId)[history.Rows.Count];
-                for (var row = 0; row < rows.Length; row++)
-                {
-                    var projected = history.Rows[row];
-                    var rowCells = new TerminalCell[projected.Cells.Count];
-                    var run = 0;
-                    for (var column = 0; column < rowCells.Length; column++)
-                        rowCells[column] = RestoreCell(projected.Cells[column], state.Styles, cells, built,
-                            RestoredSequenceUnsafe(projected.Cells[column], UnwrittenAt(projected.Unwritten, column, ref run), writeClasses));
-                    rows[row] = (rowCells, projected.OriginalWidth ?? rowCells.Length, projected.Id ?? 0);
-                }
-                scrollback.RestoreRows(rows, history.NextRowId, _timeProvider.GetUtcNow());
-            }
-            RestoreScreenUnsafe(state.Screen, state.Styles, cells, built, writeClasses);
-
-            _cursorX = state.Cursor.X;
-            _cursorY = state.Cursor.Y;
-            _pendingWrap = state.Cursor.PendingWrap;
-            _cursorVisible = state.Cursor.Visible;
-            _cursorShape = state.Cursor.Shape;
-            _cursorProtected = state.Cursor.Protected;
-            _cursorSaved = state.SavedCursor is not null;
-            if (state.SavedCursor is { } saved)
-            {
-                _savedCursorX = saved.X;
-                _savedCursorY = saved.Y;
-                _savedPendingWrap = saved.PendingWrap;
-                _savedCursorProtected = saved.Protected ?? false;
-            }
-            _alternateScreenSavedCursorX = state.AlternateSavedCursor.X;
-            _alternateScreenSavedCursorY = state.AlternateSavedCursor.Y;
-            _alternateScreenSavedPendingWrap = state.AlternateSavedCursor.PendingWrap;
-
-            foreach (var (name, value) in state.Modes)
-                RestoreMode(name, value);
-            _protectedMode = ParseName<ProtectedMode>(state.ProtectedMode);
-            _scrollTop = state.Margins.Top;
-            _scrollBottom = state.Margins.Bottom;
-            _marginLeft = state.Margins.Left;
-            _marginRight = state.Margins.Right;
-            _tabStops = new bool[state.TabStops.Width];
-            foreach (var column in state.TabStops.Columns)
-                _tabStops[column] = true;
-            _charsetG0 = state.Charsets.G0[0];
-            _charsetG1 = state.Charsets.G1[0];
-            _charsetG2 = state.Charsets.G2[0];
-            _charsetG3 = state.Charsets.G3[0];
-            _activeCharsetSlot = state.Charsets.Active;
-
-            var rendition = state.Rendition;
-            _currentForeground = ParseColor(rendition.Foreground);
-            _currentBackground = ParseColor(rendition.Background);
-            _currentAttributes = ParseAttributes(rendition.Attributes);
-            _currentUnderlineColor = ParseColor(rendition.UnderlineColor);
-            _currentUnderlineStyle = ParseName<UnderlineStyle>(rendition.UnderlineStyle);
-            _currentHyperlink?.Release();
-            _currentHyperlink = rendition.HyperlinkUri is { } uri
-                ? _trackedObjects.GetOrCreateHyperlink(uri, rendition.HyperlinkParameters ?? "")
-                : null;
-
-            var activity = state.Activity;
-            SetActivityState(new TerminalActivityState(
-                new TerminalProgress(ParseName<TerminalProgressState>(activity.ProgressState), activity.ProgressPercentage),
-                new TerminalShellIntegration(ParseName<TerminalShellIntegrationPhase>(activity.ShellPhase), activity.LastExitCode),
-                new TerminalWorkingDirectory(activity.WorkingDirectoryUri, activity.WorkingDirectoryHost, activity.WorkingDirectoryPath)));
-
-            // Titles as projected (already normalized); the projection lists the stack top first.
-            _windowTitle = state.Titles.Window;
-            _iconName = state.Titles.Icon;
-            _titleStack.Clear();
-            for (var i = state.Titles.Stack.Count - 1; i >= 0; i--)
-                _titleStack.Push((state.Titles.Stack[i].Window, state.Titles.Stack[i].Icon));
-            // Marks last: their positions are in the screens and history restored above.
-            RestoreCommandMarksUnsafe(state.CommandMarks, state.LastCommandAnchorId);
-
-            _hasLastPrintedCell = state.LastPrinted is not null;
-            if (state.LastPrinted is { } last)
-            {
-                _lastPrintedCellX = last.X;
-                _lastPrintedCellY = last.Y;
-                _lastPrintedCellWidth = last.Width;
-                // The original holds the cell as a copy, not a counted reference: the restored one does too.
-                var cell = RestoreCell(last.Cell, state.Styles, cells, built);
-                cell.TrackedHyperlink?.Release();
-                _lastPrintedCell = cell;
-            }
-            _pendingGraphemeCombine = state.PendingGraphemeCombine;
-
-            _modelSequence = state.ModelSequence;
-            // The continuation the start held goes into the live holders, then is committed as the first application would.
-            RestorePendingInputUnsafe(state.PendingInput);
-            CommitOutputContinuationUnsafe();
-            if (state.SynchronizedUpdate.Active)
-            {
-                // Re-entered on this model's clock, so the timeout fires only when that clock reaches it.
-                SetSynchronizedOutputMode(true);
-                _synchronizedOutputStartedSequence = state.SynchronizedUpdate.StartedAtSequence ?? state.ModelSequence;
-            }
+            restoredDcs?.Dispose();
         }
     }
 

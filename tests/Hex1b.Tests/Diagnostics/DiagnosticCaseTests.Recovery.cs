@@ -9,7 +9,7 @@ namespace Hex1b.Tests.Diagnostics;
 
 public partial class DiagnosticCaseTests
 {
-    // Recovery checkpoints after recording loss (ticket 13): a complete text-state/2 checkpoint taken mid-case through
+    // Recovery checkpoints after recording loss (ticket 13): a complete cumulative text checkpoint taken mid-case through
     // the same coordinator as the start, from which a later re-application can begin; refusals recorded; the loss
     // envelope past the ledger's cap; interval ends per segment.
 
@@ -131,7 +131,7 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     [DataRow("mid-application")]
     [DataRow("unapplied-output")]
-    [DataRow("unsupported-surfaces: dcs")]
+    [DataRow("unsupported-surfaces: sixel")]
     [DataRow("unsupported-surfaces: graphics")]
     [DataRow("configuration")]
     [DataRow("pending-state-budget")]
@@ -190,10 +190,10 @@ public partial class DiagnosticCaseTests
                             result = diagnostics.RecoverCase("unapplied");
                         }
                         break;
-                    case "unsupported-surfaces: dcs":
-                        await workload.WriteAndWaitAsync(terminal, "\u001bP$q");
-                        result = diagnostics.RecoverCase("dcs");
-                        await workload.WriteAndWaitAsync(terminal, "m\u001b\\");
+                    case "unsupported-surfaces: sixel":
+                        await workload.WriteAndWaitAsync(terminal, "\u001bPq");
+                        result = diagnostics.RecoverCase("sixel-pending");
+                        await workload.WriteAndWaitAsync(terminal, "\u0018");
                         break;
                     case "unsupported-surfaces: graphics":
                         await workload.WriteAndWaitAsync(terminal, "\u001bPq#0;2;100;0;0#0~~~~\u001b\\");
@@ -217,7 +217,7 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual((DiagnosticOutcome.Unavailable, "unsupported", code), (result.Outcome, result.Status, result.Problem?.Code), result.Problem?.Message);
         StringAssert.StartsWith(result.Reason, code.Replace("pending-state-budget", "pending-state budget"), shape);
         if (shape.StartsWith("unsupported-surfaces", StringComparison.Ordinal))
-            CollectionAssert.Contains(result.UnsupportedSurfaces!.ToList(), shape.EndsWith("dcs", StringComparison.Ordinal) ? "dcs-continuation" : "graphics");
+            CollectionAssert.Contains(result.UnsupportedSurfaces!.ToList(), shape.EndsWith("sixel", StringComparison.Ordinal) ? "sixel-continuation" : "graphics");
         var artifact = Artifact.Read(path);
         var recovery = Recoveries(artifact).Single();
         var checkpoint = recovery.GetProperty("checkpoint");

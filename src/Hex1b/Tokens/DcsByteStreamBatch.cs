@@ -1,12 +1,9 @@
-using System.Buffers;
-using System.Security.Cryptography;
-using Hex1b.Sixel;
-
 namespace Hex1b.Tokens;
 
-internal sealed record DcsByteStreamBatch(
+internal readonly record struct DcsByteStreamBatch(
     ReadOnlyMemory<byte> TextBytes,
-    IReadOnlyList<DcsFrameBoundary> Frames)
+    IReadOnlyList<DcsFrameBoundary> Frames,
+    bool SixelIdentified = false)
 {
     public static DcsByteStreamBatch Empty { get; } = new(
         ReadOnlyMemory<byte>.Empty,

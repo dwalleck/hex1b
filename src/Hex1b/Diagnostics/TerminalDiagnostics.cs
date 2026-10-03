@@ -712,7 +712,7 @@ public sealed class TerminalDiagnostics
     /// <summary>
     /// Starts recording a bounded diagnostic case on a running terminal. At most one case records a
     /// terminal. A fresh model's checkpoint is <c>fresh-model/1</c>; a model that has applied output takes a
-    /// <c>text-state/2</c> start checkpoint (with <c>reapplication-data</c>), complete when its restore can
+    /// <c>text-state/3</c> start checkpoint (with <c>reapplication-data</c>), complete when its restore can
     /// represent the state, otherwise naming the unsupported surfaces.
     /// </summary>
     /// <param name="request">Bounds, authorizations and storage.</param>
@@ -897,7 +897,7 @@ public sealed class TerminalDiagnostics
     }
 
     /// <summary>
-    /// Takes a recovery checkpoint in the active case: a complete <c>text-state/2</c> checkpoint of the model at its
+    /// Takes a recovery checkpoint in the active case: a complete <c>text-state/3</c> checkpoint of the model at its
     /// current model sequence, classified as a start is, from which a later re-application can begin after recording
     /// loss (a new re-applicable interval). Needs <c>reapplication-data</c>. A refusal names why and is recorded in the
     /// case as a checkpoint without state; earlier loss and the initial checkpoint are never changed.

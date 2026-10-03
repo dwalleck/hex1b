@@ -97,7 +97,17 @@ internal static class CaseReapplier
 
         var inspection = CaseArtifactReader.Inspect(new DiagnosticCaseInspectRequest { Path = path });
         if (inspection.Outcome != DiagnosticOutcome.Captured)
+        {
+            // A wrong JSON type in the new required framing policy cannot deserialize as a manifest, but is still
+            // a configuration incompatibility, not a case that this build may replay with defaults.
+            if (rawManifest?["formatVersion"] is JsonValue currentFormat && currentFormat.TryGetValue<int>(out var current)
+                && current == CaseArtifactWriter.FormatVersion && rawManifest["checkpoint"]?["configuration"] is JsonObject rawConfiguration
+                && rawConfiguration["dcsFraming"] is not null
+                && CaseConfiguration.DcsFramingProblem(rawConfiguration["dcsFraming"]) is { } framingProblem)
+                return Problem(DiagnosticOutcome.Unavailable, checks.InvalidDcsFraming(rawConfiguration, framingProblem)) with
+                { Path = path, Producer = ReadIdentity(rawManifest), Coverage = Coverage };
             return new DiagnosticCaseReapplyResult { Outcome = inspection.Outcome, Problem = inspection.Problem, Path = path, Producer = rawManifest is null ? null : ReadIdentity(rawManifest) };
+        }
         var manifest = inspection.Manifest!;
 
         // What is compared, with what: every later result carries it.
@@ -122,7 +132,7 @@ internal static class CaseReapplier
         if (checks.StartProfile(manifest.Checkpoint.Profile, manifest.Checkpoint.ModelSequence) is { } profileProblem)
             return Refused(profileProblem);
         // The initial origin: a fresh model at model sequence 0, or a case started on a model that had applied output
-        // at its text-state/2 start's sequence. The complete recovery checkpoints are the later origins; the inspection
+        // at its text-state/3 start's sequence. The complete recovery checkpoints are the later origins; the inspection
         // lists one interval per origin, and the one restored from is the earliest valid one covering the target, or
         // the one the request names.
         var start = manifest.Checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState ? manifest.Checkpoint.ModelSequence!.Value : 0;
@@ -204,15 +214,45 @@ internal static class CaseReapplier
         if (checks.Origin(origin, declaredProfile) is { } foreignOrigin)
             return Refused(foreignOrigin);
         DiagnosticModelState? originState = null;
+        DiagnosticCaseCheckpointEvent? originCheckpoint = null;
         if (origin.Profile == DiagnosticCaseCheckpointProfiles.TextState)
         {
-            if (origin.CaseSequence is not { } originLine || ReadStartState(eventsPath, originLine) is not { } state)
+            try
+            {
+                originCheckpoint = origin.CaseSequence is { } originLine ? ReadCheckpoint(eventsPath, originLine) : null;
+            }
+            catch (JsonException error)
+            {
+                return Refused(checks.Restored(error));
+            }
+            if (originCheckpoint?.State is not { } state)
                 return Refuse(DiagnosticOutcome.Unavailable, "missing-start",
                     $"The case's origin '{origin.Label}' at model sequence {originFrom} is missing from its verified events, or holds no state.");
             if (StartCheckpoint.Unsupported(state) is { Count: > 0 } surfaces)
                 return Refuse(DiagnosticOutcome.Unavailable, "unsupported-start",
                     $"The case's origin '{origin.Label}' holds {string.Join(", ", surfaces)}, which this build cannot restore.");
             originState = state;
+        }
+
+        DiagnosticCaseCheckpointEvent? recorded = null;
+        DiagnosticModelPendingInput? targetPending = null;
+        if (chosen is not null)
+        {
+            try
+            {
+                recorded = chosen.CaseSequence == origin.CaseSequence ? originCheckpoint : ReadCheckpoint(eventsPath, chosen.CaseSequence);
+                // A target that is also the origin is validated by the single restore reconstruction below.
+                if (chosen.CaseSequence != origin.CaseSequence && recorded?.State is { Unsupported.Count: 0 } targetState)
+                {
+                    targetPending = targetState.PendingInput;
+                    if (TargetPendingInputProblem(targetPending, configuration.Graphics!.MaximumRetainedInputBytesPerImage) is { } pendingProblem)
+                        return Refused(checks.TargetState(new InvalidOperationException(pendingProblem)));
+                }
+            }
+            catch (JsonException error)
+            {
+                return Refused(checks.TargetState(error));
+            }
         }
 
         // The detached model is built before anything is written: a configuration it refuses writes nothing.
@@ -225,6 +265,20 @@ internal static class CaseReapplier
         catch (Exception error) when (error is ArgumentException or InvalidOperationException or OverflowException or OutOfMemoryException)
         {
             return Refused(checks.Rebuilt(error));
+        }
+
+        // A distinct comparison target gets one parser-only reconstruction under the rebuilt producer policy.
+        // Reject impossible derived state before the origin restores any model fields; never install this candidate.
+        if (targetPending?.Dcs is not null)
+        {
+            try
+            {
+                using var targetDcs = replica.PrepareDcsRestore(targetPending);
+            }
+            catch (Exception error) when (error is InvalidOperationException or ArgumentException or FormatException or OverflowException)
+            {
+                return Refused(checks.TargetState(error));
+            }
         }
 
         if (originState is not null)
@@ -253,15 +307,15 @@ internal static class CaseReapplier
         // The replica is never started and never disposed: disposal writes terminal-control sequences to its
         // presentation. It holds no process, file or real timer, so the collector releases it.
         var result = described with { Outcome = DiagnosticOutcome.Captured, RunPath = run, Target = targetRecord, Origin = origin };
-        DiagnosticCaseCheckpointEvent? recorded = null;
+        var reachedCheckpoint = chosen is null;
         long applied = originFrom;
         try
         {
             ReplicaForTesting.Value?.Invoke(replica);
-            foreach (var item in CaseArtifactReader.ReadEvents(eventsPath, chosen?.CaseSequence))
+            foreach (var item in CaseArtifactReader.ReadEvents(eventsPath))
             {
                 if (chosen is not null && item.CaseSequence == chosen.CaseSequence)
-                    recorded = item.Checkpoint;
+                    reachedCheckpoint = true;
                 if (item.Stream == "model" && item.ModelSequence is { } sequence && sequence > originFrom && sequence <= target)
                 {
                     if (Apply(replica, clock, item, sequence) is { } divergence)
@@ -272,7 +326,7 @@ internal static class CaseReapplier
                     AfterEventForTesting.Value?.Invoke(sequence);
                 }
 
-                if (applied >= target && (chosen is null || recorded is not null))
+                if (applied >= target && reachedCheckpoint)
                     break;
             }
 
@@ -357,6 +411,11 @@ internal static class CaseReapplier
         if (configuration.CustomMarkerLimit is { } markers)
             options.CustomMarkerLimit = markers;
         ApplyGraphics(options.Graphics, configuration.Graphics!);
+        options.SixelPolicy = options.CreateSixelPolicy() with
+        {
+            MaximumDcsHeaderParameters = configuration.DcsFraming!.MaximumHeaderParameters,
+            MaximumNumericValue = configuration.DcsFraming.MaximumNumericValue,
+        };
         return new Hex1bTerminal(options);
     }
 
@@ -425,15 +484,28 @@ internal static class CaseReapplier
         public List<CheckpointLine> Checkpoints { get; init; } = [];
     }
 
-    // The start checkpoint's state: the first lines of the file, read until its line.
-    private static DiagnosticModelState? ReadStartState(string eventsPath, long caseSequence)
+    // One requested checkpoint, read before replay so required schema failures cannot be mistaken for absent state.
+    private static DiagnosticCaseCheckpointEvent? ReadCheckpoint(string eventsPath, long caseSequence)
     {
         foreach (var item in CaseArtifactReader.ReadEvents(eventsPath, caseSequence))
         {
             if (item.CaseSequence == caseSequence)
-                return item.Checkpoint?.State;
+                return item.Checkpoint;
         }
         return null;
+    }
+
+    // Bound and validate the target's required DCS fields before rebuilding the replica. Its actual base64 and derived
+    // parser state are checked once by the production candidate reconstruction, before any model mutation or replay.
+    private static string? TargetPendingInputProblem(DiagnosticModelPendingInput? pending, int maximumRetainedDcsBytes)
+    {
+        if (pending is null)
+            return "pendingInput: missing";
+        if (pending.Dcs is not { } dcs)
+            return null;
+        if (dcs.ByteCount > maximumRetainedDcsBytes)
+            return "pendingInput.dcs.byteCount: exceeds the configured retention limit";
+        return Hex1bTerminal.PendingInputProblem(pending);
     }
 
     // One streaming pass over the verified events: the checkpoints (without their state), the start line, and, for a

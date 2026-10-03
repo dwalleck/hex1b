@@ -279,14 +279,22 @@ hex1b capture case reapply <path> --to TARGET [--from ORIGIN] [--inject-fault KI
 | `--authorize` | string | | `reapplication-data`, `raw-input`, `editor-text`, `native-output` (repeatable or comma-separated) |
 | `--dir` | string | `~/.hex1b/cases` | Owner-only root for the case directory |
 
-A case started on a running terminal with `reapplication-data` owns a `text-state/2` start
-checkpoint and re-applies from it; a terminal holding a surface the start cannot restore yet
-(a DCS in progress, graphics) makes it `unsupported`, and the output names the surfaces. Output
-held between chunks (an unfinished escape sequence or UTF-8 scalar) is owned by the start. To record from the first byte, use `hex1b terminal start --record-case`. `stop` waits at most 10 s for queued events.
-Text-state checkpoints preserve repeated buffer-cell write equality, including separated glyph
-halves. The current consumer refuses `text-state/1` starts, targets and recovery origins as
-`incompatible`; older consumers decline `/2`. Artifact format `2` and diagnostics contract `1`
-are unchanged. Historical cases require their recording-era build; no legacy reader is provided.
+A case started on a running terminal with `reapplication-data` owns a cumulative `text-state/3`
+start checkpoint and re-applies from it, including intact bounded non-Sixel DCS (DECRQSS and
+ignored DCS) at introducer, payload, malformed-introducer and held-ESC boundaries. An identified
+unfinished Sixel is `unsupported` (`sixel-continuation`), discarded required DCS content is
+`dcs-retention-limit`, and graphics remain unsupported. A retained prefix that cannot fit the case's
+budget is `size-limit`, never truncated. A partial header is supported until later input identifies
+Sixel and ends its interval; a later complete supported recovery can open a new one. Other output
+held between chunks (an unfinished escape sequence or UTF-8 scalar) is also owned by the start.
+To record from the first byte, use `hex1b terminal start --record-case`. `stop` waits at most 10 s
+for queued events.
+Text-state checkpoints retain earlier text, history, metadata and continuation behavior, including
+repeated buffer-cell write equality and separated glyph halves. The current consumer refuses
+`text-state/1` and `text-state/2` starts, targets and recovery origins as `incompatible`; older
+consumers decline `/3`. Artifact format `2` and diagnostics contract `1` are unchanged. Required
+`pendingInput.dcs` state and `configuration.dcsFraming` producer limits cannot be ignored or replaced
+with consumer defaults. Historical cases require their recording-era build; no legacy reader is provided.
 
 `inspect` reads the artifact offline, verifies every line's checksum, and reports whether the case
 is `complete`, `interrupted` or `truncated`. It also reports per-stream coverage and missing
@@ -303,10 +311,11 @@ and the checkpoint's ordinal; labels need not be unique.
 range: the queue dropped the newest events). It holds the model's full text state at the current
 model sequence and is a new origin: a new re-applicable interval starts there, and `reapply`
 restores from it for targets after the gap. It needs `reapplication-data`, and is classified like a
-live start: `complete`, or `unsupported` with the reason (a DCS in progress or graphics; a state too
-large for what the case's events tier leaves after the queued events and pending checkpoint states;
-the pending-state budget, counted with the pending marks; a recovery inside an application;
-unapplied output; a configuration a re-application could not rebuild), recorded as a boundary only.
+live start: `complete`, or `unsupported` with the reason (`sixel-continuation`,
+`dcs-retention-limit` or `graphics`; `size-limit` for a state too large for what the case's events tier
+leaves after the queued events and pending checkpoint states; the pending-state budget, counted
+with the pending marks; a recovery inside an application; unapplied output; a configuration a
+re-application could not rebuild), recorded as a boundary only.
 A complete recovery's line is reserved in the case's size bound as it is accepted, before its state
 is projected, until it is written, so it always lands with its state; output that would cross the
 reduced bound is declared `size-limit`. Earlier loss and the case's initial checkpoint never
@@ -317,14 +326,22 @@ case's origin (its start, or the earliest recovery checkpoint whose interval cov
 the one `--from` names; the result's `origin` says which) and applies the recorded events after
 it up to the target. It then compares the result with the checkpoint recorded there. Each run
 writes its own directory, `reapplications/<n>`, inside the case.
+Re-application does not execute application code, write to a native terminal or clipboard, or upload
+anything. Checkpoint continuation is original terminal output, authorized by `reapplication-data`,
+not raw keyboard input.
 
 | `reapply` option | Type | Default | Description |
 |------------------|------|---------|-------------|
 | `--to` | string | (required) | A model sequence (`12`), a case sequence (`case:34`), or a checkpoint label (`label:name`, or the bare name; `stop` is the stop checkpoint, `start` a live start's checkpoint; a label several checkpoints share is ambiguous, so name one by `case:<n>`) |
 | `--from` | string | | The origin to restore from: `start`, or a recovery checkpoint by label (`label:name`, or the bare name), case sequence (`case:34`) or ordinal (`checkpoint:2`). Default: the earliest origin whose re-applicable interval covers the target. A mark is `not-an-origin`; an unknown label, case sequence or ordinal is `unknown-label`, `unknown-case-sequence` or `unknown-checkpoint`; a numeric form without its number is `invalid-origin`; a target outside the named origin's interval is `beyond-interval` |
-| `--inject-fault` | string | | A declared fault to inject before comparing, as `kind` or `kind:target` (repeatable or comma-separated): `cell-text[:row/column]`, `cell-style[:row/column]`, `cursor`, `mode[:name]`, `title`, `charset`, `tab-stop`, `pending-input`, `history-row[:index]`, `history-rows`, `pending-wrap`, `last-printed`, `rendition`, `margins`, `saved-cursor`, `pending-grapheme`, `activity`, `synchronized-update`, `title-stack`, `command-mark`, `pending-escape`, `pending-ground-escape`, `pending-framer` (the `pending-*` faults drop one holder of a live start's pending input; target the start). The result is labelled `faultInjected` |
+| `--inject-fault` | string | | A declared fault to inject before comparing, as `kind` or `kind:target` (repeatable or comma-separated): `cell-text[:row/column]`, `cell-style[:row/column]`, `cursor`, `mode[:name]`, `title`, `charset`, `tab-stop`, `pending-input`, `history-row[:index]`, `history-rows`, `pending-wrap`, `last-printed`, `rendition`, `margins`, `saved-cursor`, `pending-grapheme`, `activity`, `synchronized-update`, `title-stack`, `command-mark`, `pending-escape`, `pending-ground-escape`, `pending-framer`, `dcs-bytes`, `dcs-state`. Pending-input and DCS faults target a checkpoint taken while that input is in progress (a live start, mark or stop), not only one after completion. The result is labelled `faultInjected` |
 | `--max-differences` | int | `1000` | Most differences listed (1–100000); every difference is counted |
 | `--preview` | string | | `text`, `ansi`, `svg`, `html` (repeatable or comma-separated) |
+
+`dcs-bytes` omits nonempty `pendingInput.dcs.retainedBytes`; `dcs-state` omits the present
+`pendingInput.dcs.state`. Applicable faults report `different` at those exact paths, changing only
+the comparison copy, not `reapplied.json`. An absent DCS holder makes either fault
+`unavailable` / `fault-not-applicable`; empty retained content makes `dcs-bytes` not applicable.
 
 `reapply` exits 0 when the comparison is `matched`, and 2 when it is `different` or `unavailable`.
 Any build whose declarations match the case's can re-apply it (the candidate's own `reapply` is

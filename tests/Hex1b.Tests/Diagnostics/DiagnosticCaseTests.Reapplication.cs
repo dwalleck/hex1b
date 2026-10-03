@@ -341,7 +341,7 @@ public partial class DiagnosticCaseTests
     public async Task Compare_Unavailable()
     {
         using var root = new CaseRoot();
-        var path = await RecordCaseAsync(root, [new("one "), new("two "), new("a\u001bP0;0;0q#0;2;1"), CaseStep.Mark("mid-dcs")],
+        var path = await RecordCaseAsync(root, [new("one "), new("two "), new("target "), CaseStep.Mark("comparison-target")],
             new HeadlessPresentationAdapter(30, 4));
 
         var none = Reapply(path, modelSequence: 1);
@@ -349,9 +349,56 @@ public partial class DiagnosticCaseTests
         StringAssert.StartsWith(none.ComparisonReason, "no-checkpoint");
         Assert.IsTrue(File.Exists(Path.Combine(none.RunPath!, "reapplied.json")), "the reconstructed state was not returned");
 
-        var unsupported = Reapply(path, label: "mid-dcs");
-        Assert.AreEqual("unavailable", unsupported.Comparison);
-        StringAssert.Contains(unsupported.ComparisonReason, "dcs-continuation");
+        // A producer-declared unsupported target must fail closed at comparison, independently of interval selection.
+        // This is an artifact mutation, not a claim that a naturally captured Sixel application stays re-applicable.
+        EditEventLine(path, e => e["checkpoint"]?["label"]?.GetValue<string>() == "comparison-target",
+            e => e["checkpoint"]!["state"]!["unsupported"] = new JsonArray(JsonValue.Create("sixel-continuation")));
+        var hashes = HashCaseFiles(path);
+        var unsupported = Reapply(path, label: "comparison-target");
+        Assert.AreEqual((DiagnosticOutcome.Captured, "unavailable"), (unsupported.Outcome, unsupported.Comparison), unsupported.Problem?.Message);
+        StringAssert.Contains(unsupported.ComparisonReason, "sixel-continuation");
+        CollectionAssert.AreEqual(hashes, HashCaseFiles(path), "comparison changed the case's files");
+
+        // Real identified Sixel ends the interval before replay; cancellation and a clean recovery restore coverage.
+        var workload = new ScriptedWorkload();
+        await using var terminal = HistoryTerminal(workload, null, 100);
+        var diagnostics = new TerminalDiagnostics(terminal);
+        string sixelPath;
+        long beforeSixel;
+        DiagnosticCaseRecoverResult ground;
+        using (new Running(terminal))
+        {
+            await WriteAndWaitForModelAsync(workload, terminal, "before ");
+            sixelPath = StartLive(terminal, root);
+            beforeSixel = terminal.CurrentModelSequence;
+            await WriteAndWaitForModelAsync(workload, terminal, "a\u001bPq");
+            Mark(diagnostics, "mid-dcs");
+            await WriteAndWaitForModelAsync(workload, terminal, "\u0018 ground");
+            ground = Recover(diagnostics, "ground");
+            await WriteAndWaitForModelAsync(workload, terminal, " tail");
+            Mark(diagnostics, "recovered");
+            await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+        }
+        var sixelHashes = HashCaseFiles(sixelPath);
+        var applied = new StrongBox<int>(0);
+        DiagnosticCaseReapplyResult refused;
+        CaseReapplier.AppliedEventsForTesting.Value = applied;
+        try
+        {
+            refused = Reapply(sixelPath, label: "mid-dcs");
+        }
+        finally
+        {
+            CaseReapplier.AppliedEventsForTesting.Value = null;
+        }
+        Assert.AreEqual((DiagnosticOutcome.Unavailable, "beyond-interval", (long?)beforeSixel, "sixel-continuation"),
+            (refused.Outcome, refused.Problem?.Code, refused.LastValidModelSequence, refused.IntervalEndReason), refused.Problem?.Message);
+        Assert.AreEqual(0, applied.Value, "an unavailable Sixel interval applied events");
+        Assert.IsFalse(Directory.Exists(Path.Combine(sixelPath, "reapplications")), "the refused Sixel interval wrote a run");
+        CollectionAssert.AreEqual(sixelHashes, HashCaseFiles(sixelPath), "interval refusal changed the case's files");
+        var recovered = Reapply(sixelPath, label: "recovered");
+        AssertMatched(recovered, "clean recovery after cancelled Sixel");
+        Assert.AreEqual(("ground", ground.ModelSequence), (recovered.Origin!.Label, recovered.Origin.ModelSequence));
 
         // A checkpoint recorded without its state (too large for the case).
         var large = await RecordCaseAsync(root, [new(string.Concat(Enumerable.Range(0, 30_000).Select(i => $"{i}\r\n"))), CaseStep.Mark("large")],
@@ -587,6 +634,17 @@ public partial class DiagnosticCaseTests
         public static CaseStep Resize(int width, int height) => new(null, null, width, height);
     }
 
+    private static Task WriteAndWaitForModelAsync(ScriptedWorkload workload, Hex1bTerminal terminal, string text) =>
+        WriteAndWaitForModelAsync(workload, terminal, Encoding.UTF8.GetBytes(text));
+
+    private static async Task WriteAndWaitForModelAsync(ScriptedWorkload workload, Hex1bTerminal terminal, byte[] bytes)
+    {
+        var before = terminal.CurrentModelSequence;
+        await workload.WriteAndWaitAsync(terminal, bytes);
+        // The ingress helper only asserts that bytes were read; the locked sequence getter waits for model completion.
+        await WaitAsync(() => terminal.CurrentModelSequence >= before + 1);
+    }
+
     // Records a construction-started case with reapplication-data through the steps, then stops it.
     private static async Task<string> RecordCaseAsync(CaseRoot root, IReadOnlyList<CaseStep> steps, HeadlessPresentationAdapter presentation,
         Action<Hex1bTerminalOptions>? configure = null, bool authorized = true, long? maxBytes = null)
@@ -614,7 +672,7 @@ public partial class DiagnosticCaseTests
             foreach (var step in steps)
             {
                 if (step.Bytes is { } bytes)
-                    await workload.WriteAndWaitAsync(terminal, bytes);
+                    await WriteAndWaitForModelAsync(workload, terminal, bytes);
                 else if (step.MarkLabel is { } label)
                 {
                     // Written before the next step, so each checkpoint's place in the file is fixed.

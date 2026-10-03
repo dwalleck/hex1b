@@ -1,10 +1,11 @@
 using System.Buffers;
 using System.Security.Cryptography;
 using Hex1b.Sixel;
+using ParserState = Hex1b.Tokens.DcsParserCheckpoint.StateKind;
 
 namespace Hex1b.Tokens;
 
-internal sealed class DcsByteStreamParser
+internal sealed partial class DcsByteStreamParser : IDisposable
 {
     internal const int DefaultRetentionLimit = 1024 * 1024;
     internal const int DefaultMaximumParameterCount = 16;
@@ -60,7 +61,7 @@ internal sealed class DcsByteStreamParser
         _retentionLimit = sixelPolicy.MaximumRetainedDcsBytes;
         _maximumParameterCount = sixelPolicy.MaximumDcsHeaderParameters;
         _maximumParameterValue = sixelPolicy.MaximumNumericValue;
-        _parameters = new int?[_maximumParameterCount];
+        _parameters = new int?[Math.Min(DefaultMaximumParameterCount, _maximumParameterCount)];
     }
 
     public bool IsInDcs => _state is
@@ -68,6 +69,8 @@ internal sealed class DcsByteStreamParser
         ParserState.Payload or
         ParserState.MalformedIntroducer or
         ParserState.DcsEscape;
+
+    public bool IsSixel => IsInDcs && _sixelParser is not null;
 
     public bool HasPendingInput =>
         _state != ParserState.Ground ||
@@ -108,6 +111,7 @@ internal sealed class DcsByteStreamParser
 
         var text = new ArrayBufferWriter<byte>(Math.Min(data.Length, 256));
         List<DcsFrameBoundary>? frames = null;
+        var sixelIdentified = false;
 
         for (var index = 0; index < data.Length; index++)
         {
@@ -200,6 +204,7 @@ internal sealed class DcsByteStreamParser
                             if (_state == ParserState.Introducer)
                             {
                                 ProcessIntroducerByte(value);
+                                sixelIdentified |= IsSixel;
                             }
                             else if (_state == ParserState.Payload)
                             {
@@ -213,7 +218,8 @@ internal sealed class DcsByteStreamParser
 
         return new DcsByteStreamBatch(
             text.WrittenMemory.ToArray(),
-            frames ?? (IReadOnlyList<DcsFrameBoundary>)Array.Empty<DcsFrameBoundary>());
+            frames ?? (IReadOnlyList<DcsFrameBoundary>)Array.Empty<DcsFrameBoundary>(),
+            sixelIdentified);
     }
 
     public DcsByteStreamBatch Complete()
@@ -402,6 +408,7 @@ internal sealed class DcsByteStreamParser
             }
 
             _sawParameterSyntax = true;
+            EnsureParameterCapacity(_parameterCount + 1);
             _parameterCount++;
             return;
         }
@@ -458,6 +465,17 @@ internal sealed class DcsByteStreamParser
     {
         _introducerValid = false;
         _state = ParserState.MalformedIntroducer;
+    }
+
+    private void EnsureParameterCapacity(int required)
+    {
+        if (_parameters.Length >= required)
+            return;
+
+        var capacity = (int)Math.Min(
+            _maximumParameterCount,
+            Math.Max((long)required, (long)_parameters.Length * 2));
+        Array.Resize(ref _parameters, capacity);
     }
 
     private void AppendContent(byte value)
@@ -570,13 +588,5 @@ internal sealed class DcsByteStreamParser
         _ => 0,
     };
 
-    private enum ParserState
-    {
-        Ground,
-        GroundEscape,
-        Introducer,
-        Payload,
-        MalformedIntroducer,
-        DcsEscape,
-    }
+    public void Dispose() => _contentHash.Dispose();
 }

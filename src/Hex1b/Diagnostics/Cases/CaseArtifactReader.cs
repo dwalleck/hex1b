@@ -200,7 +200,7 @@ internal static class CaseArtifactReader
         {
             line++;
             // Checkpoint state is skipped, not deserialized: it can be large, and re-application reads it itself.
-            if (!terminated || !TryParse(bytes, out var item, includeState: false, out var stateOmitted))
+            if (!terminated || !TryParse(bytes, out var item, out var stateOmitted))
             {
                 result.TruncatedAtLine = line;
                 break;
@@ -213,7 +213,7 @@ internal static class CaseArtifactReader
             if (item.Checkpoint is { } written)
             {
                 result.Checkpoints.Events++;
-                // A text-state/2 start is the case's first checkpoint line, written with its state (skipped here).
+                // A text-state/3 start is the case's first checkpoint line, written with its state (skipped here).
                 if (result.Checkpoints.First is null && written.Trigger == "start" && written.Status == "recorded" && stateOmitted)
                 {
                     result.StartRecorded = true;
@@ -265,7 +265,7 @@ internal static class CaseArtifactReader
 
     /// <summary>
     /// Streams the verified events of an events file, one line at a time, ending at the first line that fails
-    /// its checksum or JSON (the verified prefix). Memory is bounded by one line, not by the file.
+    /// its checksum or JSON (the verified prefix). A requested state's schema error is propagated to compatibility.
     /// </summary>
     internal static IEnumerable<DiagnosticCaseEvent> ReadEvents(string eventsPath, long? includeStateAt = null)
     {
@@ -273,11 +273,11 @@ internal static class CaseArtifactReader
             yield break;
         foreach (var (bytes, terminated) in Lines(eventsPath))
         {
-            if (!terminated || !TryParse(bytes, out var item, includeState: false, out var stateOmitted))
+            if (!terminated || !TryParse(bytes, out var item, out var stateOmitted))
                 yield break;
             // Only the one checkpoint whose state is wanted is deserialized whole.
-            if (stateOmitted && item.CaseSequence == includeStateAt && TryParse(bytes, out var whole, includeState: true, out _))
-                item = whole;
+            if (stateOmitted && item.CaseSequence == includeStateAt)
+                item = JsonSerializer.Deserialize(bytes.AsSpan(9), DiagnosticsJsonContext.Default.DiagnosticCaseEvent)!;
             yield return item;
         }
     }
@@ -286,7 +286,7 @@ internal static class CaseArtifactReader
     private static long FirstDeliveryOrdinal(StreamScan stream, long ordinal) =>
         stream.Recorded.Count > 0 && stream.Recorded[0].FromOrdinal is { } from ? from : ordinal;
 
-    private static bool TryParse(byte[] bytes, out DiagnosticCaseEvent item, bool includeState, out bool stateOmitted)
+    private static bool TryParse(byte[] bytes, out DiagnosticCaseEvent item, out bool stateOmitted)
     {
         item = null!;
         stateOmitted = false;
@@ -299,7 +299,7 @@ internal static class CaseArtifactReader
             return false;
         try
         {
-            if (!includeState && WithoutCheckpointState(json) is { } lighter)
+            if (WithoutCheckpointState(json) is { } lighter)
             {
                 json = lighter;
                 stateOmitted = true;

@@ -62,6 +62,10 @@ public sealed record DiagnosticCaseModelConfiguration
     [JsonPropertyName("graphics")]
     public DiagnosticCaseGraphicsLimits? Graphics { get; init; }
 
+    /// <summary>Effective DCS introducer limits; required to rebuild both fresh and continued parsing.</summary>
+    [JsonPropertyName("dcsFraming")]
+    public DiagnosticCaseDcsFramingConfiguration? DcsFraming { get; init; }
+
     /// <summary>Recorded fields this build does not know; re-application refuses a configuration with any.</summary>
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? Unknown { get; set; }

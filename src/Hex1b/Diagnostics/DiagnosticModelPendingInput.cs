@@ -20,4 +20,10 @@ public sealed record DiagnosticModelPendingInput
     /// <summary>UTF-8 continuation bytes the byte framer still expects.</summary>
     [JsonPropertyName("framerUtf8Remaining")]
     public int FramerUtf8Remaining { get; init; }
+
+    /// <summary>An open DCS's retained continuation, or null when no DCS is open. The member is always written.</summary>
+    [JsonPropertyName("dcs")]
+    [JsonRequired]
+    [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
+    public DiagnosticModelDcsContinuation? Dcs { get; init; }
 }
