@@ -648,7 +648,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
 
     /// <summary>
     /// Records the start checkpoint of a case armed on a model that had applied output, before any model event
-    /// (the caller holds the model lock at arming). Only a complete <c>text-state/1</c> start is kept: its state is
+    /// (the caller holds the model lock at arming). Only a complete <c>text-state/2</c> start is kept: its state is
     /// the restore's source. It holds a mark's place and its state bytes until written, as a mark does.
     /// </summary>
     internal void RecordStartCheckpoint(long modelSequence, CheckpointCapture capture)

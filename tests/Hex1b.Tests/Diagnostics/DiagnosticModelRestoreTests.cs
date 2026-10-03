@@ -8,7 +8,7 @@ using Microsoft.Extensions.Time.Testing;
 namespace Hex1b.Tests.Diagnostics;
 
 /// <summary>
-/// Restoring a <c>text-state/1</c> projection into a detached model (ticket 09): the restored model projects
+/// Restoring a <c>text-state/2</c> projection into a detached model (ticket 09): the restored model projects
 /// back equal, interprets later input as the original does, owns its hyperlinks and its synchronized-update
 /// timer, and a start state's unsupported surfaces are named.
 /// </summary>

@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 namespace Hex1b.Diagnostics;
 
 /// <summary>
-/// The result of requesting a recovery checkpoint in the active case: a complete <c>text-state/1</c> checkpoint of the
+/// The result of requesting a recovery checkpoint in the active case: a complete <c>text-state/2</c> checkpoint of the
 /// terminal model, taken between two model events and classified as a start is, from which re-application can begin
 /// after recording loss. A refused request records the attempt as a checkpoint without state.
 /// </summary>

@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Hex1b.Diagnostics;
 using Hex1b.Theming;
 
@@ -6,7 +7,7 @@ namespace Hex1b;
 public sealed partial class Hex1bTerminal
 {
     /// <summary>
-    /// Restores a <c>text-state/1</c> projection into this model: the inverse of the model-state projection
+    /// Restores a <c>text-state/2</c> projection into this model: the inverse of the model-state projection
     /// for the active text buffer, the retained history (each row with its cells, original width and identity, and the
     /// next identity; rows are stamped with this model's clock) and, on the alternate screen, the saved main screen.
     /// Only the case reapplier calls
@@ -15,8 +16,8 @@ public sealed partial class Hex1bTerminal
     /// screen's cells are written at the saved screen's geometry, the model enters the alternate screen (which saves
     /// them, and selects the alternate screen for its graphics and text coordinates), then resizes to the active
     /// geometry. Every other projected field is then written in one hold of the model lock. Restored hyperlinks are this model's own
-    /// tracked objects, and an open synchronized update is re-entered on this model's clock. Identity, clock and
-    /// write-order fields keep this model's values, as the census classifies them.
+    /// tracked objects, and an open synchronized update is re-entered on this model's clock. Identity, clock and absolute
+    /// write-order fields keep this model's values; fresh write sequences preserve the projected global equality classes.
     /// </summary>
     /// <exception cref="InvalidOperationException">
     /// The state holds something this restore cannot represent (malformed pending input, an unsupported surface, a history
@@ -27,20 +28,21 @@ public sealed partial class Hex1bTerminal
     {
         if (UnrestorableField(state) is { } field)
             throw new InvalidOperationException($"The state cannot be restored: it holds {field}.");
-        Dictionary<DiagnosticModelRow, long[]> sequences;
+        Dictionary<int, long> writeClasses;
         lock (_bufferLock)
         {
             if (_modelSequence != 0 || (_scrollbackBuffer?.Count ?? 0) != 0)
                 throw new InvalidOperationException("Only a model that has applied nothing can be restored.");
             if (HistoryProblem(state.History, state.Styles, _scrollbackBuffer) is { } historyProblem)
                 throw new InvalidOperationException($"The state cannot be restored: its history {historyProblem}");
+            if (WriteClassesProblem(state, out writeClasses) is { } classProblem)
+                throw new InvalidOperationException($"The state cannot be restored: it holds {classProblem}.");
             if (state.CommandMarks.Count > _commandMarkHistoryCapacity)
                 throw new InvalidOperationException(
                     $"The state cannot be restored: its {state.CommandMarks.Count} command marks exceed the configured capacity of {_commandMarkHistoryCapacity}.");
             // Marks last: their positions are checked against rows already validated above.
             if (CommandMarksProblem(state) is { } marksProblem)
                 throw new InvalidOperationException($"The state cannot be restored: it holds {marksProblem}.");
-            sequences = RestoredSequencesUnsafe(state);
         }
 
         var cells = new TerminalCell[state.Styles.Count];
@@ -53,7 +55,7 @@ public sealed partial class Hex1bTerminal
                 Resize(savedWidth, savedHeight);
             lock (_bufferLock)
             {
-                RestoreScreenUnsafe(savedMain, state.Styles, cells, built, sequences);
+                RestoreScreenUnsafe(savedMain, state.Styles, cells, built, writeClasses);
                 DoEnterAlternateScreen();
             }
         }
@@ -74,14 +76,15 @@ public sealed partial class Hex1bTerminal
                 {
                     var projected = history.Rows[row];
                     var rowCells = new TerminalCell[projected.Cells.Count];
+                    var run = 0;
                     for (var column = 0; column < rowCells.Length; column++)
-                        rowCells[column] = RestoreCell(projected.Cells[column], state.Styles, cells, built);
-                    SequenceRestoredRow(rowCells, sequences[projected]);
+                        rowCells[column] = RestoreCell(projected.Cells[column], state.Styles, cells, built,
+                            RestoredSequenceUnsafe(projected.Cells[column], UnwrittenAt(projected.Unwritten, column, ref run), writeClasses));
                     rows[row] = (rowCells, projected.OriginalWidth ?? rowCells.Length, projected.Id ?? 0);
                 }
                 scrollback.RestoreRows(rows, history.NextRowId, _timeProvider.GetUtcNow());
             }
-            RestoreScreenUnsafe(state.Screen, state.Styles, cells, built, sequences);
+            RestoreScreenUnsafe(state.Screen, state.Styles, cells, built, writeClasses);
 
             _cursorX = state.Cursor.X;
             _cursorY = state.Cursor.Y;
@@ -199,17 +202,16 @@ public sealed partial class Hex1bTerminal
 
     // Writes projected rows into the active screen buffer, which has their geometry.
     private void RestoreScreenUnsafe(IReadOnlyList<DiagnosticModelRow> rows, IReadOnlyList<DiagnosticModelStyle> styles,
-        TerminalCell[] cells, bool[] built, Dictionary<DiagnosticModelRow, long[]> sequences)
+        TerminalCell[] cells, bool[] built, Dictionary<int, long> writeClasses)
     {
         for (var row = 0; row < rows.Count; row++)
         {
-            var projected = rows[row].Cells;
-            var rowCells = new TerminalCell[projected.Count];
-            for (var column = 0; column < rowCells.Length; column++)
-                rowCells[column] = RestoreCell(projected[column], styles, cells, built);
-            SequenceRestoredRow(rowCells, sequences[rows[row]]);
-            for (var column = 0; column < rowCells.Length; column++)
-                SetCell(row, column, rowCells[column], damageSixel: false);
+            var projected = rows[row];
+            var run = 0;
+            for (var column = 0; column < projected.Cells.Count; column++)
+                SetCell(row, column, RestoreCell(projected.Cells[column], styles, cells, built,
+                    RestoredSequenceUnsafe(projected.Cells[column], UnwrittenAt(projected.Unwritten, column, ref run), writeClasses)),
+                    damageSixel: false);
         }
     }
 
@@ -243,68 +245,64 @@ public sealed partial class Hex1bTerminal
         return null;
     }
 
-    // One restored cell. A style's colours and attributes are parsed once; each cell holding a hyperlink takes
-    // its own counted reference from this model's store, as a cell written by output does.
-    // Restored cells get write sequences in reading order (the main buffer's history rows then its screen, which is the
-    // saved main screen while the alternate screen is active; the alternate screen alone): a never-written cell 0, as in
-    // the original; a projected continuation the sequence of the cell before it (to its left, or at a row's first column
-    // the previous row's last cell, across a soft wrap); every other cell its own. Code that tells cells of one glyph by a
-    // shared sequence (anchors, selection, rendering, reflow) then reads the restored rows as the original's, and so does
-    // later output that meets never-written cells. The values themselves are write order and are not projected; which
-    // cells share one is. Assigned before any row is written, because the saved main screen is restored before history.
-    private Dictionary<DiagnosticModelRow, long[]> RestoredSequencesUnsafe(DiagnosticModelState state)
+    // Count classes across every buffer before model mutation. Negative values count one or at least two members;
+    // each is replaced by one fresh sequence on its first restored occurrence, even if saved main is written first.
+    private static string? WriteClassesProblem(DiagnosticModelState state, out Dictionary<int, long> classes)
     {
-        var result = new Dictionary<DiagnosticModelRow, long[]>(ReferenceEqualityComparer.Instance);
-        void Assign(IEnumerable<DiagnosticModelRow> rows)
+        var counted = new Dictionary<int, long>();
+        classes = counted;
+        Count(state.History?.Rows);
+        Count(state.SavedMainScreen);
+        Count(state.Screen);
+        if (state.LastPrinted is { Cell.WriteClass: not 0 })
+            return "a write class on the last-printed cell, which is not a buffer cell";
+        foreach (var (label, count) in classes)
+            if (count == -1)
+                return $"write class {label} with only one buffer cell";
+        return null;
+
+        void Count(IReadOnlyList<DiagnosticModelRow>? rows)
         {
-            long? previous = null;
+            if (rows is null)
+                return;
             foreach (var row in rows)
-            {
-                var unwritten = UnwrittenMask(row.Unwritten, row.Cells.Count);
-                var sequences = new long[row.Cells.Count];
-                for (var column = 0; column < sequences.Length; column++)
-                {
-                    var before = column > 0 ? sequences[column - 1] : previous;
-                    sequences[column] = unwritten[column] ? 0
-                        : row.Cells[column].Continues && before is { } shared ? shared
-                        : ++_writeSequence;
-                }
-                // Validation has refused a first-column continuation after a row that does not soft-wrap.
-                if (sequences.Length > 0)
-                    previous = sequences[^1];
-                result[row] = sequences;
-            }
+                foreach (var cell in row.Cells)
+                    if (cell.WriteClass > 0)
+                    {
+                        ref var count = ref CollectionsMarshal.GetValueRefOrAddDefault(counted, cell.WriteClass, out var present);
+                        count = present ? -2 : -1;
+                    }
         }
-        var mainScreen = state.ActiveBuffer == "alternate" ? state.SavedMainScreen! : state.Screen;
-        Assign([.. state.History?.Rows ?? [], .. mainScreen]);
-        if (state.ActiveBuffer == "alternate")
-            Assign(state.Screen);
-        return result;
     }
 
-    private static void SequenceRestoredRow(TerminalCell[] row, long[] sequences)
+    // Never-written cells retain zero. Every singleton gets its own value, and every repeated class one shared value.
+    // Advancing the model's counter as values are assigned keeps all subsequent output above every restored sequence.
+    private long RestoredSequenceUnsafe(DiagnosticModelCell cell, bool unwritten, Dictionary<int, long> classes)
     {
-        for (var column = 0; column < row.Length; column++)
-            row[column] = row[column] with { Sequence = sequences[column] };
+        if (unwritten)
+            return 0;
+        if (cell.WriteClass == 0)
+            return ++_writeSequence;
+        ref var sequence = ref CollectionsMarshal.GetValueRefOrAddDefault(classes, cell.WriteClass, out _);
+        if (sequence <= 0)
+            sequence = ++_writeSequence;
+        return sequence;
     }
 
-    // The never-written cells of a row. Runs outside the row are skipped here: validation names them, and may read a row
-    // before its own runs are validated.
-    private static bool[] UnwrittenMask(IReadOnlyList<int>? runs, int width)
+    // Read validated runs in one pass without a per-row mask allocation.
+    private static bool UnwrittenAt(IReadOnlyList<int>? runs, int column, ref int run)
     {
-        var mask = new bool[width];
-        for (var i = 0; runs is not null && i + 1 < runs.Count; i += 2)
-        {
-            if (runs[i] >= 0 && runs[i + 1] > 0 && (long)runs[i] + runs[i + 1] <= width)
-                Array.Fill(mask, true, runs[i], runs[i + 1]);
-        }
-        return mask;
+        if (runs is null)
+            return false;
+        while (run + 1 < runs.Count && column >= (long)runs[run] + runs[run + 1])
+            run += 2;
+        return run + 1 < runs.Count && column >= runs[run];
     }
 
-    // Why projected rows cannot be restored, or null: every row present with its cells; a continuation only on an empty
-    // cell, after the cell to its left or, at the first column, after the last cell of a row before it in reading order
-    // that soft-wraps, and never across a never-written run's edge; and the runs start, count pairs in column order within
-    // the row.
+    // Why projected rows cannot be restored, or null: runs are ordered start/count pairs within the row; classes are
+    // nonnegative and absent on unwritten cells; continuation exactly matches an empty cell's equality with its eligible
+    // predecessor (left, or the preceding row's last cell across a soft wrap). Equality can also exist without a visible
+    // continuation: class discovery is not gated by text, adjacency or soft wraps.
     private static string? RowsProblem(IReadOnlyList<DiagnosticModelRow>? rows, string what,
         IReadOnlyList<DiagnosticModelStyle>? styles, DiagnosticModelRow? before = null)
     {
@@ -326,19 +324,27 @@ public sealed partial class Hex1bTerminal
                     end = runs[i] + runs[i + 1];
                 }
             }
-            var unwritten = UnwrittenMask(rows[row].Unwritten, cells.Count);
-            // The row before in reading order, for a continuation at the first column (across a soft wrap).
+            var run = 0;
+            // The row before in reading order is eligible only across a soft wrap.
             var previous = row > 0 ? rows[row - 1] : before;
-            var previousUnwritten = previous?.Cells is { Count: > 0 } previousCells && SoftWraps(previous, styles)
-                ? UnwrittenMask(previous.Unwritten, previousCells.Count)[^1]
-                : (bool?)null;
+            DiagnosticModelCell? leftCell = previous?.Cells is { Count: > 0 } previousCells && SoftWraps(previous, styles)
+                ? previousCells[^1] : null;
+            var leftUnwritten = leftCell is not null && previous!.Unwritten is { Count: >= 2 } previousRuns
+                && previousRuns[^2] >= 0 && previousRuns[^1] > 0
+                && (long)previousRuns[^2] + previousRuns[^1] == previous.Cells.Count;
             for (var column = 0; column < cells.Count; column++)
             {
-                if (!cells[column].Continues)
-                    continue;
-                var leftUnwritten = column > 0 ? unwritten[column - 1] : previousUnwritten;
-                if (cells[column].Text is not { Length: 0 } || leftUnwritten is not { } left || unwritten[column] != left)
-                    return $"{what} row {row}: a continuation at column {column} that continues nothing";
+                var cell = cells[column];
+                var unwritten = UnwrittenAt(rows[row].Unwritten, column, ref run);
+                if (cell.WriteClass < 0 || unwritten && cell.WriteClass != 0)
+                    return $"{what} row {row}: an invalid write class {cell.WriteClass} at column {column}";
+                var shares = leftCell is { } left && (unwritten && leftUnwritten
+                    || !unwritten && !leftUnwritten && cell.WriteClass > 0 && cell.WriteClass == left.WriteClass);
+                var continues = cell.Text is { Length: 0 } && shares;
+                if (cell.Continues != continues)
+                    return $"{what} row {row}: a continuation at column {column} that continues nothing or contradicts its write class";
+                leftCell = cell;
+                leftUnwritten = unwritten;
             }
         }
         return null;
@@ -351,7 +357,7 @@ public sealed partial class Hex1bTerminal
         && styles[last.Style]?.Attributes?.Contains("soft-wrap") == true;
 
     private TerminalCell RestoreCell(DiagnosticModelCell projected, IReadOnlyList<DiagnosticModelStyle> styles,
-        TerminalCell[] cells, bool[] built)
+        TerminalCell[] cells, bool[] built, long sequence = 0)
     {
         if (!built[projected.Style])
         {
@@ -369,6 +375,7 @@ public sealed partial class Hex1bTerminal
             Character = projected.Text,
             TrackedHyperlink = hyperlink,
             IsWideWrapPadding = projected.WideWrapPadding,
+            Sequence = sequence,
         };
     }
 

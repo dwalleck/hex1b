@@ -4,9 +4,9 @@ using System.Text.Json;
 namespace Hex1b.Diagnostics.Cases;
 
 /// <summary>
-/// Compares two <c>text-state/1</c> projections field by field: every cell of every screen and history row,
-/// with styles resolved, and every other surface. It never concludes from counts alone; every difference is
-/// counted per surface, and the first ones (up to the cap) are listed in the projection's order.
+/// Compares two <c>text-state/2</c> projections field by field: every cell of every screen and history row,
+/// with styles resolved and write classes matched globally by their equality relation, and every other surface.
+/// Every difference is counted per surface, and the first ones (up to the cap) are listed in the projection's order.
 /// </summary>
 internal static class ModelStateComparer
 {
@@ -78,6 +78,8 @@ internal static class ModelStateComparer
         private readonly List<DiagnosticModelStateDifference> _differences = [];
         private readonly Dictionary<string, long> _bySurface = new(StringComparer.Ordinal);
         private readonly Dictionary<(int, int), bool> _sameStyle = [];
+        private readonly Dictionary<int, int> _recordedClasses = [];
+        private readonly Dictionary<int, int> _reappliedClasses = [];
         private long _total;
 
         public DiagnosticModelStateComparison Result() => new()
@@ -169,7 +171,8 @@ internal static class ModelStateComparer
 
         private static string Runs(IReadOnlyList<int>? runs) => runs is null ? "none" : string.Join(",", runs);
 
-        private void Cell(string surface, string prefix, int row, int column, in DiagnosticModelCell recorded, in DiagnosticModelCell reapplied)
+        private void Cell(string surface, string prefix, int row, int column, in DiagnosticModelCell recorded, in DiagnosticModelCell reapplied,
+            bool bufferCell = true)
         {
             if (!string.Equals(recorded.Text, reapplied.Text, StringComparison.Ordinal))
                 Add(surface, new Path(prefix, row, column, "text"), Json(recorded.Text), Json(reapplied.Text));
@@ -177,11 +180,33 @@ internal static class ModelStateComparer
                 Add(surface, new Path(prefix, row, column, "wideWrapPadding"), Flag(recorded.WideWrapPadding), Flag(reapplied.WideWrapPadding));
             if (recorded.Continues != reapplied.Continues)
                 Add(surface, new Path(prefix, row, column, "continues"), Flag(recorded.Continues), Flag(reapplied.Continues));
+            if (bufferCell && !SameWriteClass(recorded.WriteClass, reapplied.WriteClass))
+            {
+                var listed = _differences.Count < max;
+                Add(surface, new Path(prefix, row, column, "writeClass"), listed ? Class(recorded.WriteClass) : null,
+                    listed ? $"{Class(reapplied.WriteClass)} (different equality relation)" : null);
+            }
             if (SameStyle(recorded.Style, reapplied.Style))
                 return;
             // Rare (the styles differ), so this prefix is formatted here.
             Style(surface, new Path(prefix, row, column, "style").Format(), StyleAt(recordedStyles, recorded.Style), StyleAt(reappliedStyles, reapplied.Style));
         }
+
+        // One bijection for all buffers: labels themselves have no meaning, but a class cannot split or merge.
+        private bool SameWriteClass(int recorded, int reapplied)
+        {
+            if (recorded == 0 || reapplied == 0)
+                return recorded == reapplied;
+            if (_recordedClasses.TryGetValue(recorded, out var corresponding))
+                return corresponding == reapplied;
+            if (_reappliedClasses.ContainsKey(reapplied))
+                return false;
+            _recordedClasses.Add(recorded, reapplied);
+            _reappliedClasses.Add(reapplied, recorded);
+            return true;
+        }
+
+        private static string Class(int value) => value == 0 ? "singleton or unwritten" : $"class {value}";
 
 
         private static DiagnosticModelStyle? StyleAt(IReadOnlyList<DiagnosticModelStyle> styles, int index) =>
@@ -331,7 +356,7 @@ internal static class ModelStateComparer
             Number("lastPrinted", "lastPrinted.x", recorded!.X, reapplied!.X);
             Number("lastPrinted", "lastPrinted.y", recorded.Y, reapplied.Y);
             Number("lastPrinted", "lastPrinted.width", recorded.Width, reapplied.Width);
-            Cell("lastPrinted", "lastPrinted.cell", -1, -1, recorded.Cell, reapplied.Cell);
+            Cell("lastPrinted", "lastPrinted.cell", -1, -1, recorded.Cell, reapplied.Cell, bufferCell: false);
         }
 
         public void PendingInput(DiagnosticModelPendingInput recorded, DiagnosticModelPendingInput reapplied)

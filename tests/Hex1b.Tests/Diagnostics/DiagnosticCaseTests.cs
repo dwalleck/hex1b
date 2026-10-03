@@ -115,11 +115,11 @@ public partial class DiagnosticCaseTests
 
         Assert.AreEqual("complete", untouched.Artifact.Manifest.GetProperty("checkpoint").GetProperty("status").GetString());
         Assert.AreEqual("live", untouched.Artifact.Manifest.GetProperty("startPath").GetString());
-        // A model that has applied output owns a text-state/1 start instead (ticket 09).
+        // A model that has applied output owns a text-state/2 start instead (ticket 09).
         foreach (var (name, result) in new[] { ("applied batch", applied), ("same-size resize", resized) })
         {
             var checkpoint = result.Artifact.Manifest.GetProperty("checkpoint");
-            Assert.AreEqual(("text-state/1", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()), name);
+            Assert.AreEqual(("text-state/2", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()), name);
             Assert.IsFalse(result.Artifact.Manifest.GetProperty("fresh").GetBoolean(), name);
         }
     }
@@ -454,7 +454,7 @@ public partial class DiagnosticCaseTests
         Assert.IsFalse(artifact.Manifest.GetProperty("fresh").GetBoolean(), "a model that had read bytes is not fresh");
         // It had applied nothing: its start (ticket 09) is at model sequence 0, and the held chunk is recorded after it.
         var checkpoint = artifact.Manifest.GetProperty("checkpoint");
-        Assert.AreEqual(("text-state/1", "complete", 0L), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString(),
+        Assert.AreEqual(("text-state/2", "complete", 0L), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString(),
             checkpoint.GetProperty("modelSequence").GetInt64()));
     }
 

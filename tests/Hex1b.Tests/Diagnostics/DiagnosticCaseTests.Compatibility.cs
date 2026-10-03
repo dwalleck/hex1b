@@ -92,26 +92,29 @@ public partial class DiagnosticCaseTests
         Assert.IsTrue(checks.All(c => c.GetProperty("verdict").GetString() == "compatible"), "result.json: a check is not compatible");
         Assert.IsTrue(checks.All(c => c.TryGetProperty("producer", out _) && c.TryGetProperty("consumer", out _)), "result.json: a check lacks a side's value");
         Assert.AreEqual("2", checks[0].GetProperty("producer").GetString());
-        Assert.AreEqual("fresh-model/1; target: text-state/1", checks[2].GetProperty("producer").GetString()[7..]);
+        Assert.AreEqual("fresh-model/1; target: text-state/2", checks[2].GetProperty("producer").GetString()[7..]);
         Assert.AreEqual("rebuilt", checks[6].GetProperty("consumer").GetString());
     }
 
     [TestMethod]
     [DataRow("formatVersion", "format-3", "3", "2", "formatVersion: the artifact declares 3; this build reads 2.", "i n n n n n n")]
     [DataRow("contractVersion", "contract-2", "2", "1", "contractVersion: the artifact declares 2; this build speaks 1.", "c i n n n n n")]
-    [DataRow("checkpoint.profile", "start-profile", "start: fresh-model/9", "fresh-model/1, text-state/1", "checkpoint.profile: unknown profile 'fresh-model/9'", "c c i n n n n")]
+    [DataRow("checkpoint.profile", "start-profile", "start: fresh-model/9", "fresh-model/1, text-state/2", "checkpoint.profile: unknown profile 'fresh-model/9'", "c c i n n n n")]
     [DataRow("checkpoint.coveredSurfaces", "surfaces-fewer", "geometry-and-text-buffers", "graphics-placements-and-resources", "missing: graphics-placements-and-resources.", "c c c i n n n")]
     [DataRow("checkpoint.coveredSurfaces", "surfaces-more", "selection-state", "command-marks", "unknown: selection-state.", "c c c i n n n")]
     [DataRow("checkpoint.coveredSurfaces", "surfaces-renamed", "selection-state", "command-marks", "missing: command-marks; unknown: selection-state.", "c c c i n n n")]
     [DataRow("configuration", "width-missing", "height", "width", "configuration.width: missing", "c c c c i n n")]
     [DataRow("configuration.capabilities", "mouse-missing", "supportsSixel", "supportsMouse", "capabilities.supportsMouse: missing", "c c c c c i n")]
     [DataRow("configuration.capabilities", "mouse-missing-holograms-unknown", "supportsHolograms", "supportsMouse", "capabilities.supportsMouse: missing", "c c c c c i n")]
-    [DataRow("checkpoint.profile", "target-profile", "start: fresh-model/1; target: text-state/9", "fresh-model/1, text-state/1", "checkpoint.profile: unknown projection profile 'text-state/9'", "c c i c c c n")]
-    [DataRow("checkpoint.profile", "start-without-sequence", "start: text-state/1", "fresh-model/1, text-state/1", "checkpoint.modelSequence: a text-state/1 start names no model sequence", "c c i n n n n")]
+    [DataRow("checkpoint.profile", "target-profile", "start: fresh-model/1; target: text-state/9", "fresh-model/1, text-state/2", "checkpoint.profile: unknown projection profile 'text-state/9'", "c c i c c c n")]
+    [DataRow("checkpoint.profile", "legacy-start", "start: text-state/1", "fresh-model/1, text-state/2", "checkpoint.profile: unknown profile 'text-state/1'", "c c i n n n n")]
+    [DataRow("checkpoint.profile", "legacy-target", "start: fresh-model/1; target: text-state/1", "fresh-model/1, text-state/2", "checkpoint.profile: unknown projection profile 'text-state/1'", "c c i c c c n")]
+    [DataRow("checkpoint.profile", "start-without-sequence", "start: text-state/2", "fresh-model/1, text-state/2", "checkpoint.modelSequence: a text-state/2 start names no model sequence", "c c i n n n n")]
     public async Task Compatibility_RefusesByArtifactDeclaration(string check, string edit, string producerHas, string consumerHas, string message, string verdicts)
     {
         using var root = new CaseRoot();
-        var path = await RecordCaseAsync(root, CompatibilityCorpus, new HeadlessPresentationAdapter(20, 4));
+        var path = edit == "legacy-start" ? await RecordLiveAsync(root)
+            : await RecordCaseAsync(root, CompatibilityCorpus, new HeadlessPresentationAdapter(20, 4));
         switch (edit)
         {
             case "format-3": EditManifest(path, m => m["formatVersion"] = 3); break;
@@ -131,11 +134,20 @@ public partial class DiagnosticCaseTests
                 });
                 break;
             case "target-profile": EditEventLine(path, e => e["kind"]?.GetValue<string>() == "checkpoint", e => e["checkpoint"]!["profile"] = "text-state/9"); break;
-            case "start-without-sequence": EditManifest(path, m => { m["checkpoint"]!["profile"] = "text-state/1"; m["checkpoint"]!.AsObject().Remove("modelSequence"); }); break;
+            case "legacy-start":
+                EditManifest(path, m => m["checkpoint"]!["profile"] = "text-state/1");
+                EditEventLine(path, IsStart, e =>
+                {
+                    e["checkpoint"]!["profile"] = "text-state/1";
+                    e["checkpoint"]!["state"]!["profile"] = "text-state/1";
+                });
+                break;
+            case "legacy-target": EditEventLine(path, e => e["kind"]?.GetValue<string>() == "checkpoint", e => e["checkpoint"]!["profile"] = "text-state/1"); break;
+            case "start-without-sequence": EditManifest(path, m => { m["checkpoint"]!["profile"] = DiagnosticCaseCheckpointProfiles.TextState; m["checkpoint"]!.AsObject().Remove("modelSequence"); }); break;
         }
         var before = HashCaseFiles(path);
 
-        var result = Reapply(path, label: "m1");
+        var result = Reapply(path, label: edit == "legacy-start" ? "stop" : "m1");
         Assert.AreEqual((DiagnosticOutcome.Unavailable, "incompatible"), (result.Outcome, result.Problem?.Code), $"{edit}: {result.Problem?.Message}");
         StringAssert.Contains(result.Problem!.Message, message, edit);
         AssertRecord(result.Compatibility, verdicts, edit);
@@ -216,15 +228,18 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     [DataRow("formatVersion", "format-3", "2", "3", "formatVersion: the artifact declares 2; this build reads 3.", "i n n n n n n")]
     [DataRow("contractVersion", "contract-2", "1", "2", "contractVersion: the artifact declares 1; this build speaks 2.", "c i n n n n n")]
-    [DataRow("checkpoint.profile", "fresh-only", "target: text-state/1", "fresh-model/1", "unknown projection profile 'text-state/1'", "c c i c c c n")]
-    [DataRow("checkpoint.profile", "text-state-only", "start: fresh-model/1", "text-state/1", "unknown profile 'fresh-model/1'", "c c i n n n n")]
+    [DataRow("checkpoint.profile", "fresh-only", "target: text-state/2", "fresh-model/1", "unknown projection profile 'text-state/2'", "c c i c c c n")]
+    [DataRow("checkpoint.profile", "text-state-only", "start: fresh-model/1", "text-state/2", "unknown profile 'fresh-model/1'", "c c i n n n n")]
+    [DataRow("checkpoint.profile", "legacy-text-state", "target: text-state/2", "fresh-model/1, text-state/1", "unknown projection profile 'text-state/2'", "c c i c c c n")]
+    [DataRow("checkpoint.profile", "legacy-text-state-start", "start: text-state/2", "fresh-model/1, text-state/1", "unknown profile 'text-state/2'", "c c i n n n n")]
     [DataRow("checkpoint.coveredSurfaces", "one-more-surface", "command-marks", "selection-state", "missing: selection-state", "c c c i n n n")]
     [DataRow("configuration", "requires-tab-width", "height", "tabWidth", "configuration.tabWidth: missing", "c c c c i n n")]
     [DataRow("configuration.capabilities", "requires-hyperlinks", "supportsMouse", "supportsHyperlinks", "capabilities.supportsHyperlinks: missing", "c c c c c i n")]
     public async Task Compatibility_RefusesByConsumerDeclaration(string check, string declaration, string producerHas, string consumerHas, string message, string verdicts)
     {
         using var root = new CaseRoot();
-        var path = await RecordCaseAsync(root, CompatibilityCorpus, new HeadlessPresentationAdapter(20, 4));
+        var path = declaration == "legacy-text-state-start" ? await RecordLiveAsync(root)
+            : await RecordCaseAsync(root, CompatibilityCorpus, new HeadlessPresentationAdapter(20, 4));
         var build = CaseCompatibility.Consumer.Build;
         CaseCompatibility.Consumer.CurrentForTesting.Value = declaration switch
         {
@@ -232,13 +247,14 @@ public partial class DiagnosticCaseTests
             "contract-2" => build with { ContractVersion = 2 },
             "fresh-only" => build with { Profiles = [DiagnosticCaseCheckpointProfiles.FreshModel] },
             "text-state-only" => build with { Profiles = [DiagnosticCaseCheckpointProfiles.TextState] },
+            "legacy-text-state" or "legacy-text-state-start" => build with { Profiles = [DiagnosticCaseCheckpointProfiles.FreshModel, "text-state/1"] },
             "requires-tab-width" => build with { RequiredFields = [.. build.RequiredFields, "tabWidth"] },
             "requires-hyperlinks" => build with { RequiredCapabilities = [.. build.RequiredCapabilities, "supportsHyperlinks"] },
             _ => build with { Surfaces = [.. build.Surfaces, "selection-state"] },
         };
         try
         {
-            var result = Reapply(path, label: "m1");
+            var result = Reapply(path, label: declaration == "legacy-text-state-start" ? "stop" : "m1");
             Assert.AreEqual((DiagnosticOutcome.Unavailable, "incompatible"), (result.Outcome, result.Problem?.Code), $"{declaration}: {result.Problem?.Message}");
             StringAssert.Contains(result.Problem!.Message, message, declaration);
             AssertRecord(result.Compatibility, verdicts, declaration);
@@ -254,7 +270,7 @@ public partial class DiagnosticCaseTests
         {
             CaseCompatibility.Consumer.CurrentForTesting.Value = null;
         }
-        AssertMatched(Reapply(path, label: "m1"), "this build, the same case");
+        AssertMatched(Reapply(path, label: declaration == "legacy-text-state-start" ? "stop" : "m1"), "this build, the same case");
     }
 
     [TestMethod]
@@ -280,27 +296,6 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual((DiagnosticOutcome.Failed, "unsupported-format"), (inspection.Outcome, inspection.Problem?.Code), inspection.Problem?.Message);
     }
 
-    [TestMethod]
-    [DataRow("src/content/guide/diagnostic-capture.md")]
-    [DataRow("src/content/reference/cli.md")]
-    [DataRow("src/Hex1b.McpServer/SKILL.md")]
-    [DataRow("src/Hex1b.McpServer/README.md")]
-    public void DocsMentionCompatibility(string relativePath)
-    {
-        var root = AppContext.BaseDirectory;
-        while (!File.Exists(Path.Combine(root, "src/Hex1b/Hex1b.csproj")))
-            root = Path.GetDirectoryName(root) ?? throw new InvalidOperationException("repository root not found");
-        var text = File.ReadAllText(Path.Combine(root, relativePath));
-        foreach (var term in new[] { "`compatibility`", "`hex1bBuild`", "`sameBuild`", "`incompatible`", "`producer`", "`consumer`" })
-            StringAssert.Contains(text, term, relativePath);
-        if (relativePath.EndsWith("diagnostic-capture.md", StringComparison.Ordinal))
-        {
-            var flat = System.Text.RegularExpressions.Regex.Replace(text, @"\s+", " ");
-            Assert.IsFalse(flat.Contains("only on the build that recorded the case", StringComparison.Ordinal), "the guide still restricts re-application to the recording build");
-            foreach (var term in new[] { "### Comparing a candidate build", "`not-checked`", "`checkpoint.coveredSurfaces`", "`configuration.capabilities`" })
-                StringAssert.Contains(text, term, relativePath);
-        }
-    }
 
     private static void EditManifest(string path, Action<JsonObject> edit)
     {

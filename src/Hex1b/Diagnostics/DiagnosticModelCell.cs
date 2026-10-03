@@ -28,4 +28,13 @@ public readonly record struct DiagnosticModelCell
     [JsonPropertyName("c")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool Continues { get; init; }
+
+    /// <summary>
+    /// Projection-local equality class for a repeated nonzero buffer-cell write sequence. Every member shares a
+    /// positive label; singleton and never-written cells omit it. Labels are not write-order values. The domain spans
+    /// retained history, main (or saved main), and alternate screen; the last-printed cell is not a member.
+    /// </summary>
+    [JsonPropertyName("q")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public int WriteClass { get; init; }
 }

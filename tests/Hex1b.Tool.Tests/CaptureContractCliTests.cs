@@ -778,6 +778,10 @@ public class CaptureContractCliTests
         Assert.AreEqual("live", started.GetProperty("startPath").GetString());
         AssertCaseEquals(engine.GetCaseStatus(), started, "start", "elapsedSeconds", "bytesWritten", "streams");
 
+        // A live start writes its checkpoint asynchronously; compare status only after that write is complete.
+        for (var attempt = 0; attempt < 500 && engine.GetCaseStatus().Checkpoints?.Written != 1; attempt++)
+            await Task.Delay(10, TestContext.Current.CancellationToken);
+        Assert.AreEqual(1L, engine.GetCaseStatus().Checkpoints!.Written, "fixture: the start checkpoint was never written");
         var status = await StableStatusAsync(engine, async () => (await RunCliAsync("capture", "case", "status", Pid, "--json")).Stdout);
         AssertCaseEquals(engine.GetCaseStatus(), status, "status", "elapsedSeconds");
 
@@ -976,7 +980,7 @@ public class CaptureContractCliTests
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task CaseLiveStart_InspectAndReapplyFromTheStart()
     {
-        // Ticket 09: a case started through the CLI on a running application owns a text-state/1 start (the
+        // Ticket 09: a case started through the CLI on a running application owns a text-state/2 start (the
         // application is on the alternate screen), and re-applies from it to matched.
         if (!OperatingSystem.IsLinux())
             Assert.Inconclusive("Owner-only case storage is verified on Linux.");
@@ -986,7 +990,7 @@ public class CaptureContractCliTests
             "--authorize", "reapplication-data", "--json");
         Assert.AreEqual(0, startExit, startErr);
         var checkpoint = JsonDocument.Parse(start).RootElement.GetProperty("checkpoint");
-        Assert.AreEqual(("text-state/1", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()),
+        Assert.AreEqual(("text-state/2", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()),
             checkpoint.ToString());
         var startSequence = checkpoint.GetProperty("modelSequence").GetInt64();
         target.Resize(30, 6);
@@ -1005,7 +1009,7 @@ public class CaptureContractCliTests
             DiagnosticsJsonContext.Default.DiagnosticCaseInspection);
         Assert.IsTrue(JsonElement.DeepEquals(expected, JsonDocument.Parse(inspect).RootElement), "CLI inspect differs from the inspector");
         var (_, inspectText, _) = await RunCliAsync("capture", "case", "inspect", path);
-        StringAssert.Contains(inspectText, $"checkpoint text-state/1 complete at model sequence {startSequence}");
+        StringAssert.Contains(inspectText, $"checkpoint text-state/2 complete at model sequence {startSequence}");
         StringAssert.Contains(inspectText, $"Re-applicable: model {startSequence}..");
 
         foreach (var label in new[] { "start", "resized", "stop" })
@@ -1018,7 +1022,7 @@ public class CaptureContractCliTests
         }
         var (textExit, text, _) = await RunCliAsync("capture", "case", "reapply", path, "--to", "stop");
         Assert.AreEqual(0, textExit);
-        StringAssert.Contains(text, $"Restored from the text-state/1 start at model sequence {startSequence}");
+        StringAssert.Contains(text, $"Restored from the text-state/2 start at model sequence {startSequence}");
 
         // A start that held refused surfaces: the text names them.
         var refused = Path.Combine(root.Path, "refused");

@@ -185,7 +185,7 @@ internal static class CaseArtifactReader
     }
 
     /// <summary>A checkpoint line the scan keeps: the start, or a recovery (its state skipped, its presence noted).</summary>
-    internal sealed record CheckpointLine(long CaseSequence, long ModelSequence, long Ordinal, string Label, string Status, string? Reason, bool HasState);
+    internal sealed record CheckpointLine(long CaseSequence, long ModelSequence, long Ordinal, string Label, string Status, string Profile, string? Reason, bool HasState);
 
     // A case started on a model that had applied output records model events from after its start's sequence
     // (modelStart); a fresh case from 1.
@@ -213,14 +213,14 @@ internal static class CaseArtifactReader
             if (item.Checkpoint is { } written)
             {
                 result.Checkpoints.Events++;
-                // A text-state/1 start is the case's first checkpoint line, written with its state (skipped here).
+                // A text-state/2 start is the case's first checkpoint line, written with its state (skipped here).
                 if (result.Checkpoints.First is null && written.Trigger == "start" && written.Status == "recorded" && stateOmitted)
                 {
                     result.StartRecorded = true;
-                    result.Start = new CheckpointLine(item.CaseSequence, item.ModelSequence ?? 0, written.Ordinal, written.Label, written.Status, written.Reason, true);
+                    result.Start = new CheckpointLine(item.CaseSequence, item.ModelSequence ?? 0, written.Ordinal, written.Label, written.Status, written.Profile, written.Reason, true);
                 }
                 if (written.Trigger == "recovery" && item.ModelSequence is { } recoveryAt)
-                    result.Recoveries.Add(new CheckpointLine(item.CaseSequence, recoveryAt, written.Ordinal, written.Label, written.Status, written.Reason, stateOmitted));
+                    result.Recoveries.Add(new CheckpointLine(item.CaseSequence, recoveryAt, written.Ordinal, written.Label, written.Status, written.Profile, written.Reason, stateOmitted));
                 result.Checkpoints.First ??= written.Ordinal;
                 result.Checkpoints.Last = Math.Max(result.Checkpoints.Last ?? 0, written.Ordinal);
             }

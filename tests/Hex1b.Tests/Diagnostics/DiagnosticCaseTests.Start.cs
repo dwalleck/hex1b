@@ -8,7 +8,7 @@ using Microsoft.Extensions.Time.Testing;
 
 namespace Hex1b.Tests.Diagnostics;
 
-// Ticket 09: a case started on a terminal that has already applied output owns a text-state/1 start checkpoint,
+// Ticket 09: a case started on a terminal that has already applied output owns a text-state/2 start checkpoint,
 // taken in the arming hold, or names why it cannot.
 public partial class DiagnosticCaseTests
 {
@@ -46,7 +46,7 @@ public partial class DiagnosticCaseTests
 
         var artifact = Artifact.Read(path);
         var checkpoint = artifact.Manifest.GetProperty("checkpoint");
-        Assert.AreEqual(("text-state/1", "complete", armedAt), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString(),
+        Assert.AreEqual(("text-state/2", "complete", armedAt), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString(),
             checkpoint.GetProperty("modelSequence").GetInt64()));
         Assert.AreEqual(0, checkpoint.GetProperty("unsupportedSurfaces").GetArrayLength());
         Assert.AreEqual(FreshModelCheckpoint.CoveredSurfaces.Count, checkpoint.GetProperty("coveredSurfaces").GetArrayLength());
@@ -84,7 +84,7 @@ public partial class DiagnosticCaseTests
 
         var artifact = Artifact.Read(path);
         var checkpoint = artifact.Manifest.GetProperty("checkpoint");
-        Assert.AreEqual(("text-state/1", "unsupported"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()));
+        Assert.AreEqual(("text-state/2", "unsupported"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()));
         Assert.AreEqual("dcs-continuation",
             string.Join(",", checkpoint.GetProperty("unsupportedSurfaces").EnumerateArray().Select(s => s.GetString())));
         StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "unsupported-surfaces:");
@@ -308,10 +308,10 @@ public partial class DiagnosticCaseTests
             AssertMatched(result, $"raw {label}");
             Assert.AreEqual((DiagnosticCaseCheckpointProfiles.TextState, (long?)start), (result.Checkpoint!.Profile, result.Checkpoint.ModelSequence),
                 $"{label}: the result does not name the start it restored");
-            // Ticket 14 (R2): a complete text-state/1 start's record.
+            // Ticket 14 (R2): a complete text-state/2 start's record.
             AssertRecord(result.Compatibility, "c c c c c c c", label);
-            Assert.AreEqual("start: text-state/1; target: text-state/1", result.Compatibility.Checks[2].Producer, label);
-            Assert.AreEqual(($"text-state/1 at model sequence {start}", "restored"), (result.Compatibility.Checks[6].Producer, result.Compatibility.Checks[6].Consumer), label);
+            Assert.AreEqual("start: text-state/2; target: text-state/2", result.Compatibility.Checks[2].Producer, label);
+            Assert.AreEqual(($"text-state/2 at model sequence {start}", "restored"), (result.Compatibility.Checks[6].Producer, result.Compatibility.Checks[6].Consumer), label);
         }
     }
 
@@ -560,7 +560,7 @@ public partial class DiagnosticCaseTests
             StringAssert.StartsWith(result.Problem.Message, "origin: ", surface);
             var failed = result.Compatibility.Checks.Single(c => c.Verdict == "incompatible");
             StringAssert.Contains(result.Problem.Message, failed.Producer!, surface);
-            StringAssert.StartsWith(failed.Producer, "text-state/1 at model sequence ", surface);
+            StringAssert.StartsWith(failed.Producer, "text-state/2 at model sequence ", surface);
         }
     }
 

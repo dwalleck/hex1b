@@ -133,6 +133,93 @@ public class ModelStateComparerTests
         AssertOnly(stack, other, "titles.stack[0].window", "titles.stack[0].icon");
     }
 
+    [TestMethod]
+    public async Task Compare_WriteClassesAllowGlobalRelabeling()
+    {
+        var recorded = await WriteClassStateAsync();
+        var relabeled = RelabelWriteClasses(recorded, value => value == 1 ? 97 : 41);
+        AssertOnly(recorded, relabeled);
+    }
+
+    [TestMethod]
+    [DataRow("split")]
+    [DataRow("merge")]
+    public async Task Compare_WriteClassesDiscriminateGlobalSplitsAndMerges(string shape)
+    {
+        var recorded = await WriteClassStateAsync();
+        var changed = shape == "merge"
+            ? RelabelWriteClasses(recorded, _ => 1)
+            : recorded with
+            {
+                SavedMainScreen = [RelabelRow(recorded.SavedMainScreen![0], value => value + 10)],
+                History = recorded.History! with { Rows = [RelabelRow(recorded.History!.Rows[0], value => value + 20)] },
+            };
+        string[] paths = shape == "merge"
+            ? ["screen[0][2].writeClass", "screen[0][3].writeClass", "savedMainScreen[0][2].writeClass", "savedMainScreen[0][3].writeClass",
+                "history.rows[0][2].writeClass", "history.rows[0][3].writeClass"]
+            : ["savedMainScreen[0][0].writeClass", "savedMainScreen[0][1].writeClass", "savedMainScreen[0][2].writeClass", "savedMainScreen[0][3].writeClass",
+                "history.rows[0][0].writeClass", "history.rows[0][1].writeClass", "history.rows[0][2].writeClass", "history.rows[0][3].writeClass"];
+        AssertOnly(recorded, changed, paths);
+        var capped = ModelStateComparer.Compare(recorded, changed, 1);
+        Assert.AreEqual((paths.Length, 1, true), ((int)capped.Total, capped.Differences.Count, capped.Truncated), shape);
+    }
+
+    [TestMethod]
+    public async Task Compare_WriteClassesDiscriminateSingletonsInBothDirections()
+    {
+        var repeated = await WriteClassStateAsync();
+        var singletons = RelabelWriteClasses(repeated, _ => 0);
+        var paths = new[] { "screen", "savedMainScreen", "history.rows" }
+            .SelectMany(prefix => Enumerable.Range(0, 4).Select(column => $"{prefix}[0][{column}].writeClass")).ToArray();
+        AssertOnly(repeated, singletons, paths);
+        AssertOnly(singletons, repeated, paths);
+    }
+
+    [TestMethod]
+    public async Task Compare_LastPrintedDoesNotJoinWriteClasses()
+    {
+        var recorded = await WriteClassStateAsync();
+        var relabeled = RelabelWriteClasses(recorded, value => value + 10);
+        var printed = recorded.LastPrinted;
+        Assert.IsNotNull(printed);
+        // Even labels that conflict with the buffers cannot create a LastPrinted-to-buffer equality.
+        recorded = recorded with { LastPrinted = printed with { Cell = printed.Cell with { WriteClass = 1 } } };
+        relabeled = relabeled with { LastPrinted = printed with { Cell = printed.Cell with { WriteClass = 12 } } };
+        AssertOnly(recorded, relabeled);
+        AssertOnly(recorded, relabeled with
+        {
+            LastPrinted = printed with { Cell = printed.Cell with { Text = "different" } },
+        }, "lastPrinted.cell.text");
+    }
+
+    private static async Task<DiagnosticModelState> WriteClassStateAsync()
+    {
+        var state = await ProjectAsync("xxxx", width: 4, height: 1);
+        var row = state.Screen[0] with
+        {
+            Cells = state.Screen[0].Cells.Select((cell, column) => cell with { WriteClass = column < 2 ? 1 : 2 }).ToArray(),
+        };
+        return state with
+        {
+            ActiveBuffer = "alternate",
+            Screen = [row],
+            SavedMainScreen = [row],
+            History = new DiagnosticModelHistory { Capacity = 50, NextRowId = 2, Rows = [row with { Id = 1, OriginalWidth = 4 }] },
+        };
+    }
+
+    private static DiagnosticModelState RelabelWriteClasses(DiagnosticModelState state, Func<int, int> label) => state with
+    {
+        Screen = state.Screen.Select(row => RelabelRow(row, label)).ToArray(),
+        SavedMainScreen = state.SavedMainScreen!.Select(row => RelabelRow(row, label)).ToArray(),
+        History = state.History! with { Rows = state.History!.Rows.Select(row => RelabelRow(row, label)).ToArray() },
+    };
+
+    private static DiagnosticModelRow RelabelRow(DiagnosticModelRow row, Func<int, int> label) => row with
+    {
+        Cells = row.Cells.Select(cell => cell with { WriteClass = label(cell.WriteClass) }).ToArray(),
+    };
+
     private static void AssertOnly(DiagnosticModelState recorded, DiagnosticModelState reapplied, params string[] paths)
     {
         var comparison = ModelStateComparer.Compare(recorded, reapplied, ModelStateComparer.DefaultMaxDifferences);

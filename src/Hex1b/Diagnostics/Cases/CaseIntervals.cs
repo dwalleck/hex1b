@@ -2,7 +2,7 @@ namespace Hex1b.Diagnostics.Cases;
 
 /// <summary>
 /// The re-applicable intervals of a case, one per origin: the initial checkpoint (a fresh model, or a complete
-/// <c>text-state/1</c> start) and each recovery checkpoint, in checkpoint order. An origin's interval runs from its
+/// <c>text-state/2</c> start) and each recovery checkpoint, in checkpoint order. An origin's interval runs from its
 /// model sequence to the earliest end at or after it: a loss range, an interval end the recorder wrote, a gap in the
 /// model sequences, truncation or interruption, or the stop. An origin inside a loss range starts nothing; an origin
 /// that is not complete is listed as invalid with its reason. A later origin never changes an earlier interval.
@@ -21,7 +21,7 @@ internal static class CaseIntervals
         }
         else if (checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState && (scan.Start is not { } line || line.ModelSequence != modelStart))
         {
-            // A text-state/1 start re-applies only from its verified start line with state, at the manifest's sequence.
+            // A text-state/2 start re-applies only from its verified start line with state, at the manifest's sequence.
             intervals.Add(new DiagnosticCaseInterval { Valid = false, EndReason = "start-missing: the start checkpoint line is not among the verified events at the manifest's model sequence, or holds no state" });
         }
         else
@@ -43,7 +43,7 @@ internal static class CaseIntervals
         {
             var origin = new DiagnosticCaseOrigin
             {
-                Profile = DiagnosticCaseCheckpointProfiles.TextState,
+                Profile = recovery.Profile,
                 Trigger = "recovery",
                 Label = recovery.Label,
                 CheckpointOrdinal = recovery.Ordinal,

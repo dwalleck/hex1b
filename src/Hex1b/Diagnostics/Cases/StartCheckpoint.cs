@@ -1,7 +1,7 @@
 namespace Hex1b.Diagnostics.Cases;
 
 /// <summary>
-/// The <c>text-state/1</c> start checkpoint of a case started on a terminal that has already applied output:
+/// The <c>text-state/2</c> start checkpoint of a case started on a terminal that has already applied output:
 /// which state surfaces a start may hold. The active text buffer, its continuation, the retained history, titles and
 /// the title stack, command marks, pending input (an unfinished escape sequence or UTF-8 scalar, a held ESC) and, on the
 /// alternate screen, the saved main screen are restored; a DCS in progress and graphics are refused while present (a DCS

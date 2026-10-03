@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using Hex1b.Diagnostics;
 using Hex1b.Sixel;
 using Hex1b.Theming;
@@ -41,7 +42,9 @@ public sealed partial class Hex1bTerminal
     /// An upper estimate of a projection's size in memory, from geometry alone (no state is read cell by
     /// cell), so a checkpoint can be refused before its state is taken. Must hold <c>_bufferLock</c>.
     /// </summary>
-    internal long EstimateModelStateBytesUnsafe() => EstimateModelStateCellsUnsafe() * 40 + 64 * 1024 + (TitleAndMarkJsonFloorUnsafe() + PendingInputJsonFloorUnsafe()) * 4;
+    // 48 bytes per projected cell/row share, plus 64 for a worst-case distinct-sequence dictionary entry,
+    // including capacity slack. Class discovery is transient, but must fit while the projection is allocated.
+    internal long EstimateModelStateBytesUnsafe() => EstimateModelStateCellsUnsafe() * (48 + 64) + 64 * 1024 + (TitleAndMarkJsonFloorUnsafe() + PendingInputJsonFloorUnsafe()) * 4;
 
     /// <summary>
     /// The fewest JSON bytes a projection of this geometry can take: 14 a cell, the smallest cell
@@ -84,7 +87,7 @@ public sealed partial class Hex1bTerminal
     internal long ModelStateCapturesForTesting { get { lock (_bufferLock) return _modelStateCaptures; } }
 
     /// <summary>
-    /// Reads the model's full text state (profile <c>text-state/1</c>) in one hold of the model lock.
+    /// Reads the model's full text state (profile <c>text-state/2</c>) in one hold of the model lock.
     /// It never changes the model; lazily assigned text identities are left unassigned.
     /// </summary>
     internal DiagnosticModelState CaptureModelState()
@@ -93,13 +96,12 @@ public sealed partial class Hex1bTerminal
         {
             _modelStateCaptures++;
             var styles = new ModelStyleTable();
+            var writeClasses = DiscoverWriteClassesUnsafe();
             // In reading order the main screen (or, on the alternate screen, the saved main screen) follows the history,
             // so its first cell can continue the history's last glyph across a soft wrap; the alternate screen stands alone.
             long? historyLast = _scrollbackBuffer is { Count: > 0 } retained && retained.GetEntryAt(retained.Count - 1).Row.Cells is { Length: > 0 } lastCells
                 ? WrapPredecessor(lastCells[^1])
                 : null;
-            var screen = ProjectScreen(_screenBuffer, styles, _inAlternateScreen ? null : historyLast);
-            var savedMain = _savedMainScreenBuffer is { } main ? ProjectScreen(main, styles, historyLast) : null;
 
             DiagnosticModelHistory? history = null;
             if (_scrollbackBuffer is { } scrollback)
@@ -112,7 +114,9 @@ public sealed partial class Hex1bTerminal
                     long? before = i > 0 && entries[i - 1].Row.Cells is { Length: > 0 } previous ? WrapPredecessor(previous[^1]) : null;
                     var cells = new DiagnosticModelCell[row.Cells.Length];
                     for (var column = 0; column < cells.Length; column++)
-                        cells[column] = ProjectCell(row.Cells[column], styles, Continues(row.Cells[column], column > 0 ? row.Cells[column - 1].Sequence : before));
+                        cells[column] = ProjectCell(row.Cells[column], styles,
+                            Continues(row.Cells[column], column > 0 ? row.Cells[column - 1].Sequence : before),
+                            writeClasses.IndexOf(row.Cells[column].Sequence));
                     rows[i] = new DiagnosticModelRow
                     {
                         Cells = cells,
@@ -123,6 +127,9 @@ public sealed partial class Hex1bTerminal
                 }
                 history = new DiagnosticModelHistory { Capacity = scrollback.Capacity, NextRowId = scrollback.NextRowId, Rows = rows };
             }
+            // Assign class labels at their first occurrence in history, main/saved main, then alternate.
+            var savedMain = _savedMainScreenBuffer is { } main ? ProjectScreen(main, styles, writeClasses, historyLast) : null;
+            var screen = ProjectScreen(_screenBuffer, styles, writeClasses, _inAlternateScreen ? null : historyLast);
 
             var tabColumns = new List<int>();
             for (var column = 0; column < _tabStops.Length; column++)
@@ -277,7 +284,7 @@ public sealed partial class Hex1bTerminal
         ["wraparound"] = _wraparoundMode,
     };
 
-    private static DiagnosticModelRow[] ProjectScreen(TerminalCell[,] buffer, ModelStyleTable styles, long? before)
+    private static DiagnosticModelRow[] ProjectScreen(TerminalCell[,] buffer, ModelStyleTable styles, ModelWriteClasses writeClasses, long? before)
     {
         var height = buffer.GetLength(0);
         var width = buffer.GetLength(1);
@@ -287,19 +294,22 @@ public sealed partial class Hex1bTerminal
             var cells = new DiagnosticModelCell[width];
             long? previous = row > 0 ? (width > 0 ? WrapPredecessor(buffer[row - 1, width - 1]) : null) : before;
             for (var column = 0; column < width; column++)
-                cells[column] = ProjectCell(buffer[row, column], styles, Continues(buffer[row, column], column > 0 ? buffer[row, column - 1].Sequence : previous));
+                cells[column] = ProjectCell(buffer[row, column], styles,
+                    Continues(buffer[row, column], column > 0 ? buffer[row, column - 1].Sequence : previous),
+                    writeClasses.IndexOf(buffer[row, column].Sequence));
             var at = row;
             rows[row] = new DiagnosticModelRow { Cells = cells, Unwritten = UnwrittenRuns(width, column => buffer[at, column].Sequence) };
         }
         return rows;
     }
 
-    private static DiagnosticModelCell ProjectCell(in TerminalCell cell, ModelStyleTable styles, bool continues = false) => new()
+    private static DiagnosticModelCell ProjectCell(in TerminalCell cell, ModelStyleTable styles, bool continues = false, int writeClass = 0) => new()
     {
         Text = cell.Character,
         Style = styles.IndexOf(cell),
         WideWrapPadding = cell.IsWideWrapPadding,
         Continues = continues,
+        WriteClass = writeClass,
     };
 
     // The runs of a row's cells with write sequence 0, as start, count pairs; null when there are none.
@@ -392,6 +402,57 @@ public sealed partial class Hex1bTerminal
         return builder.ToString();
     }
 
+    // One discovery pass counts repeated nonzero sequences, independently of adjacency and soft wraps. Projection
+    // then assigns dense labels in its reading order. Storage is bounded by distinct written sequences, not cells.
+    private ModelWriteClasses DiscoverWriteClassesUnsafe()
+    {
+        var classes = new ModelWriteClasses();
+        if (_scrollbackBuffer is { } history)
+        {
+            for (var row = 0; row < history.Count; row++)
+                foreach (var cell in history.GetEntryAt(row).Row.Cells)
+                    classes.Observe(cell.Sequence);
+        }
+        ObserveScreen(_screenBuffer);
+        if (_savedMainScreenBuffer is { } main)
+            ObserveScreen(main);
+        return classes;
+
+        void ObserveScreen(TerminalCell[,] buffer)
+        {
+            for (var row = 0; row < buffer.GetLength(0); row++)
+                for (var column = 0; column < buffer.GetLength(1); column++)
+                    classes.Observe(buffer[row, column].Sequence);
+        }
+    }
+
+    private sealed class ModelWriteClasses
+    {
+        // -1 is a singleton; 0 a repeated class awaiting its first projected occurrence; positive is its label.
+        private readonly Dictionary<long, int> _classes = [];
+        private int _nextClass;
+
+        public void Observe(long sequence)
+        {
+            if (sequence == 0)
+                return;
+            ref var value = ref CollectionsMarshal.GetValueRefOrAddDefault(_classes, sequence, out var present);
+            value = present ? 0 : -1;
+        }
+
+        public int IndexOf(long sequence)
+        {
+            if (sequence == 0)
+                return 0;
+            ref var value = ref CollectionsMarshal.GetValueRefOrAddDefault(_classes, sequence, out _);
+            if (value < 0)
+                return 0;
+            if (value == 0)
+                value = ++_nextClass;
+            return value;
+        }
+    }
+
     // Interns the styles cells use. Consecutive cells usually share a style, so the last one is
     // checked before the table.
     private sealed class ModelStyleTable
@@ -442,7 +503,7 @@ public sealed partial class Hex1bTerminal
         const string Clock = "clock: a wall-clock or timer reading";
         const string Identity = "identity: differs between otherwise identical models, or is assigned lazily when text is read";
         const string Configuration = "configuration: recorded in the case manifest, fixed after construction";
-        const string WriteOrder = "write-order: write sequences order cell writes and are not state (spec)";
+        const string WriteOrder = "write-order: absolute write sequences are excluded; buffer-cell equality is projected as write classes and never-written runs";
         const string Infrastructure = "infrastructure: pumps, adapters, locks, callbacks, diagnostics or caches, not model state";
         const string InputPath = "input-path: state of the input direction, not of the output model";
         const string Anchors = "view: caller-created text anchors' views (browser custom markers are not model state)";

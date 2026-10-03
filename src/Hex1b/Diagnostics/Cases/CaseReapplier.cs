@@ -122,7 +122,7 @@ internal static class CaseReapplier
         if (checks.StartProfile(manifest.Checkpoint.Profile, manifest.Checkpoint.ModelSequence) is { } profileProblem)
             return Refused(profileProblem);
         // The initial origin: a fresh model at model sequence 0, or a case started on a model that had applied output
-        // at its text-state/1 start's sequence. The complete recovery checkpoints are the later origins; the inspection
+        // at its text-state/2 start's sequence. The complete recovery checkpoints are the later origins; the inspection
         // lists one interval per origin, and the one restored from is the earliest valid one covering the target, or
         // the one the request names.
         var start = manifest.Checkpoint.Profile == DiagnosticCaseCheckpointProfiles.TextState ? manifest.Checkpoint.ModelSequence!.Value : 0;

@@ -313,7 +313,7 @@ Start a case in one of two ways:
 - **On a running target**: `hex1b capture case start <id>`, the MCP tool `start_diagnostic_case`,
   or the socket method `case-start`. With `reapplication-data`, a model that has already applied
   output is projected at the arming, in the same hold of the model lock. The case owns a
-  `text-state/1` start checkpoint (a `checkpoint` line labelled `start`, at the arming model
+  `text-state/2` start checkpoint (a `checkpoint` line labelled `start`, at the arming model
   sequence), and every later model event is recorded after it. The start is `complete` when the
   model holds only what its restore can represent: the active screen and its continuation, the
   retained history, the window title, icon name and title stack, the OSC 133 command marks and,
@@ -373,7 +373,7 @@ relative directory against their own working directory, not the target's. Withou
 
 - `caseId`, `path`, `state` (`recording`, `stopping`, `stopped`), `startPath` (`construction`,
   `live`);
-- `bounds`, the granted `authorizations`, and the `checkpoint`: `fresh-model/1`, or `text-state/1`
+- `bounds`, the granted `authorizations`, and the `checkpoint`: `fresh-model/1`, or `text-state/2`
   for a start on a model that had applied output, with its `modelSequence` and
   `unsupportedSurfaces`. Its status is `complete`, `unsupported` or `excluded`, with the reason and
   the recorded model configuration;
@@ -421,7 +421,7 @@ disposal resets anything) and at each mark, but not after a collector failure. A
 taken in one hold of the model lock, between two model events, at the model sequence it names.
 
 - With `reapplication-data` it carries the model's full text state (`state`, profile
-  `text-state/1`): both screens, retained history, styles, the cursor and saved cursors, modes,
+  `text-state/2`): both screens, retained history, styles, the cursor and saved cursors, modes,
   margins, tab stops, character sets, rendition, titles and the title stack, activity, command
   marks with the positions of their text (`buffer`, `row` over retained history then the screen,
   and `column`), grapheme continuation, and output held between chunks. Graphics state or a DCS in
@@ -536,7 +536,7 @@ never changes the loss already recorded or the case's initial checkpoint. The de
 `recovery-` and the checkpoint's ordinal.
 
 Inspection then lists one interval per **origin**: the initial checkpoint (`fresh-model/1`, or a
-complete `text-state/1` start) and each complete recovery, in checkpoint order, each naming its
+complete `text-state/2` start) and each complete recovery, in checkpoint order, each naming its
 `origin` (`trigger`, `label`, `checkpointOrdinal`, `caseSequence`, `modelSequence`). An origin's
 interval runs from its model sequence to the earliest end at or after it (a loss range, a recorded
 `interval-end`, a gap in the model sequences, truncation or interruption, or the stop); a later
@@ -655,7 +655,7 @@ state has nothing to change for (a history fault without history) makes the comp
 
 The result also names what was compared and with what:
 - `checkpoint`: the case's initial checkpoint, with the configuration the model was rebuilt from. For
-  `fresh-model/1`, re-application starts from the fresh model. For a `text-state/1` start, it
+  `fresh-model/1`, re-application starts from the fresh model. For a `text-state/2` start, it
   restores the start's state and applies only the model events recorded after it; a target before
   the start is `invalid-request` (`unknown-model-sequence`), and a start line that is missing or
   holds a surface this build cannot restore is `unavailable` (`missing-start`,
@@ -663,8 +663,8 @@ The result also names what was compared and with what:
 - `origin`: the checkpoint the model was restored from (the start, or a recovery: `trigger`,
   `label`, `checkpointOrdinal`, `caseSequence`, `modelSequence`), chosen as [recovery after
   loss](#recovery-after-loss) describes, or named by `--from` (`from`);
-- `coverage`: the profile, the surfaces compared, and what it leaves out (clock stamps, write
-  sequences, text identities, caller anchors, graphics);
+- `coverage`: the profile, the surfaces compared, and what it leaves out (clock stamps, raw write
+  order, text identities, caller anchors, graphics);
 - `producer`: the recording build and process (`hex1bVersion`, and `hex1bBuild`, the Hex1b
   assembly's module version id, which a deterministic build derives from its inputs: the same
   source, path and build inputs give the same id, any change another; absent in cases recorded
@@ -708,6 +708,29 @@ a geometry-gated batch that was refused after its bytes were decoded (`unapplied
 
 Re-application streams the events file, so its memory is the model and one event, not the file: a
 119 MiB events file re-applies in about 133 MiB. It compares only at recorded checkpoints.
+
+### Buffer-cell write equality and profile compatibility
+
+`text-state/2` preserves which buffer cells share a nonzero write sequence, including glyph
+halves that are currently separated, have lost their soft-wrap link, or live in different buffers.
+Every member of a repeated written class carries `q` (`WriteClass`), a positive projection-local
+label. A single class domain covers retained history, main (or saved main), and alternate screen;
+labels are assigned by first occurrence in that order. Singleton and never-written cells omit
+`q`. Raw write sequence values and their order are not recorded.
+
+The visible continuation bit `c` and a row's `unwritten` runs remain distinct facts. Class capture
+does not depend on adjacency or soft wraps. Restoration assigns one fresh sequence per class,
+zero to never-written cells, and a distinct fresh sequence to each written singleton. Later
+movement, scrolling and reflow can therefore rejoin separated halves with the original glyph's
+ownership and command-mark positions. `lastPrinted.cell` is outside the buffer-cell class domain.
+Comparison checks the global equality relation: consistent label renumbering matches, while
+splitting or merging classes differs at the affected cells' `writeClass` paths.
+
+This is a clean profile cutover: the current consumer refuses `text-state/1` starts, targets and
+recovery origins as `incompatible`, and older consumers decline `text-state/2`. Artifact format
+`2` and diagnostics socket contract `1` are unchanged; `fresh-model/1` remains supported.
+Historical captures are not rewritten and require their recording-era build for re-application.
+There is no `/1` legacy reader and missing equality metadata is not silently upgraded.
 
 ### Comparing a candidate build
 
@@ -772,17 +795,8 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
 - Capture and capability requests to an attached target time out after 10 seconds with a
   `timeout` failure. Input, resize, and recording requests are not timed out by the client, and
   neither are case start and stop. Case status is timed out like capture.
-- A case started on a running target re-applies from its `text-state/1` start checkpoint, not
+- A case started on a running target re-applies from its `text-state/2` start checkpoint, not
   from the first byte: only a case started at construction holds the output before it. A start
   holding a surface the restore cannot represent yet (a DCS in progress, graphics) is
   `unsupported`, and names it. Output held between chunks is restored; the bytes of an unfinished
   escape sequence read before the start are owned as the model's decoded text, not as input.
-- A start records which empty cells continue the glyph before them in reading order (`c`, including
-  a row's first cell continuing a glyph split across a soft wrap) and which cells were never written
-  (a row's `unwritten` runs). It does not record that two cells are halves of one glyph when they
-  are apart at the start, or when the row between them no longer soft-wraps. Such halves can become
-  one glyph again in the recording after the start and stay two cells in the re-application: for
-  example after a left/right-margin scroll, after a row inserted or scrolled between the halves of a
-  glyph split across a wrap, after blank cells between them are cropped by a resize, or when a
-  pending wrap restored under left/right margins sets the soft wrap again. The re-application then
-  reports `different` at that cell's `continues`, and a new mark placed there is one column off.

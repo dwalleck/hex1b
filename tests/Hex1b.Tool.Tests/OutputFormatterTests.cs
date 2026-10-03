@@ -139,7 +139,7 @@ public class OutputFormatterTests
             State = Hex1b.Diagnostics.DiagnosticCaseState.Recording,
             Checkpoint = new Hex1b.Diagnostics.DiagnosticCaseCheckpoint
             {
-                Profile = "text-state/1",
+                Profile = "text-state/2",
                 Status = Hex1b.Diagnostics.DiagnosticCaseCheckpointStatus.Unsupported,
                 Reason = "unsupported-surfaces: the start held retained-history, titles, which this checkpoint cannot restore yet.",
                 ModelSequence = 5,
@@ -150,7 +150,7 @@ public class OutputFormatterTests
         var output = CaptureConsoleOutput(() => Hex1b.Tool.Commands.Capture.CaseCommandOutput.Write(formatter, result, json: false, "started"));
         var line = output.Split('\n').Single(l => l.StartsWith("Checkpoint:", StringComparison.Ordinal));
         Assert.AreEqual(1, System.Text.RegularExpressions.Regex.Matches(line, "retained-history").Count, line);
-        StringAssert.Contains(line, "text-state/1 unsupported at model sequence 5; unsupported surfaces: retained-history, titles");
+        StringAssert.Contains(line, "text-state/2 unsupported at model sequence 5; unsupported surfaces: retained-history, titles");
     }
 
     private static string CaptureConsoleOutput(Action action)

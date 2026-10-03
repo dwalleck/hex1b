@@ -256,7 +256,7 @@ public sealed partial class Hex1bTerminal
     }
 
     /// <summary>
-    /// Takes a recovery checkpoint in a recording case: a complete <c>text-state/1</c> checkpoint at the current model
+    /// Takes a recovery checkpoint in a recording case: a complete <c>text-state/2</c> checkpoint at the current model
     /// sequence, in one hold of the model lock, classified by <paramref name="describe"/> as the engine classifies a
     /// start. A refusal is recorded as a checkpoint line without state; the case keeps recording either way.
     /// </summary>

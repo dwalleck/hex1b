@@ -9,7 +9,7 @@ using Microsoft.Extensions.Time.Testing;
 namespace Hex1b.Tests.Diagnostics;
 
 /// <summary>
-/// The model-state projection (<c>text-state/1</c>) covers every model field, is deterministic,
+/// The model-state projection (<c>text-state/2</c>) covers every model field, is deterministic,
 /// names what it cannot represent, and is read coherently under the model lock.
 /// </summary>
 [TestClass]

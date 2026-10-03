@@ -604,10 +604,10 @@ public partial class DiagnosticCaseTests
     [TestMethod]
     public async Task Reapply_ResultNamesWhatWasCompared()
     {
-        // F5, F6: the result carries the checkpoint (with its configuration), the coverage and both builds; write
-        // sequences are not state.
+        // F5, F6: the result carries the checkpoint (with its configuration), the coverage and both builds; raw write
+        // order is not state, but repeated write equality is preserved by projection-local classes.
         using var root = new CaseRoot();
-        var path = await RecordCaseAsync(root, [new("covered")], new HeadlessPresentationAdapter(20, 4));
+        var path = await RecordCaseAsync(root, [new("covered\u6f22")], new HeadlessPresentationAdapter(20, 4));
         var result = Reapply(path, label: "stop");
         AssertMatched(result, "stop");
         Assert.AreEqual(DiagnosticCaseCheckpointProfiles.FreshModel, result.Checkpoint?.Profile);
@@ -619,8 +619,11 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual(result.Producer!.Hex1bVersion, result.ConsumerHex1bVersion);
 
         var state = File.ReadAllText(Path.Combine(result.RunPath!, "reapplied.json"));
-        Assert.IsFalse(state.Contains("\"q\":", StringComparison.Ordinal) || state.Contains("nextCellSequence", StringComparison.Ordinal),
-            "the projection carries write sequences");
+        Assert.IsFalse(state.Contains("nextCellSequence", StringComparison.Ordinal) || state.Contains("sequenceNumber", StringComparison.OrdinalIgnoreCase),
+            "the projection carries raw write order");
+        var cells = JsonDocument.Parse(state).RootElement.GetProperty("screen")[0].GetProperty("cells");
+        Assert.AreEqual((1, 1), (cells[7].GetProperty("q").GetInt32(), cells[8].GetProperty("q").GetInt32()),
+            "the wide glyph's buffer cells do not share a projection-local write class");
 
         // Refusals after the manifest is read carry the same context.
         var refused = Reapply(path, label: "nope");

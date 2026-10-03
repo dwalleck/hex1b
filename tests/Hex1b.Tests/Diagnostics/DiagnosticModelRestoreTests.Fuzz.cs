@@ -13,16 +13,26 @@ public partial class DiagnosticModelRestoreTests
     // back to the same state, and stay equal after every later step.
     //
     // The default run is a fixed seed range, so it is deterministic. HEX1B_RESTORE_FUZZ_TRIALS and HEX1B_RESTORE_FUZZ_SEED
-    // widen or move it for a review. One known class can diverge in a wider run and is not a defect of the restore: halves
-    // of one glyph separated before the start and brought back together after it (see "Current limitations" in the
-    // diagnostic capture guide). The alphabet has no left/right margins, which would make that class common; without them
-    // it is about one trial in 60,000, so a failure here after an unrelated change to the model may be that class at a new
-    // seed. Compare its steps with the pinned shapes in ModelRestore_GlyphHalvesJoinedOnlyAfterTheStartDiverge first.
+    // widen or move it for a review. Separated glyph halves must retain their identity and match when later steps
+    // rejoin them, including the cropped-blank shapes at seeds 1046966 and 22719. Named separation and soft-wrap
+    // fixtures live in ModelRestore_GlyphHalvesJoinedOnlyAfterTheStartMatch; no seed is exempt from comparison.
     [TestMethod]
     public void ModelRestore_DifferentialFuzz()
     {
         var trials = int.Parse(Environment.GetEnvironmentVariable("HEX1B_RESTORE_FUZZ_TRIALS") ?? "4000");
         var first = int.Parse(Environment.GetEnvironmentVariable("HEX1B_RESTORE_FUZZ_SEED") ?? "1");
+        AssertDifferentialFuzz(first, trials);
+    }
+
+    // These two crop regressions remain in the ordinary suite, independent of the review seed knobs:
+    // Foot's widening/padding shape and WezTerm's DCH-then-narrowing shape exercise distinct histories.
+    [TestMethod]
+    [DataRow(1046966)]
+    [DataRow(22719)]
+    public void ModelRestore_CroppedBlankCellsRejoinFromSeed(int seed) => AssertDifferentialFuzz(seed, 1);
+
+    private static void AssertDifferentialFuzz(int first, int trials)
+    {
         var strategies = CaseConfiguration.StrategyIds.Append("none").ToArray();
         var failures = new List<string>();
         var crossRow = 0;

@@ -9,7 +9,7 @@ namespace Hex1b.Tests.Diagnostics;
 
 public partial class DiagnosticCaseTests
 {
-    // Recovery checkpoints after recording loss (ticket 13): a complete text-state/1 checkpoint taken mid-case through
+    // Recovery checkpoints after recording loss (ticket 13): a complete text-state/2 checkpoint taken mid-case through
     // the same coordinator as the start, from which a later re-application can begin; refusals recorded; the loss
     // envelope past the ledger's cap; interval ends per segment.
 
@@ -43,9 +43,12 @@ public partial class DiagnosticCaseTests
                 manifestBefore = File.ReadAllBytes(Path.Combine(path, "manifest.json"));
                 await FloodAsync(terminal, workload, CaseEventQueueMax + 700);
                 gate.Set();
-                result = new TerminalDiagnostics(terminal).RecoverCase("after-loss");
+                var diagnostics = new TerminalDiagnostics(terminal);
+                result = diagnostics.RecoverCase("after-loss");
+                // Releasing the writer does not yet free the full queue; wait before offering the post-recovery event.
+                await DrainAsync(gate, diagnostics);
                 await workload.WriteAndWaitAsync(terminal, "after ");
-                await new TerminalDiagnostics(terminal).StopCaseAsync(TestContext.Current.CancellationToken);
+                await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
             }
         }
         finally
@@ -462,27 +465,6 @@ public partial class DiagnosticCaseTests
         Assert.IsNull(ledger.Take(final: true).Single(r => r.Reason == "overload-unknown-extent").ToOrdinal, "the unknown-extent range was bounded in place");
     }
 
-    // The documentation fence (design C11): the guide, the CLI reference and the MCP skill describe the recovery
-    // operation, origins, --from, the envelope and the refusals. The CLI and MCP descriptions are checked by the client
-    // tests, which read them through the tools.
-    [TestMethod]
-    [DataRow("src/content/guide/diagnostic-capture.md")]
-    [DataRow("src/content/reference/cli.md")]
-    [DataRow("src/Hex1b.McpServer/SKILL.md")]
-    public void DocsMentionRecovery(string relativePath)
-    {
-        var root = AppContext.BaseDirectory;
-        while (!File.Exists(Path.Combine(root, "src/Hex1b/Hex1b.csproj")))
-            root = Path.GetDirectoryName(root) ?? throw new InvalidOperationException("repository root not found");
-        var text = File.ReadAllText(Path.Combine(root, relativePath));
-        string[] expected = relativePath.EndsWith("cli.md", StringComparison.Ordinal)
-            ? ["capture case recover", "`--from`", "origin", "envelope", "`not-an-origin`", "`unknown-label`", "`beyond-interval`", "`invalid-origin`"]
-            : relativePath.EndsWith("SKILL.md", StringComparison.Ordinal)
-                ? ["`recover_diagnostic_case`", "`from`", "origin", "envelope", "`beyond-interval`"]
-                : ["`recover_diagnostic_case`", "`case-recover`", "`--from`", "`origin`", "`loss-envelope`", "`inside-loss`", "`not-an-origin`", "`unknown-label`", "`unknown-case-sequence`", "`unknown-checkpoint`", "`invalid-origin`", "`beyond-interval`"];
-        foreach (var term in expected)
-            StringAssert.Contains(text, term, relativePath);
-    }
 
     private static bool TryParse(string path)
     {

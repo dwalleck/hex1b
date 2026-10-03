@@ -107,7 +107,7 @@ internal static class CaseCompatibility
             return Judge(ProfileIndex, producer,
                 !_consumer.Profiles.Contains(profile) ? $"checkpoint.profile: unknown profile '{profile}'; the case declares {producer}; this build knows {Join(_consumer.Profiles)}."
                 : profile == DiagnosticCaseCheckpointProfiles.TextState && modelSequence is not >= 0
-                    ? $"checkpoint.modelSequence: a text-state/1 start names no model sequence; the case declares {producer}; this build knows {Join(_consumer.Profiles)}."
+                    ? $"checkpoint.modelSequence: a {DiagnosticCaseCheckpointProfiles.TextState} start names no model sequence; the case declares {producer}; this build knows {Join(_consumer.Profiles)}."
                     : null);
         }
 

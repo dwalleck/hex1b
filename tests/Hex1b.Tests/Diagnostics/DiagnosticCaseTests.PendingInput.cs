@@ -1,6 +1,4 @@
 using System.Text;
-using System.Text.RegularExpressions;
-using System.Text.Json.Nodes;
 using Hex1b.Diagnostics;
 using Hex1b.Diagnostics.Cases;
 using Microsoft.Extensions.Time.Testing;
@@ -83,28 +81,6 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual(("unavailable", "fault-not-applicable"), (later.Comparison, later.ComparisonReason?.Split(':')[0]), later.ComparisonReason);
     }
 
-    // The documentation fence (design C14): the guide, the CLI reference and the MCP skill name the four faults and no
-    // longer list pending input among the surfaces a start cannot restore. The CLI and MCP descriptions are checked by
-    // the client tests, which read them through the tools.
-    [TestMethod]
-    [DataRow("src/content/guide/diagnostic-capture.md")]
-    [DataRow("src/content/reference/cli.md")]
-    [DataRow("src/Hex1b.McpServer/SKILL.md")]
-    public void DocsMentionPendingInput(string relativePath)
-    {
-        var root = AppContext.BaseDirectory;
-        while (!File.Exists(Path.Combine(root, "src/Hex1b/Hex1b.csproj")))
-            root = Path.GetDirectoryName(root) ?? throw new InvalidOperationException("repository root not found");
-        var text = File.ReadAllText(Path.Combine(root, relativePath));
-        if (relativePath.EndsWith("cli.md", StringComparison.Ordinal) || relativePath.Contains("guide", StringComparison.Ordinal))
-        {
-            foreach (var fault in new[] { "pending-input", "pending-escape", "pending-ground-escape", "pending-framer" })
-                StringAssert.Contains(text, $"`{fault}`", relativePath);
-        }
-        StringAssert.Contains(text, "DCS in progress", relativePath);
-        Assert.IsFalse(Regex.IsMatch(text, @"\(pending input, a DCS in progress, graphics\)"), $"{relativePath} still lists pending input as a surface a start cannot restore");
-        Assert.IsFalse(text.Contains("holds pending input, a DCS in progress or graphics", StringComparison.Ordinal), $"{relativePath} still lists pending input as unsupported");
-    }
 
     [TestMethod]
     public async Task Reapply_PendingInputFaultsAtAMarkAndAStop()

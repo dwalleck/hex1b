@@ -714,12 +714,14 @@ public partial class DiagnosticCaseTests
             // Ticket 14: the unsupported start declares no surfaces; the record says so and the recovery's profile is what was judged.
             var surfaces = result.Compatibility.Checks.Single(c => c.Check == "checkpoint.coveredSurfaces");
             Assert.AreEqual(("compatible", "(none declared: the start is not complete)"), (surfaces.Verdict, surfaces.Producer), label);
-            Assert.AreEqual("text-state/1 at model sequence " + result.Origin.ModelSequence, result.Compatibility.Checks[6].Producer, label);
+            Assert.AreEqual("text-state/2 at model sequence " + result.Origin.ModelSequence, result.Compatibility.Checks[6].Producer, label);
         }
     }
 
     [TestMethod]
-    public async Task Reapply_RecoveryWithAForeignProfileIsIncompatible()
+    [DataRow("text-state/9")]
+    [DataRow("text-state/1")]
+    public async Task Reapply_RecoveryWithAForeignProfileIsIncompatible(string profile)
     {
         // Ticket 14 (R2): a recovery line declares its profile; a build that does not project it refuses to restore from
         // it (the origin check), before anything is read or built, even though the start and the target are this build's.
@@ -739,14 +741,17 @@ public partial class DiagnosticCaseTests
             await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
         }
         AssertMatched(Reapply(path, label: "m"), "fixture: the recovery is this build's");
-        EditEventLine(path, e => e["checkpoint"]?["trigger"]?.GetValue<string>() == "recovery", e => e["checkpoint"]!["profile"] = "text-state/9");
+        EditEventLine(path, e => e["checkpoint"]?["trigger"]?.GetValue<string>() == "recovery", e => e["checkpoint"]!["profile"] = profile);
         var hashes = HashCaseFiles(path);
+
+        var inspectedOrigin = Inspect(path).Intervals.Single(i => i.Origin is { Trigger: "recovery", Label: "r1" }).Origin!;
+        Assert.AreEqual(profile, inspectedOrigin.Profile, "inspection relabeled the recovery checkpoint instead of retaining its declared profile");
 
         var result = Reapply(path, label: "m");
         Assert.AreEqual((DiagnosticOutcome.Unavailable, "incompatible"), (result.Outcome, result.Problem?.Code), result.Problem?.Message);
         var failed = result.Compatibility.Checks.Single(c => c.Verdict == "incompatible");
         Assert.AreEqual("origin", failed.Check, result.Problem!.Message);
-        StringAssert.StartsWith(failed.Producer, "text-state/9 at model sequence ", result.Problem.Message);
+        StringAssert.StartsWith(failed.Producer, $"{profile} at model sequence ", result.Problem.Message);
         StringAssert.Contains(result.Problem.Message, failed.Producer!);
         StringAssert.Contains(result.Problem.Message, failed.Consumer!);
         CollectionAssert.AreEqual(new[] { "compatible", "compatible", "compatible", "compatible", "compatible", "compatible", "incompatible" },

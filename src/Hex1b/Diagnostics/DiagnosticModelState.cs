@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 namespace Hex1b.Diagnostics;
 
 /// <summary>
-/// A typed projection of a terminal model's text state (profile <c>text-state/1</c>), read in one
+/// A typed projection of a terminal model's text state (profile <c>text-state/2</c>), read in one
 /// hold of the model lock. It covers every model field: each is projected here, or is excluded as a
 /// clock, identity, configuration or infrastructure field, or is named in <see cref="Unsupported"/>
 /// when it holds state the profile cannot represent.

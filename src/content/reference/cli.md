@@ -279,10 +279,15 @@ hex1b capture case reapply <path> --to TARGET [--from ORIGIN] [--inject-fault KI
 | `--authorize` | string | | `reapplication-data`, `raw-input`, `editor-text`, `native-output` (repeatable or comma-separated) |
 | `--dir` | string | `~/.hex1b/cases` | Owner-only root for the case directory |
 
-A case started on a running terminal with `reapplication-data` owns a `text-state/1` start
+A case started on a running terminal with `reapplication-data` owns a `text-state/2` start
 checkpoint and re-applies from it; a terminal holding a surface the start cannot restore yet
 (a DCS in progress, graphics) makes it `unsupported`, and the output names the surfaces. Output
 held between chunks (an unfinished escape sequence or UTF-8 scalar) is owned by the start. To record from the first byte, use `hex1b terminal start --record-case`. `stop` waits at most 10 s for queued events.
+Text-state checkpoints preserve repeated buffer-cell write equality, including separated glyph
+halves. The current consumer refuses `text-state/1` starts, targets and recovery origins as
+`incompatible`; older consumers decline `/2`. Artifact format `2` and diagnostics contract `1`
+are unchanged. Historical cases require their recording-era build; no legacy reader is provided.
+
 `inspect` reads the artifact offline, verifies every line's checksum, and reports whether the case
 is `complete`, `interrupted` or `truncated`. It also reports per-stream coverage and missing
 ranges (a range of unknown extent bounded by the envelope the case wrote when it stopped says so),

@@ -486,44 +486,99 @@ public partial class DiagnosticModelRestoreTests
         }
     }
 
-    // The accepted limitation (issue 23, widened in review rounds 5 and 6: RR5#1, RR6#1): a start records continuations
-    // between cells adjacent in reading order, and at a row's first column only across a soft wrap. Halves that are apart
-    // at the start, or whose row has lost its soft wrap at the start, are one glyph in the original once they meet or the
-    // soft wrap is set again, and two cells in the replica. These rows pin the known divergence, so a change to it is
-    // noticed; issue 23's fix turns them into matches.
+    // Issue 23: separated halves retain their shared identity even when they cannot be flagged as a
+    // continuation at the start. Rejoining them, or restoring their soft wrap, must recover one glyph.
     [TestMethod]
     [DataRow("a row inserted between the halves", new[] { "\u001b[2;1H\u001b[L" },
         new[] { "\u001b[2;1H\u001b[M", "RESIZE 9 4", "\u001b[1;6H\u001b]133;A\u0007" })]
     [DataRow("the soft wrap set again under left/right margins", new[] { "\u001b[3;5Hq\u001b7", "\u001b[2T", "\u001b[3;5H" },
         new[] { "\u001b[?69h\u001b[2;5s", "\u001b8Z", "\u001b[?69l", "RESIZE 9 4", "\u001b[3;6H\u001b]133;A\u0007" })]
-    public void ModelRestore_GlyphHalvesJoinedOnlyAfterTheStartDiverge(string shape, string[] before, string[] after)
+    public void ModelRestore_GlyphHalvesJoinedOnlyAfterTheStartMatch(string shape, string[] before, string[] after)
     {
-        Hex1bTerminal Model() => new(new Hex1bTerminalOptions
-        {
-            PresentationAdapter = new HeadlessPresentationAdapter(9, 4, TerminalCapabilities.Modern).WithReflowStrategy(CaseConfiguration.CreateReflowStrategy("ghostty")!, enabled: true),
-            WorkloadAdapter = new CaseReapplier.DetachedWorkload(),
-            Width = 9,
-            Height = 4,
-            ScrollbackCapacity = 10,
-            TimeProvider = new FakeTimeProvider(),
-            DeferStart = true,
-        });
-        var original = Model();
+        var original = FuzzModel(9, 4, 10, "ghostty", modern: true);
         original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("abcd\u0E01\u0E33xyz"));
         original.Resize(5, 4);
         foreach (var step in before)
             ApplyStep(original, step);
         var state = original.CaptureModelState();
         Assert.IsFalse(state.Screen.Any(r => r.Cells.Any(c => c.Continues)), $"fixture: {shape} has a flagged continuation at the start");
-        var replica = Model();
+        AssertUnflaggedGlyphIdentity(original, state, "\u0E01\u0E33", shape);
+        var replica = FuzzModel(9, 4, 10, "ghostty", modern: true);
         replica.RestoreModelState(state);
+        AssertMatchingRejoinSteps(original, replica, shape, after);
+        Assert.AreEqual((4, 4), (original.CaptureModelState().CommandMarks[0].Column, replica.CaptureModelState().CommandMarks[0].Column),
+            $"{shape}: the restored half must rejoin its own glyph");
+    }
+
+    [TestMethod]
+    public void ModelRestore_LeftRightMarginScrollRejoinsGlyphHalves()
+    {
+        const string shape = "DECLRMM reverse index then scroll";
+        var original = FuzzModel(8, 5, 10, "none", modern: true);
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("x\u6f22\u001b[?69h\u001b[3;8s\u001bM"));
+        var state = original.CaptureModelState();
+        AssertUnflaggedGlyphIdentity(original, state, "\u6f22", shape);
+        var replica = FuzzModel(8, 5, 10, "none", modern: true);
+        replica.RestoreModelState(state);
+        AssertMatchingRejoinSteps(original, replica, shape, ["\u001b[1S", "\u001b[1;3H\u001b]133;A\u0007"]);
+        Assert.AreEqual((1, 1), (original.CaptureModelState().CommandMarks[0].Column, replica.CaptureModelState().CommandMarks[0].Column),
+            "the margin scroll must return the continuation to the glyph at column 1");
+    }
+
+    [TestMethod]
+    [DataRow("ghostty", "\u0E01\u0E33")]
+    [DataRow("alacritty", "\u1100\u1161\u11A8")]
+    [DataRow("wezterm", "\u0915\u093F")]
+    public void ModelRestore_VerticalMarginScrollRejoinsGlyphHalves(string strategy, string cluster)
+    {
+        var shape = $"DECSTBM scroll {strategy} {cluster}";
+        var original = FuzzModel(9, 4, 10, strategy, modern: true);
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("abcd" + cluster + "xyz"));
+        original.Resize(5, 4);
+        Assert.IsTrue(original.CaptureModelState().Screen[1].Cells[0].Continues, $"fixture: {shape} did not split the cluster");
+        original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("\u001b[2;4r\u001b[1T"));
+        var state = original.CaptureModelState();
+        AssertUnflaggedGlyphIdentity(original, state, cluster, shape);
+        var replica = FuzzModel(9, 4, 10, strategy, modern: true);
+        replica.RestoreModelState(state);
+        AssertMatchingRejoinSteps(original, replica, shape, ["\u001b[1S", "RESIZE 9 4", "\u001b[1;6H\u001b]133;A\u0007"]);
+        Assert.AreEqual((4, 4), (original.CaptureModelState().CommandMarks[0].Column, replica.CaptureModelState().CommandMarks[0].Column),
+            $"{shape}: the restored half must rejoin its own glyph at column 4");
+    }
+
+    private static void AssertUnflaggedGlyphIdentity(Hex1bTerminal original, DiagnosticModelState state, string cluster, string shape)
+    {
+        var raw = (TerminalCell[,])PrivateField(original, "_screenBuffer");
+        var owners = (from row in Enumerable.Range(0, state.Screen.Count)
+                      from column in Enumerable.Range(0, state.Screen[row].Cells.Count)
+                      where state.Screen[row].Cells[column].Text == cluster
+                      select (Row: row, Column: column)).ToArray();
+        Assert.AreEqual(1, owners.Length, $"fixture: {shape} must have one cluster owner");
+        var owner = owners[0];
+        var sequence = raw[owner.Row, owner.Column].Sequence;
+        Assert.IsGreaterThan(0L, sequence, $"fixture: {shape} owner is never written");
+        var halves = (from row in Enumerable.Range(0, state.Screen.Count)
+                      from column in Enumerable.Range(0, state.Screen[row].Cells.Count)
+                      where state.Screen[row].Cells[column].Text.Length == 0 && raw[row, column].Sequence == sequence
+                      select state.Screen[row].Cells[column]).ToArray();
+        Assert.AreEqual(1, halves.Length, $"fixture: {shape} must retain its own empty half, not an unrelated blank");
+        Assert.IsFalse(halves[0].Continues, $"fixture: {shape} already flags the half as a continuation");
+        Assert.IsGreaterThan(0, state.Screen[owner.Row].Cells[owner.Column].WriteClass, $"{shape}: the separated owner needs an equality class");
+        Assert.AreEqual(state.Screen[owner.Row].Cells[owner.Column].WriteClass, halves[0].WriteClass,
+            $"{shape}: the unflagged half must retain the owner's equality class");
+    }
+
+    private static void AssertMatchingRejoinSteps(Hex1bTerminal original, Hex1bTerminal replica, string shape, string[] after)
+    {
+        var start = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+        Assert.IsEmpty(start, $"{shape} restored start: " + string.Join("; ", start.Take(3)));
         foreach (var step in after)
         {
             ApplyStep(original, step);
             ApplyStep(replica, step);
+            var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+            Assert.IsEmpty(differences, $"{shape} after {JsonSerializer.Serialize(step)}: " + string.Join("; ", differences.Take(3)));
         }
-        Assert.AreEqual((4, 5), (original.CaptureModelState().CommandMarks[0].Column, replica.CaptureModelState().CommandMarks[0].Column),
-            $"{shape}: the known one-column divergence of issue 23");
     }
 
     // The projected never-written runs are exactly the cells with write sequence 0, read raw from the screen and the
@@ -641,33 +696,43 @@ public partial class DiagnosticModelRestoreTests
             [.. rows.Select((r, j) => j == index ? change(r) : r)];
         DiagnosticModelRow FirstCell(DiagnosticModelRow row, Func<DiagnosticModelCell, DiagnosticModelCell> change) =>
             row with { Cells = [change(row.Cells[0]), .. row.Cells.Skip(1)] };
+        DiagnosticModelRow LastCell(DiagnosticModelRow row, Func<DiagnosticModelCell, DiagnosticModelCell> change) =>
+            row with { Cells = [.. row.Cells.SkipLast(1), change(row.Cells[^1])] };
+        var writeClass = state.Screen.Concat(state.SavedMainScreen ?? []).Concat(state.History?.Rows ?? [])
+            .SelectMany(r => r.Cells).Max(c => c.WriteClass) + 1;
         var forged = shape switch
         {
             "a continuation at column 0" => state with { Screen = Rows(state.Screen, 0, r => FirstCell(r, c => c with { Text = "", Continues = true })) },
-            // Both rows wholly written, so only the missing soft wrap refuses it.
+            // Both rows wholly written with a shared class, so only the missing soft wrap refuses the continuation.
             "a continuation at column 0 after a row that does not soft-wrap" => state with
             {
-                Screen = [state.Screen[0] with { Unwritten = null }, FirstCell(state.Screen[1], c => c with { Text = "", Continues = true }) with { Unwritten = null }, .. state.Screen.Skip(2)],
+                Screen = [LastCell(state.Screen[0], c => c with { WriteClass = writeClass }) with { Unwritten = null },
+                    FirstCell(state.Screen[1], c => c with { Text = "", Continues = true, WriteClass = writeClass }) with { Unwritten = null }, .. state.Screen.Skip(2)],
             },
             "a continuation at the screen's first row after a history row that does not soft-wrap" => state with
             {
-                History = state.History! with { Rows = Rows(state.History.Rows, state.History.Rows.Count - 1, r => r with { Unwritten = null }) },
-                Screen = Rows(state.Screen, 0, r => FirstCell(r, c => c with { Text = "", Continues = true }) with { Unwritten = null }),
+                History = state.History! with
+                {
+                    Rows = Rows(state.History.Rows, state.History.Rows.Count - 1,
+                    r => LastCell(r, c => c with { WriteClass = writeClass }) with { Unwritten = null })
+                },
+                Screen = Rows(state.Screen, 0, r => FirstCell(r, c => c with { Text = "", Continues = true, WriteClass = writeClass }) with { Unwritten = null }),
             },
             "a continuation after a row that ends in another attribute" => state with
             {
                 Styles = [.. state.Styles, new DiagnosticModelStyle { Attributes = ["bold"] }],
                 Screen =
                 [
-                    state.Screen[0] with { Cells = [.. state.Screen[0].Cells.SkipLast(1), state.Screen[0].Cells[^1] with { Style = state.Styles.Count }], Unwritten = null },
-                    FirstCell(state.Screen[1], c => c with { Text = "", Continues = true }) with { Unwritten = null },
+                    LastCell(state.Screen[0], c => c with { Style = state.Styles.Count, WriteClass = writeClass }) with { Unwritten = null },
+                    FirstCell(state.Screen[1], c => c with { Text = "", Continues = true, WriteClass = writeClass }) with { Unwritten = null },
                     .. state.Screen.Skip(2),
                 ],
             },
             "a continuation with the styles missing" => state with
             {
                 Styles = null!,
-                Screen = [state.Screen[0] with { Unwritten = null }, FirstCell(state.Screen[1], c => c with { Text = "", Continues = true }) with { Unwritten = null }, .. state.Screen.Skip(2)],
+                Screen = [LastCell(state.Screen[0], c => c with { WriteClass = writeClass }) with { Unwritten = null },
+                    FirstCell(state.Screen[1], c => c with { Text = "", Continues = true, WriteClass = writeClass }) with { Unwritten = null }, .. state.Screen.Skip(2)],
             },
             "a continuation on a glyph" => state with { Screen = Rows(state.Screen, 0, r => r with { Cells = [r.Cells[0], r.Cells[1] with { Text = "x", Continues = true }, .. r.Cells.Skip(2)] }) },
             "a missing screen row" => state with { Screen = Rows(state.Screen, 1, _ => null!) },

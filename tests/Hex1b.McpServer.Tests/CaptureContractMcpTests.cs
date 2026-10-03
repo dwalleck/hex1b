@@ -1096,7 +1096,7 @@ public class CaptureContractMcpTests : McpServerTestBase
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task CaseLiveStart_ReapplyFromTheStartMatchesTheReapplier()
     {
-        // Ticket 09: a case started over MCP on a running application owns a text-state/1 start, and re-applies from
+        // Ticket 09: a case started over MCP on a running application owns a text-state/2 start, and re-applies from
         // it to matched through reapply_diagnostic_case, equal to the reapplier's own result.
         if (!OperatingSystem.IsLinux())
             Assert.Inconclusive("Owner-only case storage is verified on Linux.");
@@ -1113,7 +1113,7 @@ public class CaptureContractMcpTests : McpServerTestBase
         });
         Assert.IsTrue(start.GetProperty("success").GetBoolean(), start.ToString());
         var checkpoint = start.GetProperty("case").GetProperty("checkpoint");
-        Assert.AreEqual(("text-state/1", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()),
+        Assert.AreEqual(("text-state/2", "complete"), (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()),
             checkpoint.ToString());
         terminal.Resize(30, 6);
         await new Hex1bTerminalInputSequenceBuilder()

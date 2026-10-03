@@ -93,7 +93,8 @@ public partial class DiagnosticCaseTests
         int stateBytes;
         await using (terminal)
         {
-            await workload.WriteAndWaitAsync(terminal, "\u001b[32mfit\u001b[m"
+            // The wide glyph keeps repeated write-class metadata in all three exact-size boundary fixtures.
+            await workload.WriteAndWaitAsync(terminal, "\u001b[32mfit\u6f22\u001b[m"
                 + (shape == "exact overflow" ? "\u001b]2;" + new string('<', 1_200) + "\u0007" : ""));
             var diagnostics = new TerminalDiagnostics(terminal);
             await WrittenAsync(diagnostics, terminal.CurrentModelSequence);
