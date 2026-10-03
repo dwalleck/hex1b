@@ -4087,8 +4087,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 if (_cursorSaved)
                 {
                     _pendingWrap = _savedPendingWrap;
-                    _cursorX = _savedCursorX;
-                    _cursorY = _savedCursorY;
+                    // Resizes that leave the saved cursor unchanged can put it beyond the current screen.
+                    _cursorX = Math.Clamp(_savedCursorX, 0, _width - 1);
+                    _cursorY = Math.Clamp(_savedCursorY, 0, _height - 1);
                     _cursorProtected = _savedCursorProtected;
                 }
                 break;

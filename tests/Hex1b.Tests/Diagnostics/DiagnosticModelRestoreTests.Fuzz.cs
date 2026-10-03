@@ -29,14 +29,108 @@ public partial class DiagnosticModelRestoreTests
     [TestMethod]
     [DataRow(1046966)]
     [DataRow(22719)]
-    public void ModelRestore_CroppedBlankCellsRejoinFromSeed(int seed) => AssertDifferentialFuzz(seed, 1);
+    public void ModelRestore_CroppedBlankCellsRejoinFromSeed(int seed)
+    {
+        // Freeze the original generated chunks: adding alphabet entries must not replace these crop histories.
+        (string Strategy, int Width, int Height, int? Scrollback, bool Modern, object[] Before, object[] After) shape = seed switch
+        {
+            1046966 => ("foot", 5, 4, null, true,
+            [
+                Convert.FromHexString("6161"),
+                Convert.FromHexString("6161E0B881E0B8B378797A"),
+                "RESIZE 9 2",
+                "\u001b[1@",
+            ],
+            [
+                "\u001b[1;3r",
+                "aa각xyz",
+                Convert.FromHexString("1B"),
+                Convert.FromHexString("5B3253"),
+                "\u001b[2M",
+                Convert.FromHexString("0D"),
+                Convert.FromHexString("0A"),
+                "\u001b[2M",
+                Convert.FromHexString("1B5B31"),
+                Convert.FromHexString("53"),
+                Convert.FromHexString("1B"),
+                Convert.FromHexString("5B72"),
+                Convert.FromHexString("61"),
+                Convert.FromHexString("61E0B881E0B8B378797A"),
+                "\u001b[r",
+                Convert.FromHexString("616161E29DA41B5B6D"),
+                Convert.FromHexString("EFB88F78797A"),
+                "RESIZE 10 2",
+                "\u001b[2;4r",
+                "\u001b[3;3H",
+                "\u001b[r",
+                Convert.FromHexString("1B5B3F3437"),
+                Convert.FromHexString("6C"),
+                "RESIZE 10 7",
+                "a각xyz",
+                Convert.FromHexString("1B"),
+                Convert.FromHexString("5B3250"),
+                "RESIZE 13 4",
+                "a漢xyz",
+                "\n\n\n",
+                "RESIZE 6 3",
+            ]),
+            22719 => ("wezterm", 11, 2, 10, false,
+            [
+                "\u001b[1T",
+                "RESIZE 4 5",
+                "a漢xyz",
+                Convert.FromHexString("6161616161616161E2"),
+                Convert.FromHexString("9DA4EFB88F78797A"),
+                "\u001b[2;10H\u001b]133;B\u0007",
+                "aaaaaaaaaa漢xyz",
+                Convert.FromHexString("6161616161E29DA4"),
+                Convert.FromHexString("EFB88F78797A"),
+                "\u001b]133;A\u0007",
+                Convert.FromHexString("1B5B31"),
+                Convert.FromHexString("54"),
+                Convert.FromHexString("616161"),
+                Convert.FromHexString("616161E29DA4EFB88F78797A"),
+                "aaaaaaaaa\u001b[?2027hकिxyz",
+                "RESIZE 12 3",
+                Convert.FromHexString("6161616161616161"),
+                Convert.FromHexString("6161E18480E185A1E186A878797A"),
+                "\u001b[r",
+                "\u001b[?1049l",
+                "\u001b[1P",
+                "\u001b[1;5H",
+                "\u001b[?1049l",
+            ],
+            [
+                "\u001b[2;2r",
+                "\r\n",
+                "RESIZE 7 5",
+                Convert.FromHexString("1B5B"),
+                Convert.FromHexString("72"),
+            ]),
+            _ => throw new ArgumentOutOfRangeException(nameof(seed)),
+        };
+        using var original = FuzzModel(shape.Width, shape.Height, shape.Scrollback, shape.Strategy, shape.Modern);
+        foreach (var step in shape.Before)
+            ApplyFuzzStep(original, step);
+        using var replica = FuzzModel(shape.Width, shape.Height, shape.Scrollback, shape.Strategy, shape.Modern);
+        replica.RestoreModelState(original.CaptureModelState());
+        AssertDecrcModelsEqual(original, replica, $"historical seed {seed} start");
+        foreach (var step in shape.After)
+        {
+            ApplyFuzzStep(original, step);
+            ApplyFuzzStep(replica, step);
+            AssertDecrcModelsEqual(original, replica, $"historical seed {seed} after {Describe([step])}");
+        }
+    }
 
     private static void AssertDifferentialFuzz(int first, int trials)
     {
-        var strategies = CaseConfiguration.StrategyIds.Append("none").ToArray();
+        var strategies = CaseConfiguration.StrategyIds.Append("no-provider").ToArray();
         var failures = new List<string>();
         var crossRow = 0;
         var pendingStarts = 0;
+        var saves = 0;
+        var restores = 0;
         for (var seed = first; seed < first + trials; seed++)
         {
             var random = new Random(seed);
@@ -52,6 +146,8 @@ public partial class DiagnosticModelRestoreTests
             while (all.Count < count)
                 all.AddRange(FuzzSteps(random, width, height));
             var cut = random.Next(4, Math.Max(5, all.Count - 3));
+            saves += all.OfType<string>().Count(step => step == "\u001b7");
+            restores += all.OfType<string>().Count(step => step == "\u001b8");
             var before = all.Take(cut).ToList();
             var after = all.Skip(cut).ToList();
             var where = $"seed {seed} ({strategy}, {width}x{height}, scrollback {scrollback?.ToString() ?? "none"}, {(modern ? "modern" : "default")})";
@@ -108,13 +204,15 @@ public partial class DiagnosticModelRestoreTests
         {
             Assert.IsGreaterThan(0, crossRow, "the run never split a glyph across a wrap, so it did not exercise first-column continuations");
             Assert.IsGreaterThan(0, pendingStarts, "the run never started between the halves of a split chunk, so it did not exercise pending input");
+            Assert.IsGreaterThan(0, saves, "the run never applied DECSC");
+            Assert.IsGreaterThan(0, restores, "the run never applied DECRC");
         }
     }
 
     private static Hex1bTerminal FuzzModel(int width, int height, int? scrollback, string strategy, bool modern)
     {
         var capabilities = modern ? TerminalCapabilities.Modern : null;
-        var presentation = strategy == "none"
+        var presentation = strategy == "no-provider"
             ? new HeadlessPresentationAdapter(width, height, capabilities)
             : new HeadlessPresentationAdapter(width, height, capabilities).WithReflowStrategy(CaseConfiguration.CreateReflowStrategy(strategy)!, enabled: true);
         return new Hex1bTerminal(new Hex1bTerminalOptions
@@ -155,13 +253,13 @@ public partial class DiagnosticModelRestoreTests
     }
 
     // One random step: text with a wide or multi-cell cluster (weighted up), a resize (weighted up), row and region
-    // edits, scrolls, cursor moves, alternate-screen switches, erases, and command marks.
+    // edits, scrolls, cursor moves, saved-cursor restores, alternate-screen switches, erases, and command marks.
     private static string FuzzStep(Random random, int width, int height)
     {
         string[] clusters = ["กำ", "각", "\u001b[?2027hकि", "漢", "❤️", "❤\u001b[m️"];
-        var kind = random.Next(34);
-        if (kind >= 26)
-            kind = kind < 30 ? 0 : 3;
+        var kind = random.Next(36);
+        if (kind >= 28)
+            kind = kind < 32 ? 0 : 3;
         return kind switch
         {
             0 or 1 or 2 => new string('a', random.Next(0, width)) + clusters[random.Next(clusters.Length)] + "xyz",
@@ -186,7 +284,9 @@ public partial class DiagnosticModelRestoreTests
             22 => $"\u001b[{random.Next(1, height + 1)};{random.Next(1, width + 1)}H\u001b]133;B\u0007",
             23 => $"\u001b[{random.Next(3)}J",
             24 => $"\u001b[{random.Next(1, 3)}@",
-            _ => $"\u001b[{random.Next(1, 3)}P",
+            25 => $"\u001b[{random.Next(1, 3)}P",
+            26 => "\u001b7",
+            _ => "\u001b8",
         };
     }
 }
