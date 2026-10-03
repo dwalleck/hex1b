@@ -1178,6 +1178,26 @@ public class CaptureContractCliTests
     }
 
     [TestMethod]
+    [DataRow("ls", "--width=3")]
+    [DataRow("sh", "--record-case")]
+    [DataRow("prog", "--")]
+    public async Task TerminalStart_CommandArgumentsAreNotHostOptions(string command, string argument)
+    {
+        var hostArgs = Hex1b.Tool.Commands.Terminal.TerminalStartCommand.HostArguments(
+            81, 7, null, null, null, null, null, null, [command, argument]);
+        using var parser = await Program.BuildApplication([.. hostArgs]);
+        var parsed = parser.Services.GetRequiredService<Hex1b.Tool.Commands.RootCommand>().Parse(hostArgs);
+        Assert.AreEqual(0, parsed.Errors.Count, string.Join("; ", parsed.Errors));
+
+        var (config, error) = Hex1b.Tool.Commands.Terminal.TerminalHostCommand.Config(parsed);
+        Assert.IsNotNull(config, error);
+        Assert.AreEqual(command, config.Command);
+        CollectionAssert.AreEqual(new[] { argument }, config.Arguments);
+        Assert.AreEqual((81, 7), (config.Width, config.Height), "child arguments changed host geometry");
+        Assert.IsNull(config.DiagnosticCase, "a child argument enabled host case recording");
+    }
+
+    [TestMethod]
     [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public async Task Case_RecoverAndReapplyFromMatchTheEngineAndTheReapplier()
     {

@@ -295,6 +295,7 @@ internal sealed class TerminalStartCommand : BaseCommand
             if (caseRequest.Directory != null)
                 hostArgs.AddRange(["--case-dir", caseRequest.Directory]);
         }
+        hostArgs.Add("--");
         hostArgs.AddRange(command);
         return hostArgs;
     }
