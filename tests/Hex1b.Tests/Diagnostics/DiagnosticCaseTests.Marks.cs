@@ -65,6 +65,47 @@ public partial class DiagnosticCaseTests
             AssertMatched(Reapply(path, label: label), $"{strategyId} {label}");
     }
 
+    // Ticket 22: the mark scenarios recorded live with a viewer on the original only. At the start and after every
+    // later step an HMP1 capture, a jump to each mark and an HWT1 frame read the marks before the boundary is marked
+    // (the start is recorded before its read, so the read start is marked too); re-applied without a viewer, the case
+    // is matched at the start, the read start, every step and the stop.
+    [TestMethod]
+    [DynamicData(nameof(DiagnosticModelRestoreTests.MarkScenariosAndStrategies), typeof(DiagnosticModelRestoreTests))]
+    public async Task Reapply_MarksObservedByAViewer(string scenario, string strategy)
+    {
+        var shape = DiagnosticModelRestoreTests.MarkScenarios[scenario];
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = HistoryTerminal(workload, strategy == "none" ? null : CaseConfiguration.CreateReflowStrategy(strategy),
+            shape.Capacity, shape.Width, shape.Height);
+        var diagnostics = new TerminalDiagnostics(terminal);
+        await workload.WriteAndWaitAsync(terminal, shape.Before);
+        var path = StartLive(terminal, root);
+        var view = new Hwt1ViewState();
+        var requestId = 0L;
+        DiagnosticModelRestoreTests.ObserveMarks(terminal, view, shape.Capacity, ref requestId, $"{scenario} {strategy} start", static _ => { });
+        Mark(diagnostics, "observed start");
+        foreach (var (name, input) in shape.Steps)
+        {
+            if (input.StartsWith("RESIZE ", StringComparison.Ordinal))
+            {
+                var size = input.Split(' ');
+                var (width, height) = (int.Parse(size[1]), int.Parse(size[2]));
+                terminal.Resize(width, height);
+                await WaitAsync(() => terminal.Width == width && terminal.Height == height);
+            }
+            else
+                await workload.WriteAndWaitAsync(terminal, input);
+            DiagnosticModelRestoreTests.ObserveMarks(terminal, view, shape.Capacity, ref requestId, $"{scenario} {strategy} {name}", static _ => { });
+            Mark(diagnostics, name);
+        }
+        await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+
+        Assert.AreEqual("complete", Artifact.Read(path).Manifest.GetProperty("checkpoint").GetProperty("status").GetString(), $"{scenario} {strategy}: the start");
+        foreach (var label in shape.Steps.Select(s => s.Name).Prepend("observed start").Prepend("start").Append("stop"))
+            AssertMatched(Reapply(path, label: label), $"{scenario} {strategy} {label}");
+    }
+
     [TestMethod]
     public async Task Start_TitlesTooLargeForTheCase()
     {

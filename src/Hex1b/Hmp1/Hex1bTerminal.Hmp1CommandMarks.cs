@@ -25,10 +25,10 @@ public sealed partial class Hex1bTerminal
             var column = anchor.Column;
             if (anchor.Alternate == buffer.Alternate)
             {
-                if (ResolveTextAnchor(anchor, buffer) is not int resolved)
+                if (ResolveTextAnchor(anchor, buffer) is not { } resolved)
                     continue;
-                row = resolved - (buffer.Alternate ? 0 : buffer.HistoryCount - historyRows);
-                column = anchor.Column;
+                row = resolved.Row - (buffer.Alternate ? 0 : buffer.HistoryCount - historyRows);
+                column = resolved.Column;
                 if (row < 0)
                     continue;
             }

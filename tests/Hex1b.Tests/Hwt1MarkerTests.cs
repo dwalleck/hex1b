@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using Hex1b.Reflow;
@@ -1156,6 +1157,209 @@ public class Hwt1MarkerTests
         Assert.AreEqual(0, terminal.TextAnchorCount);
         Assert.AreEqual(0, terminal.CommandMarks.Count);
         Assert.AreEqual(0, Capture(terminal, view).Markers.Length);
+    }
+
+    // Ticket 22: a view reports a trailing mark at the start of the next row, but observing it (frames, jumps) leaves the
+    // model's mark where output left it: the same position, and the same lifetime, as in a twin no view observes.
+    [TestMethod]
+    [DataRow("reverse index")]
+    [DataRow("declrmm")]
+    [DataRow("wide padding")]
+    public async Task Markers_TrailingWrapObservation_ReportsNextRowWithoutMovingModelMark(string scenario)
+    {
+        var (output, column, text) = TrailingWrap(scenario);
+        await using var observed = TrailingWrapTerminal();
+        await using var unobserved = TrailingWrapTerminal();
+        Apply(output);
+        var id = TestSeq.Single(observed.CaptureModelState().CommandMarks,
+            mark => (mark.Row, mark.Column) == (0, column)).Anchor;
+        var view = new Hwt1ViewState();
+
+        AssertReportedAtNextRow(Capture(observed, view), "screen capture");
+        AssertModelMarksUnmoved(observed, unobserved, id, column, "screen capture");
+
+        // Rows 0 and 1 fill the two-row history; the jump shows the reported row, not the model's.
+        Apply("\x1b[6;1H\n\n");
+        Send(observed, view, new { type = "marker", action = "jump", requestId = 1, id });
+        Assert.IsTrue(view.MarkerResult!.Success);
+        AssertModelMarksUnmoved(observed, unobserved, id, column, "history jump");
+        var jumped = Capture(observed, view);
+        Assert.IsFalse(jumped.Following);
+        Assert.AreEqual(1, jumped.Top);
+        AssertReportedAtNextRow(jumped, "history capture");
+        AssertModelMarksUnmoved(observed, unobserved, id, column, "history capture");
+
+        // An inactive mark has no row and keeps its own column.
+        Apply("\x1b[?1049h");
+        var inactive = TestSeq.Single(Capture(observed, view).Markers, candidate => candidate.Id == id);
+        Assert.IsNull(inactive.Row);
+        Assert.AreEqual(column, inactive.Column);
+        Send(observed, view, new { type = "marker", action = "jump", requestId = 2, id });
+        Assert.AreEqual("inactive-buffer", view.MarkerResult!.Error);
+        AssertModelMarksUnmoved(observed, unobserved, id, column, "alternate");
+
+        Apply("\x1b[?1049l");
+        AssertReportedAtNextRow(Capture(observed, view), "main capture");
+        AssertModelMarksUnmoved(observed, unobserved, id, column, "main capture");
+
+        // Pruning row 0 expires the mark with the row output left it on, as in the unobserved twin.
+        Apply("\x1b[6;1H\n");
+        Assert.IsFalse(Capture(observed, view).Markers.Any(candidate => candidate.Id == id));
+        Send(observed, view, new { type = "marker", action = "jump", requestId = 3, id });
+        Assert.AreEqual("unknown-marker", view.MarkerResult!.Error);
+        Assert.IsFalse(unobserved.CaptureModelState().CommandMarks.Any(mark => mark.Anchor == id),
+            "fixture: the unobserved mark outlived row 0");
+        TestSeq.AreEqual(unobserved.CaptureModelState().CommandMarks, observed.CaptureModelState().CommandMarks,
+            "pruning row 0 expired different marks in the observed model");
+
+        void Apply(string input)
+        {
+            observed.ApplyTokens(AnsiTokenizer.Tokenize(input));
+            unobserved.ApplyTokens(AnsiTokenizer.Tokenize(input));
+        }
+
+        void AssertReportedAtNextRow(Hwt1History history, string boundary)
+        {
+            var marker = TestSeq.Single(history.Markers, candidate => candidate.Id == id);
+            Assert.AreEqual(1, marker.Row, boundary);
+            Assert.AreEqual(0, marker.Column, boundary);
+            AssertMarkerText(observed, marker, text);
+        }
+    }
+
+    [TestMethod]
+    [DataRow("ABCDE", 4, "E")]
+    [DataRow("ABC界", 3, "界")]
+    public async Task CustomMarkers_TrailingWrapObservation_ExpireWithOwnRowLikeUnobservedMarker(
+        string output, int column, string text)
+    {
+        await using var observed = Hex1bTerminal.CreateBuilder().WithWorkload(new Hex1bAppWorkloadAdapter())
+            .WithHeadless().WithDimensions(4, 2).WithScrollback(2).Build();
+        await using var unobserved = Hex1bTerminal.CreateBuilder().WithWorkload(new Hex1bAppWorkloadAdapter())
+            .WithHeadless().WithDimensions(4, 2).WithScrollback(2).Build();
+        var id = $"custom:{Guid.NewGuid():D}";
+        var view = new Hwt1ViewState();
+        AddAtRowZero(observed, view);
+        AddAtRowZero(unobserved, new Hwt1ViewState());
+
+        AssertReportedAtNextRow(Capture(observed, view));
+
+        // Rows 0 and 1 fill the two-row history; the jump shows the reported row.
+        Apply("\r\nX\r\nY");
+        Send(observed, view, new { type = "marker", action = "jump", requestId = 2, id });
+        Assert.IsTrue(view.MarkerResult!.Success);
+        var jumped = Capture(observed, view);
+        Assert.IsFalse(jumped.Following);
+        Assert.AreEqual(1, jumped.Top);
+        AssertReportedAtNextRow(jumped);
+
+        // Pruning row 0 removes both markers: observation did not rebind the observed one to row 1.
+        Apply("\r\nZ");
+        Assert.AreEqual(0, unobserved.TextAnchorCount, "fixture: the unobserved marker outlived row 0");
+        Assert.AreEqual(0, observed.TextAnchorCount, "the observed marker outlived row 0");
+        Assert.AreEqual(0, view.CustomMarkers.Count);
+        Assert.AreEqual(0, Capture(observed, view).Markers.Length);
+
+        void Apply(string input)
+        {
+            observed.ApplyTokens(AnsiTokenizer.Tokenize(input));
+            unobserved.ApplyTokens(AnsiTokenizer.Tokenize(input));
+        }
+
+        void AddAtRowZero(Hex1bTerminal terminal, Hwt1ViewState target)
+        {
+            terminal.ApplyTokens(AnsiTokenizer.Tokenize(output));
+            var initial = Capture(terminal, target);
+            Send(terminal, target, new { type = "marker", action = "add", requestId = 1, id,
+                generation = initial.Generation, rowId = initial.RowIds[0], column });
+            Assert.IsTrue(target.MarkerResult!.Success);
+        }
+
+        void AssertReportedAtNextRow(Hwt1History history)
+        {
+            var marker = TestSeq.Single(history.Markers);
+            Assert.AreEqual(1, marker.Row);
+            Assert.AreEqual(0, marker.Column);
+            AssertMarkerText(observed, marker, text);
+        }
+    }
+
+    // Reflow receives the position a view reports for a trailing mark, not the raw anchor. Its text is the glyph at
+    // logical offset 20 of the 40-glyph reverse-index line, or the wide glyph after 19 glyphs (padding is not a glyph).
+    // At 10 columns both are at row 2, column 0 (the wide glyph cannot fit at row 1, column 9); at 40, at row 0.
+    [TestMethod]
+    [DataRow("reverse index", 20, 20, "p")]
+    [DataRow("wide padding", 19, 19, "界")]
+    public async Task Markers_TrailingWrapReflow_MapsReportedPositionThroughShrinkAndGrow(
+        string scenario, int rawColumn, int grownColumn, string text)
+    {
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(new Hex1bAppWorkloadAdapter())
+            .WithHeadless().WithDimensions(20, 6).WithScrollback(2).WithReflow(GhosttyReflowStrategy.Instance).Build();
+        terminal.ApplyTokens(AnsiTokenizer.Tokenize(TrailingWrap(scenario).Output));
+        var anchor = TestSeq.Single(terminal.CaptureModelState().CommandMarks,
+            mark => (mark.Row, mark.Column) == (0, rawColumn)).Anchor;
+        var id = long.Parse(anchor.AsSpan("command:".Length), CultureInfo.InvariantCulture);
+        var view = new Hwt1ViewState();
+
+        AssertReportedAt(1, 0, "before resize");
+        var raw = TestSeq.Single(terminal.CaptureModelState().CommandMarks, mark => mark.Anchor == anchor);
+        Assert.AreEqual(0, raw.Row, "observation moved the model's mark to another row");
+        Assert.AreEqual(rawColumn, raw.Column, "observation moved the model's mark to another column");
+
+        terminal.Resize(10, 6);
+        AssertReportedAt(2, 0, "shrunk");
+        terminal.Resize(40, 6);
+        AssertReportedAt(0, grownColumn, "grown");
+
+        // Pruning row 0 expires the mark.
+        terminal.ApplyTokens(AnsiTokenizer.Tokenize("\x1b[6;1H\n\n\n"));
+        Assert.IsFalse(terminal.CaptureModelState().CommandMarks.Any(mark => mark.Anchor == anchor));
+        Assert.IsFalse(Capture(terminal, view).Markers.Any(marker => marker.Id == anchor));
+        Assert.IsFalse(Hmp1Marks().Any(mark => mark.Id == id));
+
+        void AssertReportedAt(int row, int column, string boundary)
+        {
+            var marker = TestSeq.Single(Capture(terminal, view).Markers, candidate => candidate.Id == anchor);
+            Assert.AreEqual(row, marker.Row, $"{boundary}: HWT1 row");
+            Assert.AreEqual(column, marker.Column, $"{boundary}: HWT1 column");
+            AssertMarkerText(terminal, marker, text);
+            var transferred = TestSeq.Single(Hmp1Marks(), candidate => candidate.Id == id);
+            Assert.AreEqual(row, transferred.Row, $"{boundary}: HMP1 row");
+            Assert.AreEqual(column, transferred.Column, $"{boundary}: HMP1 column");
+        }
+
+        IReadOnlyList<Hmp1CommandMark> Hmp1Marks()
+        {
+            using var snapshot = terminal.CaptureHmp1Snapshot(100, true, out _, out var marks);
+            return marks!.Marks;
+        }
+    }
+
+    // Ticket 22's fixtures: output leaves a command mark at the end, or on the wide-glyph padding, of soft-wrapped row
+    // 0 without committing it to row 1 (a reverse index back onto the row, DECLRMM, or cursor positioning). Viewers
+    // report it at row 1, column 0, where its text continues. Returns the output, the mark's column and that text.
+    internal static (string Output, int Column, string Text) TrailingWrap(string scenario) => scenario switch
+    {
+        "reverse index" => ("\r" + new string('p', 20) + "\x1b]133;B\u0007q\r" + new string('p', 20) +
+            "\x1b]133;A\u0007\x1bM\x1b]133;D;1\u0007", 20, "p"),
+        "declrmm" => ("\x1b[?69h" + new string('x', 20) + "\x1b]133;A\u0007@T rest", 20, "@"),
+        "wide padding" => (new string('p', 19) + "界\x1b[1;20H\x1b]133;A\u0007", 19, "界"),
+        _ => throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null),
+    };
+
+    internal static Hex1bTerminal TrailingWrapTerminal() => Hex1bTerminal.CreateBuilder()
+        .WithWorkload(new Hex1bAppWorkloadAdapter()).WithHeadless().WithDimensions(20, 6).WithScrollback(2).Build();
+
+    // The raw model marks of an observed terminal are its unobserved twin's, with the trailing mark still on row 0.
+    internal static void AssertModelMarksUnmoved(Hex1bTerminal observed, Hex1bTerminal unobserved, string anchor,
+        int column, string boundary)
+    {
+        var marks = observed.CaptureModelState().CommandMarks;
+        var trailing = TestSeq.Single(marks, mark => mark.Anchor == anchor);
+        Assert.AreEqual(0, trailing.Row, $"{boundary}: observation moved the model's mark to another row");
+        Assert.AreEqual(column, trailing.Column, $"{boundary}: observation moved the model's mark to another column");
+        TestSeq.AreEqual(unobserved.CaptureModelState().CommandMarks, marks,
+            $"{boundary}: the observed model's marks differ from the unobserved twin's");
     }
 
     private static Hwt1History Capture(Hex1bTerminal terminal, Hwt1ViewState view)

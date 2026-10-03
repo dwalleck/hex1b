@@ -154,29 +154,21 @@ public sealed partial class Hex1bTerminal
         return anchor;
     }
 
-    private int? ResolveTextAnchor(TerminalTextAnchor anchor, TerminalTextBuffer buffer)
+    private static (int Row, int Column)? ResolveTextAnchor(TerminalTextAnchor anchor, TerminalTextBuffer buffer)
     {
         if (anchor.Alternate != buffer.Alternate || anchor.RowId is not long id)
             return null;
         var row = buffer.FindRow(id);
         if (row < 0)
-        {
-            anchor.RowId = null;
-            InvalidateTextAnchorRetention();
             return null;
-        }
+        // Resolution is a view of the insertion position, not a model event.
+        // Only output, reflow and collection may commit changes to an anchor.
+        var column = anchor.Column;
         if (row + 1 < buffer.TotalRows && buffer.SoftWrap(row) &&
-            (anchor.Column == buffer.RowWidth(row) ||
-             (anchor.Column < buffer.RowWidth(row) && buffer.Cell(row, anchor.Column).IsWideWrapPadding)))
-        {
-            anchor.RowId = buffer.RowId(++row);
-            anchor.Column = 0;
-            if (row < buffer.HistoryCount)
-                _historyTextAnchors.Add(anchor);
-            else
-                _historyTextAnchors.Remove(anchor);
-        }
-        return row;
+            (column == buffer.RowWidth(row) ||
+             (column < buffer.RowWidth(row) && buffer.Cell(row, column).IsWideWrapPadding)))
+            return (row + 1, 0);
+        return (row, column);
     }
 
     private List<(TerminalTextAnchor Anchor, TerminalReflowAnchor Position)> PrepareTextAnchorReflow()
@@ -186,8 +178,8 @@ public sealed partial class Hex1bTerminal
         var result = new List<(TerminalTextAnchor, TerminalReflowAnchor)>();
         var id = int.MinValue;
         foreach (var anchor in _textAnchors)
-            if (ResolveTextAnchor(anchor, buffer) is int row)
-                result.Add((anchor, new(id++, row, anchor.Column, IsTextPosition: true)));
+            if (ResolveTextAnchor(anchor, buffer) is { } position)
+                result.Add((anchor, new(id++, position.Row, position.Column, IsTextPosition: true)));
         _textAnchorReflowPending = true;
         return result;
     }
@@ -270,12 +262,16 @@ public sealed partial class Hex1bTerminal
         foreach (var mark in _commandMarks)
         {
             var anchor = _commandAnchors[mark];
+            var position = ResolveTextAnchor(anchor, buffer);
             markers.Add(new(anchor.Id, "command", anchor.Alternate ? "alternate" : "main",
-                ResolveTextAnchor(anchor, buffer), anchor.Column, PhaseName(mark.Phase), mark.ExitCode));
+                position?.Row, position?.Column ?? anchor.Column, PhaseName(mark.Phase), mark.ExitCode));
         }
         foreach (var anchor in view.CustomMarkers.Values)
+        {
+            var position = ResolveTextAnchor(anchor, buffer);
             markers.Add(new(anchor.Id, "custom", anchor.Alternate ? "alternate" : "main",
-                ResolveTextAnchor(anchor, buffer), anchor.Column));
+                position?.Row, position?.Column ?? anchor.Column));
+        }
         return markers.ToArray();
     }
 
@@ -349,9 +345,9 @@ public sealed partial class Hex1bTerminal
                 view.MarkerResult = new(requestId, true, MarkerId: id);
                 break;
             case "jump":
-                if (ResolveTextAnchor(target, buffer) is int row)
+                if (ResolveTextAnchor(target, buffer) is { } position)
                 {
-                    view.JumpToRow(buffer, row);
+                    view.JumpToRow(buffer, position.Row);
                     view.MarkerResult = new(requestId, true, MarkerId: id);
                 }
                 else

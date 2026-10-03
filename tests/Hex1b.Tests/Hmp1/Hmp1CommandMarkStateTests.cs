@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.IO.Pipelines;
 using System.Text;
 using Hex1b.Automation;
@@ -415,6 +416,60 @@ public class Hmp1CommandMarkStateTests
         using var after = mirror.CreateSnapshot();
         Assert.IsFalse(after.ContainsText("PARTIAL"));
         Assert.AreEqual(0, mirror.CommandMarks.Count);
+    }
+
+    // Ticket 22: a capture transfers a trailing mark at the start of the next row, but leaves the model's mark where
+    // output left it: the same position, and the same lifetime, as in a twin that is never captured.
+    [TestMethod]
+    [DataRow("reverse index")]
+    [DataRow("declrmm")]
+    [DataRow("wide padding")]
+    public async Task Capture_TrailingWrapMark_ReportsNextRowWithoutMovingModelMark(string scenario)
+    {
+        var (output, column, _) = Hwt1MarkerTests.TrailingWrap(scenario);
+        await using var observed = Hwt1MarkerTests.TrailingWrapTerminal();
+        await using var unobserved = Hwt1MarkerTests.TrailingWrapTerminal();
+        Apply(output);
+        var anchor = TestSeq.Single(observed.CaptureModelState().CommandMarks,
+            mark => (mark.Row, mark.Column) == (0, column)).Anchor;
+        var id = long.Parse(anchor.AsSpan("command:".Length), CultureInfo.InvariantCulture);
+
+        AssertTransferredAt(Capture(observed), 1, "screen");
+        Hwt1MarkerTests.AssertModelMarksUnmoved(observed, unobserved, anchor, column, "screen");
+
+        // Rows 0 and 1 fill the two-row history; a one-row transfer starts at the reported row.
+        Apply("\x1b[6;1H\n\n");
+        AssertTransferredAt(Capture(observed), 1, "history");
+        AssertTransferredAt(Capture(observed, 1), 0, "one history row");
+        Hwt1MarkerTests.AssertModelMarksUnmoved(observed, unobserved, anchor, column, "history");
+
+        // On the alternate screen the mark is transferred from the saved main history.
+        Apply("\x1b[?1049h");
+        AssertTransferredAt(Capture(observed), 1, "saved main history");
+        Hwt1MarkerTests.AssertModelMarksUnmoved(observed, unobserved, anchor, column, "alternate");
+
+        Apply("\x1b[?1049l");
+        AssertTransferredAt(Capture(observed), 1, "main history");
+        Hwt1MarkerTests.AssertModelMarksUnmoved(observed, unobserved, anchor, column, "main history");
+
+        // Pruning row 0 expires the mark with the row output left it on, as in the unobserved twin.
+        Apply("\x1b[6;1H\n");
+        Assert.IsFalse(Capture(observed).Marks.Any(mark => mark.Id == id));
+        TestSeq.AreEqual(unobserved.CaptureModelState().CommandMarks, observed.CaptureModelState().CommandMarks,
+            "pruning row 0 expired different marks in the observed model");
+
+        void Apply(string input)
+        {
+            observed.ApplyTokens(AnsiTokenizer.Tokenize(input));
+            unobserved.ApplyTokens(AnsiTokenizer.Tokenize(input));
+        }
+
+        void AssertTransferredAt(Hmp1CommandMarkState state, int row, string boundary)
+        {
+            var mark = TestSeq.Single(state.Marks, candidate => candidate.Id == id);
+            Assert.AreEqual(row, mark.Row, boundary);
+            Assert.AreEqual(0, mark.Column, boundary);
+        }
     }
 
     private static string Commands(int count) => string.Concat(Enumerable.Range(0, count).Select(i =>

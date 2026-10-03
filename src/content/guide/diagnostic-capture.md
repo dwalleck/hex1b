@@ -321,9 +321,12 @@ Start a case in one of two ways:
   History rows keep their identities and original widths, so a later resize reflows them as it
   did the original's. Command marks keep their anchor ids and the positions of their text, so
   later output, eviction, reflow and the alternate screen move and expire them as they did the
-  original's (a viewer attached to the recorded terminal is the exception; see the notes at the end). Markers a browser viewer places (HWT1 custom markers) are view state and are not
-  recorded. Output held between chunks at the start (an unfinished escape sequence as the model's
-  decoded text, the bytes of an unfinished UTF-8 scalar, an ESC held until the next byte shows
+  original's. HWT1 frames and marker jumps, and HMP1 captures, resolve positions without moving
+  anchors or changing their lifetime. A trailing mark can be reported at the next row's start
+  while its recorded position stays where the model left it. Markers a browser viewer places
+  (HWT1 custom markers) are view state and are not recorded. Output held between chunks at the
+  start (an unfinished escape sequence as the model's decoded text, the bytes of an unfinished
+  UTF-8 scalar, an ESC held until the next byte shows
   whether a DCS begins, and the continuation bytes the byte framer still expects) is owned by the
   start and restored before the first recorded chunk, so the rest of a split scalar or sequence is
   handled as in the original. Otherwise it is `unsupported`, and `unsupportedSurfaces` names each
@@ -774,11 +777,6 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
   holding a surface the restore cannot represent yet (a DCS in progress, graphics) is
   `unsupported`, and names it. Output held between chunks is restored; the bytes of an unfinished
   escape sequence read before the start are owned as the model's decoded text, not as input.
-- An attached browser view (on every HWT1 frame, and on a marker jump) or an HMP1 client resolves
-  command-mark positions in the recorded terminal outside any model event: a mark at the end of a
-  soft-wrapped row or on a wide glyph's wrap padding is moved to the next row's start, and a mark
-  whose row is gone is dropped, there and nowhere in the recording. A re-application can then report
-  `different` at that mark (`commandMarks[i].row`/`column`).
 - A start records which empty cells continue the glyph before them in reading order (`c`, including
   a row's first cell continuing a glyph split across a soft wrap) and which cells were never written
   (a row's `unwritten` runs). It does not record that two cells are halves of one glyph when they

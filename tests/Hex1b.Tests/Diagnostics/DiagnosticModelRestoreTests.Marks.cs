@@ -9,8 +9,9 @@ using Microsoft.Extensions.Time.Testing;
 namespace Hex1b.Tests.Diagnostics;
 
 // Ticket 11: titles, the title stack and OSC 133 command marks are restored, marks at their positions (buffer, row,
-// column), and behave afterwards as the original's. The oracle for marks is the HWT1 viewer's resolution of anchors
-// (CaptureMarkers) with the public CommandMarks; for titles, the public title and icon after each OSC 23 pop.
+// column), and behave afterwards as the original's. The oracle for marks is an HWT1 frame's markers with the public
+// CommandMarks; for titles, the public title and icon after each OSC 23 pop. Ticket 22: a viewer's reads leave the
+// marks where the model put them.
 public partial class DiagnosticModelRestoreTests
 {
     [TestMethod]
@@ -59,40 +60,69 @@ public partial class DiagnosticModelRestoreTests
             Assert.IsTrue(state.CommandMarks.Any(m => m.Phase == "finished" && m.ExitCode is null), "fixture: no finished mark without an exit code");
     }
 
-    // The probe's scenarios (evidence P1) under each strategy: every later step leaves both models with the same
-    // projection (marks' positions included) and the same viewer marks, replayed to each step on a fresh pair
-    // because the viewer's resolution moves and collects anchors.
+    // The probe's scenarios (evidence P1) under each strategy: at the start and after every later step both models
+    // have the same projection (marks' positions included) and the viewer reports the same marks in each. Reading the
+    // viewer's marks moves none (ticket 22), so both models are read at every step.
     [TestMethod]
     [DynamicData(nameof(MarkScenariosAndStrategies))]
     public void ModelRestore_CommandMarksBehaveAsTheOriginal(string scenario, string strategy)
     {
         var shape = MarkScenarios[scenario];
         var (original, replica) = RestoredPair(shape, strategy);
+        Assert.AreEqual(ViewerMarks(original), ViewerMarks(replica), $"{scenario} {strategy} start: the viewer's marks");
         foreach (var (name, input) in shape.Steps)
         {
             ApplyStep(original, input);
             ApplyStep(replica, input);
             var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
             Assert.IsEmpty(differences, $"{scenario} {strategy} {name}: " + string.Join("; ", differences.Take(4)));
+            Assert.AreEqual(ViewerMarks(original), ViewerMarks(replica), $"{scenario} {strategy} {name}: the viewer's marks");
         }
+    }
 
-        for (var upTo = 0; upTo <= shape.Steps.Count; upTo++)
+    // Ticket 22: a viewer on the original only. At the start and after every later step, an HMP1 capture, a jump to
+    // each mark and an HWT1 frame leave the original's state as it was, and its marks stay the headless replica's
+    // through later output, resizes and eviction. In the trailing scenarios the viewer reports a mark at a soft-wrapped
+    // row's end on the next row while the model keeps it where output left it.
+    [TestMethod]
+    [DynamicData(nameof(MarkScenariosAndStrategies))]
+    public void ModelRestore_ObservedOriginalKeepsTheReplicasMarks(string scenario, string strategy)
+    {
+        var shape = MarkScenarios[scenario];
+        var (original, replica) = RestoredPair(shape, strategy);
+        var view = new Hwt1ViewState();
+        var requestId = 0L;
+        var reportedOnTheNextRow = false;
+        for (var step = 0; step <= shape.Steps.Count; step++)
         {
-            var (a, b) = RestoredPair(shape, strategy);
-            foreach (var (_, input) in shape.Steps.Take(upTo))
+            var at = $"{scenario} {strategy} {(step == 0 ? "start" : shape.Steps[step - 1].Name)}";
+            if (step > 0)
             {
-                ApplyStep(a, input);
-                ApplyStep(b, input);
+                ApplyStep(original, shape.Steps[step - 1].Input);
+                ApplyStep(replica, shape.Steps[step - 1].Input);
             }
-            Assert.AreEqual(ViewerMarks(a), ViewerMarks(b), $"{scenario} {strategy}: the viewer's marks after {upTo} steps");
+            var state = original.CaptureModelState();
+            var before = Json(state);
+            var markers = ObserveMarks(original, view, shape.Capacity, ref requestId, at, read =>
+            {
+                var changed = JsonDifferences(before, Json(original.CaptureModelState()));
+                Assert.IsEmpty(changed, $"{at}: the {read} changed the original's state: " + string.Join("; ", changed.Take(4)));
+            });
+            var differences = JsonDifferences(Json(original.CaptureModelState()), Json(replica.CaptureModelState()));
+            Assert.IsEmpty(differences, $"{at}: the observed original and the headless replica differ: " + string.Join("; ", differences.Take(4)));
+            var positions = state.CommandMarks.ToDictionary(m => m.Anchor);
+            reportedOnTheNextRow |= markers.Any(m => positions.TryGetValue(m.Id, out var mark) && mark.Row is int row && mark.Column > 0
+                && (m.Row, m.Column) == (row + 1, 0));
         }
+        if (scenario.EndsWith(" trailing", StringComparison.Ordinal))
+            Assert.IsTrue(reportedOnTheNextRow, $"fixture: {scenario} {strategy} has no mark the viewer reports on the next row");
     }
 
     [TestMethod]
     public void ModelRestore_ProjectionLeavesMarksUnchanged()
     {
         // Twin originals; one is projected before every step. A projection that moved an anchor (a DECLRMM trailing
-        // mark, which the viewer would resolve onto the next row) changes when the mark is lost.
+        // mark, which the viewer reports on the next row) changes when the mark is lost.
         var shape = MarkScenarios["declrmm trailing"];
         var projected = MarkModel(shape, "ghostty");
         var untouched = MarkModel(shape, "ghostty");
@@ -112,7 +142,8 @@ public partial class DiagnosticModelRestoreTests
     [TestMethod]
     public void ModelRestore_ExpiredMarkRestoredExpired()
     {
-        // A viewer's resolution can null an anchor between applications; the mark stays until the next collection.
+        // A recorded mark without a position: its anchor lost its row and awaits collection (before ticket 22 a viewer's
+        // read could leave one between applications, so recorded cases may hold it). It stays until the next collection.
         var shape = MarkScenarios["screen and history"];
         var original = MarkModel(shape, "none");
         original.ApplyRecordedOutput(Encoding.UTF8.GetBytes(shape.Before));
@@ -681,9 +712,9 @@ public partial class DiagnosticModelRestoreTests
     }
 
     // Scenarios: the probe's (evidence.md P1), with the strengthened fixtures.
-    private sealed record MarkScenario(int Width, int Height, int Capacity, string Before, List<(string Name, string Input)> Steps, string[] Regions);
+    internal sealed record MarkScenario(int Width, int Height, int Capacity, string Before, List<(string Name, string Input)> Steps, string[] Regions);
 
-    private static readonly Dictionary<string, MarkScenario> MarkScenarios = new()
+    internal static readonly Dictionary<string, MarkScenario> MarkScenarios = new()
     {
         // Early marks are evicted before the start (gapped ids); the first step scrolls one row.
         ["screen and history"] = new(40, 8, 12, MarkPrompts(1, 3) + MarkLines(12) + MarkPrompts(4, 6) + "\u001b]133;D\u0007",
@@ -705,6 +736,12 @@ public partial class DiagnosticModelRestoreTests
         // A wide glyph before a mark: the anchor's column is the owning glyph's.
         ["wide glyph"] = new(20, 6, 20, "漢漢\u001b]133;A\u0007$ 漢\r\n" + MarkPrompt(2, 0),
             [("shrink", "RESIZE 9 6"), ("grow", "RESIZE 30 6"), ("evict", MarkLines(30))], ["main-screen"]),
+        // Issue 22's input without margins: after the reverse index the finished mark sits at the soft-wrapped first
+        // row's end (0,20), which the viewer reports at (1,0); a resize and eviction follow.
+        ["reverse index trailing"] = new(20, 6, 4, "\r" + new string('p', 20) + "\u001b]133;B\u0007q",
+            [("prompt", "\r" + new string('p', 20) + "\u001b]133;A\u0007"), ("reverse index", "\u001bM"), ("finish", "\u001b]133;D;1\u0007"),
+             ("shrink", "RESIZE 12 6"), ("evict", MarkLines(10))],
+            ["main-screen"]),
     };
 
     public static IEnumerable<object[]> MarkScenarioNames() => MarkScenarios.Keys.Select(k => new object[] { k });
@@ -755,19 +792,41 @@ public partial class DiagnosticModelRestoreTests
         terminal.ApplyRecordedOutput(Encoding.UTF8.GetBytes(input));
     }
 
-    // The viewer's markers (buffer, resolved row, column, phase, exit) and the public marks, read through a path
-    // independent of the projection. It resolves and collects anchors, so call it only at a comparison's end.
+    // The viewer's markers (buffer, resolved row, column, phase, exit) from an HWT1 frame, and the public marks: a path
+    // independent of the projection.
     private static string ViewerMarks(Hex1bTerminal terminal)
     {
-        var buffer = typeof(Hex1bTerminal).GetMethod("GetTextBuffer", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(terminal, null)!;
-        var markers = (Array)typeof(Hex1bTerminal).GetMethod("CaptureMarkers", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .Invoke(terminal, [new Hwt1ViewState(), buffer])!;
+        Assert.IsTrue(terminal.TryCaptureBrowserSnapshot(new Hwt1ViewState(), out var snapshot, out var history, out _, out _), "no HWT1 frame");
+        snapshot.Dispose();
         var builder = new StringBuilder();
-        foreach (var marker in markers)
+        foreach (var marker in history.Markers)
             builder.Append(marker).Append('|');
         foreach (var mark in terminal.CommandMarks)
             builder.Append($"{mark.Phase}/{mark.ExitCode}/{mark.RawParameters}|");
         return builder.ToString();
+    }
+
+    // What a viewer attached to the terminal reads at a boundary, through the consumers' own seams: an HMP1 capture of
+    // history and command marks, a jump to every retained command mark (it succeeds where the mark's buffer is active
+    // and its row retained), then an HWT1 frame, whose markers it returns. `read` is called after each.
+    internal static Hwt1Marker[] ObserveMarks(Hex1bTerminal terminal, Hwt1ViewState view, int historyRows, ref long requestId,
+        string what, Action<string> read)
+    {
+        var state = terminal.CaptureModelState();
+        terminal.CaptureHmp1Snapshot(historyRows, includeCommandMarks: true, out _, out _).Dispose();
+        read("HMP1 capture");
+        foreach (var mark in state.CommandMarks)
+        {
+            using var jump = JsonDocument.Parse(JsonSerializer.Serialize(new { type = "marker", action = "jump", requestId = ++requestId, id = mark.Anchor }));
+            terminal.HandleBrowserHistoryMessage(view, jump.RootElement);
+            Assert.AreEqual(mark.Buffer == state.ActiveBuffer && mark.Row is not null, view.MarkerResult!.Success,
+                $"{what}: the jump to {mark.Anchor} ({view.MarkerResult?.Error})");
+        }
+        read("marker jump");
+        Assert.IsTrue(terminal.TryCaptureBrowserSnapshot(view, out var snapshot, out var history, out _, out _), $"{what}: no HWT1 frame");
+        snapshot.Dispose();
+        read("HWT1 frame");
+        return history.Markers;
     }
 
     private static bool InRegion(DiagnosticModelState state, string region)
