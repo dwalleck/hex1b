@@ -36,6 +36,13 @@ internal static class FreshModelCheckpoint
             };
         }
 
+        if (unsupported is null)
+        {
+            var raw = System.Text.Json.JsonSerializer.SerializeToNode(configuration, DiagnosticsJsonContext.Default.DiagnosticCaseModelConfiguration)!.AsObject();
+            if (CaseConfiguration.RebuildProblem(raw, configuration) is { } configurationProblem)
+                unsupported = $"configuration: {configurationProblem}";
+        }
+
         if (unsupported is not null)
         {
             return new DiagnosticCaseCheckpoint

@@ -115,6 +115,47 @@ public partial class DiagnosticCaseTests
         Assert.AreEqual(DiagnosticOutcome.Unavailable, Reapply(path, label: "stop").Outcome, "an unsupported start re-applied");
     }
 
+    [TestMethod]
+    [DataRow(false, "scrollbackCapacity")]
+    [DataRow(true, "reflowStrategy")]
+    public async Task ConstructionStart_UnrebuildableConfigurationIsUnsupportedAndStillRecords(bool customReflow, string field)
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        var presentation = new HeadlessPresentationAdapter(40, 10);
+        if (customReflow)
+            presentation.WithReflowStrategy(new CustomReflow(), enabled: true);
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithPresentation(presentation)
+            .WithDimensions(40, 10).WithScrollback(customReflow ? 100 : 1_000_001)
+            .WithDiagnosticCase(new DiagnosticCaseStartRequest
+            {
+                Directory = root.Path,
+                Authorizations = [DiagnosticAuthorization.ReapplicationData],
+            }).Build();
+        var diagnostics = new TerminalDiagnostics(terminal);
+        var armed = diagnostics.GetCaseStatus();
+        await workload.WriteAndWaitAsync(terminal, "recorded after unsupported start");
+        var stopped = await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+        Assert.AreEqual(DiagnosticOutcome.Captured, stopped.Outcome, stopped.Problem?.Message);
+        var artifact = Artifact.Read(stopped.Path!);
+        Assert.AreEqual("construction", artifact.Manifest.GetProperty("startPath").GetString());
+        Assert.IsTrue(artifact.Manifest.GetProperty("fresh").GetBoolean());
+        var checkpoint = artifact.Manifest.GetProperty("checkpoint");
+        Assert.AreEqual(("fresh-model/1", "unsupported"),
+            (checkpoint.GetProperty("profile").GetString(), checkpoint.GetProperty("status").GetString()));
+        Assert.AreEqual(DiagnosticCaseCheckpointStatus.Unsupported, armed.Checkpoint!.Status);
+        StringAssert.StartsWith(checkpoint.GetProperty("reason").GetString(), "configuration: ");
+        StringAssert.Contains(checkpoint.GetProperty("reason").GetString(), field);
+        Assert.AreEqual(armed.Checkpoint.Reason, checkpoint.GetProperty("reason").GetString());
+        Assert.AreEqual(0, checkpoint.GetProperty("coveredSurfaces").GetArrayLength());
+        var application = artifact.ModelEvents().Single(e => e.GetProperty("kind").GetString() == "application");
+        Assert.AreEqual(1L, application.GetProperty("modelSequence").GetInt64());
+        Assert.AreEqual("recorded after unsupported start", Encoding.UTF8.GetString(Convert.FromBase64String(application.GetProperty("data").GetString()!)));
+        Assert.AreEqual("requested", artifact.Completion!.Value.GetProperty("stopReason").GetString());
+        Assert.AreEqual(DiagnosticOutcome.Unavailable, Reapply(stopped.Path!, label: "stop").Outcome);
+        Assert.IsFalse(Directory.Exists(Path.Combine(stopped.Path!, "reapplications")));
+    }
+
     // A reflow strategy this build cannot name (recorded as custom:), delegating to Ghostty's.
     private sealed class CustomReflow : Hex1b.Reflow.ITerminalReflowProvider
     {

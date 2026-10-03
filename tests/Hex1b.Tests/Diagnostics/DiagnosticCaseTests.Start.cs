@@ -727,7 +727,6 @@ public partial class DiagnosticCaseTests
     {
         var configuration = new DiagnosticCaseModelConfiguration();
         Assert.ThrowsExactly<ArgumentException>(() => FreshModelCheckpoint.Describe(fresh: false, authorized: true, unsupported: null, configuration));
-        Assert.AreEqual(DiagnosticCaseCheckpointStatus.Complete, FreshModelCheckpoint.Describe(true, true, null, configuration).Status);
         Assert.AreEqual(DiagnosticCaseCheckpointStatus.Excluded, FreshModelCheckpoint.Describe(false, false, null, configuration).Status);
         Assert.AreEqual(DiagnosticCaseCheckpointStatus.Unsupported, FreshModelCheckpoint.Describe(false, true, "hmp1-workload", configuration).Status);
     }

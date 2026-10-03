@@ -304,9 +304,12 @@ Start a case in one of two ways:
 
 - **At construction**, before the model's first event: `Hex1bTerminalBuilder.WithDiagnosticCase`,
   `hex1b terminal start --record-case`, or `recordCase` on the MCP `start_bash_terminal` /
-  `start_pwsh_terminal` tools. The case is armed before the terminal's pumps read any output. The
-  case's checkpoint (`fresh-model/1`) is then the complete fresh model, and the recorded bytes
-  re-apply from model sequence 0.
+  `start_pwsh_terminal` tools. The case is armed before the terminal's pumps read any output. With
+  `reapplication-data` and a supported workload, its checkpoint (`fresh-model/1`) is complete only
+  when the recorded configuration can be rebuilt; the recorded bytes then re-apply from model
+  sequence 0. A configuration the reapplier cannot rebuild (for example, scrollback above
+  1,000,000 or a custom reflow strategy) makes the checkpoint `unsupported` with a
+  `configuration: …` reason. The case still records.
 - **On a running target**: `hex1b capture case start <id>`, the MCP tool `start_diagnostic_case`,
   or the socket method `case-start`. With `reapplication-data`, a model that has already applied
   output is projected at the arming, in the same hold of the model lock. The case owns a
