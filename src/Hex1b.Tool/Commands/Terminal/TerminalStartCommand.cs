@@ -120,31 +120,7 @@ internal sealed class TerminalStartCommand : BaseCommand
 
         var hostArgs = HostArguments(width, height, cwd, record, port, bind, scrollback, caseRequest, command);
 
-        // Find our own executable
-        var selfExe = Environment.ProcessPath ?? "dotnet";
-        var isSelfContained = !string.IsNullOrEmpty(Environment.ProcessPath) &&
-                              !Environment.ProcessPath.EndsWith("dotnet", StringComparison.OrdinalIgnoreCase);
-
-        var psi = new ProcessStartInfo
-        {
-            FileName = isSelfContained ? selfExe : "dotnet",
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true
-        };
-
-        if (!isSelfContained)
-        {
-            // Running via `dotnet run` or `dotnet hex1b` — need to pass the DLL
-            var assemblyLocation = typeof(TerminalStartCommand).Assembly.Location;
-            psi.ArgumentList.Add(assemblyLocation);
-        }
-
-        foreach (var arg in hostArgs)
-        {
-            psi.ArgumentList.Add(arg);
-        }
+        var psi = HostStartInfo(Environment.ProcessPath, hostArgs);
 
         Logger.LogDebug("Spawning host: {FileName} {Args}", psi.FileName, string.Join(" ", psi.ArgumentList));
 
@@ -249,6 +225,38 @@ internal sealed class TerminalStartCommand : BaseCommand
         Formatter.WriteError("Timeout waiting for host process to start");
         try { process.Kill(); } catch { /* best effort */ }
         return 1;
+    }
+
+    internal static ProcessStartInfo HostStartInfo(string? processPath, IEnumerable<string> hostArgs)
+    {
+        // Reuse the current host, including private SDK installations outside PATH.
+        var selfExe = string.IsNullOrEmpty(processPath) ? "dotnet" : processPath;
+        var executableName = Path.GetFileName(selfExe);
+        var isDotnetHost = executableName.Equals("dotnet", StringComparison.OrdinalIgnoreCase) ||
+                           executableName.Equals("dotnet.exe", StringComparison.OrdinalIgnoreCase);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = selfExe,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        if (isDotnetHost)
+        {
+            // Framework-dependent launch: the host needs the Tool assembly before its arguments.
+            var assemblyLocation = typeof(TerminalStartCommand).Assembly.Location;
+            psi.ArgumentList.Add(assemblyLocation);
+        }
+
+        foreach (var arg in hostArgs)
+        {
+            psi.ArgumentList.Add(arg);
+        }
+
+        return psi;
     }
 
     /// <summary>

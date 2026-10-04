@@ -264,7 +264,7 @@ internal sealed class WindowsPtyHandle : IPtyHandle
                 foreach (var arg in arguments)
                 {
                     cmdLine.Append(' ');
-                    if (arg.Contains(' ') || arg.Contains('"'))
+                    if (arg.Length == 0 || arg.Contains(' ') || arg.Contains('"'))
                     {
                         cmdLine.Append('"').Append(arg.Replace("\"", "\\\"")).Append('"');
                     }
