@@ -46,24 +46,24 @@ public sealed class ConsolePresentationAdapter :
 
     // DSR 6 (Cursor Position Report). Plain CPR is the only cursor query Ghostty
     // implements (ghostty src/terminal/device_status.zig registers cursor_position
-    // with question=false), and Windows conhost/ConPTY documents only this form —
-    // it additionally answers out of band through TryGetCursorPosition, so no DSR is
-    // sent there at all. DECXCPR (CSI ?6n) is therefore not usable: on Ghostty it is
-    // silently ignored, which would turn every observation into a timeout.
-    // XTVERSION is queried in the same startup read pass as the other
-    // capabilities. There is one stdin owner: after this probe completes,
-    // normal input and cursor observations use the existing reader.
+    // with question=false), and it is the shared runtime path on every platform.
+    // DECXCPR (CSI ?6n) is therefore not usable: on Ghostty it is silently ignored,
+    // which would turn every observation into a timeout.
+    // XTVERSION is queried in the same startup read pass as the other capabilities.
+    // There is one stdin owner: after this probe completes, normal input and cursor
+    // observations use the existing reader.
     private static readonly byte[] XtVersionProbeQuery = Encoding.ASCII.GetBytes("\x1b[>0q");
     private static readonly byte[] CursorPositionQuery = Encoding.ASCII.GetBytes("\x1b[6n");
 
-    // How long the reader waits for a reply once it has written the query.
+    // How long the reader waits for a reply once it has written and flushed the query.
     private static readonly TimeSpan CursorPositionReplyTimeout = TimeSpan.FromMilliseconds(150);
 
-    // How long the caller waits for the reader to finish a request. Deliberately
-    // longer than the reply timeout so the reader's own outcome wins the race when
-    // the reader is running at all; if no reader ever services the request (for
-    // example the terminal has not started), the observation fails deterministically
-    // with null rather than hanging.
+    // How long the caller waits for the whole observation: queueing, reader wake,
+    // query write/flush, and the post-write reply. This is deliberately longer than
+    // the reply timeout, but the reply timer starts only after the query is written,
+    // so the reader's outcome is not guaranteed to win this overall watchdog race.
+    // If no reader ever services the request (for example the terminal has not
+    // started), the observation still fails deterministically with null.
     private static readonly TimeSpan CursorObservationTimeout = TimeSpan.FromMilliseconds(250);
 
     // Upper bound on bytes accepted while a reply is pending, so a paste arriving
@@ -81,6 +81,7 @@ public sealed class ConsolePresentationAdapter :
     private readonly bool _enableMouse;
     private readonly bool _preserveOPost;
     private readonly TimeSpan _kgpProbeTimeout;
+    private readonly TimeProvider _timeProvider;
     private readonly CancellationTokenSource _disposeCts = new();
     private ITerminalReflowProvider _reflowStrategy;
     private TerminalCapabilities _capabilities;
@@ -93,10 +94,12 @@ public sealed class ConsolePresentationAdapter :
 
     // Cursor-observation request plumbing. All of these are guarded by
     // _cursorObservationSync. The gate task serializes overlapping callers; the
-    // pending request is picked up by the input reader on its next pass; the wake
-    // source cancels a reader parked in a blocking read so it notices promptly.
+    // pending request is claimed by the input reader, which owns the gate through
+    // the complete service/finally path; the wake source cancels a reader parked
+    // in a blocking read so it notices promptly.
     private readonly object _cursorObservationSync = new();
     private CursorObservationRequest? _pendingCursorObservation;
+    private CursorObservationRequest? _activeCursorObservation;
     private CancellationTokenSource? _activeReadWakeCts;
     private Task _cursorObservationGate = Task.CompletedTask;
 
@@ -137,12 +140,14 @@ public sealed class ConsolePresentationAdapter :
         IConsoleDriver driver,
         bool enableMouse = false,
         bool preserveOPost = false,
-        TimeSpan? kgpProbeTimeout = null)
+        TimeSpan? kgpProbeTimeout = null,
+        TimeProvider? timeProvider = null)
     {
         _driver = driver ?? throw new ArgumentNullException(nameof(driver));
         _enableMouse = enableMouse;
         _preserveOPost = preserveOPost;
         _kgpProbeTimeout = kgpProbeTimeout ?? DefaultKgpProbeTimeout;
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _capabilities = CreateCapabilities(supportsKgp: false);
 
         // Wire up resize events. A resize invalidates only derived cell metrics
@@ -478,7 +483,15 @@ public sealed class ConsolePresentationAdapter :
                 var observation = TakePendingCursorObservation();
                 if (observation is not null)
                 {
-                    await ServiceCursorPositionObservationAsync(observation, linkedCts.Token).ConfigureAwait(false);
+                    try
+                    {
+                        await ServiceCursorPositionObservationAsync(
+                            observation, linkedCts.Token).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        CompleteCursorObservationService(observation);
+                    }
 
                     // Never return empty for a query-only iteration: the terminal
                     // treats an empty read as EOF and stops the presentation reader.
@@ -604,16 +617,37 @@ public sealed class ConsolePresentationAdapter :
         {
             var request = _pendingCursorObservation;
             _pendingCursorObservation = null;
+            if (request is not null)
+            {
+                _activeCursorObservation = request;
+            }
+
             return request;
         }
     }
 
+    private void CompleteCursorObservationService(CursorObservationRequest request)
+    {
+        lock (_cursorObservationSync)
+        {
+            if (!ReferenceEquals(_activeCursorObservation, request))
+            {
+                return;
+            }
+
+            _activeCursorObservation = null;
+        }
+
+        request.ReleaseGate();
+    }
+
     /// <summary>
-    /// Writes the cursor-position query and reads the reply on the input reader,
-    /// bounded by <see cref="CursorPositionReplyTimeout"/>. Any byte that is not an
-    /// accepted report — including text typed during the window, a partial sequence,
-    /// and an ambiguous modified-F3-shaped sequence — is preserved and re-delivered
-    /// through the normal input path.
+    /// Writes the cursor-position query and reads the reply on the input reader.
+    /// The capability-probe wait and the post-write reply deadline are each bounded
+    /// by <see cref="CursorPositionReplyTimeout"/>. Any byte that is not an accepted
+    /// report — including text typed during the window, a partial sequence, and an
+    /// ambiguous modified-F3-shaped sequence — is preserved and re-delivered through
+    /// the normal input path.
     /// </summary>
     private async ValueTask ServiceCursorPositionObservationAsync(
         CursorObservationRequest request,
@@ -627,11 +661,6 @@ public sealed class ConsolePresentationAdapter :
         var buffered = new List<byte>();
         var readBuffer = new byte[64];
 
-        // The caller already linked its token to the adapter's disposal, so link only
-        // to that: touching _disposeCts here could race its disposal during shutdown.
-        using var replyCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        replyCts.CancelAfter(CursorPositionReplyTimeout);
-
         try
         {
             if (_disposed || ct.IsCancellationRequested)
@@ -640,12 +669,20 @@ public sealed class ConsolePresentationAdapter :
             }
 
             // Never issue the query while the capability probe may still be reading
-            // the driver: the two would race for the reply on the same fd. Bounded by
-            // the reply deadline above, so it fails as an unobserved position rather
-            // than stalling.
+            // the driver: the two would race for the reply on the same fd. Keep this
+            // bounded wait separate from the reply deadline, which starts only after
+            // the query write and flush complete.
             if (_inRawMode)
             {
-                await _probeReadCompleted.Task.WaitAsync(replyCts.Token).ConfigureAwait(false);
+                try
+                {
+                    await _probeReadCompleted.Task.WaitAsync(
+                        CursorPositionReplyTimeout, _timeProvider, ct).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    return;
+                }
             }
 
             // Written straight to the driver, not through the workload output path:
@@ -657,6 +694,15 @@ public sealed class ConsolePresentationAdapter :
                 _driver.Write(CursorPositionQuery);
                 _driver.Flush();
             }
+
+            // The reply deadline begins once the query is fully written and flushed.
+            // This leaves the caller's longer watchdog to cover query-write latency.
+            // Declare the registration after the CTS so disposal unregisters the
+            // callback before disposing the CTS it targets.
+            using var replyCts =
+                new CancellationTokenSource(CursorPositionReplyTimeout, _timeProvider);
+            using var cancellationRegistration = ct.UnsafeRegister(
+                static state => ((CancellationTokenSource)state!).Cancel(), replyCts);
 
             while (!replyCts.IsCancellationRequested)
             {
@@ -792,9 +838,8 @@ public sealed class ConsolePresentationAdapter :
         reportRow == 1 && reportColumn is >= 2 and <= 16;
 
     /// <summary>
-    /// Observes the attached terminal's cursor position. Prefers an out-of-band
-    /// platform query (Windows) and otherwise asks the input reader to issue and
-    /// filter a DSR reply.
+    /// Observes the attached terminal's cursor position through the serialized input
+    /// reader, which issues and filters a plain DSR/CPR reply.
     /// </summary>
     async Task<(int Column, int Row)?> ICursorPositionSource.ObserveCursorPositionAsync(
         CancellationToken cancellationToken)
@@ -804,13 +849,8 @@ public sealed class ConsolePresentationAdapter :
             return null;
         }
 
-        // Out-of-band platforms answer without touching stdin at all.
-        if (_driver.TryGetCursorPosition(out var column, out var row))
-        {
-            return (column, row);
-        }
-
         var gate = await EnterCursorObservationGateAsync(cancellationToken).ConfigureAwait(false);
+        CursorObservationRequest? request = null;
 
         try
         {
@@ -819,19 +859,34 @@ public sealed class ConsolePresentationAdapter :
                 return null;
             }
 
-            var request = new CursorObservationRequest();
+            request = new CursorObservationRequest(gate);
 
-            using var timeoutCts = new CancellationTokenSource(CursorObservationTimeout);
+            using var timeoutCts = new CancellationTokenSource(CursorObservationTimeout, _timeProvider);
             using var timeoutRegistration = timeoutCts.Token.Register(
                 static state => ((CursorObservationRequest)state!).TrySetResult(null), request);
             using var cancellationRegistration = cancellationToken.Register(
                 static state => ((CursorObservationRequest)state!).TrySetCanceled(), request);
 
             CancellationTokenSource? wake;
+            bool posted;
             lock (_cursorObservationSync)
             {
-                _pendingCursorObservation = request;
-                wake = _activeReadWakeCts;
+                if (_disposed)
+                {
+                    wake = null;
+                    posted = false;
+                }
+                else
+                {
+                    _pendingCursorObservation = request;
+                    wake = _activeReadWakeCts;
+                    posted = true;
+                }
+            }
+
+            if (!posted)
+            {
+                return null;
             }
 
             // Nudge a reader parked in a blocking read so it notices the request
@@ -842,19 +897,30 @@ public sealed class ConsolePresentationAdapter :
         }
         finally
         {
+            bool releaseGate;
             lock (_cursorObservationSync)
             {
-                _pendingCursorObservation = null;
+                if (request is not null &&
+                    ReferenceEquals(_pendingCursorObservation, request))
+                {
+                    _pendingCursorObservation = null;
+                }
+
+                releaseGate = request is null ||
+                    !ReferenceEquals(_activeCursorObservation, request);
             }
 
-            gate.TrySetResult();
+            if (releaseGate)
+            {
+                gate.TrySetResult();
+            }
         }
     }
 
     /// <summary>
     /// Serializes observations: one query window is in flight at a time, because the
-    /// reader services exactly one pending request per pass. Returns the gate the
-    /// caller must complete (in a <c>finally</c>).
+    /// reader services exactly one pending request per pass. The reader owns a gate
+    /// after claiming its request; callers only complete gates that never reached it.
     /// </summary>
     private async Task<TaskCompletionSource> EnterCursorObservationGateAsync(CancellationToken cancellationToken)
     {
@@ -874,11 +940,23 @@ public sealed class ConsolePresentationAdapter :
         }
         catch
         {
-            // Never strand the queue: release our own slot even though we never ran,
-            // then surface the failure (cancellation included) to the caller.
-            gate.TrySetResult();
+            // A canceled waiter returns immediately, but its queue slot cannot
+            // complete until its predecessor has released the reader gate.
+            ReleaseCursorObservationGateAfterPredecessor(predecessor, gate);
             throw;
         }
+    }
+
+    private static void ReleaseCursorObservationGateAfterPredecessor(
+        Task predecessor,
+        TaskCompletionSource gate)
+    {
+        predecessor.ContinueWith(
+            static (_, state) => ((TaskCompletionSource)state!).TrySetResult(),
+            gate,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     /// <summary>
@@ -888,8 +966,11 @@ public sealed class ConsolePresentationAdapter :
     /// </summary>
     private sealed class CursorObservationRequest
     {
+        private readonly TaskCompletionSource _gate;
         private readonly TaskCompletionSource<(int Column, int Row)?> _completion =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public CursorObservationRequest(TaskCompletionSource gate) => _gate = gate;
 
         public Task<(int Column, int Row)?> Completion => _completion.Task;
 
@@ -898,6 +979,8 @@ public sealed class ConsolePresentationAdapter :
         public void TrySetResult((int Column, int Row)? position) => _completion.TrySetResult(position);
 
         public void TrySetCanceled() => _completion.TrySetCanceled();
+
+        public void ReleaseGate() => _gate.TrySetResult();
     }
 
     private ReadOnlyMemory<byte> NormalizeInputToUtf8(ReadOnlySpan<byte> input)
@@ -1813,23 +1896,36 @@ public sealed class ConsolePresentationAdapter :
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        if (_disposed) return;
-        _disposed = true;
-        _disposeCts.Cancel();
-
-        // Fail any in-flight cursor observation deterministically, and wake the
-        // reader so shutdown cannot leave it parked in a blocking read.
         CursorObservationRequest? pendingObservation;
+        CursorObservationRequest? activeObservation;
         CancellationTokenSource? activeWake;
         lock (_cursorObservationSync)
         {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
             pendingObservation = _pendingCursorObservation;
             _pendingCursorObservation = null;
+            activeObservation = _activeCursorObservation;
+            _activeCursorObservation = null;
             activeWake = _activeReadWakeCts;
+            _activeReadWakeCts = null;
         }
 
+        _disposeCts.Cancel();
+
+        // Fail any active or still-pending cursor observation deterministically,
+        // release their queue slots, and wake the reader so shutdown cannot leave
+        // it parked in a blocking read. A reader that finishes later releases its
+        // already-cleared active slot idempotently.
         TryCancelWake(activeWake);
+        activeObservation?.TrySetResult(null);
         pendingObservation?.TrySetResult(null);
+        activeObservation?.ReleaseGate();
+        pendingObservation?.ReleaseGate();
 
         Disconnected?.Invoke();
 

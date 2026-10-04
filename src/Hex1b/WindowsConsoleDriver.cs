@@ -105,8 +105,8 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
     
     // Wait constants
     private const uint WAIT_OBJECT_0 = 0;
-    private const uint WAIT_TIMEOUT = 0x00000102;
-    
+    private const uint WAIT_FAILED = 0xFFFFFFFF;
+    private const uint INFINITE = 0xFFFFFFFF;
     private readonly nint _inputHandle;
     private readonly nint _outputHandle;
     private uint _originalInputMode;
@@ -202,22 +202,6 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         return false;
     }
 
-    /// <inheritdoc />
-    public bool TryGetCursorPosition(out int column, out int row)
-    {
-        column = 0;
-        row = 0;
-
-        if (!GetConsoleScreenBufferInfo(_outputHandle, out var info))
-            return false;
-
-        // dwCursorPosition is in buffer coordinates; the visible window origin can
-        // be scrolled away from the buffer origin, so translate into window
-        // coordinates the way GetWindowSize() derives its dimensions.
-        column = info.dwCursorPosition.X - info.srWindow.Left;
-        row = info.dwCursorPosition.Y - info.srWindow.Top;
-        return column >= 0 && row >= 0;
-    }
     
     public void EnterRawMode(bool preserveOPost = false)
     {
@@ -321,84 +305,152 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         }
     }
     
-    public async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+    public ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
     {
         if (!_inRawMode)
         {
             throw new InvalidOperationException("Must enter raw mode before reading");
         }
-        
-        return await Task.Run(() =>
-        {
-            try
-            {
-                while (!ct.IsCancellationRequested)
-                {
-                    // First, drain any pending bytes from previous key events
-                    if (_pendingBytes.Count > 0)
-                    {
-                        return DrainPendingBytes(buffer.Span);
-                    }
-                    
-                    // Wait for input with timeout
-                    var waitResult = WaitForSingleObject(_inputHandle, 100);
-                    
-                    if (waitResult == WAIT_TIMEOUT)
-                    {
-                        continue;
-                    }
-                    
-                    if (waitResult != WAIT_OBJECT_0)
-                    {
-                        throw new InvalidOperationException($"WaitForSingleObject failed: {Marshal.GetLastWin32Error()}");
-                    }
-                    
-                    // Read console input records
-                    var records = new INPUT_RECORD[16];
-                    if (!ReadConsoleInput(_inputHandle, records, (uint)records.Length, out var numRead))
-                    {
-                        throw new InvalidOperationException($"ReadConsoleInput failed: {Marshal.GetLastWin32Error()}");
-                    }
-                    
-                    // Process each record. A single malformed or transiently failing
-                    // record should not permanently kill keyboard input for the session.
-                    for (int i = 0; i < numRead; i++)
-                    {
-                        try
-                        {
-                            ProcessInputRecord(ref records[i]);
-                        }
-                        catch (Exception ex)
-                        {
-                            TraceInput(
-                                $"record-error type=0x{records[i].EventType:X4} error={ex.GetType().Name}: {ex.Message}");
-                        }
-                    }
-                    
-                    // If only a lone ESC (\x1b) remains in the VT input buffer after
-                    // processing the entire batch, it's a standalone Escape keypress —
-                    // not the start of an escape sequence. Flush it now; otherwise it
-                    // would be stuck until the next non-VT key event arrives.
-                    if (_pendingVtInput.Length == 1 && _pendingVtInput[0] == '\x1b')
-                    {
-                        FlushPendingVirtualTerminalInput();
-                    }
 
-                    // Return any bytes that were generated
-                    if (_pendingBytes.Count > 0)
+        return new ValueTask<int>(Task.Run(() => ReadCore(buffer, ct), ct));
+    }
+
+    private unsafe int ReadCore(Memory<byte> buffer, CancellationToken ct)
+    {
+        var records = stackalloc INPUT_RECORD[16];
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                // First, drain any pending bytes from previous key events.
+                if (_pendingBytes.Count > 0)
+                {
+                    return DrainPendingBytes(buffer.Span);
+                }
+
+                // A cancellable read waits on both the console input handle and the
+                // token's wait handle. An ordinary read waits on the console directly.
+                if (!WaitForInputOrCancellation(ct))
+                {
+                    return 0;
+                }
+
+                // Keep the input records on the worker stack. There is one reader,
+                // so no heap-backed batch or synthetic wake record is needed.
+                if (!ReadConsoleInput(_inputHandle, records, 16, out var numRead))
+                {
+                    throw new InvalidOperationException(
+                        $"ReadConsoleInput failed: {Marshal.GetLastWin32Error()}");
+                }
+
+                // Process each record. A single malformed or transiently failing
+                // record should not permanently kill keyboard input for the session.
+                for (int i = 0; i < numRead; i++)
+                {
+                    try
                     {
-                        return DrainPendingBytes(buffer.Span);
+                        ProcessInputRecord(ref records[i]);
+                    }
+                    catch (Exception ex)
+                    {
+                        TraceInput(
+                            $"record-error type=0x{records[i].EventType:X4} error={ex.GetType().Name}: {ex.Message}");
                     }
                 }
 
-                return 0;
+                // If only a lone ESC (\x1b) remains in the VT input buffer after
+                // processing the entire batch, it's a standalone Escape keypress —
+                // not the start of an escape sequence. Flush it now; otherwise it
+                // would be stuck until the next non-VT key event arrives.
+                if (_pendingVtInput.Length == 1 && _pendingVtInput[0] == '\x1b')
+                {
+                    FlushPendingVirtualTerminalInput();
+                }
+
+                // Return any bytes that were generated.
+                if (_pendingBytes.Count > 0)
+                {
+                    return DrainPendingBytes(buffer.Span);
+                }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+
+            return 0;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            TraceInput($"read-error {ex.GetType().Name}: {ex.Message}");
+            throw;
+        }
+    }
+
+    private bool WaitForInputOrCancellation(CancellationToken ct)
+    {
+        if (!ct.CanBeCanceled)
+        {
+            var waitResult = WaitForSingleObject(_inputHandle, INFINITE);
+            if (waitResult == WAIT_OBJECT_0)
             {
-                TraceInput($"read-error {ex.GetType().Name}: {ex.Message}");
-                throw;
+                return true;
             }
-        }, ct);
+
+            if (waitResult == WAIT_FAILED)
+            {
+                throw new InvalidOperationException(
+                    $"WaitForSingleObject failed: {Marshal.GetLastWin32Error()}");
+            }
+
+            throw new InvalidOperationException(
+                $"WaitForSingleObject returned unexpected result 0x{waitResult:X8}.");
+        }
+
+        // Keep the managed wait-handle wrapper strongly reachable and hold the
+        // SafeHandle reference across the native wait. The token's wait handle is
+        // owned by CancellationTokenSource; this method must not dispose it.
+        var tokenWaitHandle = ct.WaitHandle;
+        var safeTokenHandle = tokenWaitHandle.SafeWaitHandle;
+        var addRef = false;
+        try
+        {
+            safeTokenHandle.DangerousAddRef(ref addRef);
+            unsafe
+            {
+                var handles = stackalloc nint[2];
+                // Put cancellation first so a simultaneous wake and input event
+                // returns the wake to the adapter; the next pass then preserves and
+                // delivers the already-buffered input.
+                handles[0] = safeTokenHandle.DangerousGetHandle();
+                handles[1] = _inputHandle;
+
+                var waitResult = WaitForMultipleObjects(2, handles, false, INFINITE);
+                if (waitResult == WAIT_OBJECT_0)
+                {
+                    return false;
+                }
+
+                if (waitResult == WAIT_OBJECT_0 + 1)
+                {
+                    return true;
+                }
+
+                if (waitResult == WAIT_FAILED)
+                {
+                    throw new InvalidOperationException(
+                        $"WaitForMultipleObjects failed: {Marshal.GetLastWin32Error()}");
+                }
+
+                throw new InvalidOperationException(
+                    $"WaitForMultipleObjects returned unexpected result 0x{waitResult:X8}.");
+            }
+        }
+        finally
+        {
+            if (addRef)
+            {
+                safeTokenHandle.DangerousRelease();
+            }
+
+            GC.KeepAlive(tokenWaitHandle);
+        }
     }
     
     private int DrainPendingBytes(Span<byte> buffer)
@@ -1004,11 +1056,18 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
     
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint WaitForSingleObject(nint hHandle, uint dwMilliseconds);
-    
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern unsafe uint WaitForMultipleObjects(
+        uint nCount,
+        nint* lpHandles,
+        bool bWaitAll,
+        uint dwMilliseconds);
+
     [DllImport("kernel32.dll", EntryPoint = "ReadConsoleInputW", SetLastError = true)]
-    private static extern bool ReadConsoleInput(
+    private static extern unsafe bool ReadConsoleInput(
         nint hConsoleInput,
-        [Out] INPUT_RECORD[] lpBuffer,
+        INPUT_RECORD* lpBuffer,
         uint nLength,
         out uint lpNumberOfEventsRead);
     

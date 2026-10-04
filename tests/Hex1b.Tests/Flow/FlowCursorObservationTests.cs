@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Time.Testing;
 using Hex1b;
 using Hex1b.Diagnostics;
 using Hex1b.Flow;
@@ -86,6 +87,212 @@ public class FlowCursorObservationTests
         Assert.AreEqual("tx", Encoding.UTF8.GetString(input.Span),
             "Typed text around a fragmented report must be delivered in order, once.");
     }
+
+    [TestMethod]
+    public async Task ObserveCursorPositionAsync_QueryWriteAndReplyWithinSeparateDeadlines_AcceptsReplyAndPreservesInterleavedInput()
+    {
+        var clock = new FakeTimeProvider();
+        using var driver = new ScriptedConsoleDriver
+        {
+            Clock = clock,
+            CursorQueryWriteDuration = TimeSpan.FromMilliseconds(100)
+        };
+        await using var adapter = new ConsolePresentationAdapter(driver, timeProvider: clock);
+        var ct = TestContext.Current.CancellationToken;
+        var source = (ICursorPositionSource)adapter;
+        var reader = Task.Run(async () => await adapter.ReadInputAsync(ct), ct);
+        var observationStarted = clock.GetTimestamp();
+        var observation = source.ObserveCursorPositionAsync(ct);
+
+        // The fake advances 100 ms while the adapter writes the query and only
+        // completes this gate after Flush, proving the request crossed both calls.
+        await driver.CursorQueryFlushed.Task.WaitAsync(ct);
+        // This second gate is reached only after the adapter creates the reply CTS
+        // and enters the actual driver read, so advancing virtual time cannot race
+        // deadline construction.
+        await driver.CursorReplyReadEntered.Task.WaitAsync(ct);
+        Assert.Contains("\x1b[6n", driver.WrittenText);
+        Assert.AreEqual(TimeSpan.FromMilliseconds(100), clock.GetElapsedTime(observationStarted));
+
+        // The reply arrives 100 ms after the completed write: 200 ms total is inside
+        // the caller's 250 ms watchdog, while the reply itself is inside its 150 ms
+        // post-write deadline. Text on both sides must remain ordinary input.
+        var replyStarted = clock.GetTimestamp();
+        clock.Advance(TimeSpan.FromMilliseconds(100));
+        driver.Enqueue("before");
+        driver.Enqueue("\x1b[12;5Rafter");
+
+        var position = await observation.WaitAsync(ct);
+        Assert.IsTrue(position.HasValue, "The CPR must be accepted within both budgets.");
+        var decoded = position.GetValueOrDefault();
+        Assert.AreEqual(4, decoded.Column);
+        Assert.AreEqual(11, decoded.Row);
+        Assert.AreEqual(TimeSpan.FromMilliseconds(100), clock.GetElapsedTime(replyStarted));
+        Assert.AreEqual(TimeSpan.FromMilliseconds(200), clock.GetElapsedTime(observationStarted));
+
+        var input = await reader.WaitAsync(ct);
+        Assert.AreEqual("beforeafter", Encoding.UTF8.GetString(input.Span),
+            "Interleaved user text must survive CPR filtering in order and exactly once.");
+    }
+
+    [TestMethod]
+    public async Task ObserveCursorPositionAsync_QueuedRequestWaitsForReaderServiceAfterCallerTimeout()
+    {
+        var clock = new FakeTimeProvider();
+        using var driver = new ScriptedConsoleDriver { Clock = clock };
+        driver.CursorQueryWriteDurations.Enqueue(TimeSpan.FromMilliseconds(200));
+        driver.CursorQueryWriteDurations.Enqueue(TimeSpan.FromMilliseconds(100));
+        await using var adapter = new ConsolePresentationAdapter(driver, timeProvider: clock);
+        var ct = TestContext.Current.CancellationToken;
+        var source = (ICursorPositionSource)adapter;
+        var reader = Task.Run(async () => await adapter.ReadInputAsync(ct), ct);
+        var started = clock.GetTimestamp();
+        try
+        {
+            var first = source.ObserveCursorPositionAsync(ct);
+            await driver.CursorQueryFlushed.Task.WaitAsync(ct);
+            await driver.CursorReplyReadEntered.Task.WaitAsync(ct);
+            Assert.AreEqual(TimeSpan.FromMilliseconds(200), clock.GetElapsedTime(started));
+
+            // Queue the second caller while the first reader service is still waiting
+            // for its absent reply. The first caller's 250 ms watchdog fires at t=250,
+            // but the reader service remains the owner of the serialized gate until its
+            // own 150 ms post-write deadline at t=350.
+            var second = source.ObserveCursorPositionAsync(ct);
+            clock.Advance(TimeSpan.FromMilliseconds(50));
+            Assert.IsNull(await first.WaitAsync(ct));
+
+            clock.Advance(TimeSpan.FromMilliseconds(100));
+            await driver.SecondCursorQueryFlushed.Task.WaitAsync(ct);
+            await driver.SecondCursorReplyReadEntered.Task.WaitAsync(ct);
+            Assert.AreEqual(TimeSpan.FromMilliseconds(450), clock.GetElapsedTime(started));
+
+            // The second caller must have been admitted at t=350, not t=250. Its
+            // watchdog therefore remains alive at t=500 while its query is in flight.
+            clock.Advance(TimeSpan.FromMilliseconds(100));
+            driver.Enqueue("before\x1b[12;5Rafter");
+
+            var position = await second.WaitAsync(ct);
+            Assert.IsTrue(position.HasValue, "The queued observation should retain its full caller budget.");
+            Assert.AreEqual((4, 11), position.GetValueOrDefault());
+            Assert.AreEqual(TimeSpan.FromMilliseconds(550), clock.GetElapsedTime(started));
+
+            // Returning the buffered text proves the reader completed the second service
+            // (including its finally) rather than only completing the caller's result TCS.
+            var input = await reader.WaitAsync(ct);
+            Assert.AreEqual("beforeafter", Encoding.UTF8.GetString(input.Span));
+        }
+        finally
+        {
+            await adapter.DisposeAsync();
+            await reader.WaitAsync(WaitTimeout, ct);
+        }
+    }
+
+    [TestMethod]
+    public async Task ObserveCursorPositionAsync_CancelledQueuedRequestPreservesFifoForTail()
+    {
+        var clock = new FakeTimeProvider();
+        using var driver = new ScriptedConsoleDriver
+        {
+            Clock = clock,
+            BlockFirstCursorQueryWrite = true
+        };
+        await using var adapter = new ConsolePresentationAdapter(driver, timeProvider: clock);
+        var ct = TestContext.Current.CancellationToken;
+        var source = (ICursorPositionSource)adapter;
+        var reader = Task.Run(async () => await adapter.ReadInputAsync(ct), ct);
+
+        try
+        {
+            var first = source.ObserveCursorPositionAsync(ct);
+            await driver.CursorQueryWriteEntered.Task.WaitAsync(ct);
+
+            using var secondCancellation = new CancellationTokenSource();
+            var second = source.ObserveCursorPositionAsync(secondCancellation.Token);
+            secondCancellation.Cancel();
+            await Assert.ThrowsAsync<OperationCanceledException>(() => second.WaitAsync(ct));
+
+            // Keep A inside its synchronous query write while B is canceled and C is
+            // queued. A's caller watchdog expires at t=250, but the reader-owned
+            // service gate remains held until the write is released at t=300.
+            var tail = source.ObserveCursorPositionAsync(ct);
+            clock.Advance(TimeSpan.FromMilliseconds(300));
+            Assert.IsNull(await first.WaitAsync(ct));
+
+            driver.CursorQueryWriteRelease.TrySetResult();
+            await driver.CursorQueryFlushed.Task.WaitAsync(ct);
+            await driver.CursorReplyReadEntered.Task.WaitAsync(ct);
+            driver.Enqueue("\x1b[12;5R"); // Complete A's still-active reader service.
+
+            // If canceled B released its slot immediately, C's watchdog began at t=0
+            // and has already returned null. Correct FIFO chaining admits C only after
+            // A's service finishes, so C's own query is the next driver gate.
+            var firstCompleted = await Task.WhenAny(tail, driver.SecondCursorQueryFlushed.Task).WaitAsync(ct);
+            Assert.AreSame(
+                driver.SecondCursorQueryFlushed.Task,
+                firstCompleted,
+                "A canceled waiter must not let its successor bypass the active reader service.");
+            await driver.SecondCursorReplyReadEntered.Task.WaitAsync(ct);
+
+            // C is admitted at t=300 and has the full 250 ms caller budget. Its reply
+            // arrives 100 ms after its query, within the independent 150 ms reply budget.
+            clock.Advance(TimeSpan.FromMilliseconds(100));
+            driver.Enqueue("before\x1b[12;5Rafter");
+            var position = await tail.WaitAsync(ct);
+            Assert.IsTrue(position.HasValue, "The tail observation must receive its own CPR.");
+            Assert.AreEqual((4, 11), position.GetValueOrDefault());
+
+            // The tail's preserved input is delivered only after its reader service
+            // finishes, so this also fences shutdown behind the full service lifetime.
+            var input = await reader.WaitAsync(ct);
+            Assert.AreEqual("beforeafter", Encoding.UTF8.GetString(input.Span));
+        }
+        finally
+        {
+            driver.CursorQueryWriteRelease.TrySetResult();
+            await adapter.DisposeAsync();
+            await reader.WaitAsync(WaitTimeout, ct);
+        }
+    }
+
+    [TestMethod]
+    public async Task ObserveCursorPositionAsync_DisposeCompletesActiveAndQueuedObservations()
+    {
+        var clock = new FakeTimeProvider();
+        using var driver = new ScriptedConsoleDriver
+        {
+            Clock = clock,
+            BlockFirstCursorQueryWrite = true
+        };
+        await using var adapter = new ConsolePresentationAdapter(driver, timeProvider: clock);
+        var ct = TestContext.Current.CancellationToken;
+        var source = (ICursorPositionSource)adapter;
+        var reader = Task.Run(async () => await adapter.ReadInputAsync(ct), ct);
+
+        var active = source.ObserveCursorPositionAsync(ct);
+        await driver.CursorQueryWriteEntered.Task.WaitAsync(ct);
+        var queued = source.ObserveCursorPositionAsync(ct);
+
+        try
+        {
+            // Shutdown must complete both caller tasks without waiting for the
+            // synchronous reader write to return or advancing its watchdog clock.
+            await adapter.DisposeAsync();
+            await Task.WhenAll(active, queued).WaitAsync(WaitTimeout, ct);
+            Assert.IsNull(await active.WaitAsync(ct));
+            Assert.IsNull(await queued.WaitAsync(ct));
+        }
+        finally
+        {
+            // The write is deliberately released only after the shutdown assertion
+            // so the reader can unwind and the test cannot strand a blocked thread.
+            driver.CursorQueryWriteRelease.TrySetResult();
+            await reader.WaitAsync(WaitTimeout, ct);
+        }
+    }
+
+
 
     [TestMethod]
     public async Task ObserveCursorPositionAsync_Native_WhenNoReportArrives_TimesOutNullAndPreservesBufferedInput()
@@ -184,24 +391,6 @@ public class FlowCursorObservationTests
         Assert.IsNull(await observation, "Shutdown must fail a pending observation deterministically.");
     }
 
-    [TestMethod]
-    public async Task ObserveCursorPositionAsync_WhenDriverAnswersOutOfBand_ReturnsPositionWithoutWritingDsrQuery()
-    {
-        using var driver = new ScriptedConsoleDriver { OutOfBandPosition = (4, 7) };
-        await using var adapter = new ConsolePresentationAdapter(driver, kgpProbeTimeout: FastProbeTimeout);
-        var ct = TestContext.Current.CancellationToken;
-        await adapter.EnterRawModeAsync(ct);
-
-        var source = (ICursorPositionSource)adapter;
-        var position = await source.ObserveCursorPositionAsync(ct);
-
-        Assert.IsTrue(position.HasValue, "An out-of-band platform must answer directly.");
-        var decoded = position.GetValueOrDefault();
-        Assert.AreEqual(4, decoded.Column);
-        Assert.AreEqual(7, decoded.Row);
-        Assert.IsFalse(driver.WrittenText.Contains("\x1b[6n", StringComparison.Ordinal),
-            "An out-of-band cursor read must not issue a DSR query.");
-    }
 
     [TestMethod]
     public async Task ObserveCursorPositionAsync_WhenNativeObservationFails_DoesNotFallBackToTerminalModel()
@@ -634,12 +823,43 @@ public class FlowCursorObservationTests
 /// </summary>
 internal sealed class ScriptedConsoleDriver : IConsoleDriver
 {
+    private static readonly byte[] CursorPositionQuery = Encoding.ASCII.GetBytes("\x1b[6n");
     private readonly object _sync = new();
     private readonly Queue<byte[]> _chunks = new();
     private readonly SemaphoreSlim _available = new(0);
     private readonly List<byte> _written = new();
+    private bool _cursorQueryAwaitingFlush;
+    private bool _cursorQueryFlushed;
+    private int _cursorQueryFlushCount;
+    private int _cursorReplyReadCount;
+    private int _cursorQueryWriteCount;
 
-    public (int Column, int Row)? OutOfBandPosition { get; set; }
+    public FakeTimeProvider? Clock { get; init; }
+
+    public TimeSpan CursorQueryWriteDuration { get; init; }
+
+    public Queue<TimeSpan> CursorQueryWriteDurations { get; } = new();
+
+    public bool BlockFirstCursorQueryWrite { get; init; }
+
+    public TaskCompletionSource CursorQueryWriteEntered { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public TaskCompletionSource CursorQueryWriteRelease { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public TaskCompletionSource CursorQueryFlushed { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public TaskCompletionSource SecondCursorQueryFlushed { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public TaskCompletionSource CursorReplyReadEntered { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public TaskCompletionSource SecondCursorReplyReadEntered { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
 
     public string WrittenText
     {
@@ -687,6 +907,29 @@ internal sealed class ScriptedConsoleDriver : IConsoleDriver
 
     public async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
     {
+        int replyReadNumber;
+        lock (_sync)
+        {
+            replyReadNumber = 0;
+            if (_cursorQueryFlushed && _cursorReplyReadCount < _cursorQueryFlushCount)
+            {
+                replyReadNumber = ++_cursorReplyReadCount;
+            }
+        }
+
+        if (replyReadNumber > 0)
+        {
+            switch (replyReadNumber)
+            {
+                case 1:
+                    CursorReplyReadEntered.TrySetResult();
+                    break;
+                case 2:
+                    SecondCursorReplyReadEntered.TrySetResult();
+                    break;
+            }
+        }
+
         while (true)
         {
             lock (_sync)
@@ -720,14 +963,63 @@ internal sealed class ScriptedConsoleDriver : IConsoleDriver
 
     public void Write(ReadOnlySpan<byte> data)
     {
+        var isCursorQuery = data.SequenceEqual(CursorPositionQuery);
+        FakeTimeProvider? clock = null;
+        TimeSpan writeDuration = default;
+        int queryNumber = 0;
         lock (_sync)
         {
             _written.AddRange(data.ToArray());
+            if (isCursorQuery)
+            {
+                queryNumber = ++_cursorQueryWriteCount;
+                _cursorQueryAwaitingFlush = true;
+                clock = Clock;
+                writeDuration = CursorQueryWriteDurations.Count > 0
+                    ? CursorQueryWriteDurations.Dequeue()
+                    : CursorQueryWriteDuration;
+            }
+        }
+
+        if (isCursorQuery && BlockFirstCursorQueryWrite && queryNumber == 1)
+        {
+            CursorQueryWriteEntered.TrySetResult();
+            CursorQueryWriteRelease.Task.GetAwaiter().GetResult();
+        }
+
+        if (isCursorQuery && clock is not null && writeDuration > TimeSpan.Zero)
+        {
+            clock.Advance(writeDuration);
         }
     }
 
     public void Flush()
     {
+        bool queryAwaitingFlush;
+        int queryFlushNumber = 0;
+        lock (_sync)
+        {
+            queryAwaitingFlush = _cursorQueryAwaitingFlush;
+            _cursorQueryAwaitingFlush = false;
+            if (queryAwaitingFlush)
+            {
+                _cursorQueryFlushed = true;
+                queryFlushNumber = ++_cursorQueryFlushCount;
+            }
+        }
+
+        if (queryFlushNumber > 0)
+        {
+            switch (queryFlushNumber)
+            {
+                case 1:
+                    CursorQueryFlushed.TrySetResult();
+                    break;
+                case 2:
+                    SecondCursorQueryFlushed.TrySetResult();
+                    break;
+            }
+        }
     }
 
     public void DrainInput()
@@ -746,20 +1038,6 @@ internal sealed class ScriptedConsoleDriver : IConsoleDriver
     {
         pixelWidth = 0;
         pixelHeight = 0;
-        return false;
-    }
-
-    public bool TryGetCursorPosition(out int column, out int row)
-    {
-        if (OutOfBandPosition is { } position)
-        {
-            column = position.Column;
-            row = position.Row;
-            return true;
-        }
-
-        column = 0;
-        row = 0;
         return false;
     }
 
