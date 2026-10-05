@@ -119,6 +119,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
     
     // Buffer for pending bytes from key events
     private readonly Queue<byte> _pendingBytes = new();
+    private readonly Encoder _inputEncoder = Encoding.UTF8.GetEncoder();
     private readonly StringBuilder _pendingVtInput = new();
     
     // Track previous mouse state for generating proper events
@@ -514,10 +515,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         {
             for (int repeat = 0; repeat < repeatCount; repeat++)
             {
-                foreach (var b in vtSequence)
-                {
-                    _pendingBytes.Enqueue(b);
-                }
+                EnqueueUtf8(Encoding.ASCII.GetString(vtSequence));
             }
             return;
         }
@@ -527,7 +525,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         {
             for (int repeat = 0; repeat < repeatCount; repeat++)
             {
-                _pendingBytes.Enqueue((byte)ch);
+                EnqueueUtf8Char(ch);
             }
             return;
         }
@@ -538,7 +536,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         {
             for (int repeat = 0; repeat < repeatCount; repeat++)
             {
-                _pendingBytes.Enqueue(0x1B); // ESC
+                EnqueueUtf8Char('\x1b'); // ESC
                 EnqueueUtf8Char(ch);
             }
             return;
@@ -574,7 +572,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
 
             _pendingVtInput.Remove(0, sequence.Length);
 
-            if (TryTranslateWin32InputSequence(sequence, out var translated))
+            if (TryTranslateWin32InputSequence(sequence, out var translated, _inputEncoder))
             {
                 foreach (var b in translated)
                 {
@@ -600,29 +598,20 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         _pendingVtInput.Clear();
     }
 
-    private void EnqueueUtf8Char(char value)
-    {
-        Span<byte> utf8 = stackalloc byte[4];
-        var charSpan = new ReadOnlySpan<char>(in value);
-        var len = Encoding.UTF8.GetBytes(charSpan, utf8);
-        for (int i = 0; i < len; i++)
-        {
-            _pendingBytes.Enqueue(utf8[i]);
-        }
-    }
+    private void EnqueueUtf8Char(char value) => EnqueueUtf8(value.ToString());
 
     private void EnqueueUtf8(string text)
     {
-        if (string.IsNullOrEmpty(text))
-        {
-            return;
-        }
+        foreach (var value in EncodeInput(_inputEncoder, text)) _pendingBytes.Enqueue(value);
+    }
 
-        var bytes = Encoding.UTF8.GetBytes(text);
-        foreach (var b in bytes)
-        {
-            _pendingBytes.Enqueue(b);
-        }
+    internal static byte[] EncodeInput(Encoder encoder, string text)
+    {
+        // Windows delivers UTF-16 code units in separate input records. Keep a
+        // trailing high surrogate until its partner (or fallback-triggering input).
+        var bytes = new byte[Encoding.UTF8.GetMaxByteCount(text.Length)];
+        int count = encoder.GetBytes(text.AsSpan(), bytes, flush: false);
+        return bytes[..count];
     }
 
     internal static string? GetPrintableText(ushort vk, char ch, bool hasCtrl, bool hasAlt, bool hasShift)
@@ -671,7 +660,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         };
     }
 
-    internal static bool TryTranslateWin32InputSequence(string sequence, out byte[] bytes)
+    internal static bool TryTranslateWin32InputSequence(string sequence, out byte[] bytes, Encoder? encoder = null)
     {
         bytes = Array.Empty<byte>();
 
@@ -713,17 +702,18 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         var hasAlt = (controlState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) != 0;
         var hasShift = (controlState & SHIFT_PRESSED) != 0;
 
-        var output = new List<byte>(Math.Max(4, repeatCount));
+        var output = new StringBuilder(Math.Max(4, repeatCount));
+        encoder ??= Encoding.UTF8.GetEncoder();
 
         var vtSequence = GetVtSequence(vk, hasCtrl, hasAlt, hasShift);
         if (vtSequence != null)
         {
             for (var repeat = 0; repeat < repeatCount; repeat++)
             {
-                output.AddRange(vtSequence);
+                output.Append(Encoding.ASCII.GetString(vtSequence));
             }
 
-            bytes = output.ToArray();
+            bytes = EncodeInput(encoder, output.ToString());
             return true;
         }
 
@@ -731,10 +721,10 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         {
             for (var repeat = 0; repeat < repeatCount; repeat++)
             {
-                output.Add((byte)unicodeChar);
+                output.Append(unicodeChar);
             }
 
-            bytes = output.ToArray();
+            bytes = EncodeInput(encoder, output.ToString());
             return true;
         }
 
@@ -742,11 +732,11 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         {
             for (var repeat = 0; repeat < repeatCount; repeat++)
             {
-                output.Add(0x1B);
-                output.AddRange(Encoding.UTF8.GetBytes(unicodeChar.ToString()));
+                output.Append('\x1b');
+                output.Append(unicodeChar);
             }
 
-            bytes = output.ToArray();
+            bytes = EncodeInput(encoder, output.ToString());
             return true;
         }
 
@@ -758,10 +748,10 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
 
         for (var repeat = 0; repeat < repeatCount; repeat++)
         {
-            output.AddRange(Encoding.UTF8.GetBytes(text));
+            output.Append(text);
         }
 
-        bytes = output.ToArray();
+        bytes = EncodeInput(encoder, output.ToString());
         return true;
     }
 
@@ -974,6 +964,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         
         _pendingBytes.Clear();
         _pendingVtInput.Clear();
+        _inputEncoder.Reset();
         FlushConsoleInputBuffer(_inputHandle);
     }
 

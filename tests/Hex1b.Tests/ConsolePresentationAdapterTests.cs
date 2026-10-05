@@ -8,6 +8,29 @@ namespace Hex1b.Tests;
 public class ConsolePresentationAdapterTests
 {
     [TestMethod]
+    public void WindowsConsoleDriver_EncodeInput_PreservesSplitSurrogatesAndFallbackOrder()
+    {
+        var encoder = Encoding.UTF8.GetEncoder();
+        CollectionAssert.AreEqual(Array.Empty<byte>(), WindowsConsoleDriver.EncodeInput(encoder, "\ud83d"));
+        CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("👩"), WindowsConsoleDriver.EncodeInput(encoder, "\udc69"));
+        CollectionAssert.AreEqual(Array.Empty<byte>(), WindowsConsoleDriver.EncodeInput(encoder, "\ud83d"));
+        CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("�\rZ"), WindowsConsoleDriver.EncodeInput(encoder, "\rZ"));
+        CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("�"), WindowsConsoleDriver.EncodeInput(encoder, "\udc69"));
+    }
+
+    [TestMethod]
+    public void WindowsConsoleDriver_ForwardedInput_PreservesSplitSurrogates()
+    {
+        var encoder = Encoding.UTF8.GetEncoder();
+        Assert.IsTrue(WindowsConsoleDriver.TryTranslateWin32InputSequence("\x1b[0;0;55357;1;0;1_", out var high, encoder));
+        CollectionAssert.AreEqual(Array.Empty<byte>(), high);
+        Assert.IsTrue(WindowsConsoleDriver.TryTranslateWin32InputSequence("\x1b[0;0;55357;0;0;1_", out var keyUp, encoder));
+        CollectionAssert.AreEqual(Array.Empty<byte>(), keyUp);
+        Assert.IsTrue(WindowsConsoleDriver.TryTranslateWin32InputSequence("\x1b[0;0;56425;1;0;1_", out var low, encoder));
+        CollectionAssert.AreEqual(Encoding.UTF8.GetBytes("👩"), low);
+    }
+
+    [TestMethod]
     [DataRow(0x45, '\0', false, false, false, "e")]
     [DataRow(0x45, '\0', false, false, true, "E")]
     [DataRow(0x31, '\0', false, false, false, "1")]
