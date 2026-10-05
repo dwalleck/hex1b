@@ -1034,8 +1034,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 // Non-text tokens during paste (mouse, special keys) fall through to normal dispatch
             }
             
-            var evt = TokenToEvent(token);
-            if (evt != null)
+            foreach (var evt in TokenToInputEvents(token))
             {
                 await workload.WriteInputEventAsync(evt, ct);
                 
@@ -1051,6 +1050,27 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         }
     }
     
+    private static IEnumerable<Hex1bEvent> TokenToInputEvents(AnsiToken token)
+    {
+        // Output tokenization can batch C0 controls with printable text. Input
+        // controls must remain individual bindings, even when one read holds both.
+        if (token is TextToken text)
+        {
+            int start = 0;
+            for (int i = 0; i < text.Text.Length; i++)
+            {
+                if (text.Text[i] > '\x1f' && text.Text[i] != '\x7f') continue;
+                if (i > start && TextTokenToEvent(new TextToken(text.Text[start..i])) is { } prefix)
+                    yield return prefix;
+                if (ParseKeyInput(text.Text[i]) is { } control) yield return control;
+                start = i + 1;
+            }
+            if (start < text.Text.Length && TextTokenToEvent(new TextToken(text.Text[start..])) is { } suffix)
+                yield return suffix;
+        }
+        else if (TokenToEvent(token) is { } evt) yield return evt;
+    }
+
     /// <summary>
     /// Extracts text content from a token for paste accumulation.
     /// Returns null for non-text tokens (which should be dispatched normally during paste).
@@ -1249,14 +1269,15 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     {
         return token.Character switch
         {
-            '\r' or '\n' => new Hex1bKeyEvent(Hex1bKey.Enter, token.Character, Hex1bModifiers.None),
+            '\r' => new Hex1bKeyEvent(Hex1bKey.Enter, token.Character, Hex1bModifiers.None),
+            '\x1f' => new Hex1bKeyEvent(Hex1bKey.OemMinus, token.Character, Hex1bModifiers.Control),
             '\t' => new Hex1bKeyEvent(Hex1bKey.Tab, token.Character, Hex1bModifiers.None),
             // \b (0x08) and DEL (0x7F) are both treated as Backspace. The \b case also falls
             // inside the Ctrl+A–Z range below, so it must come first.
             '\x7f' or '\b' => new Hex1bKeyEvent(Hex1bKey.Backspace, token.Character, Hex1bModifiers.None),
             // Ctrl+A (\x01) through Ctrl+Z (\x1A): map to Hex1bKey.A–Z with Control modifier so
             // that chord bindings like Ctrl+B can fire. The Enter/Tab/Backspace arms above have
-            // already claimed \x0A, \x0D, \x09, and \x08, so those are never reached here.
+            // already claimed \x0D, \x09, and \x08; \x0A remains Ctrl+J.
             char c when c is >= '\x01' and <= '\x1a' =>
                 new Hex1bKeyEvent((Hex1bKey)((int)Hex1bKey.A + (c - '\x01')), c, Hex1bModifiers.Control),
             _ => null
@@ -7882,7 +7903,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         return c switch
         {
             '\0' => new Hex1bKeyEvent(Hex1bKey.Spacebar, c, Hex1bModifiers.Control), // Ctrl+Space sends NUL
-            '\r' or '\n' => new Hex1bKeyEvent(Hex1bKey.Enter, c, Hex1bModifiers.None),
+            '\r' => new Hex1bKeyEvent(Hex1bKey.Enter, c, Hex1bModifiers.None),
+            '\x1f' => new Hex1bKeyEvent(Hex1bKey.OemMinus, c, Hex1bModifiers.Control), // Legacy Ctrl+_ / Ctrl+-
             '\t' => new Hex1bKeyEvent(Hex1bKey.Tab, c, Hex1bModifiers.None),
             '\x1b' => new Hex1bKeyEvent(Hex1bKey.Escape, c, Hex1bModifiers.None),
             '\x7f' or '\b' => new Hex1bKeyEvent(Hex1bKey.Backspace, c, Hex1bModifiers.None),

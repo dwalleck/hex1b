@@ -1038,6 +1038,64 @@ public class Hex1bTerminalTests
     }
 
     [TestMethod]
+    [DataRow("\n", Hex1bKey.J, Hex1bModifiers.Control)]
+    [DataRow("\x1f", Hex1bKey.OemMinus, Hex1bModifiers.Control)]
+    [DataRow("\x17", Hex1bKey.W, Hex1bModifiers.Control)]
+    [DataRow("\r", Hex1bKey.Enter, Hex1bModifiers.None)]
+    [DataRow("\t", Hex1bKey.Tab, Hex1bModifiers.None)]
+    public async Task PresentationInput_PromptControls_PreserveDistinctBindings(
+        string input, Hex1bKey expectedKey, Hex1bModifiers expectedModifiers)
+    {
+        await using var presentation = new QueuedInputPresentationAdapter();
+        using var workload = new Hex1bAppWorkloadAdapter();
+        await using var terminal = new Hex1bTerminal(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = presentation,
+            WorkloadAdapter = workload,
+            Width = 80,
+            Height = 24
+        });
+        // A printable sentinel makes a dropped control fail by wrong identity,
+        // rather than requiring a timeout as the defect oracle.
+        presentation.EnqueueInput("x" + input + "z");
+        var prefix = TestSeq.IsType<Hex1bKeyEvent>(await workload.InputEvents.ReadAsync(TestContext.Current.CancellationToken)
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+        Assert.AreEqual(Hex1bKey.X, prefix.Key);
+        var first = TestSeq.IsType<Hex1bKeyEvent>(await workload.InputEvents.ReadAsync(TestContext.Current.CancellationToken)
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+        Assert.AreEqual(expectedKey, first.Key);
+        Assert.AreEqual(expectedModifiers, first.Modifiers);
+        var sentinel = TestSeq.IsType<Hex1bKeyEvent>(await workload.InputEvents.ReadAsync(TestContext.Current.CancellationToken)
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+        Assert.AreEqual(Hex1bKey.Z, sentinel.Key);
+        Assert.AreEqual(Hex1bModifiers.None, sentinel.Modifiers);
+        Assert.IsFalse(workload.InputEvents.TryRead(out _));
+    }
+
+    [TestMethod]
+    public async Task PresentationInput_BracketedPaste_PreservesPromptControlBytes()
+    {
+        await using var presentation = new QueuedInputPresentationAdapter();
+        using var workload = new Hex1bAppWorkloadAdapter();
+        await using var terminal = new Hex1bTerminal(new Hex1bTerminalOptions
+        {
+            PresentationAdapter = presentation,
+            WorkloadAdapter = workload,
+            Width = 80,
+            Height = 24
+        });
+        const string text = "before\n\u001f\u0017after";
+        presentation.EnqueueInput("\x1b[200~" + text + "\x1b[201~z");
+        var paste = TestSeq.IsType<Hex1bPasteEvent>(await workload.InputEvents.ReadAsync(TestContext.Current.CancellationToken)
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+        Assert.AreEqual(text, await paste.Paste.ReadToEndAsync(ct: TestContext.Current.CancellationToken));
+        var sentinel = TestSeq.IsType<Hex1bKeyEvent>(await workload.InputEvents.ReadAsync(TestContext.Current.CancellationToken)
+            .AsTask().WaitAsync(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken));
+        Assert.AreEqual(Hex1bKey.Z, sentinel.Key);
+        Assert.IsFalse(workload.InputEvents.TryRead(out _));
+    }
+
+    [TestMethod]
     public async Task PresentationInput_BareEscape_FlushedAfterTimeout()
     {
         await using var presentation = new QueuedInputPresentationAdapter();
