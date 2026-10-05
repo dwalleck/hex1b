@@ -1782,8 +1782,13 @@ internal sealed class Hex1bFlowRunner
                         {
                             if (settleOriginalDims is null)
                             {
-                                settlePreBurstMute =
-                                    System.Threading.Volatile.Read(ref outputMuteGate.Value);
+                                // An unresumed commit owns a transient mute.
+                                // Preserve the owner from before its admission,
+                                // rather than handing its mute to the next burst.
+                                settlePreBurstMute = CommitInFlightNow()
+                                    && !System.Threading.Volatile.Read(ref admission.ResumeGranted)
+                                    ? System.Threading.Volatile.Read(ref admission.PriorMute)
+                                    : System.Threading.Volatile.Read(ref outputMuteGate.Value);
                                 settleOriginalDims = (lastKnownWidth, lastKnownHeight);
                             }
 

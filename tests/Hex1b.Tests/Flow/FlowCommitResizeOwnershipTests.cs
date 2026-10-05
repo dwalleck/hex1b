@@ -213,6 +213,54 @@ public class FlowCommitResizeOwnershipTests
 
 
     [TestMethod]
+    [DataRow(80)]
+    [DataRow(10000)]
+    public async Task ResizeDuringCommit_NextCommitAndEditReleaseLiveOutput(int settleMilliseconds)
+    {
+        var liveText = LiveMarker;
+        var resized = false;
+        Hex1bTerminal terminal = null!;
+        using var terminalLifetime = terminal = CreateTerminal(async flow =>
+        {
+            Task<Hex1bWidget> Live(FlowStepContext ctx) =>
+                Task.FromResult<Hex1bWidget>(ctx.Text(liveText));
+            var step = flow.Step(Live, options => options.MaxHeight = 14);
+            await step.WaitForReadyAsync();
+            try
+            {
+                var source = new RowCommitSource(CommitId, PayloadRows);
+                source.Gate = async index =>
+                {
+                    if (index != 10 || resized) return;
+                    resized = true;
+                    _ = terminal.ResizeWithWorkloadAsync(100, 30);
+                    var deadline = Environment.TickCount64 + 5000;
+                    while (step.TerminalWidth != 100 && Environment.TickCount64 < deadline)
+                        await Task.Delay(10);
+                    Assert.AreEqual(100, step.TerminalWidth, "resize must reach the runner while this unit is held");
+                };
+                var first = await step.CommitAsync(source, Live);
+                Assert.AreEqual(PayloadRows + 2, first.CompletedUnits);
+                Assert.IsTrue(resized, "the first commit must contain the resize");
+                var second = await step.CommitAsync(new RowCommitSource("rz-next", 2), Live);
+                Assert.AreEqual(4, second.CompletedUnits);
+
+                // Neither the commit's direct repaint nor a stale snapshot can
+                // supply this new text. The ordinary live output pump must resume.
+                liveText = LiveMarker + "-AFTER-SECOND-COMMIT";
+                step.Invalidate();
+                Assert.IsTrue(await WaitForScreenTextAsync(terminal, liveText, TimeSpan.FromSeconds(3)),
+                    $"post-commit edit must reach the terminal after a mid-commit resize\n{ScreenText(terminal)}");
+                AssertCommittedExactlyOnce(ReadFullBuffer(terminal), "after second commit and live edit");
+                Assert.AreEqual(1, Regex.Matches(ScreenText(terminal), Regex.Escape(liveText)).Count);
+            }
+            finally { step.Complete(); }
+        }, width: 121, height: 30, settleDelay: TimeSpan.FromMilliseconds(settleMilliseconds));
+
+        await terminal.RunAsync().WaitAsync(TimeSpan.FromSeconds(30));
+    }
+
+    [TestMethod]
     public async Task ScreenRead_DuringAtomicRepaint_ReturnsCompletedFrame()
     {
         using var workload = new Hex1bAppWorkloadAdapter();
@@ -392,6 +440,7 @@ public class FlowCommitResizeOwnershipTests
     private sealed class RowCommitSource(string commitId, int payloadRows) : FlowCommitSource
     {
         public int DelayMs { get; set; }
+        public Func<int, Task>? Gate { get; set; }
 
         public override int UnitCount => payloadRows + 2;
 
@@ -400,6 +449,7 @@ public class FlowCommitResizeOwnershipTests
             int width,
             CancellationToken cancellationToken)
         {
+            if (Gate is { } gate) await gate(index).ConfigureAwait(false);
             if (DelayMs > 0)
             {
                 await Task.Delay(DelayMs, cancellationToken).ConfigureAwait(false);
