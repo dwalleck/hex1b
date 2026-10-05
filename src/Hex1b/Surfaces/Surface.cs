@@ -688,6 +688,14 @@ public sealed class Surface : ISurfaceSource
                     oldCell.Sixel?.Release();
                 }
 
+                if (!ReferenceEquals(oldCell.Hyperlink, srcCell.Hyperlink))
+                {
+                    // The source surface retains its own reference. The copied
+                    // destination must survive source cleanup independently.
+                    srcCell.Hyperlink?.AddRef();
+                    oldCell.Hyperlink?.Release();
+                }
+
                 SetCellInternal(index, srcCell);
                 ExpandContentBounds(destX, destY);
             }

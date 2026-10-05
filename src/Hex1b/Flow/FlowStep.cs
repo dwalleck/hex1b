@@ -1,3 +1,4 @@
+using Hex1b.Surfaces;
 using Hex1b.Widgets;
 
 namespace Hex1b.Flow;
@@ -13,6 +14,7 @@ public sealed class FlowStep
     private volatile Hex1bApp? _app;
     private int _completed; // 0 = active, 1 = completed
     private FlowCommitCoordinator? _commitCoordinator;
+    private FlowWidgetRenderer? _widgetRenderer;
 
     internal FlowStep(int terminalWidth, int terminalHeight, int stepHeight)
     {
@@ -27,6 +29,61 @@ public sealed class FlowStep
     /// </summary>
     internal void AttachCommitCoordinator(FlowCommitCoordinator coordinator)
         => _commitCoordinator = coordinator;
+
+    internal void AttachWidgetRenderer(FlowWidgetRenderer renderer)
+        => _widgetRenderer = renderer;
+
+    /// <summary>
+    /// Renders finalized widget content into a new surface without writing to the
+    /// terminal or changing this step's live widget tree.
+    /// </summary>
+    /// <remarks>
+    /// Uses the flow's theme and current terminal capabilities and the standard
+    /// widget reconciliation, measurement, arrangement, and rendering pipeline.
+    /// The surface has the requested width and the widget's measured height (at
+    /// least one row). Widget-defined wrapping and clipping still apply; content
+    /// whose measured height exceeds <paramref name="maxHeight"/> is rejected,
+    /// never truncated by this method. Use content-sized widgets for history units.
+    /// The framework cleans up the transient tree, including reconciled siblings
+    /// when a later child fails. Widget code remains responsible for resources it
+    /// allocates and abandons before exposing a node to reconciliation.
+    /// <see cref="SurfaceWidget"/> is unsupported because its private widget-layer
+    /// trees do not participate in transient-tree ownership; it is rejected before
+    /// any layers are rendered.
+    /// Cancellation is cooperative during reconciliation and checked between the
+    /// synchronous layout/render phases. A returned surface belongs to the caller
+    /// and can be supplied to a <see cref="FlowCommitUnit"/>.
+    /// </remarks>
+    /// <param name="widget">Immutable finalized presentation to render.</param>
+    /// <param name="width">Positive width in terminal columns.</param>
+    /// <param name="maxHeight">Positive maximum height in terminal rows.</param>
+    /// <param name="cancellationToken">Cancels this materialization.</param>
+    /// <returns>The complete rendered surface, including cell styles and hyperlinks.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="widget"/> is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">A dimension is not positive.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The step has completed, is not owned by a runner, or the measured content
+    /// exceeds the requested bounds. Widget and cleanup failures also propagate.
+    /// The renderer also refuses surfaces exceeding its 10,000-cell dimension limit.
+    /// </exception>
+    /// <exception cref="OverflowException">The surface cell count exceeds an integer.</exception>
+    /// <exception cref="NotSupportedException">The tree contains a <see cref="SurfaceWidget"/>.</exception>
+    /// <exception cref="OperationCanceledException">The caller or flow was canceled.</exception>
+    public Task<Surface> RenderWidgetAsync(
+        Hex1bWidget widget,
+        int width,
+        int maxHeight,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(widget);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxHeight);
+        if (Volatile.Read(ref _completed) != 0 || _tcs.Task.IsCompleted)
+            throw new InvalidOperationException("Cannot render widgets for a completed flow step.");
+        var renderer = _widgetRenderer
+            ?? throw new InvalidOperationException("The flow step has no widget renderer.");
+        return renderer.RenderAsync(widget, width, maxHeight, cancellationToken);
+    }
 
     /// <summary>
     /// Gets the completed builder set by <see cref="Complete(Func{RootContext, Hex1bWidget})"/>

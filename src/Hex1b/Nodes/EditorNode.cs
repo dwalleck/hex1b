@@ -1,3 +1,4 @@
+using System.Runtime.ExceptionServices;
 using Hex1b.Documents;
 using Hex1b.Input;
 using Hex1b.Layout;
@@ -93,6 +94,35 @@ public sealed class EditorNode : Hex1bNode, IEditorSession
         }
 
         DecorationProviders = newProviders;
+    }
+
+    /// <summary>
+    /// Releases subscriptions held by an offscreen, one-shot editor without
+    /// disposing the caller's document, state, or decoration providers.
+    /// </summary>
+    internal void ReleaseTransientResources()
+    {
+        var document = _subscribedDocument;
+        var providers = DecorationProviders;
+        _subscribedDocument = null;
+        DecorationProviders = null;
+        _lastRenderContext = null;
+        List<Exception>? failures = null;
+        try
+        {
+            if (document is not null) document.Changed -= OnDocumentChanged;
+        }
+        catch (Exception ex) { (failures ??= []).Add(ex); }
+        if (providers is not null)
+        {
+            foreach (var provider in providers)
+            {
+                try { provider.Deactivate(); }
+                catch (Exception ex) { (failures ??= []).Add(ex); }
+            }
+        }
+        if (failures is { Count: 1 }) ExceptionDispatchInfo.Capture(failures[0]).Throw();
+        if (failures is { Count: > 1 }) throw new AggregateException(failures);
     }
 
     /// <summary>Whether to show line numbers in a gutter on the left side.</summary>

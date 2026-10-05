@@ -1120,6 +1120,8 @@ internal sealed class Hex1bFlowRunner
 
         // Pre-measure the widget to determine actual content height
         var step = new FlowStep(terminalWidth, terminalHeight, maxHeight);
+        step.AttachWidgetRenderer(new FlowWidgetRenderer(
+            _options.Theme, () => _parentAdapter.Capabilities, _cancellationToken));
         var contentHeight = MeasureStepContent(builder, step, terminalWidth, maxHeight);
 
         // MinHeight gives the live region a stable, reliably interactive
@@ -2233,14 +2235,8 @@ internal sealed class Hex1bFlowRunner
         var measured = node.Measure(constraints);
         var height = Math.Max(1, Math.Min(measured.Height, measureMax));
 
-        var surface = new Surface(width, height);
-        node.Arrange(new Rect(0, 0, width, height));
-
-        var renderCtx = new SurfaceRenderContext(surface, _options.Theme);
-        renderCtx.SetCapabilities(_parentAdapter.Capabilities);
-        node.Render(renderCtx);
-
-        return surface;
+        return FlowWidgetRenderer.RenderNode(
+            node, width, height, _options.Theme, _parentAdapter.Capabilities);
     }
 
     /// <summary>

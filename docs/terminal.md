@@ -433,6 +433,26 @@ its pending-wrap and character-protection state.
 
 ### Flow history-commit delivery
 
+`FlowStep.RenderWidgetAsync(widget, width, maxHeight, cancellationToken)` renders
+finalized widget content into a naturally measured `Surface` using the step's
+parent terminal capabilities and Flow theme. A `FlowCommitSource` can call it
+from `UnitAsync` with the coordinator-supplied width and return the surface in
+its existing `FlowCommitUnit`. Rendering does not write terminal output or replace
+the live app. Submit the source through `CommitAsync` for ordered delivery.
+
+The explicit height bound is a content limit, not a clipping request: oversized
+widgets fail instead of silently losing rows. Keep logical units bounded and
+immutable; if a new width requires re-materialization, the same unit must retain
+its identity and content. Rendering errors and cancellation propagate to the
+caller. This API renders widget styling and metadata into cells; support for a
+particular terminal protocol still depends on the active Flow emitter and host.
+Use content-sized widgets: a widget's own explicit viewport or clipping policy
+still applies. The API rejects `SurfaceWidget` trees, whose private widget-layer
+lifetime is not covered by this materializer, and surfaces whose actual width or
+measured height exceeds the renderer's 10,000-cell dimension limit. Temporary
+nodes are cleaned up after rendering; the returned surface retains its own tracked
+cell references. Caller-owned documents and editor state remain caller-owned.
+
 Flow can request geometry-gated delivery when every presentation filter is an
 `IHex1bTerminalOutputObserver`. Presentations with transforming filters retain the
 ordinary, unconditional output path.

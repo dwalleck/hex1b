@@ -60,6 +60,10 @@ public sealed class ReconcileContext
     /// Only set (non-null) when per-node metrics are enabled.
     /// </summary>
     internal Diagnostics.Hex1bMetrics? Metrics { get; set; }
+
+    // Opt-in ownership tracking for offscreen transient trees. Ordinary app
+    // reconciliation does not register or tear down nodes through this hook.
+    internal Action<Hex1bNode>? ObserveTransientNode { get; set; }
     
     /// <summary>
     /// The layout axis of the parent container (if any).
@@ -179,6 +183,7 @@ public sealed class ReconcileContext
         {
             DiagnosticTimingEnabled = DiagnosticTimingEnabled,
             Metrics = Metrics,
+            ObserveTransientNode = ObserveTransientNode,
             _inputOverrides = _inputOverrides
         };
     }
@@ -192,7 +197,7 @@ public sealed class ReconcileContext
         return new ReconcileContext(Parent, FocusRing, CancellationToken, _ancestors.ToList(), axis, InvalidateCallback,
             CaptureInputCallback, ReleaseCaptureCallback, ScheduleTimerCallback, WindowManagerRegistry, RequestFocusCallback,
             CopyToClipboardCallback)
-        { IsNew = IsNew, DiagnosticTimingEnabled = DiagnosticTimingEnabled, Metrics = Metrics, _inputOverrides = _inputOverrides };
+        { IsNew = IsNew, DiagnosticTimingEnabled = DiagnosticTimingEnabled, Metrics = Metrics, ObserveTransientNode = ObserveTransientNode, _inputOverrides = _inputOverrides };
     }
     
     /// <summary>
@@ -204,7 +209,7 @@ public sealed class ReconcileContext
         return new ReconcileContext(Parent, FocusRing, CancellationToken, _ancestors.ToList(), LayoutAxis, InvalidateCallback,
             CaptureInputCallback, ReleaseCaptureCallback, ScheduleTimerCallback, WindowManagerRegistry, RequestFocusCallback,
             CopyToClipboardCallback)
-        { IsNew = IsNew, ChildIndex = index, ChildCount = count, DiagnosticTimingEnabled = DiagnosticTimingEnabled, Metrics = Metrics, _inputOverrides = _inputOverrides };
+        { IsNew = IsNew, ChildIndex = index, ChildCount = count, DiagnosticTimingEnabled = DiagnosticTimingEnabled, Metrics = Metrics, ObserveTransientNode = ObserveTransientNode, _inputOverrides = _inputOverrides };
     }
 
     /// <summary>
@@ -216,7 +221,7 @@ public sealed class ReconcileContext
         return new ReconcileContext(Parent, FocusRing, CancellationToken, _ancestors.ToList(), LayoutAxis, InvalidateCallback,
             CaptureInputCallback, ReleaseCaptureCallback, ScheduleTimerCallback, WindowManagerRegistry, RequestFocusCallback,
             CopyToClipboardCallback)
-        { IsNew = IsNew, ChildIndex = ChildIndex, ChildCount = ChildCount, DiagnosticTimingEnabled = DiagnosticTimingEnabled, Metrics = Metrics, _inputOverrides = overrides };
+        { IsNew = IsNew, ChildIndex = ChildIndex, ChildCount = ChildCount, DiagnosticTimingEnabled = DiagnosticTimingEnabled, Metrics = Metrics, ObserveTransientNode = ObserveTransientNode, _inputOverrides = overrides };
     }
 
     /// <summary>
@@ -245,6 +250,7 @@ public sealed class ReconcileContext
     /// </summary>
     public async Task<Hex1bNode?> ReconcileChildAsync(Hex1bNode? existingNode, Hex1bWidget? widget, Hex1bNode parent)
     {
+        ObserveTransientNode?.Invoke(parent);
         if (widget is null)
         {
             return null;
@@ -259,6 +265,7 @@ public sealed class ReconcileContext
         if (DiagnosticTimingEnabled || recordReconcileMetric) reconcileStart = System.Diagnostics.Stopwatch.GetTimestamp();
         
         var node = await widget.ReconcileAsync(existingNode, childContext);
+        ObserveTransientNode?.Invoke(node);
         
         long reconcileElapsed = 0;
         if (DiagnosticTimingEnabled || recordReconcileMetric)
