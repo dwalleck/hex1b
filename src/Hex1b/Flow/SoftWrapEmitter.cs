@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using Hex1b.Surfaces;
 using Hex1b.Theming;
+using Hex1b.Tokens;
 
 namespace Hex1b.Flow;
 
@@ -198,6 +199,7 @@ internal static class SoftWrapEmitter
         var currentAttrs = CellAttributes.None;
         var currentUnderlineStyle = UnderlineStyle.None;
         Hex1bColor? currentUnderlineColor = null;
+        HyperlinkData? currentHyperlink = null;
         bool stateUnknown = true;
 
         var lastContent = FindLastContentColumn(surface, row);
@@ -246,9 +248,25 @@ internal static class SoftWrapEmitter
                 sb.Append('m');
             }
 
+            var hyperlink = emit.Hyperlink?.Data;
+            if (hyperlink?.Uri != currentHyperlink?.Uri
+                || hyperlink?.Parameters != currentHyperlink?.Parameters)
+            {
+                sb.Append(AnsiTokenSerializer.Serialize(new OscToken(
+                    "8", hyperlink?.Parameters ?? "", hyperlink?.Uri ?? "", UseEscBackslash: true)));
+                currentHyperlink = hyperlink;
+            }
+
             sb.Append(emit.Character);
 
             x += Math.Max(1, emit.DisplayWidth);
+        }
+
+        // OSC 8 is independent of SGR. Close it before row delimiters, clears
+        // or a later prompt can inherit the final cell's hyperlink.
+        if (currentHyperlink is not null)
+        {
+            sb.Append(AnsiTokenSerializer.Serialize(new OscToken("8", "", "", UseEscBackslash: true)));
         }
 
         // Reset SGR before any line clear the caller emits so cleared cells
