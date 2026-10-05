@@ -26,7 +26,10 @@ internal interface ILiveStepHandle
     /// its first frame. Used to repaint the live image during a commit without
     /// re-rendering the widget tree.
     /// </summary>
-    Surface? SnapshotLiveSurface();
+    LiveRenderSnapshot? SnapshotLiveFrame();
+
+    /// <summary>Serializes a graphics transaction before the synchronous write locks.</summary>
+    ValueTask<IDisposable> AcquireGraphicsAsync(CancellationToken cancellationToken);
 
     /// <summary>
     /// Reads the current presentation geometry. Native presentations refresh
@@ -136,7 +139,7 @@ internal interface ILiveStepHandle
     /// paint's own clear-before-content handling must not be undone by a later
     /// clear.
     /// </remarks>
-    void ReanchorLive(int rowOrigin, int liveHeight, Surface liveSurface);
+    void ReanchorLive(int rowOrigin, int liveHeight, LiveRenderSnapshot liveSurface);
 
     /// <summary>Forwards a resize to the live step's adapter.</summary>
     void ResizeLive(int width, int liveHeight);

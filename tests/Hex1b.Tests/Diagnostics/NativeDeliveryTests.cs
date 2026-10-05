@@ -15,6 +15,24 @@ namespace Hex1b.Tests.Diagnostics;
 public class NativeDeliveryTests
 {
     [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task RequiredProcessing_RecordsUngatedDeliveryAfterModel(bool filtered)
+    {
+        await using var harness = await ConsoleHarness.StartAsync(workloadFilter: filtered);
+        var outcome = await harness.Workload.WriteRequiredForProcessing("REQUIRED-PROCESSING")
+            .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        var record = harness.Capture(authorizations: [DiagnosticAuthorization.NativeOutput]).Records
+            .Single(r => Decode(r).Contains("REQUIRED-PROCESSING", StringComparison.Ordinal));
+        Assert.AreEqual(NativeDeliveryOutcome.Applied, outcome);
+        Assert.AreEqual(DiagnosticDeliverySource.WorkloadOutput, record.Source);
+        Assert.AreEqual(DiagnosticDeliveryPhase.AfterModel, record.Phase);
+        Assert.AreEqual(DiagnosticDeliveryOutcome.Accepted, record.Outcome);
+        Assert.AreEqual(record.Length, record.BytesAccepted);
+        StringAssert.Contains(harness.Driver.WrittenText, "REQUIRED-PROCESSING");
+    }
+
+    [TestMethod]
     public async Task Accepted_RecordsEachWriteWithItsLinks()
     {
         await using var harness = await ConsoleHarness.StartAsync(milestones: true);
@@ -883,7 +901,7 @@ public class NativeDeliveryTests
         public TerminalDiagnostics? Diagnostics { get; }
         public Task<int> Run { get; }
 
-        public static async Task<ConsoleHarness> StartAsync(bool diagnostics = true, bool filter = false, bool milestones = false)
+        public static async Task<ConsoleHarness> StartAsync(bool diagnostics = true, bool filter = false, bool milestones = false, bool workloadFilter = false)
         {
             var driver = new FakeConsoleDriver { TerminalSize = (40, 6) };
             var presentation = new ConsolePresentationAdapter(driver, kgpProbeTimeout: TimeSpan.FromMilliseconds(25));
@@ -891,6 +909,8 @@ public class NativeDeliveryTests
             var builder = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithPresentation(presentation).WithDimensions(40, 6);
             if (filter)
                 builder.AddPresentationFilter(new PassFilter());
+            if (workloadFilter)
+                builder.AddWorkloadFilter(new PassWorkloadFilter());
             var terminal = builder.Build();
             var harness = new ConsoleHarness(driver, presentation, workload, terminal,
                 diagnostics ? new TerminalDiagnostics(terminal, "delivery") : null);

@@ -48,6 +48,57 @@ public class KgpPlacementTrackerTests
     }
 
     [TestMethod]
+    public void Clone_DiscardedUploadAndRemoval_DoNotAdvanceAcceptedState()
+    {
+        var accepted = new KgpPlacementTracker();
+        var surface = CreateSurfaceWithKgp(42, 3, 2);
+        var discardedUpload = accepted.Clone();
+        discardedUpload.GenerateCommands(surface);
+        Assert.IsFalse(accepted.HasTransmittedImages);
+        var delivered = accepted.Clone();
+        var (upload, _) = delivered.GenerateCommands(surface);
+        Assert.IsTrue(upload.Any(token => token is UnrecognizedSequenceToken sequence
+            && sequence.Sequence.Contains("a=t", StringComparison.Ordinal)));
+        accepted = delivered;
+        var discardedRemoval = accepted.Clone();
+        discardedRemoval.GenerateCommands(new List<KgpFragment>());
+        Assert.AreEqual(1, accepted.ActivePlacementCount);
+        Assert.IsTrue(accepted.HasTransmittedImages);
+        var (removal, _) = accepted.GenerateCommands(new List<KgpFragment>());
+        Assert.IsTrue(removal.Any(token => token is UnrecognizedSequenceToken sequence
+            && sequence.Sequence.Contains("a=d,d=I,i=42,", StringComparison.Ordinal)));
+        Assert.IsFalse(accepted.HasTransmittedImages);
+    }
+
+    [TestMethod]
+    [DataRow(false, "i")]
+    [DataRow(true, "I")]
+    public void GenerateOwnedDeletionCommands_OnlyDeletesOwnedIds(bool freeData, string mode)
+    {
+        var tracker = new KgpPlacementTracker();
+        tracker.GenerateCommands(CreateSurfaceWithKgp(42, 3, 2));
+        var commands = tracker.GenerateOwnedDeletionCommands(freeData);
+        var command = TestSeq.IsType<UnrecognizedSequenceToken>(TestSeq.Single(commands));
+        Assert.AreEqual($"\x1b_Ga=d,d={mode},i=42,q=2\x1b\\", command.Sequence);
+        Assert.IsTrue(tracker.HasTransmittedImages, "Preparing cleanup must not forget ownership before delivery.");
+        Assert.AreEqual(1, tracker.ActivePlacementCount);
+    }
+
+    [TestMethod]
+    public void GenerateCommands_AfterPlacementReset_RemovesDisappearedUpload()
+    {
+        var tracker = new KgpPlacementTracker();
+        tracker.GenerateCommands(CreateSurfaceWithKgp(42, 3, 2));
+        tracker.ResetPlacements();
+        var (before, after) = tracker.GenerateCommands(new List<KgpFragment>());
+        Assert.IsEmpty(after);
+        Assert.IsTrue(before.Any(token => token is UnrecognizedSequenceToken sequence
+            && sequence.Sequence.Contains("a=d,d=I,i=42,", StringComparison.Ordinal)),
+            "Reanchor may retain pixels, but a later disappearance must still free them.");
+        Assert.IsFalse(tracker.HasTransmittedImages);
+    }
+
+    [TestMethod]
     public void FirstFrame_EmitsTransmitAndPlacement()
     {
         var tracker = new KgpPlacementTracker();

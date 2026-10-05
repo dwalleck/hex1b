@@ -433,7 +433,10 @@ public sealed class FlowCommitReservationTests
             _terminal.Resize(_terminalWidth, height);
         }
 
-        public Surface SnapshotLiveSurface() => _liveSurface;
+        public LiveRenderSnapshot SnapshotLiveFrame() => new(_liveSurface, []);
+        private readonly SoftWrapGraphicsState _graphics = new();
+        public ValueTask<IDisposable> AcquireGraphicsAsync(CancellationToken cancellationToken)
+            => _graphics.AcquireAsync(cancellationToken);
         public void EnsureHistoryCommitSupported() { }
         public Task<bool> PrepareForCommitAsync(CancellationToken cancellationToken)
             => Task.FromResult(SetLiveOutputMuted(true));
@@ -464,8 +467,9 @@ public sealed class FlowCommitReservationTests
 
         public void MarkCommittedRow(int row) { }
 
-        public void ReanchorLive(int rowOrigin, int liveHeight, Surface liveSurface)
+        public void ReanchorLive(int rowOrigin, int liveHeight, LiveRenderSnapshot liveFrame)
         {
+            var liveSurface = liveFrame.Surface;
             if (_firstReanchor && ShrinkOnReanchor)
                 Shrink();
 
@@ -569,6 +573,9 @@ public sealed class FlowCommitReservationTests
         private sealed class AtomicUpdate(ReservationLiveHandle owner) : IAtomicTerminalUpdate
         {
             private bool _resolved;
+
+            public Task<NativeDeliveryOutcome>? Delivery => null;
+            public void Discard() => TakePendingOutput();
 
             public bool FlushCompleted { get; private set; }
 

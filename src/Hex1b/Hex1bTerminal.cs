@@ -1399,7 +1399,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     /// </para>
     /// </remarks>
     private async ValueTask DeliverGeometryGatedAsync(
-        GeometryGatedDelivery delivery,
+        WorkloadDelivery delivery,
         ReadOnlyMemory<byte> data,
         IReadOnlyList<AnsiToken>? preTokenizedTokens,
         byte[]? pooledBuffer,
@@ -1688,10 +1688,10 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 Interlocked.Add(ref _outputBytesRead, data.Length);
                 StashCaseIngress(data);
 
-                GeometryGatedDelivery? acceptedDelivery = null;
+                WorkloadDelivery? acceptedDelivery = null;
                 if (readItem.Delivery is { } gatedDelivery)
                 {
-                    if (_presentation is IGeometryGatedPresentationAdapter)
+                    if (gatedDelivery.IsGeometryGated && _presentation is IGeometryGatedPresentationAdapter)
                     {
                         await DeliverGeometryGatedAsync(
                             gatedDelivery,
@@ -1710,7 +1710,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     }
 
                     var modelAdapter = _workload as Hex1bAppWorkloadAdapter;
-                    if (modelAdapter is null || !modelAdapter.GeometryGatedDeliveryEnforceable)
+                    if (modelAdapter is null || (gatedDelivery.IsGeometryGated && !modelAdapter.GeometryGatedDeliveryEnforceable))
                     {
                         // Direct callers can still offer an unsupported delivery. Flow never
                         // does so because it consults the capability published by the terminal.
@@ -1805,15 +1805,25 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 {
                     if (acceptedDelivery is { } rawGated)
                     {
-                        var gatedOutcome = ApplyTokensWithImpactsIfGeometry(
-                            tokens,
-                            framedDcs,
-                            false,
-                            rawGated.ExpectedWidth,
-                            rawGated.ExpectedHeight,
-                            sixelIdentified,
-                            out _,
-                            out var geometryChangedDuringApplication);
+                        NativeDeliveryOutcome? gatedOutcome;
+                        var geometryChangedDuringApplication = false;
+                        if (rawGated.IsGeometryGated)
+                        {
+                            gatedOutcome = ApplyTokensWithImpactsIfGeometry(
+                                tokens,
+                                framedDcs,
+                                false,
+                                rawGated.ExpectedWidth,
+                                rawGated.ExpectedHeight,
+                                sixelIdentified,
+                                out _,
+                                out geometryChangedDuringApplication);
+                        }
+                        else
+                        {
+                            ApplyTokens(tokens, framedDcs, sixelIdentified);
+                            gatedOutcome = NativeDeliveryOutcome.Applied;
+                        }
                         if (geometryChangedDuringApplication)
                         {
                             acceptedDelivery = null;
@@ -1853,7 +1863,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         var passthroughStarted = Stopwatch.GetTimestamp();
                         await WritePresentationAsync(_presentation ?? throw new InvalidOperationException(
                             "A model-gated delivery requires a presentation adapter."), data,
-                            Diagnostics.DiagnosticDeliverySource.GatedDelivery, Diagnostics.DiagnosticDeliveryPhase.AfterModel, readItem.MilestoneSequence, ct);
+                            rawGated.IsGeometryGated ? Diagnostics.DiagnosticDeliverySource.GatedDelivery : Diagnostics.DiagnosticDeliverySource.WorkloadOutput, Diagnostics.DiagnosticDeliveryPhase.AfterModel, readItem.MilestoneSequence, ct);
                         _metrics.TerminalRawPassthroughDuration.Record(
                             Stopwatch.GetElapsedTime(passthroughStarted).TotalMilliseconds);
                         _metrics.TerminalOutputBytes.Record(data.Length);
@@ -1876,7 +1886,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 
                 // HWT reads authoritative snapshots but still needs its per-batch callback.
                 IReadOnlyList<AppliedToken> appliedTokens;
-                if (acceptedDelivery is { } gated)
+                if (acceptedDelivery is { IsGeometryGated: true } gated)
                 {
                     var gatedOutcome = ApplyTokensWithImpactsIfGeometry(
                         tokens,
@@ -1956,7 +1966,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
                             // Model-gated delivery writes only after the model has applied the
                             // batch, so observers must preserve the exact applied token stream.
-                            if (acceptedDelivery is not null)
+                            if (acceptedDelivery is { IsGeometryGated: true })
                                 VerifyObserversPreservedOutput(appliedTokens, observedTokens);
                         }
                         // Send applied tokens with impacts directly to the adapter
@@ -1977,11 +1987,11 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                             }
                             continue;
                         }
-                        if (acceptedDelivery is not null)
+                        if (acceptedDelivery is { IsGeometryGated: true })
                             VerifyObserversPreservedOutput(appliedTokens, filteredTokens);
 
                         var filteredBytes = Tokens.AnsiTokenUtf8Serializer.Serialize(filteredTokens);
-                        await WritePresentationAsync(_presentation, filteredBytes, acceptedDelivery is not null
+                        await WritePresentationAsync(_presentation, filteredBytes, acceptedDelivery is { IsGeometryGated: true }
                             ? Diagnostics.DiagnosticDeliverySource.GatedDelivery : Diagnostics.DiagnosticDeliverySource.WorkloadOutput,
                             Diagnostics.DiagnosticDeliveryPhase.AfterModel, readItem.MilestoneSequence, ct);
                         _metrics.TerminalOutputBytes.Record(filteredBytes.Length);
@@ -1991,7 +2001,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                         // Accepted model-gated raw output was intentionally held back before
                         // tokenization; forward the original bytes only after model application.
                         var passthroughStarted = Stopwatch.GetTimestamp();
-                        await WritePresentationAsync(_presentation, data, Diagnostics.DiagnosticDeliverySource.GatedDelivery,
+                        await WritePresentationAsync(_presentation, data,
+                            acceptedDelivery.IsGeometryGated ? Diagnostics.DiagnosticDeliverySource.GatedDelivery : Diagnostics.DiagnosticDeliverySource.WorkloadOutput,
                             Diagnostics.DiagnosticDeliveryPhase.AfterModel, readItem.MilestoneSequence, ct);
                         _metrics.TerminalRawPassthroughDuration.Record(
                             Stopwatch.GetElapsedTime(passthroughStarted).TotalMilliseconds);

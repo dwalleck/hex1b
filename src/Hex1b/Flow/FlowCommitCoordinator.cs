@@ -118,6 +118,10 @@ internal sealed class FlowCommitCoordinator
     private readonly IHex1bAppTerminalWorkloadAdapter _terminal;
     private readonly CancellationToken _flowCancellationToken;
 
+    private readonly object _lifetimeSync = new();
+    private readonly CancellationTokenSource _stepStop = new();
+    private Task<FlowCommitResult>? _activeCommit;
+    private volatile bool _stopped;
     private int _admission;
     private volatile bool _uncertain;
     private volatile bool _inFlight;
@@ -146,7 +150,7 @@ internal sealed class FlowCommitCoordinator
     /// True when no commit is outstanding and no previous commit ended in an
     /// uncertain emission failure.
     /// </summary>
-    public bool CanCommit => !_uncertain && Volatile.Read(ref _admission) == 0;
+    public bool CanCommit => !_stopped && !_uncertain && Volatile.Read(ref _admission) == 0;
 
     /// <summary>
     /// True when a previous commit failed after content may already have reached
@@ -180,15 +184,43 @@ internal sealed class FlowCommitCoordinator
         // in-flight state or reaches source preparation.
         _live.EnsureHistoryCommitSupported();
 
-        if (Interlocked.CompareExchange(ref _admission, 1, 0) != 0)
+        lock (_lifetimeSync)
         {
-            throw new FlowCommitAdmissionException(
-                "A commit is already outstanding. Wait for it to complete before requesting " +
-                "another one; history commitment is admitted one request at a time.");
+            if (_stopped) throw new FlowCommitAdmissionException("The live step has ended and cannot accept another commitment.");
+            if (Interlocked.CompareExchange(ref _admission, 1, 0) != 0)
+            {
+                throw new FlowCommitAdmissionException(
+                    "A commit is already outstanding. Wait for it to complete before requesting " +
+                    "another one; history commitment is admitted one request at a time.");
+            }
+            _inFlight = true;
+            return _activeCommit = CommitAndReleaseAsync(source, nextLive, cancellationToken);
         }
+    }
 
-        _inFlight = true;
-        return CommitAndReleaseAsync(source, nextLive, cancellationToken);
+    internal async Task StopAsync()
+    {
+        Task<FlowCommitResult>? pending;
+        lock (_lifetimeSync)
+        {
+            _stopped = true;
+            pending = _activeCommit;
+        }
+        try { _stepStop.Cancel(); }
+        finally
+        {
+            if (pending is not null)
+            {
+                // User cancellation callbacks can throw. Join the admitted
+                // operation before propagating that failure to runner cleanup.
+                // The commit caller still owns its result/failure.
+                try { await pending.ConfigureAwait(false); }
+                catch (Exception failure)
+                {
+                    _live.RecordCommitEvent($"stopped-commit {failure.GetType().Name}: {failure.Message}");
+                }
+            }
+        }
     }
 
     private async Task<FlowCommitResult> CommitAndReleaseAsync(
@@ -224,7 +256,7 @@ internal sealed class FlowCommitCoordinator
 
         var commitId = Interlocked.Increment(ref _nextCommitId);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken, _flowCancellationToken);
+            cancellationToken, _flowCancellationToken, _stepStop.Token);
         var token = linked.Token;
         var events = 0;
 
@@ -456,6 +488,7 @@ internal sealed class FlowCommitCoordinator
                 var checkpointRowsWritten = emission.RowsWritten;
                 var checkpointNextRowOffset = emission.NextRowOffset;
 
+                using var graphicsLease = await _live.AcquireGraphicsAsync(token).ConfigureAwait(false);
                 if (gated)
                 {
                     // Read before the scope opens: the scope holds the step lock the
@@ -478,7 +511,8 @@ internal sealed class FlowCommitCoordinator
                     // asynchronous observation and this write. The scope is
                     // still empty, so release it and rebuild/re-observe rather
                     // than emitting bytes laid out for stale geometry.
-                    scope.Dispose();
+                    scope.Discard();
+                    graphicsLease.Dispose();
                     var widthChanged = freshGeometry.Width != committedWidth;
                     if (widthChanged)
                     {
@@ -547,6 +581,7 @@ internal sealed class FlowCommitCoordinator
                         else
                         {
                             scope.Dispose();
+                            delivery = scope.Delivery;
                         }
                     }
                     catch (Exception handoffEx)
@@ -600,6 +635,8 @@ internal sealed class FlowCommitCoordinator
 
                     unitFlushed = true;
                 }
+
+                graphicsLease.Dispose();
 
                 if (unitFlushed && wholeUnitComposed)
                 {
@@ -686,6 +723,7 @@ internal sealed class FlowCommitCoordinator
             while (true)
             {
                 finalAttempts++;
+                using var graphicsLease = await _live.AcquireGraphicsAsync(token).ConfigureAwait(false);
                 var finalCheckpoint = gatedFinal ? _live.CaptureAtomicCheckpoint() : default;
                 var finalAttemptAppendRow = appendRow;
                 Task<NativeDeliveryOutcome>? finalDelivery = null;
@@ -727,7 +765,7 @@ internal sealed class FlowCommitCoordinator
                         _live.ReanchorLive(
                             liveOrigin,
                             finalLiveHeight,
-                            _live.SnapshotLiveSurface() ?? EmptySurface(finalWidth));
+                            _live.SnapshotLiveFrame() ?? new LiveRenderSnapshot(EmptySurface(finalWidth), []));
                         liveOrigin = _live.RowOrigin;
 
                         if (gatedFinal)
@@ -739,7 +777,9 @@ internal sealed class FlowCommitCoordinator
                 }
                 finally
                 {
-                    reanchorUpdate.Dispose();
+                    if (!finalStable) reanchorUpdate.Discard();
+                    else reanchorUpdate.Dispose();
+                    finalDelivery ??= reanchorUpdate.Delivery;
                 }
 
                 if (finalStable && finalDelivery is null)
@@ -961,7 +1001,7 @@ internal sealed class FlowCommitCoordinator
         }
         finally
         {
-            if (resumeOutput && !wasMuted)
+            if (resumeOutput && !wasMuted && !_stopped)
             {
                 _live.SetLiveOutputMuted(false);
             }
@@ -1034,6 +1074,10 @@ internal sealed class FlowCommitCoordinator
         int abortedRows,
         bool wasMuted)
     {
+        // An ending step has no live frame to restore. Its runner joins this
+        // operation and then owns cleanup; never resurrect that app's images.
+        if (_stopped) return appendRow;
+
         // Same order as the success path, and for the same reason: the pump stays
         // muted while the layout is applied (when the hand-off rule says it
         // applies) and the app renders it, and the region is painted from the
@@ -1069,6 +1113,7 @@ internal sealed class FlowCommitCoordinator
         while (true)
         {
             recoveryAttempts++;
+            using var graphicsLease = await _live.AcquireGraphicsAsync(_flowCancellationToken).ConfigureAwait(false);
             var recoveryCheckpoint = gatedRecovery ? _live.CaptureAtomicCheckpoint() : default;
             var recoveryAttemptAppendRow = appendRow;
             Task<NativeDeliveryOutcome>? recoveryDelivery = null;
@@ -1109,7 +1154,7 @@ internal sealed class FlowCommitCoordinator
                     _live.ReanchorLive(
                         liveOrigin,
                         liveHeight,
-                        _live.SnapshotLiveSurface() ?? EmptySurface(recoveryWidth));
+                        _live.SnapshotLiveFrame() ?? new LiveRenderSnapshot(EmptySurface(recoveryWidth), []));
                     liveOrigin = _live.RowOrigin;
 
                     if (gatedRecovery)
@@ -1121,7 +1166,9 @@ internal sealed class FlowCommitCoordinator
             }
             finally
             {
-                reanchorUpdate.Dispose();
+                if (!recoveryStable) reanchorUpdate.Discard();
+                else reanchorUpdate.Dispose();
+                recoveryDelivery ??= reanchorUpdate.Delivery;
             }
 
             if (recoveryStable && recoveryDelivery is null)
@@ -1293,7 +1340,7 @@ internal sealed class FlowCommitCoordinator
             _live.ReanchorLive(
                 origin,
                 liveHeight,
-                _live.SnapshotLiveSurface() ?? EmptySurface(Math.Max(1, geometryAfter.Width)));
+                _live.SnapshotLiveFrame() ?? new LiveRenderSnapshot(EmptySurface(Math.Max(1, geometryAfter.Width)), []));
             return _live.RowOrigin;
         }
 

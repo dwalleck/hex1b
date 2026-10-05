@@ -72,7 +72,7 @@ public sealed class Hex1bAppWorkloadAdapter :
     // producer learns the fate of its own bytes rather than of the queue position.
     // Disposal and shutdown fault every outstanding delivery, because a batch that
     // was never offered cannot be retried and must not be reported as applied.
-    private readonly HashSet<GeometryGatedDelivery> _pendingDeliveries = new();
+    private readonly HashSet<WorkloadDelivery> _pendingDeliveries = new();
 
     /// <summary>
     /// The application that publishes frames for diagnostics. Set by Hex1bApp when it starts running.
@@ -398,9 +398,18 @@ public sealed class Hex1bAppWorkloadAdapter :
         string text,
         int expectedWidth,
         int expectedHeight)
+        => QueueRequiredDelivery(text, new WorkloadDelivery(expectedWidth, expectedHeight));
+
+    /// <summary>
+    /// Queues required output and acknowledges actual processing, even when the
+    /// presentation cannot enforce a geometry-conditioned write.
+    /// </summary>
+    internal Task<NativeDeliveryOutcome> WriteRequiredForProcessing(string text)
+        => QueueRequiredDelivery(text, new WorkloadDelivery());
+
+    private Task<NativeDeliveryOutcome> QueueRequiredDelivery(string text, WorkloadDelivery delivery)
     {
         ArgumentNullException.ThrowIfNull(text);
-        var delivery = new GeometryGatedDelivery(expectedWidth, expectedHeight);
 
         lock (_barrierSync)
         {
@@ -437,14 +446,14 @@ public sealed class Hex1bAppWorkloadAdapter :
     }
 
     /// <summary>
-    /// Records the presentation's verdict on a gated batch.
+    /// Records the terminal's processing verdict on a required batch.
     /// </summary>
     /// <remarks>
     /// Called by the terminal's output pump. <paramref name="outcome"/> is
     /// <see cref="NativeDeliveryOutcome.GeometryChanged"/> only when nothing was
     /// written.
     /// </remarks>
-    internal void CompleteDelivery(GeometryGatedDelivery delivery, NativeDeliveryOutcome outcome)
+    internal void CompleteDelivery(WorkloadDelivery delivery, NativeDeliveryOutcome outcome)
     {
         lock (_barrierSync)
         {
@@ -455,14 +464,14 @@ public sealed class Hex1bAppWorkloadAdapter :
     }
 
     /// <summary>
-    /// Fails a gated batch that could not be offered to the presentation.
+    /// Fails a required batch whose processing could not be completed.
     /// </summary>
     /// <remarks>
     /// Always an error rather than a retryable outcome: the pump reaches this only
     /// when the batch could not be delivered as a whole, so whether any of it
     /// reached the device is not observable from here.
     /// </remarks>
-    internal void FaultDelivery(GeometryGatedDelivery delivery, Exception error)
+    internal void FaultDelivery(WorkloadDelivery delivery, Exception error)
     {
         lock (_barrierSync)
         {

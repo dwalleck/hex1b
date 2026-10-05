@@ -95,9 +95,11 @@ internal class KgpPlacementTracker
         // 1. Delete images that disappeared entirely.
         // Use d=I (free data) so epoch changes and true removals do not leak terminal-side
         // image storage under orphaned image IDs.
-        foreach (var (imageId, previousList) in _previousFragments)
+        // Placement reset after reanchor intentionally keeps uploads. They still
+        // need deletion if the next desired frame no longer contains the image.
+        foreach (var imageId in _transmittedImages.ToArray())
         {
-            if (!currentByImage.ContainsKey(imageId) && previousList.Count > 0)
+            if (!currentByImage.ContainsKey(imageId))
             {
                 beforeText.Add(new UnrecognizedSequenceToken(
                     $"\x1b_Ga=d,d=I,i={imageId},q=2\x1b\\"));
@@ -200,8 +202,12 @@ internal class KgpPlacementTracker
     /// </summary>
     public (List<AnsiToken> BeforeText, List<AnsiToken> AfterText) GenerateCommands(Surface? currentSurface)
     {
-        var placements = ExtractDesiredPlacements(currentSurface);
+        return GenerateCommands(ExtractFragments(currentSurface));
+    }
 
+    internal static List<KgpFragment> ExtractFragments(Surface? currentSurface)
+    {
+        var placements = ExtractDesiredPlacements(currentSurface);
         // Convert to fragments for the unified path
         var fragments = new List<KgpFragment>();
         foreach (var (_, placement) in placements)
@@ -219,7 +225,7 @@ internal class KgpPlacementTracker
                 placement.Data));
         }
 
-        return GenerateCommands(fragments);
+        return fragments;
     }
 
     /// <summary>
@@ -245,6 +251,33 @@ internal class KgpPlacementTracker
         }
 
         return placements;
+    }
+
+    /// <summary>
+    /// Prepares private candidate state without advancing the last delivered frame.
+    /// KgpFragment and its image data are immutable; placement lists are copied.
+    /// </summary>
+    internal KgpPlacementTracker Clone()
+    {
+        var copy = new KgpPlacementTracker { _hasEverTransmitted = _hasEverTransmitted };
+        copy._transmittedImages.UnionWith(_transmittedImages);
+        foreach (var (id, fragments) in _previousFragments)
+            copy._previousFragments.Add(id, new List<KgpFragment>(fragments));
+        return copy;
+    }
+
+    /// <summary>
+    /// Emits deletion restricted to this owner's uploaded IDs. Placement-only
+    /// deletion retains pixels for reanchor; freeing data is used for termination
+    /// and conservative resize. The caller installs reset state after delivery.
+    /// </summary>
+    internal List<AnsiToken> GenerateOwnedDeletionCommands(bool freeData)
+    {
+        var commands = new List<AnsiToken>(_transmittedImages.Count);
+        foreach (var id in _transmittedImages.Order())
+            commands.Add(new UnrecognizedSequenceToken(
+                $"\x1b_Ga=d,d={(freeData ? "I" : "i")},i={id},q=2\x1b\\"));
+        return commands;
     }
 
     /// <summary>

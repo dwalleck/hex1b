@@ -294,6 +294,78 @@ public class GeometryGatedDeliveryEnforcementTests
             "a partially applied batch must never be forwarded as Applied");
     }
 
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task RequiredProcessingDelivery_DelayedPresentation_CompletesOnlyAfterWrite(bool filtered)
+    {
+        var presentation = new RecordingManagedPresentation(68, 21) { BlockMarkerWrite = true };
+        using var workload = new Hex1bAppWorkloadAdapter();
+        var builder = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+            .WithPresentation(presentation).WithDimensions(68, 21);
+        if (filtered) builder.AddWorkloadFilter(new PassiveWorkloadFilter());
+        await using var terminal = builder.Build();
+        var ct = TestContext.Current.CancellationToken;
+        var delivery = workload.WriteRequiredForProcessing(ComposedBatch());
+        try
+        {
+            await presentation.WriteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+            Assert.IsFalse(delivery.IsCompleted, "Queue admission and model application are not presentation delivery.");
+            Assert.IsTrue(terminal.GetScreenText().Contains(Marker, StringComparison.Ordinal));
+            Assert.IsFalse(presentation.OutputText.Contains(Marker, StringComparison.Ordinal));
+            presentation.ReleaseWrite.TrySetResult();
+            Assert.AreEqual(NativeDeliveryOutcome.Applied, await delivery.WaitAsync(TimeSpan.FromSeconds(5), ct));
+            Assert.Contains(Marker, presentation.OutputText);
+        }
+        finally
+        {
+            presentation.ReleaseWrite.TrySetResult();
+        }
+    }
+
+    [TestMethod]
+    public async Task RequiredProcessingDelivery_TransformingFilter_PreservesOrdinaryForwarding()
+    {
+        var presentation = new RecordingNativePresentation(68, 21);
+        using var workload = new Hex1bAppWorkloadAdapter();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+            .WithPresentation(presentation).AddPresentationFilter(new TransformingPresentationFilter("FILTERED"))
+            .WithDimensions(68, 21).Build();
+        Assert.IsFalse(workload.GeometryGatedDeliveryEnforceable);
+        var outcome = await workload.WriteRequiredForProcessing(ComposedBatch())
+            .WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+        Assert.AreEqual(NativeDeliveryOutcome.Applied, outcome);
+        Assert.IsFalse(presentation.GeometryGateCalled);
+        Assert.Contains(Marker, presentation.OutputText);
+        Assert.Contains("FILTERED", presentation.OutputText);
+    }
+
+    [TestMethod]
+    public async Task RequiredProcessingDelivery_PresentationFails_PropagatesFailure()
+    {
+        var failure = new InvalidOperationException("required-write-failed");
+        var presentation = new RecordingManagedPresentation(68, 21) { MarkerWriteFailure = failure };
+        using var workload = new Hex1bAppWorkloadAdapter();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+            .WithPresentation(presentation).WithDimensions(68, 21).Build();
+        var delivery = workload.WriteRequiredForProcessing(ComposedBatch());
+        var observed = await Assert.ThrowsExactlyAsync<InvalidOperationException>(async () =>
+            await delivery.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        Assert.AreSame(failure, observed);
+        Assert.IsFalse(presentation.OutputText.Contains(Marker, StringComparison.Ordinal));
+    }
+
+    [TestMethod]
+    public async Task RequiredProcessingDelivery_DisposedAdapter_FaultsPendingAndRejectsNextWrite()
+    {
+        using var workload = new Hex1bAppWorkloadAdapter();
+        var pending = workload.WriteRequiredForProcessing(ComposedBatch());
+        Assert.IsFalse(pending.IsCompleted);
+        workload.Dispose();
+        await Assert.ThrowsExactlyAsync<ObjectDisposedException>(async () => await pending);
+        Assert.ThrowsExactly<ObjectDisposedException>(() => workload.WriteRequiredForProcessing("NEXT"));
+    }
+
     private sealed class PassiveWorkloadFilter : IHex1bTerminalWorkloadFilter
     {
         public ValueTask OnSessionStartAsync(
@@ -348,6 +420,11 @@ public class GeometryGatedDeliveryEnforcementTests
             }
         }
 
+        internal bool BlockMarkerWrite { get; init; }
+        internal Exception? MarkerWriteFailure { get; init; }
+        internal TaskCompletionSource WriteEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource ReleaseWrite { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         public int Width => width;
         public int Height => height;
         public TerminalCapabilities Capabilities => TerminalCapabilities.Modern;
@@ -362,13 +439,19 @@ public class GeometryGatedDeliveryEnforcementTests
             remove { }
         }
 
-        public ValueTask WriteOutputAsync(
+        public async ValueTask WriteOutputAsync(
             ReadOnlyMemory<byte> data,
             CancellationToken ct = default)
         {
+            var text = Encoding.UTF8.GetString(data.Span);
+            if (text.Contains(Marker, StringComparison.Ordinal))
+            {
+                WriteEntered.TrySetResult();
+                if (BlockMarkerWrite) await ReleaseWrite.Task.WaitAsync(ct);
+                if (MarkerWriteFailure is { } failure) throw failure;
+            }
             lock (_sync)
-                _output.Append(Encoding.UTF8.GetString(data.Span));
-            return ValueTask.CompletedTask;
+                _output.Append(text);
         }
 
         public ValueTask<ReadOnlyMemory<byte>> ReadInputAsync(

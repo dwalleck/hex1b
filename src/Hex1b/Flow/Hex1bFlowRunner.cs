@@ -122,6 +122,45 @@ internal sealed class Hex1bFlowRunner
         }
     }
 
+    // All callers hold the step/write locks; sampling admission here keeps both
+    // legacy raw output and complete graphics frames on the same boundary.
+    private bool CanForwardLiveOutput(Func<bool>? isMuted, long? outputEpoch, InlineStepAdapter? generationSource)
+    {
+        if (isMuted?.Invoke() == true)
+        {
+            return false;
+        }
+        if (generationSource is not null)
+        {
+            var (presentationWidth, presentationHeight) = ReadCurrentGeometry();
+            if ((outputEpoch is { } frameEpoch
+                    && frameEpoch != generationSource.OutputEpoch)
+                || presentationWidth != generationSource.Width
+                || presentationHeight != Math.Max(1, _parentAdapter.Height))
+            {
+                // A native resize can be visible through the parent
+                // presentation before its resize event has reached the
+                // inline adapter. Hold the old frame until the resize
+                // handler publishes matching render dimensions.
+                return false;
+            }
+
+            var expectedStepHeight = _activeStep is { StepHeight: > 0 } activeStep
+                ? Math.Min(activeStep.StepHeight, presentationHeight)
+                : generationSource.Height;
+            if (generationSource.Height != expectedStepHeight)
+            {
+                // The presentation may have published a new height while
+                // the app's resize event is still queued. Do not forward a
+                // frame from the old live rectangle.
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+
     /// <summary>
     /// Writes live-application output under the terminal write lock, re-checking
     /// the mute gate <em>inside</em> the lock.
@@ -150,36 +189,7 @@ internal sealed class Hex1bFlowRunner
     {
         lock (_terminalWriteLock)
         {
-            if (isMuted?.Invoke() == true)
-            {
-                return;
-            }
-            if (generationSource is not null)
-            {
-                var (presentationWidth, presentationHeight) = ReadCurrentGeometry();
-                if ((outputEpoch is { } frameEpoch
-                        && frameEpoch != generationSource.OutputEpoch)
-                    || presentationWidth != generationSource.Width
-                    || presentationHeight != Math.Max(1, _parentAdapter.Height))
-                {
-                    // A native resize can be visible through the parent
-                    // presentation before its resize event has reached the
-                    // inline adapter. Hold the old frame until the resize
-                    // handler publishes matching render dimensions.
-                    return;
-                }
-
-                var expectedStepHeight = _activeStep is { StepHeight: > 0 } activeStep
-                    ? Math.Min(activeStep.StepHeight, presentationHeight)
-                    : generationSource.Height;
-                if (generationSource.Height != expectedStepHeight)
-                {
-                    // The presentation may have published a new height while
-                    // the app's resize event is still queued. Do not forward a
-                    // frame from the old live rectangle.
-                    return;
-                }
-            }
+            if (!CanForwardLiveOutput(isMuted, outputEpoch, generationSource)) return;
 
             if (parkAtOriginOf is null)
             {
@@ -359,7 +369,7 @@ internal sealed class Hex1bFlowRunner
     /// held for its duration; the writes it contains are a bounded number of
     /// escape sequences, so the hold is short.
     /// </remarks>
-    private IAtomicTerminalUpdate BeginAtomicTerminalUpdate()
+    private IAtomicTerminalUpdate BeginAtomicTerminalUpdate(SoftWrapGraphicsState? graphics = null)
     {
         Monitor.Enter(_stepOpsLock);
         Monitor.Enter(_terminalWriteLock);
@@ -368,7 +378,25 @@ internal sealed class Hex1bFlowRunner
         _atomicUpdate.Clear();
         _atomicUpdateThreadId = Environment.CurrentManagedThreadId;
         _atomicUpdateActive = true;
-        return new AtomicTerminalUpdateScope(this);
+        try
+        {
+            if (graphics is not null)
+            {
+                var geometry = ReadCurrentGeometry();
+                _atomicUpdate.Append(graphics.PrepareRelocation(geometry.Width, geometry.Height, invalidateUploads: false));
+            }
+            return new AtomicTerminalUpdateScope(this, graphics);
+        }
+        catch
+        {
+            graphics?.DeliveryFailed();
+            _atomicUpdate.Clear();
+            _atomicUpdateActive = false;
+            if (_parentAdapter is Hex1bAppWorkloadAdapter failedAdapter) failedAdapter.OutputGeometryGate.Release();
+            Monitor.Exit(_terminalWriteLock);
+            Monitor.Exit(_stepOpsLock);
+            throw;
+        }
     }
 
     /// <summary>
@@ -441,8 +469,8 @@ internal sealed class Hex1bFlowRunner
     /// <param name="expectedHeight">Rows the composed bytes assume.</param>
     /// <returns>The delivery's outcome, or null when the scope composed nothing.</returns>
     private Task<NativeDeliveryOutcome>? EndAtomicTerminalUpdateIfGeometry(
-        int expectedWidth,
-        int expectedHeight)
+        int? expectedWidth,
+        int? expectedHeight)
     {
         try
         {
@@ -455,7 +483,9 @@ internal sealed class Hex1bFlowRunner
 
                 if (_parentAdapter is Hex1bAppWorkloadAdapter app)
                 {
-                    return app.WriteRequiredIfGeometry(payload, expectedWidth, expectedHeight);
+                    return expectedWidth is { } width && expectedHeight is { } height
+                        ? app.WriteRequiredIfGeometry(payload, width, height)
+                        : app.WriteRequiredForProcessing(payload);
                 }
 
                 // Nothing to condition on: this parent has no device that can
@@ -665,7 +695,7 @@ internal sealed class Hex1bFlowRunner
         var overflow = (observedRow + height) - terminalHeight;
         if (overflow > 0)
         {
-            _parentAdapter.SetCursorPosition(0, terminalHeight - 1);
+            SetTerminalCursorRow(terminalHeight - 1);
             for (var i = 0; i < overflow; i++)
             {
                 WriteTerminal("\n");
@@ -704,7 +734,7 @@ internal sealed class Hex1bFlowRunner
     /// <summary>
     /// Atomically moves the live region to <paramref name="rowOrigin"/> and
     /// resizes it to <paramref name="liveHeight"/>, then repaints it as one
-    /// serialized pass: blank every row, paint <paramref name="liveSurface"/>,
+    /// serialized pass: blank every row, paint <paramref name="liveFrame"/>,
     /// and leave the cursor at the region's top-left. Callers hold
     /// <c>_stepOpsLock</c>.
     /// </summary>
@@ -713,8 +743,9 @@ internal sealed class Hex1bFlowRunner
         InlineStepAdapter stepAdapter,
         int rowOrigin,
         int liveHeight,
-        Surface liveSurface)
+        LiveRenderSnapshot liveFrame)
     {
+        var liveSurface = liveFrame.Surface;
         var terminalHeight = ReadCurrentGeometry().Height;
         liveHeight = Math.Clamp(liveHeight, 1, terminalHeight);
         rowOrigin = Math.Clamp(rowOrigin, 0, Math.Max(0, terminalHeight - liveHeight));
@@ -754,6 +785,8 @@ internal sealed class Hex1bFlowRunner
                     WriteTerminalUpdate(rowOrigin, GhosttyLivePromptMark);
                 }
 
+                var placements = stepAdapter.Graphics.PreparePlacements(liveFrame.Graphics, rowOrigin, stepAdapter.Width, liveHeight);
+                WriteTerminal(placements.BeforeText);
                 var paintRows = Math.Min(liveHeight, Math.Max(1, liveSurface.Height));
                 for (var row = 0; row < paintRows; row++)
                 {
@@ -764,6 +797,7 @@ internal sealed class Hex1bFlowRunner
                         SoftWrapEmitter.OrderedRowPrefix + SoftWrapEmitter.RenderRowText(liveSurface, row));
                 }
 
+                WriteTerminal(placements.AfterText);
                 SetTerminalCursorRow(rowOrigin);
             }
             finally
@@ -825,7 +859,7 @@ internal sealed class Hex1bFlowRunner
         }
     }
 
-    private sealed class AtomicTerminalUpdateScope(Hex1bFlowRunner runner) : IAtomicTerminalUpdate
+    private sealed class AtomicTerminalUpdateScope(Hex1bFlowRunner runner, SoftWrapGraphicsState? graphics) : IAtomicTerminalUpdate
     {
         private bool _disposed;
 
@@ -835,6 +869,33 @@ internal sealed class Hex1bFlowRunner
         /// taken, which is the fact the exception alone cannot carry.
         /// </summary>
         public bool FlushCompleted { get; private set; }
+        public Task<NativeDeliveryOutcome>? Delivery { get; private set; }
+
+        public void Discard()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            runner._atomicUpdate.Clear();
+            // An empty scope releases the locks without issuing bytes.
+            runner.EndAtomicTerminalUpdate();
+            graphics?.Complete(NativeDeliveryOutcome.GeometryChanged);
+            FlushCompleted = true;
+        }
+
+        private async Task<NativeDeliveryOutcome> ObserveGraphicsAsync(Task<NativeDeliveryOutcome>? receipt)
+        {
+            try
+            {
+                var outcome = receipt is null ? NativeDeliveryOutcome.Applied : await receipt.ConfigureAwait(false);
+                graphics!.Complete(outcome);
+                return outcome;
+            }
+            catch
+            {
+                graphics!.DeliveryFailed();
+                throw;
+            }
+        }
 
         /// <inheritdoc />
         public bool SupportsGeometryGatedDelivery => runner.GuardedDeliveryAvailable;
@@ -848,12 +909,15 @@ internal sealed class Hex1bFlowRunner
             }
 
             _disposed = true;
-            var delivery = runner.EndAtomicTerminalUpdateIfGeometry(expectedWidth, expectedHeight);
+            Task<NativeDeliveryOutcome>? delivery;
+            try { delivery = runner.EndAtomicTerminalUpdateIfGeometry(expectedWidth, expectedHeight); }
+            catch { graphics?.DeliveryFailed(); throw; }
+            Delivery = graphics is null ? delivery : ObserveGraphicsAsync(delivery);
 
             // No hand-off happened, so nothing can have failed: an empty scope
             // writes nothing, which is the same fact Dispose records.
             FlushCompleted = delivery is null;
-            return delivery;
+            return Delivery;
         }
 
         public void Dispose()
@@ -868,7 +932,25 @@ internal sealed class Hex1bFlowRunner
             // Assigned only when the hand-off returns: if it throws, this stays
             // false and Dispose rethrows, so a caller catching that exception
             // can still read it.
-            FlushCompleted = runner.EndAtomicTerminalUpdate();
+            if (graphics is null || !graphics.RequiresProcessingReceipt)
+            {
+                // Pure text retains its existing queue-admission contract.
+                // No image identity can be advanced by this hand-off.
+                try
+                {
+                    FlushCompleted = runner.EndAtomicTerminalUpdate();
+                    graphics?.Complete(NativeDeliveryOutcome.Applied);
+                }
+                catch { graphics?.DeliveryFailed(); throw; }
+                return;
+            }
+            try
+            {
+                var receipt = runner.EndAtomicTerminalUpdateIfGeometry(null, null);
+                Delivery = ObserveGraphicsAsync(receipt);
+                FlushCompleted = true;
+            }
+            catch { graphics.DeliveryFailed(); throw; }
         }
     }
 
@@ -1523,6 +1605,7 @@ internal sealed class Hex1bFlowRunner
                         Task<NativeDeliveryOutcome>? repaintDelivery = null;
                         var repaintCheckpoint = default(FlowAtomicCheckpoint);
                         var repaintAttemptHeight = 0;
+                        using var graphicsLease = await stepAdapter.Graphics.AcquireAsync(resizeToken).ConfigureAwait(false);
                         lock (_stepOpsLock)
                         {
                             if (generation != Interlocked.Read(ref resizeGeneration))
@@ -1540,40 +1623,40 @@ internal sealed class Hex1bFlowRunner
                             else
                             {
                                 var (width, terminalHeight) = ReadCurrentGeometry();
-                                var liveHeight = FlowResizeMath.ComputeStepHeight(
-                                    options?.MaxHeight, terminalHeight);
-                                var anchor = CommitInFlightNow()
-                                    ? Math.Clamp(
-                                        stepAdapter.RowOrigin,
-                                        0,
-                                        Math.Max(0, terminalHeight - liveHeight))
-                                    : observed is { } observedRow
-                                        ? ReserveBelowObservedAnchor(observedRow, liveHeight)
-                                        : FlowResizeMath.ComputeRowOriginAtWidth(
-                                            _initialRowOrigin, _emittedTombstones, width);
-                                anchor = Math.Clamp(
-                                    anchor,
-                                    0,
-                                    Math.Max(0, terminalHeight - liveHeight));
-
                                 repaintCheckpoint = CaptureAtomicCheckpoint(stepAdapter, step);
                                 repaintAttemptHeight = desiredHeight;
-                                desiredHeight = liveHeight;
-                                step.StepHeight = liveHeight;
-                                step.TerminalWidth = width;
-                                stepAdapter.RowOrigin = anchor;
-                                if (stepAdapter.Width != width
-                                    || stepAdapter.Height != liveHeight)
-                                {
-                                    _ = stepAdapter.ResizeAsync(width, liveHeight);
-                                }
-
-                                // Keep positioning, clearing, prompt mark and
-                                // surface bytes in one serialized hand-off.
-                                var scope = BeginAtomicTerminalUpdate();
+                                // Owned placement deletion precedes reservation
+                                // scrolls and repaint in this same native batch.
+                                var scope = BeginAtomicTerminalUpdate(stepAdapter.Graphics);
                                 try
                                 {
-                                    var surface = appBox.Value?.SnapshotCurrentSurface();
+                                    var liveHeight = FlowResizeMath.ComputeStepHeight(
+                                        options?.MaxHeight, terminalHeight);
+                                    var anchor = CommitInFlightNow()
+                                        ? Math.Clamp(
+                                            stepAdapter.RowOrigin,
+                                            0,
+                                            Math.Max(0, terminalHeight - liveHeight))
+                                        : observed is { } observedRow
+                                            ? ReserveBelowObservedAnchor(observedRow, liveHeight)
+                                            : FlowResizeMath.ComputeRowOriginAtWidth(
+                                                _initialRowOrigin, _emittedTombstones, width);
+                                    anchor = Math.Clamp(
+                                        anchor,
+                                        0,
+                                        Math.Max(0, terminalHeight - liveHeight));
+
+                                    desiredHeight = liveHeight;
+                                    step.StepHeight = liveHeight;
+                                    step.TerminalWidth = width;
+                                    stepAdapter.RowOrigin = anchor;
+                                    if (stepAdapter.Width != width
+                                        || stepAdapter.Height != liveHeight)
+                                    {
+                                        _ = stepAdapter.ResizeAsync(width, liveHeight);
+                                    }
+
+                                    var surface = appBox.Value?.SnapshotCurrentLiveFrame();
                                     if (surface is not null)
                                     {
                                         var painted = ReanchorLiveRegion(
@@ -1600,6 +1683,7 @@ internal sealed class Hex1bFlowRunner
                                 finally
                                 {
                                     scope.Dispose();
+                                    repaintDelivery ??= scope.Delivery;
                                 }
                             }
                         }
@@ -1855,28 +1939,61 @@ internal sealed class Hex1bFlowRunner
             }
             finally
             {
-                outputPumpCts.Cancel();
-                inputPumpCts.Cancel();
-
-                try { await outputPumpTask; } catch (OperationCanceledException) { }
-                try { await inputPumpTask; } catch (OperationCanceledException) { }
-                // The pump may have handed the ended step input after its application stopped.
-                MilestoneTracker?.StepEnded("the ended flow step");
-                Task[] pendingResizeTasks;
-                lock (resizeTaskSync)
-                {
-                    pendingResizeTasks = resizeRepaintTasks.ToArray();
-                }
-
+                // One ordered teardown owns every outstanding operation. Each
+                // later owner is drained even when an earlier stop fails.
                 try
                 {
-                    await Task.WhenAll(pendingResizeTasks).ConfigureAwait(false);
+                    if (commitCoordinatorBox.Value is { } endingCoordinator)
+                        await endingCoordinator.StopAsync().ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) when (inputPumpCts.IsCancellationRequested) { }
-
-                settleTimerCts?.Cancel();
-                settleTimerCts?.Dispose();
-                resizeObservationGate.Dispose();
+                finally
+                {
+                    try
+                    {
+                        try { outputPumpCts.Cancel(); }
+                        finally
+                        {
+                            try { inputPumpCts.Cancel(); }
+                            finally
+                            {
+                                // The pump retains its graphics lease through
+                                // receipt disposition, including cancellation.
+                                try { await outputPumpTask.ConfigureAwait(false); }
+                                catch (OperationCanceledException) when (stepAdapter.OutputFailure is null) { }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        try
+                        {
+                            try
+                            {
+                                try { await inputPumpTask.ConfigureAwait(false); }
+                                catch (OperationCanceledException) { }
+                                MilestoneTracker?.StepEnded("the ended flow step");
+                            }
+                            finally
+                            {
+                                Task[] pendingResizeTasks;
+                                lock (resizeTaskSync) pendingResizeTasks = resizeRepaintTasks.ToArray();
+                                try { await Task.WhenAll(pendingResizeTasks).ConfigureAwait(false); }
+                                catch (OperationCanceledException) when (inputPumpCts.IsCancellationRequested) { }
+                            }
+                        }
+                        finally
+                        {
+                            try { settleTimerCts?.Cancel(); }
+                            finally
+                            {
+                                settleTimerCts?.Dispose();
+                                resizeObservationGate.Dispose();
+                                stepAdapter.DiscardQueuedOutput();
+                                await ReleaseStepGraphicsAsync(stepAdapter).ConfigureAwait(false);
+                            }
+                        }
+                    }
+                }
             }
 
             // Clear the step region so remnants don't show through the yield widget
@@ -2416,6 +2533,92 @@ internal sealed class Hex1bFlowRunner
     /// <summary>
     /// Pumps output from a step adapter to the parent adapter.
     /// </summary>
+    private async Task ReleaseStepGraphicsAsync(InlineStepAdapter adapter)
+    {
+        var graphics = adapter.Graphics;
+        using (await graphics.AcquireAsync().ConfigureAwait(false))
+        {
+            Task<NativeDeliveryOutcome>? receipt = null;
+            lock (_stepOpsLock)
+            {
+                lock (_terminalWriteLock)
+                {
+                    var cleanup = graphics.PrepareOwnedCleanup();
+                    if (cleanup.Length == 0) return;
+                    // Owned-ID deletion does not depend on viewport geometry.
+                    if (_parentAdapter is Hex1bAppWorkloadAdapter queued)
+                        receipt = queued.WriteRequiredForProcessing(cleanup);
+                    else _parentAdapter.Write(cleanup);
+                }
+            }
+            if (receipt is not null) await receipt.ConfigureAwait(false);
+            graphics.CleanupCompleted();
+        }
+    }
+
+    private async Task ForwardRenderFrameAsync(
+        InlineStepAdapter stepAdapter,
+        SoftWrapRenderFrame frame,
+        long epoch,
+        Func<bool>? isMuted,
+        bool parkCursorAtLiveOrigin,
+        CancellationToken ct)
+    {
+        var graphics = stepAdapter.Graphics;
+        var repaint = false;
+        using (await graphics.AcquireAsync(ct).ConfigureAwait(false))
+        {
+            Task<NativeDeliveryOutcome> delivery;
+            lock (_stepOpsLock)
+            {
+                lock (_terminalWriteLock)
+                {
+                    if (!CanForwardLiveOutput(isMuted, epoch, stepAdapter)
+                        || frame.Width != stepAdapter.Width || frame.Height != stepAdapter.Height)
+                        return;
+                    var (width, height) = ReadCurrentGeometry();
+                    try
+                    {
+                        var batch = graphics.PrepareFrame(frame, stepAdapter.RowOrigin, width, height);
+                        if (parkCursorAtLiveOrigin)
+                        {
+                            var row = Math.Clamp(stepAdapter.RowOrigin, 0, Math.Max(0, height - 1));
+                            batch += $"\x1b[{row + 1};1H";
+                        }
+                        if (_parentAdapter is Hex1bAppWorkloadAdapter queued)
+                            delivery = queued.GeometryGatedDeliveryEnforceable
+                                ? queued.WriteRequiredIfGeometry(batch, width, height)
+                                : queued.WriteRequiredForProcessing(batch);
+                        else
+                        {
+                            _parentAdapter.Write(batch);
+                            delivery = Task.FromResult(NativeDeliveryOutcome.Applied);
+                        }
+                    }
+                    catch
+                    {
+                        graphics.DeliveryFailed();
+                        throw;
+                    }
+                }
+            }
+            try
+            {
+                // Do not relinquish unresolved delivery on reader/pump cancellation.
+                // Termination owns the receipt before another graphics operation.
+                var outcome = await delivery.ConfigureAwait(false);
+                graphics.Complete(outcome);
+                repaint = outcome == NativeDeliveryOutcome.GeometryChanged;
+            }
+            catch
+            {
+                graphics.DeliveryFailed();
+                throw;
+            }
+        }
+        if (repaint) stepAdapter.RequestRenderFrame();
+    }
+
     private async Task PumpStepOutputAsync(
         InlineStepAdapter stepAdapter,
         CancellationToken ct,
@@ -2469,6 +2672,14 @@ internal sealed class Hex1bFlowRunner
             while (!ct.IsCancellationRequested)
             {
                 var frame = await stepAdapter.ReadOutputFrameAsync(ct);
+                if (frame.Kind == InlineOutputFrameKind.RenderFrame)
+                {
+                    DropPendingFrame();
+                    discardUntilBoundary = false;
+                    await ForwardRenderFrameAsync(stepAdapter, frame.RenderFrame!, frame.Epoch,
+                        isMuted, parkCursorAtLiveOrigin, ct).ConfigureAwait(false);
+                    continue;
+                }
                 if (frame.Kind == InlineOutputFrameKind.DiscardBoundary)
                 {
                     // DiscardQueuedOutput may have removed the BSU before the
@@ -2599,7 +2810,12 @@ internal sealed class Hex1bFlowRunner
             // An incomplete synchronized frame is deliberately not flushed on
             // cancellation or channel disposal: without ESU it is not a frame.
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception failure)
+        {
+            stepAdapter.FailOutput(failure);
+            throw;
+        }
     }
 
     /// <summary>
@@ -2759,11 +2975,14 @@ internal sealed class Hex1bFlowRunner
 
         public long FrameCount => _app.FrameCount;
 
-        public Surface? SnapshotLiveSurface() => _app.SnapshotCurrentSurface();
+        public LiveRenderSnapshot? SnapshotLiveFrame() => _app.SnapshotCurrentLiveFrame();
+
+        public ValueTask<IDisposable> AcquireGraphicsAsync(CancellationToken cancellationToken)
+            => _stepAdapter.Graphics.AcquireAsync(cancellationToken);
 
         public void WriteTerminalAt(int row, string text) => _runner.WriteTerminalAt(row, text);
 
-        public IAtomicTerminalUpdate BeginAtomicTerminalUpdate() => _runner.BeginAtomicTerminalUpdate();
+        public IAtomicTerminalUpdate BeginAtomicTerminalUpdate() => _runner.BeginAtomicTerminalUpdate(_stepAdapter.Graphics);
 
         public void MarkCommittedRow(int row) => _runner.MarkCommittedRow(row);
 
@@ -2790,7 +3009,7 @@ internal sealed class Hex1bFlowRunner
             }
         }
 
-        public void ReanchorLive(int rowOrigin, int liveHeight, Surface liveSurface)
+        public void ReanchorLive(int rowOrigin, int liveHeight, LiveRenderSnapshot liveSurface)
         {
             lock (_runner._stepOpsLock)
             {

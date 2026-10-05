@@ -22,6 +22,12 @@ namespace Hex1b.Flow;
 /// </remarks>
 internal interface IAtomicTerminalUpdate : IDisposable
 {
+    /// <summary>The processing receipt when this scope owns graphics.</summary>
+    Task<NativeDeliveryOutcome>? Delivery { get; }
+
+    /// <summary>Abandons a composed update without submitting any bytes.</summary>
+    void Discard();
+
     /// <summary>
     /// True once the adapter accepted the composed bytes.
     /// </summary>

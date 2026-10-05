@@ -48,6 +48,16 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
     private volatile Func<RootContext, Task<Hex1bWidget>> _rootComponent;
     private readonly Func<Hex1bTheme>? _themeProvider;
     private readonly IHex1bAppTerminalWorkloadAdapter _adapter;
+    private readonly IHex1bAppTerminalWorkloadAdapter _renderAdapter;
+    private readonly SoftWrapFrameAdapter? _softWrapOutput;
+    private readonly object _runLifecycleSync = new();
+    private TaskCompletionSource? _runStopped;
+    private Task? _resourceDisposal;
+    private readonly AsyncLocal<bool> _runExecutionContext = new();
+    private bool _disposeRequested;
+
+    private IReadOnlyList<Kgp.KgpFragment> _softWrapFragments = Array.Empty<Kgp.KgpFragment>();
+    private int _softWrapRepaintRequested;
     private readonly Hex1bTerminal? _ownedTerminal; // Terminal we created and should dispose
     private readonly Hex1bRenderContext _context;
     private readonly RootContext _rootContext = new();
@@ -312,7 +322,10 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         }
         
         var initialTheme = options.ThemeProvider?.Invoke() ?? options.Theme;
-        _context = new Hex1bRenderContext(_adapter, initialTheme);
+        if (options.UseSoftWrapEmission)
+            _softWrapOutput = new SoftWrapFrameAdapter(_adapter, RequestSoftWrapRepaint);
+        _renderAdapter = _softWrapOutput is null ? _adapter : _softWrapOutput;
+        _context = new Hex1bRenderContext(_renderAdapter, initialTheme);
         
         // Rescue (error boundary) options
         _rescueEnabled = options.EnableRescue;
@@ -362,6 +375,12 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         _invalidateChannel.Writer.TryWrite(true);
     }
 
+    private void RequestSoftWrapRepaint()
+    {
+        Interlocked.Exchange(ref _softWrapRepaintRequested, 1);
+        Invalidate();
+    }
+
     /// <summary>
     /// Number of frames this app has completed rendering. Incremented on the
     /// render loop thread immediately after <see cref="RenderFrameAsync"/>'s
@@ -388,6 +407,15 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
     /// Surface reuse and snapshot copying share a lock. Copying on the caller's
     /// thread alone would race the next frame's clear and produce a torn image.
     /// </remarks>
+    internal LiveRenderSnapshot? SnapshotCurrentLiveFrame()
+    {
+        lock (_surfaceSnapshotSync)
+        {
+            var surface = SnapshotCurrentSurface();
+            return surface is null ? null : new LiveRenderSnapshot(surface, _softWrapFragments);
+        }
+    }
+
     internal Surface? SnapshotCurrentSurface()
     {
         lock (_surfaceSnapshotSync)
@@ -581,6 +609,44 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
     /// Runs the application until cancellation is requested.
     /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken = default)
+    {
+        TaskCompletionSource stopped;
+        lock (_runLifecycleSync)
+        {
+            if (_disposeRequested) throw new ObjectDisposedException(nameof(Hex1bApp));
+            if (_runStopped is not null) throw new InvalidOperationException("The application is already running.");
+            _runStopped = stopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+        Exception? failure = null;
+        _runExecutionContext.Value = true;
+        try { await RunCoreAsync(cancellationToken).ConfigureAwait(false); }
+        catch (Exception error) { failure = error; throw; }
+        finally
+        {
+            try
+            {
+                bool dispose;
+                lock (_runLifecycleSync)
+                {
+                    _runStopped = null;
+                    dispose = _disposeRequested;
+                }
+                if (dispose) await DisposeResourcesAsync().ConfigureAwait(false);
+            }
+            catch (Exception error) { failure = error; throw; }
+            finally
+            {
+                lock (_runLifecycleSync)
+                {
+                    if (_disposeRequested && failure is not null) stopped.TrySetException(failure);
+                    else stopped.TrySetResult();
+                }
+                _runExecutionContext.Value = false;
+            }
+        }
+    }
+
+    private async Task RunCoreAsync(CancellationToken cancellationToken)
     {
         // Register this app as the application-frame source if the adapter supports it
         if (_adapter is Hex1bAppWorkloadAdapter workloadAdapter)
@@ -783,21 +849,30 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         }
         finally
         {
-            // Always exit alternate buffer, even on error
-            _context.ExitAlternateScreen();
-
-            // Drop the repaint handler so we don't keep this app alive via
-            // the workload adapter's delegate slot if RunAsync is restarted
-            // or the host swaps adapters.
-            if (_adapter is Hex1bAppWorkloadAdapter wa)
+            _softWrapOutput?.AbortFrame();
+            try
             {
-                wa.SetRepaintRequestHandler(null);
-                // A stopped app publishes no frames; later captures must not see its last one.
-                if (ReferenceEquals(wa.ApplicationFrameSource, this))
-                    wa.ApplicationFrameSource = null;
+                if (_softWrapOutput is not null)
+                    await _softWrapOutput.ReleaseDirectGraphicsAsync().ConfigureAwait(false);
             }
+            finally
+            {
+                // Always exit alternate buffer, even on error
+                _context.ExitAlternateScreen();
 
-            _inputMilestones?.ApplicationStopped(_applicationInstanceId);
+                // Drop the repaint handler so we don't keep this app alive via
+                // the workload adapter's delegate slot if RunAsync is restarted
+                // or the host swaps adapters.
+                if (_adapter is Hex1bAppWorkloadAdapter wa)
+                {
+                    wa.SetRepaintRequestHandler(null);
+                    // A stopped app publishes no frames; later captures must not see its last one.
+                    if (ReferenceEquals(wa.ApplicationFrameSource, this))
+                        wa.ApplicationFrameSource = null;
+                }
+
+                _inputMilestones?.ApplicationStopped(_applicationInstanceId);
+            }
         }
     }
 
@@ -1153,6 +1228,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
 
         // Check if anything needs rendering before doing expensive output operations
         var needsRender = _isFirstFrame
+            || Interlocked.Exchange(ref _softWrapRepaintRequested, 0) != 0
             || _kgpRetransmitPendingAfterResize
             || (_rootNode?.NeedsRender() ?? false);
         long renderTicks = 0;
@@ -1169,8 +1245,10 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         // Terminals that don't support mode 2026 ignore the sequences.
         if (needsRender)
         {
+            _softWrapOutput?.BeginFrame(frameWidth, frameHeight);
             _context.Write(SyncUpdateBegin);
         }
+        var renderSucceeded = false;
         try
         {
             if (needsRender)
@@ -1233,15 +1311,21 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
             // a synchronized update (needsRender), the cursor restore is part of the
             // atomic frame, so the user never sees the cursor at the last cell-write
             // position.
-            RenderCursor();
+            RenderCursor(force: needsRender && _softWrapOutput is not null);
+            renderSucceeded = true;
         }
         finally
         {
             if (needsRender)
             {
-                _context.Write(SyncUpdateEnd);
+                try { _context.Write(SyncUpdateEnd); }
+                finally { if (!renderSucceeded) _softWrapOutput?.AbortFrame(); }
             }
         }
+        // The surface lock has been released, and hardware cursor output plus
+        // ESU have been captured. Only a complete render reaches the output owner.
+        if (needsRender && _softWrapOutput is not null)
+            await _softWrapOutput.CompleteFrameAsync(cancellationToken).ConfigureAwait(false);
 
         // Frame completed on the render loop thread: publish the count and
         // notify waiters (flow commitment coordinates with the loop here).
@@ -1328,7 +1412,9 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
             // Clear all visible KGP placements before clearing text cells. Some terminals
             // invalidate placements on resize. Repaint the resized text frame first, then
             // retransmit image data on an immediate follow-up frame without another clear.
-            if (_kgpTracker.HasEverTransmitted)
+            if (_useSoftWrapEmission && _currentSurface is not null)
+                _kgpImageEpoch++;
+            if (!_useSoftWrapEmission && _kgpTracker.HasEverTransmitted)
             {
                 _adapter.Write("\x1b_Ga=d,d=a,q=2\x1b\\");
                 Kgp.KgpDebugLog.Write($"frame-resize delete-all-placements size={width}x{height}");
@@ -1360,7 +1446,12 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
                 _kgpRetransmitScheduledAfterResize = false;
             }
 
-            _adapter.Write("\x1b[0m\x1b[2J");
+            if (_useSoftWrapEmission)
+            {
+                _renderAdapter.Write("\x1b[0m");
+                _renderAdapter.Clear();
+            }
+            else _renderAdapter.Write("\x1b[0m\x1b[2J");
 
             _currentSurface?.ClearAndReleaseTrackedObjects();
             _previousSurface?.ClearAndReleaseTrackedObjects();
@@ -1414,8 +1505,8 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         // terminal owns reflow and scroll. Used by inline (non-alt-buffer)
         // step rendering where the active step content has to survive
         // horizontal terminal resizes alongside any tombstones above it.
-        // KGP/sixel content is not supported in this mode — soft-wrap
-        // rendering targets text-only step UIs.
+        // Desired KGP fragments travel with the complete frame; its output
+        // owner advances placement state only after accepted delivery.
         if (_useSoftWrapEmission)
         {
             // CUP to the top-left of the frame, then repaint every row with
@@ -1430,8 +1521,13 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
             // path is deliberately different from SoftWrapEmitter.Emit, whose
             // trailing clear is correct for append-once tombstones but would
             // truncate a full-width live row.
-            _adapter.Write("\x1b[1;1H");
-            SoftWrapEmitter.EmitOrdered(_currentSurface, _adapter);
+            _softWrapFragments = (_kgpRegistry.Images.Count > 0
+                ? Kgp.KgpOcclusionSolver.ComputeFragments(_kgpRegistry)
+                : Kgp.KgpPlacementTracker.ExtractFragments(_currentSurface)).ToArray();
+            _softWrapOutput!.BeginBody(_softWrapFragments);
+            _renderAdapter.Write("\x1b[1;1H");
+            SoftWrapEmitter.EmitOrdered(_currentSurface, _renderAdapter);
+            _softWrapOutput.EndBody();
             // Reset the previous-surface cache so a future switch off of
             // soft-wrap emission (or a downstream diff) starts from a
             // known-empty baseline rather than a stale cell grid that the
@@ -1700,8 +1796,17 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
     /// For other nodes: uses mouse position if mouse cursor is enabled.
     /// Only emits cursor updates when position or shape has changed to reduce flicker.
     /// </summary>
-    private void RenderCursor()
+    private void RenderCursor(bool force = false)
     {
+        if (force)
+        {
+            // Captured frames can be discarded. State emitted in another frame
+            // cannot stand in for this frame's final native cursor state.
+            _context.Write("\x1b[?25l");
+            _lastRenderedCursorVisible = false;
+            _lastRenderedCursorX = -1;
+            _lastRenderedCursorY = -1;
+        }
         var focusedNode = _focusRing.FocusedNode;
 
         // Check if a TextBoxNode is focused and requesting a native line caret
@@ -2585,35 +2690,55 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
 
     public void Dispose()
     {
-        // Signal RunAsync to exit immediately
-        _stopRequested = true;
-        _invalidateChannel.Writer.TryComplete();
-        
-        // Dispose the owned terminal if we created it
-        // The terminal handles writing mouse disable sequences directly to the console
-        _ownedTerminal?.Dispose();
-        
-        // Dispose the adapter
-        if (_adapter is IDisposable disposable)
+        Task? running;
+        lock (_runLifecycleSync)
         {
-            disposable.Dispose();
+            _disposeRequested = true;
+            _stopRequested = true;
+            _invalidateChannel.Writer.TryComplete();
+            running = _runStopped?.Task;
         }
+        // An event handler may dispose its own running app. Its run loop owns
+        // receipt disposition and cleanup before closing the parent adapter.
+        if (running is null) DisposeResourcesAsync().AsTask().GetAwaiter().GetResult();
     }
-    
+
     public async ValueTask DisposeAsync()
     {
-        // Signal RunAsync to exit immediately
-        _stopRequested = true;
-        _invalidateChannel.Writer.TryComplete();
-        
-        // Dispose the owned terminal if we created it
-        // The terminal handles writing mouse disable sequences directly to the console
-        if (_ownedTerminal != null)
+        Task? running;
+        lock (_runLifecycleSync)
         {
-            await _ownedTerminal.DisposeAsync();
+            _disposeRequested = true;
+            _stopRequested = true;
+            _invalidateChannel.Writer.TryComplete();
+            running = _runStopped?.Task;
         }
-        
-        // Dispose the adapter asynchronously
-        await _adapter.DisposeAsync();
+        if (running is not null)
+        {
+            // An awaited callback cannot await the run loop that is awaiting it.
+            if (!_runExecutionContext.Value) await running.ConfigureAwait(false);
+        }
+        else await DisposeResourcesAsync().ConfigureAwait(false);
+    }
+
+    private ValueTask DisposeResourcesAsync()
+    {
+        lock (_runLifecycleSync)
+            return new ValueTask(_resourceDisposal ??= DisposeResourcesCoreAsync());
+    }
+
+    private async Task DisposeResourcesCoreAsync()
+    {
+        try
+        {
+            if (_softWrapOutput is not null)
+                await _softWrapOutput.ReleaseDirectGraphicsAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            _softWrapOutput?.Detach();
+            if (_ownedTerminal is not null) await _ownedTerminal.DisposeAsync().ConfigureAwait(false);
+            await _adapter.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }

@@ -108,7 +108,7 @@ public class FlowHostSignalTests
             // Inject the existing atomic scope without widening the public API.
             // Public Flow operations remain the behavior under test.
             var begin = typeof(Hex1bFlowRunner).GetMethod("BeginAtomicTerminalUpdate", BindingFlags.Instance | BindingFlags.NonPublic)!;
-            var update = (IAtomicTerminalUpdate)begin.Invoke(runner, null)!;
+            var update = (IAtomicTerminalUpdate)begin.Invoke(runner, [null])!;
             using (update)
             {
                 flow.SetWindowTitle("working");

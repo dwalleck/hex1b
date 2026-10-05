@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Text;
 using Hex1b;
 using Hex1b.Flow;
+using Hex1b.Kgp;
 
 namespace Hex1b.Tests.Flow;
 
@@ -203,6 +204,121 @@ public sealed class FlowOutputPumpContractTests
         }
     }
 
+    [TestMethod]
+    public async Task CompleteImages_DiscardedUploadAndRemoval_DoNotAdvanceDeliveredState()
+    {
+        using var harness = PumpHarness.Create(Width, Height, startPump: false);
+        var image = ImageFrame("INITIAL", includeImage: true);
+        harness.StepAdapter.SubmitRenderFrame(image, harness.StepAdapter.OutputEpoch);
+        Assert.AreEqual(1, harness.StepAdapter.DiscardQueuedOutput());
+        harness.StepAdapter.SubmitRenderFrame(image with { Body = ClearPrompt + "DELIVERED" }, harness.StepAdapter.OutputEpoch);
+        harness.StartOutputPump();
+        await harness.WaitForCapturedFrameContainingAsync("DELIVERED");
+        Assert.AreEqual(1, harness.Terminal.KgpImageStore.ImageCount);
+        Assert.AreEqual(41u, TestSeq.Single(harness.Terminal.KgpPlacements).ImageId);
+
+        // Hold the real pump before admission: an already-dequeued removal must
+        // not mutate the accepted tracker when its generation is discarded.
+        var stepLock = typeof(Hex1bFlowRunner).GetField("_stepOpsLock", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(harness.Runner)!;
+        Monitor.Enter(stepLock);
+        try
+        {
+            harness.StepAdapter.SubmitRenderFrame(ImageFrame("STALE-REMOVAL", false), harness.StepAdapter.OutputEpoch);
+            harness.WaitForStepQueueToDrainSynchronously();
+            harness.StepAdapter.DiscardQueuedOutput();
+        }
+        finally { Monitor.Exit(stepLock); }
+        harness.StepAdapter.SubmitRenderFrame(ImageFrame("REMOVED", false), harness.StepAdapter.OutputEpoch);
+        await harness.WaitForCapturedFrameContainingAsync("REMOVED");
+        Assert.AreEqual(0, harness.Terminal.KgpPlacements.Count);
+        Assert.AreEqual(0, harness.Terminal.KgpImageStore.ImageCount);
+        Assert.IsFalse(harness.CapturedFrames.Any(frame => frame.Contains("STALE-REMOVAL", StringComparison.Ordinal)));
+    }
+
+    [TestMethod]
+    public async Task CompleteImages_SlowProcessing_CoalescesOnePendingFrameBehindControls()
+    {
+        using var harness = PumpHarness.Create(Width, Height, startPump: false);
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        void HoldFirstDelivery()
+        {
+            if (Interlocked.Increment(ref calls) != 1) return;
+            entered.SetResult();
+            if (!release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("delivery release was not signalled");
+        }
+        harness.Handle.OutputReceived += HoldFirstDelivery;
+        try
+        {
+            harness.StepAdapter.SubmitRenderFrame(ImageFrame("FIRST", true), harness.StepAdapter.OutputEpoch);
+            harness.StartOutputPump();
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            for (var i = 0; i < 30; i++)
+                harness.StepAdapter.SubmitRenderFrame(ImageFrame($"SUPERSEDED-{i}", false), harness.StepAdapter.OutputEpoch);
+            harness.StepAdapter.Write("\x1b[3;1HCONTROL");
+            harness.StepAdapter.SubmitRenderFrame(ImageFrame("FINAL", true), harness.StepAdapter.OutputEpoch);
+            Assert.AreEqual(2, harness.StepAdapter.OutputQueueDepth, "one pending complete frame and one ordered control");
+            Assert.AreEqual(1, calls, "no second downstream frame may pass the unsettled receipt");
+            release.Set();
+            await harness.WaitForCapturedFrameContainingAsync("FINAL");
+            Assert.AreEqual(1, harness.Terminal.KgpImageStore.ImageCount);
+            Assert.AreEqual(1, harness.Terminal.KgpPlacements.Count);
+            var frames = harness.CapturedFrames;
+            var controlIndex = Array.FindIndex(frames.ToArray(), frame => frame.Contains("CONTROL", StringComparison.Ordinal));
+            var finalIndex = Array.FindIndex(frames.ToArray(), frame => frame.Contains("FINAL", StringComparison.Ordinal));
+            Assert.IsTrue(controlIndex >= 0 && finalIndex > controlIndex, "replacement must stay after intervening controls");
+            Assert.IsFalse(frames.Any(frame => frame.Contains("SUPERSEDED-", StringComparison.Ordinal)));
+        }
+        finally
+        {
+            release.Set();
+            harness.Handle.OutputReceived -= HoldFirstDelivery;
+        }
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task CompleteImages_EpochInvalidation_ReleasesPendingFrameAndPreservesControls(bool resize)
+    {
+        using var adapter = new InlineStepAdapter(Width, Height, 0);
+        adapter.SubmitRenderFrame(ImageFrame("STALE", true), adapter.OutputEpoch);
+        adapter.Write("CONTROL");
+        if (resize) await adapter.ResizeAsync(Width + 1, Height);
+        else adapter.RowOrigin = 1;
+        Assert.AreEqual(1, adapter.OutputQueueDepth, "epoch invalidation must release the pending image snapshot immediately");
+        var control = await adapter.ReadOutputFrameAsync();
+        Assert.AreEqual(InlineOutputFrameKind.Data, control.Kind);
+        Assert.AreEqual("CONTROL", Encoding.UTF8.GetString(control.Bytes));
+    }
+
+    [TestMethod]
+    public async Task CompleteImages_UnexpectedProcessingCancellation_FaultsPumpAndApplicationInput()
+    {
+        using var harness = PumpHarness.Create(Width, Height, startPump: false);
+        void FailPresentation() => throw new OperationCanceledException("parent delivery cancelled while the step remains active");
+        harness.Handle.OutputReceived += FailPresentation;
+        try
+        {
+            harness.StepAdapter.SubmitRenderFrame(ImageFrame("FAILED", true), harness.StepAdapter.OutputEpoch);
+            harness.StartOutputPump();
+            await Assert.ThrowsAsync<OperationCanceledException>(async () =>
+                await harness.OutputPump.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.IsInstanceOfType<OperationCanceledException>(harness.StepAdapter.OutputFailure);
+            await Assert.ThrowsAsync<OperationCanceledException>(async () =>
+                await harness.StepAdapter.InputEvents.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+        finally { harness.Handle.OutputReceived -= FailPresentation; }
+    }
+
+    private static SoftWrapRenderFrame ImageFrame(string text, bool includeImage)
+    {
+        var data = new KgpCellData("\x1b_Ga=t,f=32,s=1,v=1,i=41,q=2;/4AA/w==\x1b\\", 41, 1, 1, 1, 1, [1]);
+        IReadOnlyList<KgpFragment> graphics = includeImage ? [new KgpFragment(41, 0, 1, 1, 1, 0, 0, 1, 1, data)] : [];
+        return new SoftWrapRenderFrame(Width, Height, SyncUpdateBegin, ClearPrompt + text, SyncUpdateEnd, graphics);
+    }
+
     private sealed class PumpHarness : IDisposable
     {
         private readonly object _captureSync = new();
@@ -228,6 +344,8 @@ public sealed class FlowOutputPumpContractTests
             _pumpTask = pumpTask;
         }
 
+        public Task OutputPump => _pumpTask ?? throw new InvalidOperationException("pump has not started");
+
         public Hex1bAppWorkloadAdapter Workload { get; }
 
         public Hex1bTerminal Terminal { get; }
@@ -240,12 +358,15 @@ public sealed class FlowOutputPumpContractTests
 
         public static PumpHarness Create(int width, int height, bool startPump = true)
         {
-            var workload = new Hex1bAppWorkloadAdapter();
+            var caps = new TerminalCapabilities { SupportsKgp = true, SupportsTrueColor = true };
+            var workload = new Hex1bAppWorkloadAdapter(caps);
             var terminal = Hex1bTerminal.CreateBuilder()
                 .WithWorkload(workload)
                 .WithDimensions(width, height)
                 .WithTerminalWidget(out var handle)
                 .Build();
+
+            handle.UpdateHostCapabilities(caps);
 
             var harness = new PumpHarness(
                 workload,

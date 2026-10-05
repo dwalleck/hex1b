@@ -10,10 +10,14 @@ namespace Hex1b.Flow;
 /// without entering the alternate screen. All cursor positioning is offset by the
 /// step's row origin in the terminal.
 /// </summary>
-internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapter, IDisposable
+internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapter, ISoftWrapFrameSink, IDisposable
 {
 
-    private readonly Channel<InlineOutputFrame> _outputChannel;
+    private readonly LinkedList<InlineOutputFrame> _outputQueue = new();
+    private readonly Channel<bool> _outputReady;
+    private LinkedListNode<InlineOutputFrame>? _pendingRenderFrame;
+    internal SoftWrapGraphicsState Graphics { get; } = new();
+    public event Action? FrameRejected;
     private readonly Channel<Hex1bEvent> _inputChannel;
     private readonly TerminalCapabilities _capabilities;
     private readonly object _outputGenerationSync = new();
@@ -45,10 +49,11 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
             SupportsTrueColor = true,
         };
 
-        _outputChannel = Channel.CreateUnbounded<InlineOutputFrame>(new UnboundedChannelOptions
+        _outputReady = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
         {
             SingleReader = false,
-            SingleWriter = false
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropWrite
         });
 
         _inputChannel = Channel.CreateUnbounded<Hex1bEvent>(new UnboundedChannelOptions
@@ -69,6 +74,7 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
 
                 _rowOrigin = value;
                 Interlocked.Increment(ref _outputEpoch);
+                ReleasePendingRenderFrameLocked();
             }
         }
     }
@@ -84,14 +90,8 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
             // for one origin with another origin's generation.
             var rewritten = RewriteCursorPositions(text);
             var bytes = Encoding.UTF8.GetBytes(rewritten);
-            if (_outputChannel.Writer.TryWrite(
-                    new InlineOutputFrame(
-                        bytes,
-                        Volatile.Read(ref _outputEpoch),
-                        InlineOutputFrameKind.Data)))
-            {
-                Interlocked.Increment(ref _outputQueueDepth);
-            }
+            EnqueueOutputLocked(new InlineOutputFrame(
+                bytes, Volatile.Read(ref _outputEpoch), InlineOutputFrameKind.Data));
         }
     }
 
@@ -126,26 +126,17 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
             // sentinel plus every later write as the new generation.
             var epoch = Interlocked.Increment(ref _outputEpoch);
             var dropped = 0;
-            while (_outputChannel.Reader.TryRead(out var queued))
+            foreach (var queued in _outputQueue)
             {
-                Interlocked.Decrement(ref _outputQueueDepth);
-                if (queued.Kind == InlineOutputFrameKind.Data)
-                {
+                if (queued.Kind is InlineOutputFrameKind.Data or InlineOutputFrameKind.RenderFrame)
                     dropped++;
-                }
             }
-
-            // The sentinel is a control item, not a data frame: keep it out of
-            // the returned discard count while tracking it in queue depth.
-            if (!_disposed
-                && _outputChannel.Writer.TryWrite(
-                    new InlineOutputFrame(
-                        Array.Empty<byte>(),
-                        epoch,
-                        InlineOutputFrameKind.DiscardBoundary)))
-            {
-                Interlocked.Increment(ref _outputQueueDepth);
-            }
+            _outputQueue.Clear();
+            _pendingRenderFrame = null;
+            Interlocked.Exchange(ref _outputQueueDepth, 0);
+            if (!_disposed)
+                EnqueueOutputLocked(new InlineOutputFrame(
+                    Array.Empty<byte>(), epoch, InlineOutputFrameKind.DiscardBoundary));
 
             return dropped;
         }
@@ -238,30 +229,85 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
 
     internal async ValueTask<InlineOutputFrame> ReadOutputFrameAsync(CancellationToken ct = default)
     {
-        if (_disposed)
-        {
-            return new InlineOutputFrame(
-                Array.Empty<byte>(),
-                OutputEpoch,
-                InlineOutputFrameKind.Data);
-        }
-
         try
         {
-            if (await _outputChannel.Reader.WaitToReadAsync(ct).ConfigureAwait(false)
-                && _outputChannel.Reader.TryRead(out var frame))
+            while (!ct.IsCancellationRequested)
             {
-                Interlocked.Decrement(ref _outputQueueDepth);
-                return frame;
+                lock (_outputGenerationSync)
+                {
+                    if (_disposed) break;
+                    if (_outputQueue.First is { } next)
+                    {
+                        _outputQueue.RemoveFirst();
+                        if (ReferenceEquals(next, _pendingRenderFrame)) _pendingRenderFrame = null;
+                        Interlocked.Decrement(ref _outputQueueDepth);
+                        return next.Value;
+                    }
+                }
+                await _outputReady.Reader.ReadAsync(ct).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) { }
         catch (ChannelClosedException) { }
+        return new InlineOutputFrame(Array.Empty<byte>(), OutputEpoch, InlineOutputFrameKind.Data);
+    }
 
-        return new InlineOutputFrame(
-            Array.Empty<byte>(),
-            OutputEpoch,
-            InlineOutputFrameKind.Data);
+    public long CaptureOutputEpoch()
+    {
+        lock (_outputGenerationSync) return _outputEpoch;
+    }
+
+    public void SubmitRenderFrame(SoftWrapRenderFrame frame, long epoch)
+    {
+        var rejected = false;
+        lock (_outputGenerationSync)
+        {
+            if (_disposed) return;
+            if (epoch != _outputEpoch || frame.Width != _width || frame.Height != _height)
+            {
+                rejected = true;
+            }
+            else
+            {
+                var rewritten = frame with
+                {
+                    Prefix = RewriteCursorPositions(frame.Prefix),
+                    Body = RewriteCursorPositions(frame.Body),
+                    Suffix = RewriteCursorPositions(frame.Suffix)
+                };
+                // Move the replacement behind intervening controls. Replacing
+                // the old node in place would deliver a newer frame too early.
+                ReleasePendingRenderFrameLocked();
+                _pendingRenderFrame = EnqueueOutputLocked(new InlineOutputFrame(
+                    Encoding.UTF8.GetBytes(rewritten.Text), epoch, InlineOutputFrameKind.RenderFrame)
+                { RenderFrame = rewritten });
+            }
+        }
+        if (rejected) RequestRenderFrame();
+    }
+
+    internal void RequestRenderFrame() => FrameRejected?.Invoke();
+    internal Exception? OutputFailure { get; private set; }
+    internal void FailOutput(Exception failure)
+    {
+        OutputFailure = failure;
+        _inputChannel.Writer.TryComplete(failure);
+    }
+
+    private void ReleasePendingRenderFrameLocked()
+    {
+        if (_pendingRenderFrame is not { } pending) return;
+        _outputQueue.Remove(pending);
+        _pendingRenderFrame = null;
+        Interlocked.Decrement(ref _outputQueueDepth);
+    }
+
+    private LinkedListNode<InlineOutputFrame> EnqueueOutputLocked(InlineOutputFrame frame)
+    {
+        var node = _outputQueue.AddLast(frame);
+        Interlocked.Increment(ref _outputQueueDepth);
+        _outputReady.Writer.TryWrite(true);
+        return node;
     }
 
     public ValueTask WriteInputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
@@ -315,6 +361,7 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
         lock (_outputGenerationSync)
         {
             Interlocked.Increment(ref _outputEpoch);
+            ReleasePendingRenderFrameLocked();
             _width = width;
             _height = height;
             _inputChannel.Writer.TryWrite(new Hex1bResizeEvent(width, height));
@@ -333,7 +380,11 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
         {
             if (_disposed) return;
             _disposed = true;
-            _outputChannel.Writer.TryComplete();
+            _outputQueue.Clear();
+            _pendingRenderFrame = null;
+            FrameRejected = null;
+            Interlocked.Exchange(ref _outputQueueDepth, 0);
+            _outputReady.Writer.TryComplete();
             _inputChannel.Writer.TryComplete();
         }
     }
@@ -355,14 +406,8 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
         {
             if (_disposed) return;
             var bytes = Encoding.UTF8.GetBytes(text);
-            if (_outputChannel.Writer.TryWrite(
-                    new InlineOutputFrame(
-                        bytes,
-                        Volatile.Read(ref _outputEpoch),
-                        InlineOutputFrameKind.Data)))
-            {
-                Interlocked.Increment(ref _outputQueueDepth);
-            }
+            EnqueueOutputLocked(new InlineOutputFrame(
+                bytes, Volatile.Read(ref _outputEpoch), InlineOutputFrameKind.Data));
         }
     }
 

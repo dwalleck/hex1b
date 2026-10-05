@@ -87,14 +87,15 @@ public readonly record struct WorkloadOutputItem(
     internal (int Width, int Height)? Resize { get; init; }
 
     /// <summary>
-    /// Present when this batch must be delivered only if the native presentation
-    /// still reports the geometry it was composed for.
+    /// Present when this batch requires a processing receipt, optionally conditioned
+    /// on the presentation still reporting the geometry it was composed for.
     /// </summary>
     /// <remarks>
-    /// The terminal delivers such a batch, and only then brings the model and the
-    /// presentation observers up to date, so a refused batch leaves no trace on
-    /// either. The receipt is what a producer retries against.
+    /// Ungated receipts complete after model/presentation processing through the
+    /// ordinary filter path. Geometry-gated batches are refused before application
+    /// when their geometry is stale; only that zero-byte outcome permits retry.
+    /// Queue admission alone never completes a receipt.
     /// </remarks>
-    internal GeometryGatedDelivery? Delivery { get; init; }
+    internal WorkloadDelivery? Delivery { get; init; }
 }
 
