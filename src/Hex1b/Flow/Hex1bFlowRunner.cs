@@ -3,6 +3,7 @@ using Hex1b.Input;
 using Hex1b.Layout;
 using Hex1b.Surfaces;
 using Hex1b.Theming;
+using Hex1b.Tokens;
 using Hex1b.Widgets;
 
 namespace Hex1b.Flow;
@@ -1000,6 +1001,12 @@ internal sealed class Hex1bFlowRunner
         _options = options;
         _parentAdapter = parentAdapter;
     }
+
+    internal void SetWindowTitle(string title)
+        => WriteTerminal(AnsiTokenSerializer.Serialize(new OscToken(
+            "2", "", TerminalTitle.Normalize(title), UseEscBackslash: true)));
+
+    internal void RequestAttention() => WriteTerminal("\a");
 
     /// <summary>
     /// Gets the cancellation token from the outer flow runner.

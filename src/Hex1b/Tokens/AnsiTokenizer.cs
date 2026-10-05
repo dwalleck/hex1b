@@ -176,6 +176,14 @@ public static class AnsiTokenizer
                 i += 2;
             }
             // Check for control characters
+            else if (text[i] == '\a')
+            {
+                // A standalone BEL requests attention; OSC terminators are
+                // consumed by the OSC parser before reaching this branch.
+                FlushTextToken(text, ref textStart, i, tokens);
+                tokens.Add(new ControlCharacterToken('\a'));
+                i++;
+            }
             else if (text[i] == '\n')
             {
                 FlushTextToken(text, ref textStart, i, tokens);

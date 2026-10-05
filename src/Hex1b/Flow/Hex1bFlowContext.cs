@@ -39,6 +39,41 @@ public sealed class Hex1bFlowContext
     /// </summary>
     public CancellationToken CancellationToken => _runner.CancellationToken;
 
+    /// <summary>
+    /// Requests a new native terminal window title.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Use while the owning flow callback is running. The request is queued with
+    /// the flow's serialized terminal output; returning does not acknowledge
+    /// display by the host. Host settings may suppress application title changes.
+    /// </para>
+    /// <para>
+    /// Control characters are removed, unpaired surrogates are replaced, and the
+    /// title is limited to 4096 UTF-16 code units without splitting a surrogate
+    /// pair. Empty text requests an empty title. The previous title is not
+    /// restored automatically when the flow ends.
+    /// </para>
+    /// </remarks>
+    /// <param name="title">Plain title text, including Unicode and punctuation.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="title"/> is null.</exception>
+    public void SetWindowTitle(string title)
+    {
+        ArgumentNullException.ThrowIfNull(title);
+        _runner.SetWindowTitle(title);
+    }
+
+    /// <summary>
+    /// Requests the user's attention through the native terminal bell.
+    /// </summary>
+    /// <remarks>
+    /// Use while the owning flow callback is running. Each call queues one bell
+    /// with serialized flow output. The host chooses its configured sound or
+    /// visual response and may disable it. Returning does not acknowledge a
+    /// displayed notification, and this method does not request keyboard focus.
+    /// </remarks>
+    public void RequestAttention() => _runner.RequestAttention();
+
     private static Hex1bFlowStepOptions? BuildOptions(Action<Hex1bFlowStepOptions>? configure)
     {
         if (configure == null) return null;
