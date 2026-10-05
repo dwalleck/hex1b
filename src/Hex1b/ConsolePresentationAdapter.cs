@@ -66,9 +66,9 @@ public sealed class ConsolePresentationAdapter :
     // started), the observation still fails deterministically with null.
     private static readonly TimeSpan CursorObservationTimeout = TimeSpan.FromMilliseconds(250);
 
-    // Upper bound on bytes accepted while a reply is pending, so a paste arriving
-    // during the window cannot grow the buffer without bound. Anything buffered is
-    // preserved on exit, so nothing is lost when the cap is hit.
+    // Bound the observation's scan window, not the amount of ordinary input that
+    // can precede a report. Safe prefixes return through the existing stdin reader
+    // while the same request retains its query/deadline and serialization gate.
     private const int MaxCursorObservationBufferedBytes = 4096;
 
     // A cell dimension above this is treated as implausible/overflow garbage
@@ -463,10 +463,19 @@ public sealed class ConsolePresentationAdapter :
                     return ReadOnlyMemory<byte>.Empty;
                 }
 
-                if (_prefetchedInput.Length > 0)
+                byte[] prefetched;
+                CursorObservationRequest? observation;
+                lock (_cursorObservationSync)
                 {
-                    var prefetched = _prefetchedInput;
+                    prefetched = _prefetchedInput;
                     _prefetchedInput = [];
+                    // Idle expiry may flush a retained suffix. Drain input or
+                    // claim its request atomically, so newer driver bytes cannot
+                    // overtake a suffix flushed between these two decisions.
+                    observation = prefetched.Length == 0 ? TakePendingCursorObservation() : null;
+                }
+                if (prefetched.Length > 0)
+                {
                     var result = NormalizeInputToUtf8(prefetched);
                     if (!result.IsEmpty)
                     {
@@ -480,17 +489,17 @@ public sealed class ConsolePresentationAdapter :
                 // A pending native cursor observation is serviced here, on the reader
                 // that already owns stdin. Opening a second reader on fd 0 would
                 // compete with this one and deadlock.
-                var observation = TakePendingCursorObservation();
                 if (observation is not null)
                 {
+                    var completed = true;
                     try
                     {
-                        await ServiceCursorPositionObservationAsync(
+                        completed = await ServiceCursorPositionObservationAsync(
                             observation, linkedCts.Token).ConfigureAwait(false);
                     }
                     finally
                     {
-                        CompleteCursorObservationService(observation);
+                        CompleteCursorObservationService(observation, completed);
                     }
 
                     // Never return empty for a query-only iteration: the terminal
@@ -615,29 +624,66 @@ public sealed class ConsolePresentationAdapter :
     {
         lock (_cursorObservationSync)
         {
+            if (_activeCursorObservation is not null)
+            {
+                _activeCursorObservation.ServiceActive = true;
+                return _activeCursorObservation;
+            }
+
             var request = _pendingCursorObservation;
             _pendingCursorObservation = null;
             if (request is not null)
             {
                 _activeCursorObservation = request;
+                request.ServiceActive = true;
             }
 
             return request;
         }
     }
 
-    private void CompleteCursorObservationService(CursorObservationRequest request)
+    private void CompleteCursorObservationService(CursorObservationRequest request, bool completed = true)
     {
         lock (_cursorObservationSync)
         {
             if (!ReferenceEquals(_activeCursorObservation, request))
             {
+                if (_disposed)
+                    FinishCursorObservation(request);
                 return;
             }
 
+            request.ServiceActive = false;
+            if (!completed && request.ReplyDeadline is { IsCancellationRequested: false } && !_disposed)
+                return;
+
             _activeCursorObservation = null;
+            FinishCursorObservation(request);
         }
 
+        request.ReleaseGate();
+    }
+
+    // Called under _cursorObservationSync only when the reader has finished or
+    // yielded. Caller timeout/cancellation alone never retires an issued query.
+    private void FinishCursorObservation(CursorObservationRequest request)
+    {
+        request.TrySetResult(null);
+        AppendPrefetchedInput(CollectionsMarshal.AsSpan(request.BufferedInput));
+        request.BufferedInput.Clear();
+        request.ReplyDeadline?.Dispose();
+        request.ReplyDeadline = null;
+    }
+
+    private void RetireExpiredIdleCursorObservation(CursorObservationRequest request)
+    {
+        lock (_cursorObservationSync)
+        {
+            if (!ReferenceEquals(_activeCursorObservation, request) || request.ServiceActive)
+                return;
+            _activeCursorObservation = null;
+            FinishCursorObservation(request);
+        }
         request.ReleaseGate();
     }
 
@@ -649,30 +695,24 @@ public sealed class ConsolePresentationAdapter :
     /// ambiguous modified-F3-shaped sequence — is preserved and re-delivered through
     /// the normal input path.
     /// </summary>
-    private async ValueTask ServiceCursorPositionObservationAsync(
+    private async ValueTask<bool> ServiceCursorPositionObservationAsync(
         CursorObservationRequest request,
         CancellationToken ct)
     {
-        if (request.IsCompleted)
-        {
-            return;
-        }
-
-        var buffered = new List<byte>();
-        var readBuffer = new byte[64];
-
+        var buffered = request.BufferedInput;
+        var readBuffer = new byte[256];
         try
         {
-            if (_disposed || ct.IsCancellationRequested)
+            if ((request.IsCompleted && request.ReplyDeadline is null) || _disposed)
             {
-                return;
+                return true;
             }
 
             // Never issue the query while the capability probe may still be reading
             // the driver: the two would race for the reply on the same fd. Keep this
             // bounded wait separate from the reply deadline, which starts only after
             // the query write and flush complete.
-            if (_inRawMode)
+            if (request.ReplyDeadline is null && _inRawMode)
             {
                 try
                 {
@@ -681,7 +721,7 @@ public sealed class ConsolePresentationAdapter :
                 }
                 catch (TimeoutException)
                 {
-                    return;
+                    return true;
                 }
             }
 
@@ -689,26 +729,35 @@ public sealed class ConsolePresentationAdapter :
             // the terminal would answer that from its own model, and the reply would
             // never be ours. The write lock keeps it from splitting a live frame the
             // output pump is concurrently writing.
-            lock (_driverWriteSync)
+            if (request.ReplyDeadline is null)
             {
-                _driver.Write(CursorPositionQuery);
-                _driver.Flush();
+                lock (_driverWriteSync)
+                {
+                    _driver.Write(CursorPositionQuery);
+                    _driver.Flush();
+                }
+                request.ReplyDeadline = new CancellationTokenSource(CursorPositionReplyTimeout, _timeProvider);
+                request.ReplyDeadline.Token.UnsafeRegister(static state =>
+                {
+                    var (adapter, observation) = ((ConsolePresentationAdapter, CursorObservationRequest))state!;
+                    // Queue retirement so disposing the deadline under the state
+                    // lock never waits on a callback trying to acquire that lock.
+                    ThreadPool.QueueUserWorkItem(_ => adapter.RetireExpiredIdleCursorObservation(observation));
+                }, (this, request));
             }
 
             // The reply deadline begins once the query is fully written and flushed.
             // This leaves the caller's longer watchdog to cover query-write latency.
-            // Declare the registration after the CTS so disposal unregisters the
-            // callback before disposing the CTS it targets.
-            using var replyCts =
-                new CancellationTokenSource(CursorPositionReplyTimeout, _timeProvider);
-            using var cancellationRegistration = ct.UnsafeRegister(
-                static state => ((CancellationTokenSource)state!).Cancel(), replyCts);
+            var replyCts = request.ReplyDeadline;
+            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct, replyCts.Token);
 
             while (!replyCts.IsCancellationRequested)
             {
-                var bytesRead = await _driver.ReadAsync(readBuffer, replyCts.Token).ConfigureAwait(false);
+                var bytesRead = await _driver.ReadAsync(readBuffer, readCts.Token).ConfigureAwait(false);
                 if (bytesRead <= 0)
                 {
+                    if (ct.IsCancellationRequested && !replyCts.IsCancellationRequested)
+                        return false; // Retain query ownership through its reply window.
                     break;
                 }
 
@@ -720,30 +769,34 @@ public sealed class ConsolePresentationAdapter :
                     break;
                 }
 
-                if (buffered.Count > MaxCursorObservationBufferedBytes)
+                if (buffered.Count >= MaxCursorObservationBufferedBytes)
                 {
-                    break;
+                    // Keep a possible split CPR beginning at the last ESC. A
+                    // candidate larger than the previous scan cap was already
+                    // unobservable; do not let such input grow retained state.
+                    var lastEscape = buffered.FindLastIndex(value => value == 0x1b);
+                    var retained = lastEscape < 0 ? 0
+                        : Math.Min(MaxCursorObservationBufferedBytes, buffered.Count - lastEscape);
+                    var prefixLength = buffered.Count - retained;
+                    if (prefixLength > 0)
+                    {
+                        AppendPrefetchedInput(CollectionsMarshal.AsSpan(buffered)[..prefixLength]);
+                        buffered.RemoveRange(0, prefixLength);
+                        return false;
+                    }
                 }
             }
         }
         catch (OperationCanceledException)
         {
-            // Bounded deadline (or shutdown) reached before a usable report arrived.
+            if (ct.IsCancellationRequested && request.ReplyDeadline is { IsCancellationRequested: false } && !_disposed)
+                return false;
         }
         catch (ObjectDisposedException)
         {
             // Shutdown raced the observation; fall through to the null result.
         }
-        finally
-        {
-            // A no-op when a report already completed the request.
-            request.TrySetResult(null);
-
-            if (buffered.Count > 0)
-            {
-                AppendPrefetchedInput(CollectionsMarshal.AsSpan(buffered));
-            }
-        }
+        return true;
     }
 
     /// <summary>
@@ -975,6 +1028,11 @@ public sealed class ConsolePresentationAdapter :
         public Task<(int Column, int Row)?> Completion => _completion.Task;
 
         public bool IsCompleted => _completion.Task.IsCompleted;
+
+        // Only the serialized presentation reader accesses continuation state.
+        public List<byte> BufferedInput { get; } = new();
+        public CancellationTokenSource? ReplyDeadline { get; set; }
+        public bool ServiceActive { get; set; }
 
         public void TrySetResult((int Column, int Row)? position) => _completion.TrySetResult(position);
 
@@ -1721,16 +1779,19 @@ public sealed class ConsolePresentationAdapter :
         if (data.IsEmpty)
             return;
 
-        if (_prefetchedInput.Length == 0)
+        lock (_cursorObservationSync)
         {
-            _prefetchedInput = data.ToArray();
-            return;
-        }
+            if (_prefetchedInput.Length == 0)
+            {
+                _prefetchedInput = data.ToArray();
+                return;
+            }
 
-        var combined = new byte[_prefetchedInput.Length + data.Length];
-        _prefetchedInput.CopyTo(combined, 0);
-        data.CopyTo(combined.AsSpan(_prefetchedInput.Length));
-        _prefetchedInput = combined;
+            var combined = new byte[_prefetchedInput.Length + data.Length];
+            _prefetchedInput.CopyTo(combined, 0);
+            data.CopyTo(combined.AsSpan(_prefetchedInput.Length));
+            _prefetchedInput = combined;
+        }
     }
 
     private static bool TryConsumeKgpProbeResponse(List<byte> buffer, uint probeImageId, out bool supportsKgp)
@@ -1911,6 +1972,8 @@ public sealed class ConsolePresentationAdapter :
             _pendingCursorObservation = null;
             activeObservation = _activeCursorObservation;
             _activeCursorObservation = null;
+            if (activeObservation is { ServiceActive: false })
+                FinishCursorObservation(activeObservation);
             activeWake = _activeReadWakeCts;
             _activeReadWakeCts = null;
         }

@@ -107,6 +107,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
     private const uint WAIT_OBJECT_0 = 0;
     private const uint WAIT_FAILED = 0xFFFFFFFF;
     private const uint INFINITE = 0xFFFFFFFF;
+    private const int InputRecordBatchSize = 256;
     private readonly nint _inputHandle;
     private readonly nint _outputHandle;
     private uint _originalInputMode;
@@ -318,7 +319,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
 
     private unsafe int ReadCore(Memory<byte> buffer, CancellationToken ct)
     {
-        var records = stackalloc INPUT_RECORD[16];
+        var records = stackalloc INPUT_RECORD[InputRecordBatchSize];
         try
         {
             while (!ct.IsCancellationRequested)
@@ -338,7 +339,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
 
                 // Keep the input records on the worker stack. There is one reader,
                 // so no heap-backed batch or synthetic wake record is needed.
-                if (!ReadConsoleInput(_inputHandle, records, 16, out var numRead))
+                if (!ReadConsoleInput(_inputHandle, records, InputRecordBatchSize, out var numRead))
                 {
                     throw new InvalidOperationException(
                         $"ReadConsoleInput failed: {Marshal.GetLastWin32Error()}");
