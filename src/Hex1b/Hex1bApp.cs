@@ -806,6 +806,15 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
     /// </summary>
     private async Task ProcessInputEventAsync(Hex1bEvent inputEvent, CancellationToken cancellationToken)
     {
+        // A preceding event may have replaced the focused surface. Reconcile the
+        // requested focus before routing the next event, even within a coalesced
+        // batch or an invalidation-driven drain of the input queue.
+        if (_pendingFocusPredicate is not null)
+        {
+            await RenderFrameAsync(cancellationToken);
+            _lastRenderTimestamp = _frameTimeProvider.GetTimestamp();
+        }
+
         var inputStart = Stopwatch.GetTimestamp();
         var eventType = inputEvent switch
         {
