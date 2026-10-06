@@ -973,9 +973,9 @@ public sealed class Hex1bAppWorkloadAdapter :
         // If we receive raw bytes, we need to parse them
         // This is a simplified version - full parsing is in Hex1bTerminal
         var text = Encoding.UTF8.GetString(data.Span);
-        foreach (var c in text)
+        foreach (var rune in text.EnumerateRunes())
         {
-            var evt = ParseKeyInput(c);
+            var evt = rune.IsBmp ? ParseKeyInput((char)rune.Value) : Hex1bKeyEvent.FromText(rune.ToString());
             if (evt != null)
             {
                 await WriteInputTrackedAsync(evt, ct);
