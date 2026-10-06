@@ -24,9 +24,15 @@ public class FlowCursorPasteObservationTests
         Assert.AreEqual(new string('x', 4096), Encoding.UTF8.GetString((await prefix.WaitAsync(stop.Token)).Span));
         var second = source.ObserveCursorPositionAsync(stop.Token);
         clock.Advance(TimeSpan.FromMilliseconds(50));
-        Assert.IsNull(await first.WaitAsync(stop.Token));
+        // The first caller's watchdog expired at t=250 after its query was written, so it
+        // no longer decides (framework 53, decision A); the yielded query keeps its window.
+        // An early (wrong) completion finishes the async caller on a pooled continuation; let it surface.
+        await Task.WhenAny(first, Task.Delay(TimeSpan.FromMilliseconds(200), stop.Token));
+        Assert.IsFalse(first.IsCompleted, "The caller watchdog must not decide after the query write began.");
         var resumed = adapter.ReadInputAsync(stop.Token).AsTask();
-        driver.Enqueue("\x1b[7;1R"); // Late for the caller, inside the first reply window.
+        driver.Enqueue("\x1b[7;1R"); // After the caller watchdog, inside the first reply window.
+        Assert.AreEqual(6, (await first.WaitAsync(stop.Token)).GetValueOrDefault((-1, -1)).Row,
+            "The first query's in-window reply is its own result.");
         await driver.SecondCursorQueryFlushed.Task.WaitAsync(stop.Token);
         driver.Enqueue("\x1b[20;1Rz");
         var position = await second.WaitAsync(stop.Token);

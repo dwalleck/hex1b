@@ -58,12 +58,16 @@ public sealed class ConsolePresentationAdapter :
     // How long the reader waits for a reply once it has written and flushed the query.
     private static readonly TimeSpan CursorPositionReplyTimeout = TimeSpan.FromMilliseconds(150);
 
-    // How long the caller waits for the whole observation: queueing, reader wake,
-    // query write/flush, and the post-write reply. This is deliberately longer than
-    // the reply timeout, but the reply timer starts only after the query is written,
-    // so the reader's outcome is not guaranteed to win this overall watchdog race.
-    // If no reader ever services the request (for example the terminal has not
-    // started), the observation still fails deterministically with null.
+    // How long the caller waits for its posted request to be serviced: reader claim,
+    // reader wake and the capability-probe wait, up to the moment the reader begins
+    // writing the query (any wait behind an in-progress output write is after that).
+    // It starts once the request reaches the head of the FIFO gate. If no reader ever services the request (for example the terminal has not
+    // started), the observation fails deterministically with null. Once the query write
+    // begins, the reader decides: the console write blocks as all output does (Windows
+    // console writes were measured at hundreds of milliseconds under terminal
+    // backpressure), and the 150 ms reply deadline then starts after the flush. A
+    // wall-clock watchdog across that write would discard a reply the terminal
+    // delivered promptly and report no authoritative boundary.
     private static readonly TimeSpan CursorObservationTimeout = TimeSpan.FromMilliseconds(250);
 
     // Bound the observation's scan window, not the amount of ordinary input that
@@ -731,6 +735,13 @@ public sealed class ConsolePresentationAdapter :
             // output pump is concurrently writing.
             if (request.ReplyDeadline is null)
             {
+                // From here the caller watchdog no longer decides the request; the
+                // blocking write and the post-flush reply deadline below do.
+                lock (_cursorObservationSync)
+                {
+                    request.QueryWriteStarted = true;
+                }
+
                 lock (_driverWriteSync)
                 {
                     _driver.Write(CursorPositionQuery);
@@ -747,7 +758,7 @@ public sealed class ConsolePresentationAdapter :
             }
 
             // The reply deadline begins once the query is fully written and flushed.
-            // This leaves the caller's longer watchdog to cover query-write latency.
+            // Query-write latency is not bounded by the caller watchdog (framework 53).
             var replyCts = request.ReplyDeadline;
             using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct, replyCts.Token);
 
@@ -916,7 +927,11 @@ public sealed class ConsolePresentationAdapter :
 
             using var timeoutCts = new CancellationTokenSource(CursorObservationTimeout, _timeProvider);
             using var timeoutRegistration = timeoutCts.Token.Register(
-                static state => ((CursorObservationRequest)state!).TrySetResult(null), request);
+                static state =>
+                {
+                    var (adapter, observation) = ((ConsolePresentationAdapter, CursorObservationRequest))state!;
+                    adapter.ExpireCallerWatchdog(observation);
+                }, (this, request));
             using var cancellationRegistration = cancellationToken.Register(
                 static state => ((CursorObservationRequest)state!).TrySetCanceled(), request);
 
@@ -970,6 +985,20 @@ public sealed class ConsolePresentationAdapter :
         }
     }
 
+    // The caller watchdog bounds admission only: it completes the request with null
+    // unless the reader has already begun writing its query. Completion runs
+    // continuations asynchronously, so no caller code runs under the state lock.
+    private void ExpireCallerWatchdog(CursorObservationRequest request)
+    {
+        lock (_cursorObservationSync)
+        {
+            if (!request.QueryWriteStarted)
+            {
+                request.TrySetResult(null);
+            }
+        }
+    }
+
     /// <summary>
     /// Serializes observations: one query window is in flight at a time, because the
     /// reader services exactly one pending request per pass. The reader owns a gate
@@ -1014,7 +1043,8 @@ public sealed class ConsolePresentationAdapter :
 
     /// <summary>
     /// A single in-flight cursor observation: completed by the input reader with the
-    /// decoded position, by the deadline with <see langword="null"/>, or by caller
+    /// decoded position, with <see langword="null"/> by the caller watchdog before its
+    /// query write begins or by the post-flush reply deadline after it, or by caller
     /// cancellation.
     /// </summary>
     private sealed class CursorObservationRequest
@@ -1033,6 +1063,10 @@ public sealed class ConsolePresentationAdapter :
         public List<byte> BufferedInput { get; } = new();
         public CancellationTokenSource? ReplyDeadline { get; set; }
         public bool ServiceActive { get; set; }
+
+        // Set under the adapter's state lock when the reader begins writing the query;
+        // from then on the caller watchdog no longer completes the request.
+        public bool QueryWriteStarted { get; set; }
 
         public void TrySetResult((int Column, int Row)? position) => _completion.TrySetResult(position);
 

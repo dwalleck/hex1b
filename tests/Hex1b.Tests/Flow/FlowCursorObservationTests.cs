@@ -114,9 +114,9 @@ public class FlowCursorObservationTests
         Assert.Contains("\x1b[6n", driver.WrittenText);
         Assert.AreEqual(TimeSpan.FromMilliseconds(100), clock.GetElapsedTime(observationStarted));
 
-        // The reply arrives 100 ms after the completed write: 200 ms total is inside
-        // the caller's 250 ms watchdog, while the reply itself is inside its 150 ms
-        // post-write deadline. Text on both sides must remain ordinary input.
+        // The reply arrives 100 ms after the completed write, inside its 150 ms
+        // post-write deadline (the caller watchdog no longer applies once the write
+        // began). Text on both sides must remain ordinary input.
         var replyStarted = clock.GetTimestamp();
         clock.Advance(TimeSpan.FromMilliseconds(100));
         driver.Enqueue("before");
@@ -133,6 +133,56 @@ public class FlowCursorObservationTests
         var input = await reader.WaitAsync(ct);
         Assert.AreEqual("beforeafter", Encoding.UTF8.GetString(input.Span),
             "Interleaved user text must survive CPR filtering in order and exactly once.");
+    }
+
+    // Framework 53 (decision A): the caller watchdog bounds admission only. Native Windows evidence measured the
+    // cursor query's blocking console write at 224 ms of the 250 ms watchdog under output backpressure; a reply
+    // delivered promptly after such a write must not be discarded as "no authoritative boundary".
+    [TestMethod]
+    public async Task ObserveCursorPositionAsync_QueryWriteBlockedPastCallerWatchdog_ReportsPromptReply()
+    {
+        var clock = new FakeTimeProvider();
+        using var driver = new ScriptedConsoleDriver { Clock = clock, CursorQueryWriteDuration = TimeSpan.FromMilliseconds(260) };
+        await using var adapter = new ConsolePresentationAdapter(driver, timeProvider: clock);
+        var ct = TestContext.Current.CancellationToken;
+        var reader = Task.Run(async () => await adapter.ReadInputAsync(ct), ct);
+        var started = clock.GetTimestamp();
+        var observation = ((ICursorPositionSource)adapter).ObserveCursorPositionAsync(ct);
+        await driver.CursorReplyReadEntered.Task.WaitAsync(WaitTimeout, ct);
+        Assert.AreEqual(TimeSpan.FromMilliseconds(260), clock.GetElapsedTime(started));
+
+        driver.Enqueue("before\x1b[12;5Rafter");
+
+        Assert.AreEqual((4, 11), await observation.WaitAsync(WaitTimeout, ct),
+            "A reply inside the post-write reply window must reach the caller after a slow query write.");
+        Assert.AreEqual("beforeafter", Encoding.UTF8.GetString((await reader.WaitAsync(WaitTimeout, ct)).Span));
+    }
+
+    [TestMethod]
+    public async Task ObserveCursorPositionAsync_QueryWriteBlockedPastCallerWatchdog_NoReplyFailsAtPostFlushDeadline()
+    {
+        var clock = new FakeTimeProvider();
+        using var driver = new ScriptedConsoleDriver { Clock = clock, CursorQueryWriteDuration = TimeSpan.FromMilliseconds(260) };
+        await using var adapter = new ConsolePresentationAdapter(driver, timeProvider: clock);
+        var ct = TestContext.Current.CancellationToken;
+        var reader = Task.Run(async () => await adapter.ReadInputAsync(ct), ct);
+        try
+        {
+            var observation = ((ICursorPositionSource)adapter).ObserveCursorPositionAsync(ct);
+            await driver.CursorReplyReadEntered.Task.WaitAsync(WaitTimeout, ct);
+            await AssertStillPendingAsync(observation, "The caller watchdog must not decide once the query write has begun.");
+
+            // The unchanged 150 ms reply deadline, started after the flush, still bounds the reply.
+            clock.Advance(TimeSpan.FromMilliseconds(149));
+            await AssertStillPendingAsync(observation, "The reply deadline must not expire early.");
+            clock.Advance(TimeSpan.FromMilliseconds(1));
+            Assert.IsNull(await observation.WaitAsync(WaitTimeout, ct));
+        }
+        finally
+        {
+            await adapter.DisposeAsync();
+            await reader.WaitAsync(WaitTimeout, ct);
+        }
     }
 
     [TestMethod]
@@ -155,20 +205,22 @@ public class FlowCursorObservationTests
             Assert.AreEqual(TimeSpan.FromMilliseconds(200), clock.GetElapsedTime(started));
 
             // Queue the second caller while the first reader service is still waiting
-            // for its absent reply. The first caller's 250 ms watchdog fires at t=250,
-            // but the reader service remains the owner of the serialized gate until its
-            // own 150 ms post-write deadline at t=350.
+            // for its absent reply. The first caller's 250 ms watchdog expires at t=250,
+            // but the first query was already written, so the watchdog no longer decides
+            // (framework 53, decision A): the reader owns both the result and the
+            // serialized gate until its own 150 ms post-write deadline at t=350.
             var second = source.ObserveCursorPositionAsync(ct);
             clock.Advance(TimeSpan.FromMilliseconds(50));
-            Assert.IsNull(await first.WaitAsync(ct));
+            await AssertStillPendingAsync(first, "The caller watchdog must not decide after the query write began.");
 
             clock.Advance(TimeSpan.FromMilliseconds(100));
+            Assert.IsNull(await first.WaitAsync(ct));
             await driver.SecondCursorQueryFlushed.Task.WaitAsync(ct);
             await driver.SecondCursorReplyReadEntered.Task.WaitAsync(ct);
             Assert.AreEqual(TimeSpan.FromMilliseconds(450), clock.GetElapsedTime(started));
 
-            // The second caller must have been admitted at t=350, not t=250. Its
-            // watchdog therefore remains alive at t=500 while its query is in flight.
+            // The second caller must have been admitted at t=350, not t=250, and its
+            // query was written before its own watchdog could expire.
             clock.Advance(TimeSpan.FromMilliseconds(100));
             driver.Enqueue("before\x1b[12;5Rafter");
 
@@ -214,16 +266,18 @@ public class FlowCursorObservationTests
             await Assert.ThrowsAsync<OperationCanceledException>(() => second.WaitAsync(ct));
 
             // Keep A inside its synchronous query write while B is canceled and C is
-            // queued. A's caller watchdog expires at t=250, but the reader-owned
-            // service gate remains held until the write is released at t=300.
+            // queued. A's caller watchdog expires at t=250, but A's query write had
+            // begun, so the watchdog no longer decides (framework 53, decision A) and
+            // the reader-owned service gate remains held until the write is released.
             var tail = source.ObserveCursorPositionAsync(ct);
             clock.Advance(TimeSpan.FromMilliseconds(300));
-            Assert.IsNull(await first.WaitAsync(ct));
+            await AssertStillPendingAsync(first, "A blocked query write must not be decided by the caller watchdog.");
 
             driver.CursorQueryWriteRelease.TrySetResult();
             await driver.CursorQueryFlushed.Task.WaitAsync(ct);
             await driver.CursorReplyReadEntered.Task.WaitAsync(ct);
-            driver.Enqueue("\x1b[12;5R"); // Complete A's still-active reader service.
+            driver.Enqueue("\x1b[12;5R"); // A's reply, inside its post-write reply window.
+            Assert.AreEqual((4, 11), await first.WaitAsync(ct));
 
             // If canceled B released its slot immediately, C's watchdog began at t=0
             // and has already returned null. Correct FIFO chaining admits C only after
@@ -254,6 +308,56 @@ public class FlowCursorObservationTests
             await adapter.DisposeAsync();
             await reader.WaitAsync(WaitTimeout, ct);
         }
+    }
+
+    // A caller that stops waiting while the reader actively services its request must not
+    // release the FIFO slot: a successor admitted early would start its watchdog while the
+    // reader is still busy and lose it before its own query is written.
+    [TestMethod]
+    public async Task ObserveCursorPositionAsync_CancelledActiveRequestKeepsSlotUntilReaderFinishes()
+    {
+        var clock = new FakeTimeProvider();
+        using var driver = new ScriptedConsoleDriver { Clock = clock, BlockFirstCursorQueryWrite = true };
+        await using var adapter = new ConsolePresentationAdapter(driver, timeProvider: clock);
+        var ct = TestContext.Current.CancellationToken;
+        var source = (ICursorPositionSource)adapter;
+        var reader = Task.Run(async () => await adapter.ReadInputAsync(ct), ct);
+        try
+        {
+            using var firstCancellation = new CancellationTokenSource();
+            var first = source.ObserveCursorPositionAsync(firstCancellation.Token);
+            await driver.CursorQueryWriteEntered.Task.WaitAsync(WaitTimeout, ct);
+            firstCancellation.Cancel();
+            await Assert.ThrowsAsync<OperationCanceledException>(() => first.WaitAsync(WaitTimeout, ct));
+
+            // The reader still owns the first query: the successor must not be admitted yet.
+            var tail = source.ObserveCursorPositionAsync(ct);
+            clock.Advance(TimeSpan.FromMilliseconds(300));
+            driver.CursorQueryWriteRelease.TrySetResult();
+            await driver.CursorReplyReadEntered.Task.WaitAsync(WaitTimeout, ct);
+            driver.Enqueue("\x1b[3;2R"); // The first query's own reply ends its service.
+
+            // Admitted only now, the tail keeps its full budget for its own query and reply.
+            await driver.SecondCursorReplyReadEntered.Task.WaitAsync(WaitTimeout, ct);
+            clock.Advance(TimeSpan.FromMilliseconds(100));
+            driver.Enqueue("\x1b[12;5R");
+            Assert.AreEqual((4, 11), await tail.WaitAsync(WaitTimeout, ct),
+                "A successor admitted while the reader was busy would have lost its watchdog.");
+        }
+        finally
+        {
+            driver.CursorQueryWriteRelease.TrySetResult();
+            await adapter.DisposeAsync();
+            await reader.WaitAsync(WaitTimeout, ct);
+        }
+    }
+
+    // A request completion finishes the async caller on a pooled continuation, so an early
+    // (wrong) completion needs real time to surface before "still pending" can be asserted.
+    private static async Task AssertStillPendingAsync(Task task, string message)
+    {
+        await Task.WhenAny(task, Task.Delay(TimeSpan.FromMilliseconds(200)));
+        Assert.IsFalse(task.IsCompleted, message);
     }
 
     [TestMethod]

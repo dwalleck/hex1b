@@ -481,20 +481,26 @@ terminal's cursor during resize. Non-reply input is preserved while the reader
 collects the response.
 
 Windows input waits are directly cancellable, so an observation request does not
-wait for a polling interval to wake the reader. The 150 ms reply deadline starts
-after the query has been written and flushed. An admitted request also has a
-250 ms caller watchdog covering reader wake-up, query delivery and the reply.
-An unavailable native observation fails the boundary check rather than falling
-back to a Win32 or modeled cursor position.
+wait for a polling interval to wake the reader. A request at the head of the FIFO
+gate has a 250 ms caller watchdog covering its posting, reader claim and wake-up
+and the capability-probe wait, up to the moment the reader begins writing the
+query. From then on the reader decides: the query write, including any wait behind
+an in-progress output write, blocks like any console output (Windows console
+writes can take hundreds of milliseconds under terminal backpressure), and the 150 ms
+reply deadline starts after the query has been written and flushed. A reply that
+arrives within that window is therefore never discarded because the write was
+slow. An unavailable native observation fails the boundary check rather than
+falling back to a Win32 or modeled cursor position.
 
 Observation requests are serialized FIFO. Once the input reader claims a request,
 the reader owns that request's queue slot through query service and buffered-input
-handoff; the caller's 250 ms watchdog may return `null` without releasing the slot
-while the reader is still active. A canceled waiter returns promptly, but its slot
-is released only after its predecessor, so a later request cannot overtake an active
-reader service. Disposal completes active and pending observations, releases their
-slots, and prevents a new query; the reader may finish its current driver operation
-and releases an already-cleared slot idempotently.
+handoff; before the query write begins, the caller's 250 ms watchdog may return
+`null` without releasing the slot while the reader is still active. A canceled
+waiter returns promptly, but its slot is released only after its predecessor, so
+a later request cannot overtake an active reader service. Disposal completes
+active and pending observations, releases their slots, and prevents a new query;
+the reader may finish its current driver operation and releases an
+already-cleared slot idempotently.
 
 These delivery checks do not separate history append from live-region repaint,
 and do not establish native retention for every resize or concurrent-input
