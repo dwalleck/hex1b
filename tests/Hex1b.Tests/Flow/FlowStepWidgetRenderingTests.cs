@@ -218,12 +218,45 @@ public class FlowStepWidgetRenderingTests
     }
 
     [TestMethod]
-    public async Task RenderWidgetAsync_RendererDimensionLimit_IsExplicitRatherThanClipped()
+    public async Task RenderWidgetAsync_RendererWidthLimit_RemainsExplicit()
     {
-        var probe = new ProbeNode { NaturalHeight = 10_001 };
+        var probe = new ProbeNode();
         var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
-            () => CreateStep().RenderWidgetAsync(new VStackWidget([new ProbeWidget(probe)]), 1, 10_001));
+            () => CreateStep().RenderWidgetAsync(new VStackWidget([new ProbeWidget(probe)]), 10_001, 1));
         StringAssert.Contains(error.Message, "10000");
+        Assert.AreEqual(0, probe.RenderCount);
+        Assert.AreEqual(1, probe.DisposeCount);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task MaterializeAsync_TallCallerBound_RefusesBeforeRenderAndDisposes(bool measure)
+    {
+        var probe = new ProbeNode { NaturalHeight = 10_002 };
+        var step = CreateStep();
+        var widget = new ProbeWidget(probe);
+        var error = measure
+            ? await Assert.ThrowsExactlyAsync<FlowWidgetBoundsException>(() => step.MeasureWidgetAsync(widget, 20, 10_001))
+            : await Assert.ThrowsExactlyAsync<FlowWidgetBoundsException>(() => step.RenderWidgetAsync(widget, 20, 10_001));
+        Assert.AreEqual(10_001, error.RequestedMaxHeight);
+        Assert.AreEqual(10_002, error.MeasuredHeight);
+        Assert.AreEqual(0, probe.RenderCount);
+        Assert.AreEqual(1, probe.DisposeCount);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task MaterializeAsync_CellProductOverflow_RefusesBeforeRenderAndDisposes(bool measure)
+    {
+        var probe = new ProbeNode { Measurement = new Size(10_000, 214_749) };
+        var step = CreateStep();
+        var widget = new ProbeWidget(probe);
+        if (measure)
+            await Assert.ThrowsExactlyAsync<OverflowException>(() => step.MeasureWidgetAsync(widget, 10_000, 214_749));
+        else
+            await Assert.ThrowsExactlyAsync<OverflowException>(() => step.RenderWidgetAsync(widget, 10_000, 214_749));
         Assert.AreEqual(0, probe.RenderCount);
         Assert.AreEqual(1, probe.DisposeCount);
     }

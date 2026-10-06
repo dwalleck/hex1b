@@ -64,7 +64,7 @@ public sealed class FlowStep
     /// <exception cref="InvalidOperationException">
     /// The step has completed, is not owned by a runner, or measurement returned
     /// an invalid negative dimension. Widget and cleanup failures also propagate.
-    /// The renderer also refuses surfaces exceeding its 10,000-cell dimension limit.
+    /// The renderer also refuses widths exceeding its 10,000-column limit.
     /// </exception>
     /// <exception cref="FlowWidgetBoundsException">
     /// Nonnegative measured content exceeds the requested width or maximum height.
@@ -87,7 +87,7 @@ public sealed class FlowStep
     /// transient-tree cleanup as <see cref="RenderWidgetAsync"/>. No surface is
     /// allocated and no render callback is invoked. Widget reconciliation and
     /// measurement may themselves allocate resources; cleanup failures propagate.
-    /// Bounds and the renderer's hard dimension limit are checked identically to
+    /// Bounds and the renderer's hard width limit are checked identically to
     /// rendering. Reported width is measured content width, not surface width.
     /// </remarks>
     /// <example>
@@ -130,7 +130,7 @@ public sealed class FlowStep
     /// <exception cref="ArgumentNullException"><paramref name="widget"/> is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException">A dimension is not positive.</exception>
     /// <exception cref="FlowWidgetBoundsException">Nonnegative measured content exceeds requested bounds.</exception>
-    /// <exception cref="InvalidOperationException">The step is unavailable, measurement is invalid, or renderer dimension limits are exceeded.</exception>
+    /// <exception cref="InvalidOperationException">The step is unavailable, measurement is invalid, or the renderer width limit is exceeded.</exception>
     /// <exception cref="OverflowException">The equivalent surface cell count exceeds an integer.</exception>
     /// <exception cref="NotSupportedException">The tree contains a <see cref="SurfaceWidget"/>.</exception>
     /// <exception cref="OperationCanceledException">The caller or flow was canceled.</exception>

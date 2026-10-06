@@ -54,11 +54,10 @@ internal sealed class FlowWidgetRenderer(
             if (measured.Height > maxHeight || measured.Width > width)
                 throw new FlowWidgetBoundsException(measured, width, maxHeight);
             var height = Math.Max(1, measured.Height);
-            // SurfaceRenderContext bounds temporary child surfaces to 10,000
-            // columns/rows. Refuse larger materializations rather than silently
-            // losing a child's tail in that existing rendering path.
-            if (width > 10_000 || height > 10_000)
-                throw new InvalidOperationException("Widget width or height exceeds the renderer's 10000-cell dimension limit.");
+            // Retain the existing width restriction. Height is bounded by the
+            // caller's maxHeight; child clipping supports the complete measured tail.
+            if (width > 10_000)
+                throw new InvalidOperationException("Widget width exceeds the renderer's 10000-cell width limit.");
             _ = checked(width * height);
             token.ThrowIfCancellationRequested();
             size = new Size(measured.Width, height);
