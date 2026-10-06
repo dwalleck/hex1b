@@ -253,12 +253,7 @@ public class TextBoxStateHoistedTests
         Assert.AreEqual(34, hstack.Children[1].Bounds.Width);
     }
 
-    private static long ReadVersion(TextBoxState state)
-    {
-        var prop = typeof(TextBoxState).GetProperty(
-            "Version",
-            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
-        return (long)prop.GetValue(state)!;
-    }
+    private static long ReadVersion(TextBoxState state) => state.Version;
+
 }
 

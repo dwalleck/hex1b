@@ -27,14 +27,17 @@ public class TextBoxState
 {
     private string _text = "";
     private int _cursorPosition = 0;
+    private int? _selectionAnchor;
 
     /// <summary>
-    /// Monotonically-increasing counter that bumps every time the buffer or
-    /// cursor mutates. Used by <c>TextBoxNode</c> to detect out-of-band parent
-    /// mutations on hoisted state and re-render in response. Internal because
-    /// there is no scenario where a caller needs to read or reset it directly.
+    /// Gets an opaque change token for this instance's text, cursor and selection.
     /// </summary>
-    internal long Version { get; private set; }
+    /// <remarks>
+    /// Actual mutations advance the token, including changes later reversed. No-op
+    /// assignments do not. Compound operations may advance it more than once;
+    /// compare tokens only within the same instance. This state is not thread-safe.
+    /// </remarks>
+    public long Version { get; private set; }
 
     private void BumpVersion() => Version++;
 
@@ -126,7 +129,16 @@ public class TextBoxState
     /// The anchor position for text selection. If null, no selection is active.
     /// Selection range is from min(SelectionAnchor, CursorPosition) to max(SelectionAnchor, CursorPosition).
     /// </summary>
-    public int? SelectionAnchor { get; set; } = null;
+    public int? SelectionAnchor
+    {
+        get => _selectionAnchor;
+        set
+        {
+            if (_selectionAnchor == value) return;
+            _selectionAnchor = value;
+            BumpVersion();
+        }
+    }
 
     /// <summary>
     /// Returns true if there is an active text selection.
@@ -323,6 +335,7 @@ public class TextBoxState
 
         _text = _text.Insert(_cursorPosition, "\n");
         _cursorPosition++;
+        BumpVersion();
         _preferredColumn = null;
     }
 
@@ -356,6 +369,7 @@ public class TextBoxState
                 {
                     _text = _text.Remove(_cursorPosition - 1, 1);
                     _cursorPosition--;
+                    BumpVersion();
                 }
                 _preferredColumn = null;
                 return true;
@@ -368,6 +382,7 @@ public class TextBoxState
                 else if (_cursorPosition < _text.Length)
                 {
                     _text = _text.Remove(_cursorPosition, 1);
+                    BumpVersion();
                 }
                 _preferredColumn = null;
                 return true;
@@ -510,6 +525,7 @@ public class TextBoxState
                     }
                     _text = _text.Insert(_cursorPosition, evt.Character.ToString());
                     _cursorPosition++;
+                    BumpVersion();
                     _preferredColumn = null;
                     return true;
                 }
