@@ -765,6 +765,9 @@ internal sealed class Hex1bFlowRunner
                 // Its snapshot may still have the pre-resize width: clipping
                 // that frame is safe, wrapping it into scrollback is not.
                 WriteTerminal(UseOsc133PromptMarks ? "\x1b[?7h" : "\x1b[?7l");
+                // Issue 58: the image carries the step's drawn focused cursor, so
+                // the host cursor parked at its origin stays hidden.
+                if (_options.UseSoftWrapTombstones) WriteTerminal("\x1b[?25l");
 
                 // Blank before painting. A hard LF also clears persistent
                 // soft-wrap metadata, which EL alone leaves behind. Never send
@@ -1472,7 +1475,8 @@ internal sealed class Hex1bFlowRunner
                             // app so it is laid out for the size the host already
                             // has rather than the pre-resize one.
                             WriteTerminal("\x1b[?7h");
-                            WriteTerminal("\x1b[?25h");
+                            // A soft-wrap step draws its focused cursor (issue 58).
+                            WriteTerminal(_options.UseSoftWrapTombstones ? "\x1b[?25l" : "\x1b[?25h");
                             _ = stepAdapter.ResizeAsync(
                                 Math.Max(1, settleLatestDims.Width),
                                 Math.Max(1, FlowResizeMath.ComputeStepHeight(

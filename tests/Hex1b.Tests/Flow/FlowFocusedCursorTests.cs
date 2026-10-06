@@ -354,6 +354,10 @@ public class FlowFocusedCursorTests
         {
             step = await ready.Task.WaitAsync(stop.Token);
             await WaitForAsync(terminal, s => CaretCells(s).Count == 1, "the live caret before commit", stop.Token);
+            // Whatever showed the host cursor before (a shell, an earlier owner), the commit's repaint of the live
+            // image hides it again: the image carries the drawn caret.
+            terminal.ApplyTokens(Hex1b.Tokens.AnsiTokenizer.Tokenize("\x1b[?25h"));
+            Assert.IsTrue(terminal.CreateSnapshot().CursorVisible);
             commit.TrySetResult();
             await finish.Task.WaitAsync(stop.Token);
             Assert.AreEqual(FlowCommitStatus.Emitted, result!.Status);
@@ -362,6 +366,7 @@ public class FlowFocusedCursorTests
                 s => s.GetScreenText().Contains("HISTORY-58-13", StringComparison.Ordinal) && CaretCells(s).Count == 1,
                 "the live caret after commit", stop.Token);
             var live = after.CursorY; // the hidden cursor is parked at the live origin
+            Assert.IsFalse(after.CursorVisible, "the commit's repaint keeps the parked cursor hidden");
             Assert.AreEqual("LIVE-58", after.GetScreenText().Split('\n')[live].TrimEnd(), "the park still marks the live origin");
             CollectionAssert.AreEqual(new List<(int, int)> { (2, live + 1) }, CaretCells(after),
                 "only the live prompt carries the drawn caret");
@@ -488,6 +493,7 @@ public class FlowFocusedCursorTests
             && cell.Foreground is { } fg && fg.R == 1 && fg.G == 2 && fg.B == 3;
         var notes = new TextBoxState("ab\ncd") { CursorPosition = 4 };
         var name = new TextBoxState("xyz") { CursorPosition = 1 };
+        var fixedBox = new TextBoxState("abcdef") { CursorPosition = 0 };
         var created = new TaskCompletionSource<FlowStep>(TaskCreationOptions.RunContinuationsAsynchronously);
         var runner = new Hex1bFlowRunner(async flow =>
         {
@@ -495,7 +501,7 @@ public class FlowFocusedCursorTests
                     v.TextBox().State(notes).Multiline(),
                     v.ThemePanel(t => t.Set(TextBoxTheme.CursorForegroundColor, panelForeground)
                         .Set(TextBoxTheme.CursorBackgroundColor, panelBackground), v.TextBox().State(name)),
-                    v.HStack(h => [h.TextBox("abcdef").FixedWidth(6), h.Text("NEXT")]),
+                    v.HStack(h => [h.TextBox().State(fixedBox).FixedWidth(6), h.Text("NEXT")]),
                 ]),
                 o => { o.MinHeight = 5; o.MaxHeight = 5; o.EnableMouse = true; });
             created.TrySetResult(step);
@@ -521,12 +527,15 @@ public class FlowFocusedCursorTests
             Assert.AreEqual("y", scoped.GetCell(1, 4).Character);
 
             // A caret just past a full six-column box would land on its neighbour: it is not drawn there.
-            await new Hex1bTerminalInputSequenceBuilder().Tab().Key(Hex1bKey.End).Build().ApplyAsync(terminal, stop.Token);
-            await Task.Delay(300, stop.Token);
-            var full = await WaitForAsync(terminal, s => !IsPanelCaret(s.GetCell(1, 4)), "focus on the fixed-width box", stop.Token);
-            Assert.IsFalse(IsCaretCell(full.GetCell(6, 5)), "the neighbour's 'N' is never recoloured");
+            await new Hex1bTerminalInputSequenceBuilder().Tab().Build().ApplyAsync(terminal, stop.Token);
+            await WaitForAsync(terminal, s => CaretCells(s) is [(0, 5)], "the caret in the fixed-width box", stop.Token);
+            await new Hex1bTerminalInputSequenceBuilder().Key(Hex1bKey.End).Build().ApplyAsync(terminal, stop.Token);
+            var full = await WaitForAsync(terminal, s => fixedBox.CursorPosition == 6 && CaretCells(s).Count == 0,
+                "the caret past the full box not drawn", stop.Token);
             Assert.AreEqual("N", full.GetCell(6, 5).Character);
-            Assert.IsTrue(CaretCells(full).All(c => c.X < 6 && c.Y == 5), "any caret stays inside the box");
+            Assert.IsFalse(IsCaretCell(full.GetCell(6, 5)), "the neighbour's 'N' is never recoloured");
+            await new Hex1bTerminalInputSequenceBuilder().Key(Hex1bKey.LeftArrow).Build().ApplyAsync(terminal, stop.Token);
+            await WaitForAsync(terminal, s => CaretCells(s) is [(5, 5)], "the caret back inside the box", stop.Token);
         }
         finally
         {
@@ -584,4 +593,3 @@ public class FlowFocusedCursorTests
         }
     }
 }
-
