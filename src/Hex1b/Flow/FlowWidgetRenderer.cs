@@ -15,11 +15,20 @@ internal sealed class FlowWidgetRenderer(
 {
     public async Task<Surface> RenderAsync(
         Hex1bWidget widget, int width, int maxHeight, CancellationToken cancellationToken)
+        => (await MaterializeAsync(widget, width, maxHeight, render: true, cancellationToken)).Surface!;
+
+    public async Task<Size> MeasureAsync(
+        Hex1bWidget widget, int width, int maxHeight, CancellationToken cancellationToken)
+        => (await MaterializeAsync(widget, width, maxHeight, render: false, cancellationToken)).Size;
+
+    private async Task<(Size Size, Surface? Surface)> MaterializeAsync(
+        Hex1bWidget widget, int width, int maxHeight, bool render, CancellationToken cancellationToken)
     {
         using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(flowCancellation, cancellationToken);
         var token = lifetime.Token;
         var nodes = new HashSet<Hex1bNode>(ReferenceEqualityComparer.Instance);
         Surface? surface = null;
+        Size size = default;
         Exception? failure = null;
         try
         {
@@ -40,8 +49,10 @@ internal sealed class FlowWidgetRenderer(
             // container constrains its reported height. Do not allocate that row.
             var measureHeight = maxHeight == int.MaxValue ? int.MaxValue : maxHeight + 1;
             var measured = node.Measure(new Constraints(0, width, 0, measureHeight));
-            if (measured.Height > maxHeight || measured.Height < 0 || measured.Width > width || measured.Width < 0)
-                throw new InvalidOperationException($"Widget content exceeds width {width} or maximum height {maxHeight}.");
+            if (measured.Height < 0 || measured.Width < 0)
+                throw new InvalidOperationException("Widget measurement returned a negative dimension.");
+            if (measured.Height > maxHeight || measured.Width > width)
+                throw new FlowWidgetBoundsException(measured, width, maxHeight);
             var height = Math.Max(1, measured.Height);
             // SurfaceRenderContext bounds temporary child surfaces to 10,000
             // columns/rows. Refuse larger materializations rather than silently
@@ -50,7 +61,8 @@ internal sealed class FlowWidgetRenderer(
                 throw new InvalidOperationException("Widget width or height exceeds the renderer's 10000-cell dimension limit.");
             _ = checked(width * height);
             token.ThrowIfCancellationRequested();
-            surface = RenderNode(node, width, height, theme, terminalCapabilities, transient: true);
+            size = new Size(measured.Width, height);
+            if (render) surface = RenderNode(node, width, height, theme, terminalCapabilities, transient: true);
             token.ThrowIfCancellationRequested();
         }
         catch (Exception ex)
@@ -92,7 +104,7 @@ internal sealed class FlowWidgetRenderer(
             surface?.ClearAndReleaseTrackedObjects();
             ExceptionDispatchInfo.Capture(failure).Throw();
         }
-        return surface!;
+        return (size, surface);
     }
 
     // Shared with legacy tombstones. Their measurement and fallback policy stays

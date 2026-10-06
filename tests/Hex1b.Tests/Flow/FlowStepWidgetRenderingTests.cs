@@ -57,6 +57,68 @@ public class FlowStepWidgetRenderingTests
     }
 
     [TestMethod]
+    public async Task MeasureWidgetAsync_OscText_DoesNotRenderOrAcquireTrackedReferences()
+    {
+        const string text = "\x1b]8;;https://example.test/measure\x1b\\site\x1b]8;;\x1b\\";
+        var rendered = new ObservedTextNode { Text = text };
+        var surface = await CreateStep().RenderWidgetAsync(new ProbeWidget(rendered), 80, 2);
+        try { Assert.AreEqual(1, rendered.AcquiredHyperlinks, "The fixture must exercise OSC tracking when rendered."); }
+        finally { surface.ClearAndReleaseTrackedObjects(); }
+
+        var measured = new ObservedTextNode { Text = text };
+        var size = await CreateStep().MeasureWidgetAsync(new ProbeWidget(measured), 80, 2);
+        Assert.AreEqual(1, size.Height);
+        Assert.AreEqual(0, measured.RenderCount);
+        Assert.AreEqual(0, measured.AcquiredHyperlinks);
+        Assert.AreEqual(1, measured.DisposeCount);
+    }
+
+    [TestMethod]
+    public async Task MeasureWidgetAsync_WrappedText_UsesMeasuredDimensionsAndTypedBounds()
+    {
+        var step = CreateStep();
+        var text = new TextBlockWidget("abcde fghij", TextOverflow.Wrap);
+        Assert.AreEqual(new Size(5, 2), await step.MeasureWidgetAsync(text, 5, 2));
+        var error = await Assert.ThrowsExactlyAsync<FlowWidgetBoundsException>(() => step.MeasureWidgetAsync(text, 5, 1));
+        Assert.AreEqual(2, error.MeasuredHeight);
+        Assert.AreEqual(1, error.RequestedMaxHeight);
+    }
+
+    [TestMethod]
+    public async Task MeasureWidgetAsync_CleanupFailure_PropagatesAndReleasesOtherProviders()
+    {
+        var expected = new InvalidOperationException("measurement cleanup failed deliberately");
+        var failing = new TrackingDecorationProvider { CleanupFailure = expected };
+        var remaining = new TrackingDecorationProvider();
+        var widget = new CodeBlockEditorWidget(new EditorWidget(new EditorState(new Hex1bDocument("code")))
+            .Decorations(failing).Decorations(remaining));
+        var actual = await Assert.ThrowsExactlyAsync<InvalidOperationException>(() => CreateStep().MeasureWidgetAsync(widget, 20, 1));
+        Assert.AreSame(expected, actual);
+        Assert.AreEqual(1, failing.Activations);
+        Assert.AreEqual(1, failing.Deactivations);
+        Assert.AreEqual(1, remaining.Activations);
+        Assert.AreEqual(1, remaining.Deactivations);
+    }
+
+    [TestMethod]
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task MeasureWidgetAsync_CancellationDuringReconciliation_DisposesEarlierSibling(bool cancelFlow)
+    {
+        using var cancellation = new CancellationTokenSource();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var probe = new ProbeNode();
+        var widget = new VStackWidget([new ProbeWidget(probe), new WaitingWidget(entered)]);
+        var step = CreateStep(cancelFlow ? cancellation.Token : default);
+        var measure = step.MeasureWidgetAsync(widget, 10, 10, cancelFlow ? default : cancellation.Token);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        cancellation.Cancel();
+        await Assert.ThrowsAsync<OperationCanceledException>(() => measure.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreEqual(0, probe.RenderCount);
+        Assert.AreEqual(1, probe.DisposeCount);
+    }
+
+    [TestMethod]
     public async Task RenderWidgetAsync_WrappedText_UsesRequestedWidthAndNaturalHeight()
     {
         var step = CreateStep();
@@ -114,15 +176,45 @@ public class FlowStepWidgetRenderingTests
     public async Task RenderWidgetAsync_OversizedContent_IsRejectedBeforeRenderAndCleanedUp()
     {
         var probe = new ProbeNode { NaturalHeight = 2 };
-        var error = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+        var error = await Assert.ThrowsExactlyAsync<FlowWidgetBoundsException>(
             () => CreateStep().RenderWidgetAsync(new ProbeWidget(probe), 10, 1));
         StringAssert.Contains(error.Message, "height 1");
+        Assert.AreEqual(10, error.RequestedWidth);
+        Assert.AreEqual(1, error.RequestedMaxHeight);
+        Assert.AreEqual(5, error.MeasuredWidth);
+        Assert.AreEqual(2, error.MeasuredHeight);
         Assert.AreEqual(1, probe.MeasureCount);
         Assert.AreEqual(0, probe.RenderCount);
         Assert.AreEqual(1, probe.DisposeCount);
-        var textError = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+        var textError = await Assert.ThrowsExactlyAsync<FlowWidgetBoundsException>(
             () => CreateStep().RenderWidgetAsync(new TextBlockWidget("first\nsecond"), 10, 1));
         StringAssert.Contains(textError.Message, "height 1");
+    }
+
+    [TestMethod]
+    public async Task RenderWidgetAsync_ExcessWidth_ReportsMeasuredBoundsWithoutRendering()
+    {
+        var probe = new ProbeNode { Measurement = new Size(11, 1) };
+        var error = await Assert.ThrowsExactlyAsync<FlowWidgetBoundsException>(
+            () => CreateStep().RenderWidgetAsync(new ProbeWidget(probe), 10, 3));
+        Assert.AreEqual(11, error.MeasuredWidth);
+        Assert.AreEqual(1, error.MeasuredHeight);
+        Assert.AreEqual(10, error.RequestedWidth);
+        Assert.AreEqual(3, error.RequestedMaxHeight);
+        Assert.AreEqual(0, probe.RenderCount);
+        Assert.AreEqual(1, probe.DisposeCount);
+    }
+
+    [TestMethod]
+    [DataRow(-1, 2)]
+    [DataRow(11, -1)]
+    public async Task RenderWidgetAsync_NegativeMeasurement_IsNotAnOversizeRefusal(int width, int height)
+    {
+        var probe = new ProbeNode { Measurement = new Size(width, height) };
+        await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            () => CreateStep().RenderWidgetAsync(new ProbeWidget(probe), 10, 1));
+        Assert.AreEqual(0, probe.RenderCount);
+        Assert.AreEqual(1, probe.DisposeCount);
     }
 
     [TestMethod]
@@ -373,6 +465,7 @@ public class FlowStepWidgetRenderingTests
 
     private sealed class ProbeNode : Hex1bNode, IDisposable
     {
+        public Size? Measurement { get; init; }
         public int NaturalHeight { get; init; } = 1;
         public Exception? RenderFailure { get; init; }
         public int MeasureCount { get; private set; }
@@ -384,7 +477,7 @@ public class FlowStepWidgetRenderingTests
         {
             MeasureCount++;
             MeasuredTrueColor = TerminalCapabilities.SupportsTrueColor;
-            return constraints.Constrain(new Size(5, NaturalHeight));
+            return Measurement ?? constraints.Constrain(new Size(5, NaturalHeight));
         }
         public override void Render(Hex1bRenderContext context)
         {
@@ -396,11 +489,30 @@ public class FlowStepWidgetRenderingTests
         public void Dispose() => DisposeCount++;
     }
 
-    private sealed record ProbeWidget(ProbeNode Node) : Hex1bWidget
+    private sealed class ObservedTextNode : Hex1bNode, IDisposable
+    {
+        public int RenderCount { get; private set; }
+        private readonly TextBlockNode child = new();
+        public string Text { init => child.Text = value; }
+        public int AcquiredHyperlinks { get; private set; }
+        public int DisposeCount { get; private set; }
+        protected override Size MeasureCore(Constraints constraints) => child.Measure(constraints);
+        protected override void ArrangeCore(Rect bounds) => child.Arrange(bounds);
+        public override IEnumerable<Hex1bNode> GetChildren() => [child];
+        public override void Render(Hex1bRenderContext context)
+        {
+            RenderCount++;
+            child.Render(context);
+            AcquiredHyperlinks = ((SurfaceRenderContext)context).TrackedObjectStore.HyperlinkCount;
+        }
+        public void Dispose() => DisposeCount++;
+    }
+
+    private sealed record ProbeWidget(Hex1bNode Node) : Hex1bWidget
     {
         internal override Task<Hex1bNode> ReconcileAsync(Hex1bNode? existingNode, ReconcileContext context)
             => Task.FromResult<Hex1bNode>(Node);
-        internal override Type GetExpectedNodeType() => typeof(ProbeNode);
+        internal override Type GetExpectedNodeType() => Node.GetType();
     }
 
     private sealed record StatefulWidget(DisposableState State, Hex1bWidget Child) : Hex1bWidget

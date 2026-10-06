@@ -62,9 +62,14 @@ public sealed class FlowStep
     /// <exception cref="ArgumentNullException"><paramref name="widget"/> is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException">A dimension is not positive.</exception>
     /// <exception cref="InvalidOperationException">
-    /// The step has completed, is not owned by a runner, or the measured content
-    /// exceeds the requested bounds. Widget and cleanup failures also propagate.
+    /// The step has completed, is not owned by a runner, or measurement returned
+    /// an invalid negative dimension. Widget and cleanup failures also propagate.
     /// The renderer also refuses surfaces exceeding its 10,000-cell dimension limit.
+    /// </exception>
+    /// <exception cref="FlowWidgetBoundsException">
+    /// Nonnegative measured content exceeds the requested width or maximum height.
+    /// Measurement is constrained, so reported dimensions need not be natural size.
+    /// No content is rendered for this refusal. Cleanup failures can wrap it.
     /// </exception>
     /// <exception cref="OverflowException">The surface cell count exceeds an integer.</exception>
     /// <exception cref="NotSupportedException">The tree contains a <see cref="SurfaceWidget"/>.</exception>
@@ -74,15 +79,73 @@ public sealed class FlowStep
         int width,
         int maxHeight,
         CancellationToken cancellationToken = default)
+        => GetWidgetRenderer(widget, width, maxHeight).RenderAsync(widget, width, maxHeight, cancellationToken);
+
+    /// <summary>Measures finalized content within the requested bounds without arranging or rendering it.</summary>
+    /// <remarks>
+    /// Uses the same reconciliation, capabilities, constrained measurement and
+    /// transient-tree cleanup as <see cref="RenderWidgetAsync"/>. No surface is
+    /// allocated and no render callback is invoked. Widget reconciliation and
+    /// measurement may themselves allocate resources; cleanup failures propagate.
+    /// Bounds and the renderer's hard dimension limit are checked identically to
+    /// rendering. Reported width is measured content width, not surface width.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// using System;
+    /// using System.Threading.Tasks;
+    /// using Hex1b;
+    /// using Hex1b.Flow;
+    /// using Hex1b.Widgets;
+    ///
+    /// string report = "";
+    /// await using var terminal = Hex1bTerminal.CreateBuilder()
+    ///     .WithHex1bFlow(async flow =&gt;
+    ///     {
+    ///         var step = flow.Step(context =&gt; Task.FromResult&lt;Hex1bWidget&gt;(context.Text("Measuring preview")));
+    ///         await step.WaitForReadyAsync(flow.CancellationToken);
+    ///         var content = new TextBlockWidget(new string('x', 81)).Wrap();
+    ///         var size = await step.MeasureWidgetAsync(content, 40, 3, flow.CancellationToken);
+    ///         report = $"Measured {size.Width} columns by {size.Height} rows.";
+    ///         try
+    ///         {
+    ///             await step.MeasureWidgetAsync(content, 40, 2, flow.CancellationToken);
+    ///         }
+    ///         catch (FlowWidgetBoundsException bounds)
+    ///         {
+    ///             report += $" Preview exceeds {bounds.RequestedMaxHeight} rows; retain full content.";
+    ///         }
+    ///         await step.CompleteAsync(context =&gt; Task.FromResult&lt;Hex1bWidget&gt;(context.Text(report)));
+    ///     })
+    ///     .WithHeadless().WithDimensions(40, 10).Build();
+    /// await terminal.RunAsync();
+    /// Console.WriteLine(report);
+    /// </code>
+    /// </example>
+    /// <param name="widget">Immutable content to measure.</param>
+    /// <param name="width">Positive available width in columns.</param>
+    /// <param name="maxHeight">Positive maximum height in rows.</param>
+    /// <param name="cancellationToken">Cancels reconciliation and measurement.</param>
+    /// <returns>Constrained measured dimensions; height is at least one row.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="widget"/> is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">A dimension is not positive.</exception>
+    /// <exception cref="FlowWidgetBoundsException">Nonnegative measured content exceeds requested bounds.</exception>
+    /// <exception cref="InvalidOperationException">The step is unavailable, measurement is invalid, or renderer dimension limits are exceeded.</exception>
+    /// <exception cref="OverflowException">The equivalent surface cell count exceeds an integer.</exception>
+    /// <exception cref="NotSupportedException">The tree contains a <see cref="SurfaceWidget"/>.</exception>
+    /// <exception cref="OperationCanceledException">The caller or flow was canceled.</exception>
+    public Task<Hex1b.Layout.Size> MeasureWidgetAsync(Hex1bWidget widget, int width, int maxHeight,
+        CancellationToken cancellationToken = default)
+        => GetWidgetRenderer(widget, width, maxHeight).MeasureAsync(widget, width, maxHeight, cancellationToken);
+
+    private FlowWidgetRenderer GetWidgetRenderer(Hex1bWidget widget, int width, int maxHeight)
     {
         ArgumentNullException.ThrowIfNull(widget);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxHeight);
         if (Volatile.Read(ref _completed) != 0 || _tcs.Task.IsCompleted)
-            throw new InvalidOperationException("Cannot render widgets for a completed flow step.");
-        var renderer = _widgetRenderer
-            ?? throw new InvalidOperationException("The flow step has no widget renderer.");
-        return renderer.RenderAsync(widget, width, maxHeight, cancellationToken);
+            throw new InvalidOperationException("Cannot materialize widgets for a completed flow step.");
+        return _widgetRenderer ?? throw new InvalidOperationException("The flow step has no widget renderer.");
     }
 
     /// <summary>
