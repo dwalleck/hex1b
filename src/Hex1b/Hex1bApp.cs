@@ -51,6 +51,8 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
     private readonly bool _ownsWorkloadAdapter;
     private readonly IHex1bAppTerminalWorkloadAdapter _renderAdapter;
     private readonly SoftWrapFrameAdapter? _softWrapOutput;
+    // Issue 58: Flow parks the hidden host cursor after each soft-wrap step frame, so the focused cursor is drawn.
+    private readonly bool _drawFocusedCursorInFrame;
     private readonly object _runLifecycleSync = new();
     private TaskCompletionSource? _runStopped;
     private Task? _resourceDisposal;
@@ -347,6 +349,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
 
         _enableRenderCaching = options.EnableRenderCaching;
         _useSoftWrapEmission = options.UseSoftWrapEmission;
+        _drawFocusedCursorInFrame = options.UseSoftWrapEmission && options.DrawFocusedCursorInFrame;
 
         _surfacePool = options.EnableSurfacePooling
             ? new SurfacePool(options.SurfacePoolMaxSurfacesPerBucket, options.SurfacePoolMaxIdleFrames)
@@ -1571,6 +1574,8 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
                 ? Kgp.KgpOcclusionSolver.ComputeFragments(_kgpRegistry)
                 : Kgp.KgpPlacementTracker.ExtractFragments(_currentSurface)).ToArray();
             _softWrapOutput!.BeginBody(_softWrapFragments);
+            if (_drawFocusedCursorInFrame)
+                DrawSoftWrapFocusedCursor(_currentSurface);
             _renderAdapter.Write("\x1b[1;1H");
             SoftWrapEmitter.EmitOrdered(_currentSurface, _renderAdapter);
             _softWrapOutput.EndBody();
@@ -1837,6 +1842,80 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
     }
     
     /// <summary>
+    /// Draws the focused node's requested cursor into a soft-wrap frame as a
+    /// styled cell (issue 58).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Flow ends every forwarded soft-wrap frame with the host cursor parked at
+    /// the live region's top-left: commit admission and resize repaint observe
+    /// that park as the live boundary, and Ghostty's prompt clear trims the
+    /// live region below it on a height shrink. The hardware cursor therefore
+    /// cannot also mark the editing position, so it stays hidden and the cursor
+    /// becomes part of the frame's live content.
+    /// </para>
+    /// <para>
+    /// A focused <see cref="TextBoxNode"/> caret uses the TextBox cursor colours
+    /// of the theme in scope where it rendered; a focused <see cref="TerminalNode"/>
+    /// shows its child's cursor as a reverse cell while the child reports it
+    /// visible and the handle is not in copy mode (which draws its own). The cell
+    /// is clipped to the focused node. Shape and blink are not reproduced, and
+    /// the cell lives only in the live frame: committed history is rendered
+    /// separately and never receives it.
+    /// </para>
+    /// <para>
+    /// Only a Flow soft-wrap step sets <see cref="Hex1bAppOptions.DrawFocusedCursorInFrame"/>;
+    /// other soft-wrap apps keep the native cursor.
+    /// </para>
+    /// </remarks>
+    private void DrawSoftWrapFocusedCursor(Surface surface)
+    {
+        int x, y;
+        Hex1bColor? foreground = null, background = null;
+        var reverse = false;
+        Rect bounds;
+        switch (_focusRing.FocusedNode)
+        {
+            case TextBoxNode textBox when textBox.ScreenCursorX >= 0:
+                x = textBox.ScreenCursorX;
+                y = textBox.ScreenCursorY;
+                (foreground, background) = textBox.CaretColors;
+                bounds = textBox.Bounds;
+                break;
+            case TerminalNode terminal when terminal.Handle is { IsInCopyMode: false }:
+                // Copy mode draws its own cursor and selection, which a reverse cell would cancel.
+                var cursor = terminal.RenderedCursor;
+                if (!cursor.Visible) return;
+                x = terminal.Bounds.X + cursor.X;
+                y = terminal.Bounds.Y + cursor.Y;
+                reverse = true;
+                bounds = terminal.Bounds;
+                break;
+            default:
+                return;
+        }
+
+        // A drawn cell recolours whatever is there, so never draw outside the focused node
+        // (a caret just past a full-width single-line box, a child wider than its node).
+        if (x < bounds.X || y < bounds.Y || x >= bounds.X + bounds.Width || y >= bounds.Y + bounds.Height) return;
+        if (x < 0 || y < 0 || x >= surface.Width || y >= surface.Height) return;
+        var cell = surface.GetCell(x, y);
+        if (cell.IsContinuation && x > 0)
+        {
+            // The wide glyph to the left owns this column.
+            x--;
+            cell = surface.GetCell(x, y);
+        }
+        if (string.IsNullOrEmpty(cell.Character) || cell.Character == SurfaceCells.UnwrittenMarker)
+            cell = cell with { Character = " ", DisplayWidth = 1 };
+
+        cell = reverse
+            ? cell with { Attributes = cell.Attributes ^ CellAttributes.Reverse }
+            : cell with { Foreground = foreground, Background = background };
+        surface.TrySetCell(x, y, cell);
+    }
+
+    /// <summary>
     /// Renders the hardware cursor at the appropriate position.
     /// For focused TerminalNode: uses child terminal's cursor position/shape/visibility.
     /// For other nodes: uses mouse position if mouse cursor is enabled.
@@ -1852,6 +1931,14 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
             _lastRenderedCursorVisible = false;
             _lastRenderedCursorX = -1;
             _lastRenderedCursorY = -1;
+        }
+        if (_drawFocusedCursorInFrame)
+        {
+            // Issue 58: a Flow soft-wrap step frame ends parked at the live
+            // origin, the anchor commit admission and resize repaint observe. The
+            // focused cursor is drawn into the frame instead
+            // (DrawSoftWrapFocusedCursor), so the hardware cursor is never shown.
+            return;
         }
         var focusedNode = _focusRing.FocusedNode;
 

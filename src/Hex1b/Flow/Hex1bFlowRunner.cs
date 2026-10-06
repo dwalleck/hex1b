@@ -1365,6 +1365,7 @@ internal sealed class Hex1bFlowRunner
                 // leave wrap-spillover ghost cells around the new step
                 // region.
                 UseSoftWrapEmission = _options.UseSoftWrapTombstones,
+                DrawFocusedCursorInFrame = _options.UseSoftWrapTombstones,
             };
 
             if (_options.Theme != null)

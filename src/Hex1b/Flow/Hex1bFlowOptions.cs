@@ -82,6 +82,15 @@ public sealed class Hex1bFlowOptions
     /// both behaviours move together under this single flag.
     /// </para>
     /// <para>
+    /// Every live frame on this path leaves the host cursor hidden and parked
+    /// at the live region's top-left: resize repaint and history commitment
+    /// observe that position as the live boundary. The focused cursor is
+    /// therefore drawn into the frame as a cell — a TextBox caret in the
+    /// <c>TextBoxTheme</c> cursor colours, an embedded terminal's visible
+    /// cursor in reverse video — without native blink or cursor shape, and an
+    /// input method or screen reader sees the parked position.
+    /// </para>
+    /// <para>
     /// Once validated across the supported terminal matrix this will become
     /// the default and the legacy cell-positioning path will be removed.
     /// </para>

@@ -814,8 +814,10 @@ public sealed class TerminalWidgetHandle :
     {
         int maxY = -1;
         var hasPresentationChanges = false;
+        var cursorChanged = false;
         lock (_bufferLock)
         {
+            var cursorBefore = (_cursorX, _cursorY, _cursorVisible);
             foreach (var applied in appliedTokens)
             {
                 if (applied.Token is KgpToken or SoftResetToken or
@@ -856,11 +858,16 @@ public sealed class TerminalWidgetHandle :
                 _cursorX = Math.Clamp(applied.CursorXAfter, 0, _width - 1);
                 _cursorY = Math.Clamp(applied.CursorYAfter, 0, _height - 1);
             }
+            // A move of a cursor hidden before and after changes nothing presented.
+            cursorChanged = cursorBefore != (_cursorX, _cursorY, _cursorVisible)
+                && (cursorBefore.Item3 || _cursorVisible);
         }
         
         // Graphics and synchronized-output completion can change the presented frame
         // without changing any cells, including an end marker in a separate read.
-        if (maxY >= 0 || hasPresentationChanges)
+        // A cursor-only move or visibility change changes it too: the host renders
+        // the child's cursor (a drawn cell under Flow soft-wrap, issue 58).
+        if (maxY >= 0 || hasPresentationChanges || cursorChanged)
         {
             OutputReceived?.Invoke();
         }

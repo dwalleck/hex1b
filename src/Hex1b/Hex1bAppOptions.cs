@@ -131,6 +131,13 @@ public class Hex1bAppOptions
     /// </para>
     /// </remarks>
     public bool UseSoftWrapEmission { get; set; }
+
+    /// <summary>
+    /// Set by the Flow runner for a soft-wrap step whose frames it ends with the hidden host cursor parked at the live
+    /// region's origin: the focused cursor is then drawn into the frame as a cell instead (issue 58). Other soft-wrap
+    /// apps keep the native cursor.
+    /// </summary>
+    internal bool DrawFocusedCursorInFrame { get; set; }
     
     /// <summary>
     /// Initial delay in milliseconds for input coalescing. After processing an input,

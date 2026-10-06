@@ -210,6 +210,12 @@ public sealed class TextBoxNode : Hex1bNode
     /// </summary>
     internal int ScreenCursorY { get; private set; }
 
+    /// <summary>
+    /// The caret colours resolved from the theme in scope at the last render (a theme panel can override the app's).
+    /// A host that draws the caret as a cell instead of the native cursor uses these (issue 58).
+    /// </summary>
+    internal (Hex1bColor Foreground, Hex1bColor Background) CaretColors { get; private set; }
+
     // ───── Predictive input ────────────────────────────────────────────────
 
     /// <summary>
@@ -1479,6 +1485,7 @@ public sealed class TextBoxNode : Hex1bNode
         var theme = context.Theme;
         var cursorFg = theme.Get(TextBoxTheme.CursorForegroundColor);
         var cursorBg = theme.Get(TextBoxTheme.CursorBackgroundColor);
+        CaretColors = (cursorFg, cursorBg);
         var selFg = theme.Get(TextBoxTheme.SelectionForegroundColor);
         var selBg = theme.Get(TextBoxTheme.SelectionBackgroundColor);
         var fillBg = IsFocused
