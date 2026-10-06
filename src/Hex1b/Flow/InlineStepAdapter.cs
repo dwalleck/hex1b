@@ -28,6 +28,7 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
     private bool _disposed;
     private int _outputQueueDepth;
     private bool _inTuiMode;
+    private readonly bool _ownsInputModes;
 
     // Regex to match ANSI CUP sequences: ESC [ row ; col H  or  ESC [ row H  or  ESC [ H
     [GeneratedRegex(@"\x1b\[(\d*)(;(\d*))?(H|f)", RegexOptions.Compiled)]
@@ -37,8 +38,9 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
     [GeneratedRegex(@"\x1b\[2J")]
     private static partial Regex ClearScreenRegex();
 
-    public InlineStepAdapter(int width, int height, int rowOrigin, TerminalCapabilities? capabilities = null, OrderedInputState? orderedInput = null)
+    public InlineStepAdapter(int width, int height, int rowOrigin, TerminalCapabilities? capabilities = null, OrderedInputState? orderedInput = null, bool ownsInputModes = true)
     {
+        _ownsInputModes = ownsInputModes;
         OrderedInput = orderedInput;
         OrderedEpoch = orderedInput?.BeginFlowOwner();
         var orderedPasteCapacity = orderedInput?.Capacity ?? 0;
@@ -165,12 +167,12 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
 
             var sb = new StringBuilder();
             sb.Append("\x1b[?25l"); // Hide cursor
-            if (_capabilities.SupportsMouse)
+            if (_ownsInputModes && _capabilities.SupportsMouse)
             {
                 sb.Append("\x1b[?1003h"); // Enable mouse tracking (all motion)
                 sb.Append("\x1b[?1006h"); // Enable SGR mouse mode
             }
-            if (_capabilities.SupportsBracketedPaste)
+            if (_ownsInputModes && _capabilities.SupportsBracketedPaste)
             {
                 sb.Append("\x1b[?2004h"); // Enable bracketed paste mode
             }
@@ -186,11 +188,11 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
             _inTuiMode = false;
 
             var sb = new StringBuilder();
-            if (_capabilities.SupportsBracketedPaste)
+            if (_ownsInputModes && _capabilities.SupportsBracketedPaste)
             {
                 sb.Append("\x1b[?2004l"); // Disable bracketed paste mode
             }
-            if (_capabilities.SupportsMouse)
+            if (_ownsInputModes && _capabilities.SupportsMouse)
             {
                 sb.Append("\x1b[?1006l"); // Disable SGR mouse mode
                 sb.Append("\x1b[?1003l"); // Disable mouse tracking

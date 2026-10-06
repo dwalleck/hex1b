@@ -1290,6 +1290,8 @@ internal sealed class Hex1bFlowRunner
         Hex1bFlowStepOptions? options,
         int desiredHeight)
     {
+        string? inputModeRelease = null;
+        Exception? lifecycleFailure = null;
         try
         {
             var (terminalWidth, terminalHeight) = ReadCurrentGeometry();
@@ -1323,7 +1325,16 @@ internal sealed class Hex1bFlowRunner
 
             using var stepAdapter = new InlineStepAdapter(
                 terminalWidth, desiredHeight, startRowOrigin,
-                stepCapabilities, (_parentAdapter as Hex1bAppWorkloadAdapter)?.OrderedInput);
+                stepCapabilities, (_parentAdapter as Hex1bAppWorkloadAdapter)?.OrderedInput,
+                ownsInputModes: false);
+
+            // Capture the input-mode policy once for matching entry/release.
+            var pasteMode = stepCapabilities.SupportsBracketedPaste;
+            var mouseMode = stepEnableMouse && stepCapabilities.SupportsMouse;
+            var modeRelease = (pasteMode ? "\u001b[?2004l" : "")
+                + (mouseMode ? "\u001b[?1006l\u001b[?1003l" : "");
+            var modeEntry = (mouseMode ? "\u001b[?1003h\u001b[?1006h" : "")
+                + (pasteMode ? "\u001b[?2004h" : "");
 
             if (UseOsc133PromptMarks)
             {
@@ -1942,6 +1953,12 @@ internal sealed class Hex1bFlowRunner
 
                 try
                 {
+                    // Step() must synchronously attach the app and coordinator
+                    // before returning its handle. Only then may mode delivery
+                    // yield; callers can immediately wait for readiness or stop.
+                    // Register release before an uncertain partial entry write.
+                    inputModeRelease = modeRelease;
+                    await WriteInlineInputModesAsync(modeEntry).ConfigureAwait(false);
                     await app.RunAsync(default);
                 }
                 finally
@@ -2014,6 +2031,12 @@ internal sealed class Hex1bFlowRunner
                 }
             }
 
+            // The app and both pumps have stopped. Release before any static
+            // output or successor owner, without relying on the discarded queue.
+            var completedModeRelease = inputModeRelease;
+            inputModeRelease = null;
+            await WriteInlineInputModesAsync(completedModeRelease).ConfigureAwait(false);
+
             // Clear the step region so remnants don't show through the yield widget
             ClearRegion(_cursorRow, desiredHeight);
 
@@ -2043,14 +2066,42 @@ internal sealed class Hex1bFlowRunner
                 }
             }
 
-            _activeStep = null;
-            step.SetCompleted();
         }
         catch (Exception ex)
         {
-            _activeStep = null;
-            step.SetFaulted(ex);
+            lifecycleFailure = ex;
         }
+        finally
+        {
+            if (inputModeRelease is not null)
+            {
+                try { await WriteInlineInputModesAsync(inputModeRelease).ConfigureAwait(false); }
+                catch (Exception cleanupFailure)
+                {
+                    lifecycleFailure = lifecycleFailure is null ? cleanupFailure
+                        : new AggregateException(lifecycleFailure, cleanupFailure);
+                }
+            }
+        }
+
+        _activeStep = null;
+        if (lifecycleFailure is null) step.SetCompleted();
+        else step.SetFaulted(lifecycleFailure);
+    }
+
+    // Required delivery bypasses only geometry gating, not serialization. No
+    // step/write lock is held while waiting for the terminal processing receipt.
+    private async Task WriteInlineInputModesAsync(string? modes)
+    {
+        if (string.IsNullOrEmpty(modes)) return;
+        Task<NativeDeliveryOutcome>? receipt = null;
+        lock (_terminalWriteLock)
+        {
+            if (_parentAdapter is Hex1bAppWorkloadAdapter queued)
+                receipt = queued.WriteRequiredForProcessing(modes);
+            else _parentAdapter.Write(modes);
+        }
+        if (receipt is not null) await receipt.ConfigureAwait(false);
     }
 
     /// <summary>
@@ -2215,7 +2266,7 @@ internal sealed class Hex1bFlowRunner
 
         // A static output page has no input pump and must never claim a Flow input epoch.
         using var yieldAdapter = new InlineStepAdapter(
-            width, height, _cursorRow, _parentAdapter.Capabilities);
+            width, height, _cursorRow, _parentAdapter.Capabilities, ownsInputModes: false);
 
         var yieldOptions = new Hex1bAppOptions
         {
