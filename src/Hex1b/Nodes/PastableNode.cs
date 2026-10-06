@@ -31,6 +31,17 @@ public sealed class PastableNode : Hex1bNode
     /// </summary>
     public TimeSpan? PasteTimeout { get; internal set; }
 
+    internal Func<OrderedPasteStart, Action<OrderedPasteUpdate>?>? OrderedPasteFactory { get; set; }
+
+    /// <inheritdoc />
+    public override Action<OrderedPasteUpdate>? BeginOrderedPaste(OrderedPasteStart start)
+    {
+        if (OrderedPasteFactory is not { } factory) return null;
+        if (MaxSize.HasValue || PasteTimeout.HasValue)
+            throw new InvalidOperationException("MaxSize and Timeout apply to legacy streaming paste; an ordered receiver must own its limits.");
+        return factory(start);
+    }
+
     public override bool IsFocusable => false;
 
     public override IEnumerable<Hex1bNode> GetChildren()
