@@ -14,6 +14,21 @@ namespace Hex1b.Nodes;
 /// </summary>
 public sealed class MarkdownNode : Hex1bNode
 {
+    internal enum InputMode { Source, Document, Prepared }
+    private InputMode _inputMode;
+    internal MarkdownDocument? PreparedDocument { get; set; }
+
+    internal void SetInputMode(InputMode mode)
+    {
+        if (_inputMode == mode) return;
+        _inputMode = mode;
+        _cachedDocument = null;
+        _lastParsedSource = null;
+        PreparedDocument = null;
+        Document = null;
+        MarkDirty();
+    }
+
     private MarkdownDocument? _cachedDocument;
     private string? _lastParsedSource;
 
@@ -77,6 +92,10 @@ public sealed class MarkdownNode : Hex1bNode
     /// </summary>
     internal Hex1bWidget BuildWidgetTree()
     {
+        if (PreparedDocument is { } prepared)
+            return MarkdownWidgetRenderer.Render(
+                prepared, BlockHandlers, FocusableChildren, LinkActivatedHandler, SourceWidget, ImageLoader);
+
         // Re-parse only when source changes
         if (_cachedDocument == null || _lastParsedSource != Source)
         {

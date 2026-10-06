@@ -27,6 +27,25 @@ public sealed record MarkdownWidget(string Source) : Hex1bWidget
     }
 
     /// <summary>
+    /// Creates a widget that renders an already parsed document without parsing source text.
+    /// </summary>
+    /// <param name="document">The prepared document to borrow for rendering.</param>
+    /// <remarks>
+    /// The caller must not mutate the document or any reachable collection while it is
+    /// in use. Publish a new document instance for edits. This constructor neither clones
+    /// the graph nor makes it thread safe. Prepared input takes precedence over
+    /// <see cref="Source"/>, including changes made by record copying.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="document"/> is null.</exception>
+    public MarkdownWidget(MarkdownDocument document) : this("")
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        PreparedDocument = document;
+    }
+
+    internal MarkdownDocument? PreparedDocument { get; init; }
+
+    /// <summary>
     /// The backing document, if constructed from an <see cref="IHex1bDocument"/>.
     /// When set, <see cref="IHex1bDocument.Version"/> is used for change detection
     /// instead of string equality.
@@ -110,7 +129,20 @@ public sealed record MarkdownWidget(string Source) : Hex1bWidget
     {
         var node = existingNode as MarkdownNode ?? new MarkdownNode();
 
-        if (Document != null)
+        var mode = PreparedDocument != null ? MarkdownNode.InputMode.Prepared
+            : Document != null ? MarkdownNode.InputMode.Document : MarkdownNode.InputMode.Source;
+        node.SetInputMode(mode);
+        if (PreparedDocument != null)
+        {
+            if (!ReferenceEquals(node.PreparedDocument, PreparedDocument))
+            {
+                node.PreparedDocument = PreparedDocument;
+                node.MarkDirty();
+            }
+            node.Document = null;
+            node.Source = "";
+        }
+        else if (Document != null)
         {
             // Document-backed: use version for efficient change detection
             var currentVersion = Document.Version;
@@ -124,6 +156,8 @@ public sealed record MarkdownWidget(string Source) : Hex1bWidget
         }
         else
         {
+            // Clear document ownership even when the new source has identical text.
+            node.Document = null;
             // String-backed: compare source text directly
             if (node.Source != Source)
             {
