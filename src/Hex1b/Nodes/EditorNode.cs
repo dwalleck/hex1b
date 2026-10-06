@@ -36,11 +36,24 @@ public sealed class EditorNode : Hex1bNode, IEditorSession
     private readonly FoldingGutterProvider _foldingGutterProvider = new();
     private int _cachedDocMaxWidth; // Cached max line width across entire document
     private long _cachedDocMaxWidthVersion = -1; // Document version when cache was computed
+    private IHex1bDocument? _cachedDocMaxWidthDocument;
     private BreadcrumbData? _breadcrumbs;
     private SignaturePanel? _signaturePanel;
     private Hex1bRenderContext? _lastRenderContext; // For IEditorSession.Capabilities
     private CompletionController? _completionController;
     private string _completionFilterPrefix = "";
+
+    /// <summary>
+    /// Requests that the next layout reveal the current cursor after a parent-owned
+    /// editor state change. Call on the application's serialized input/dispatch owner.
+    /// Does not move the cursor, change selection, or enable persistent following.
+    /// </summary>
+    public void RevealCursor()
+    {
+        _cursorDirty = true;
+        MarkDirty();
+        AppInvalidate?.Invoke();
+    }
 
     /// <summary>
     /// Marks that the cursor has changed and scroll should adjust to keep it visible
@@ -895,7 +908,7 @@ public sealed class EditorNode : Hex1bNode, IEditorSession
         if (State == null) return 0;
         var doc = State.Document;
         var version = doc.Version;
-        if (version == _cachedDocMaxWidthVersion)
+        if (ReferenceEquals(doc, _cachedDocMaxWidthDocument) && version == _cachedDocMaxWidthVersion)
             return _cachedDocMaxWidth;
 
         var max = 0;
@@ -907,6 +920,7 @@ public sealed class EditorNode : Hex1bNode, IEditorSession
 
         _cachedDocMaxWidth = max;
         _cachedDocMaxWidthVersion = version;
+        _cachedDocMaxWidthDocument = doc;
         return max;
     }
 
