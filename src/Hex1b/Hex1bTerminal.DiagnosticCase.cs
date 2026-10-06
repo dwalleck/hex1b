@@ -274,8 +274,8 @@ public sealed partial class Hex1bTerminal
             return RecoverProblem("requires-reapplication-data", "A recovery checkpoint holds the model's state, which only reapplication-data authorizes.") with { CaseId = recorder.CaseId };
         if (_workload is IHmp1TerminalOutputSource)
             return RecoverProblem("hmp1-workload", "A remote workload's model is driven by state synchronization the case does not hold.") with { CaseId = recorder.CaseId };
-        if (!recorder.TryReserveMark())
-            return RecoverProblem("busy", $"{DiagnosticCaseRecorder.MaxPendingMarks} checkpoints already await the case's writer.") with { CaseId = recorder.CaseId };
+        if (!recorder.TryReserveRecoveryMark())
+            return RecoverProblem("busy", $"The live start or {DiagnosticCaseRecorder.MaxPendingMarks} checkpoints await the case's writer.") with { CaseId = recorder.CaseId };
         lock (_bufferLock)
         {
             if (!recorder.IsRecording)

@@ -580,6 +580,11 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         }
     }
 
+    // Set before publication; recovery must not reserve room until the fitted start and its manifest are written.
+    private int _startCheckpointPending;
+
+    internal bool TryReserveRecoveryMark() => Volatile.Read(ref _startCheckpointPending) == 0 && TryReserveMark();
+
     /// <summary>Returns a reservation that recorded no mark.</summary>
     internal void AbandonMark()
     {
@@ -657,6 +662,7 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
     {
         if (capture.State is null || Manifest.Checkpoint is not { Profile: DiagnosticCaseCheckpointProfiles.TextState, Status: DiagnosticCaseCheckpointStatus.Complete })
             return;
+        Volatile.Write(ref _startCheckpointPending, 1);
         Interlocked.Increment(ref _pendingMarks);
         Interlocked.Add(ref _pendingStateBytes, capture.StateBytes);
         _checkpoints.Enqueue(new PendingCheckpoint(modelSequence,
@@ -1194,6 +1200,8 @@ internal sealed class DiagnosticCaseRecorder : IDiagnosticStreamObserver
         ReleaseStateBytes(pending.StateBytes);
         if (pending.ReservedBytes > 0)
             Interlocked.Add(ref _reservedStateBytes, -pending.StateBytes);
+        if (pending.Checkpoint.Trigger == "start")
+            Volatile.Write(ref _startCheckpointPending, 0);
     }
 
     // A checkpoint whose state does not fit is written without it (status missing, reason size-limit), so the

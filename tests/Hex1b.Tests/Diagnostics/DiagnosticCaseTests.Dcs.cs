@@ -74,7 +74,15 @@ public partial class DiagnosticCaseTests
             terminal.Resize(20, 6);
             var diagnostics = new TerminalDiagnostics(terminal);
             diagnostics.MarkCase("held-resized");
+            // Keep the parser-ahead suffix held while the initial start finishes writing. Retry only busy:
+            // it takes no boundary, while the first non-busy response must be the single recovery below.
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
             var recovery = diagnostics.RecoverCase("held-recovery");
+            while (recovery.Problem?.Code == "busy" && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+                recovery = diagnostics.RecoverCase("held-recovery");
+            }
             Assert.AreEqual((DiagnosticOutcome.Captured, "complete"), (recovery.Outcome, recovery.Status),
                 shape + ": supported committed recovery refused: " + recovery.Problem?.Message);
         }

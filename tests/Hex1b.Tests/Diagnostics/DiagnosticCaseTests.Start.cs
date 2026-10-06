@@ -765,6 +765,98 @@ public partial class DiagnosticCaseTests
     }
 
     [TestMethod]
+    [DataRow(0)]
+    [DataRow(300_000)]
+    public async Task Start_RecoveryBeforeWriterPreservesCompleteStartState(int applicationNameLength)
+    {
+        using var root = new CaseRoot();
+        var workload = new ScriptedWorkload();
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(200, 10).Build();
+        var diagnostics = new TerminalDiagnostics(terminal, new string('n', applicationNameLength));
+        DiagnosticCaseRecoverResult? recovery = null;
+        string path;
+        long armedAt;
+        string original;
+        using (new Running(terminal))
+        {
+            // Recovery's oversized-serialization fixture: wide glyphs and continuation cells, with distinct long
+            // hyperlink styles so the exact JSON exceeds not only the geometry floor but the memory estimate.
+            var suffix = new string('x', 600);
+            for (var row = 0; row < 10; row++)
+                await workload.WriteAndWaitAsync(terminal, string.Concat(Enumerable.Range(0, 100)
+                    .Select(column => $"\u001b]8;;https://example.test/{row}/{column}/{suffix}\u001b\\\u6f22\u001b]8;;\u001b\\"))
+                    + (row < 9 ? "\r\n" : ""));
+            original = JsonSerializer.Serialize(terminal.CaptureModelState(), DiagnosticsJsonContext.Default.DiagnosticModelState);
+            var exact = Encoding.UTF8.GetByteCount(original);
+            var estimate = terminal.EstimateModelStateBytesUnsafe();
+            Assert.IsTrue(exact > estimate, $"fixture: serialized state {exact} must exceed memory estimate {estimate}");
+            var maxBytes = Math.Max(1024 * 1024, exact + estimate + 128 * 1024);
+            Assert.IsTrue(exact * 2 > maxBytes,
+                $"fixture: two exact states must not fit (exact {exact}, estimate {estimate}, maxBytes {maxBytes})");
+            Assert.IsTrue(exact + estimate + 64 * 1024 < maxBytes,
+                $"fixture: old accounting must admit recovery (exact {exact}, estimate {estimate}, maxBytes {maxBytes})");
+            armedAt = terminal.CurrentModelSequence;
+            // The writer gate is after the initial start pass; this hook runs before the writer starts at all.
+            DiagnosticCaseRecorder.AfterArmForTesting.Value = () =>
+            {
+                Assert.AreEqual(0L, diagnostics.GetCaseStatus().BytesWritten, "fixture: writer already started");
+                var captures = terminal.ModelStateCapturesForTesting;
+                recovery = diagnostics.RecoverCase("before-writer");
+                Assert.AreEqual((DiagnosticOutcome.Unavailable, "busy"), (recovery.Outcome, recovery.Problem?.Code));
+                Assert.AreEqual(terminal.DiagnosticCase!.CaseId, recovery.CaseId, "busy recovery must identify the active case");
+                Assert.AreEqual(captures, terminal.ModelStateCapturesForTesting, "busy recovery must not project state");
+            };
+            try
+            {
+                path = diagnostics.StartCase(new DiagnosticCaseStartRequest
+                {
+                    Directory = root.Path,
+                    MaxBytes = maxBytes + applicationNameLength,
+                    Authorizations = [DiagnosticAuthorization.ReapplicationData],
+                }).Path!;
+            }
+            finally
+            {
+                DiagnosticCaseRecorder.AfterArmForTesting.Value = null;
+            }
+            var recorder = terminal.DiagnosticCase!;
+            // A smaller subsequent state fits beside the retained start. Retry only the transient busy admission;
+            // success proves the start gate is released after the writer settles its initial line.
+            await workload.WriteAndWaitAsync(terminal, "\u001b[2J\u001b[Hafter");
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+            var afterStart = diagnostics.RecoverCase("after-start");
+            while (afterStart.Problem?.Code == "busy" && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(10, TestContext.Current.CancellationToken);
+                afterStart = diagnostics.RecoverCase("after-start");
+            }
+            Assert.AreEqual(DiagnosticOutcome.Captured, afterStart.Outcome, afterStart.Problem?.Message);
+            await diagnostics.StopCaseAsync(TestContext.Current.CancellationToken);
+            Assert.AreEqual(0L, recorder.ReservedRoomForTesting, "the later recovery left reserved room after closing");
+            Assert.AreEqual(0L, recorder.PendingStateBytesForTesting, "the start left pending state after closing");
+        }
+
+        Assert.IsNotNull(recovery, "fixture: recovery was not requested in the arming window");
+        var artifact = Artifact.Read(path);
+        Assert.AreEqual("complete", artifact.Manifest.GetProperty("checkpoint").GetProperty("status").GetString());
+        var first = artifact.Events[0];
+        var start = first.GetProperty("checkpoint");
+        Assert.AreEqual(("case", "checkpoint", "start", armedAt),
+            (first.GetProperty("stream").GetString(), first.GetProperty("kind").GetString(),
+                start.GetProperty("trigger").GetString(), first.GetProperty("modelSequence").GetInt64()));
+        Assert.AreEqual("recorded", start.GetProperty("status").GetString(),
+            "a complete manifest must not lose its initial state as missing: size-limit to a pre-writer recovery");
+        Assert.AreEqual(original, start.GetProperty("state").GetRawText(), "the start must retain its exact arming state");
+        var recordedRecovery = Recoveries(artifact).Single();
+        Assert.AreEqual("after-start", recordedRecovery.GetProperty("checkpoint").GetProperty("label").GetString(),
+            "busy recovery must not record a boundary");
+        var interval = DiagnosticCaseInspector.Inspect(new DiagnosticCaseInspectRequest { Path = path }).Intervals.First();
+        Assert.IsTrue(interval.Valid, $"the initial interval is invalid: {interval.EndReason}");
+        Assert.AreEqual(armedAt, interval.FromModelSequence);
+        AssertMatched(Reapply(path, label: "start"), "the complete initial state remains re-applicable");
+    }
+
+    [TestMethod]
     public async Task Start_SizedWithItsManifest()
     {
         // A start that fits the events tier on its own, but not with a large manifest (a long application name): the

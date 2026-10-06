@@ -338,6 +338,12 @@ Start a case in one of two ways:
   could not rebuild (`configuration:`, for example a custom reflow strategy), is `unsupported`
   with that reason. History and pending DCS content are never truncated to fit. The case
   records either way.
+  While a complete live start awaits the writer, recovery requests return `busy` without
+  projecting state or recording a recovery boundary. Recovery becomes available once the
+  manifest and start line have been written and the start's pending-state accounting has
+  settled. It therefore cannot consume the start's room and leave a stateless
+  `missing: size-limit` start under a `complete` manifest, even when the start's serialized
+  state exceeds its memory estimate or the manifest is large.
 
 A local terminal retains history only when started with a scrollback: `hex1b terminal start
 --scrollback <rows>`, or `scrollback` on the MCP `start_bash_terminal` / `start_pwsh_terminal`
@@ -573,7 +579,8 @@ states; `mid-application`; `unapplied-output`; `configuration: …`; `capture-fa
 the line records the boundary only and starts nothing. A complete recovery's line is reserved in
 the case's size bound as it is accepted, before its state is projected, so it always lands with its
 state: whatever the writer appends from then on respects the reduced bound, and output that would
-cross it is declared `size-limit` and stops the case, as output does at the bound today. A recovery never waits for the writer (`busy` past 64 pending checkpoints) and
+cross it is declared `size-limit` and stops the case, as output does at the bound today. A recovery never waits for the writer
+(`busy` while the complete live start awaits it, or past 64 pending checkpoints) and
 never changes the loss already recorded or the case's initial checkpoint. The default label is
 `recovery-` and the checkpoint's ordinal.
 
