@@ -1391,6 +1391,7 @@ internal sealed class Hex1bFlowRunner
             // Set once the live app exists, so the settle path can wait for a
             // frame rendered at the settled geometry before it repaints.
             var appBox = new System.Runtime.CompilerServices.StrongBox<Hex1bApp?>(null);
+            var appStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
             // Admission state shared with the commit's preparation hook: the
             // frame gate, the mute ownership admission takes, and the app whose
@@ -1583,6 +1584,9 @@ internal sealed class Hex1bFlowRunner
             }
             async Task RepaintLiveAfterResizeAsync(long generation, CancellationToken resizeToken)
             {
+                // Attachment precedes required native input-mode acknowledgement.
+                // Do not time a frame or observe the host before rendering can start.
+                await appStarted.Task.WaitAsync(resizeToken).ConfigureAwait(false);
                 await resizeObservationGate.WaitAsync(resizeToken).ConfigureAwait(false);
                 try
                 {
@@ -1968,7 +1972,9 @@ internal sealed class Hex1bFlowRunner
                     // Register release before an uncertain partial entry write.
                     inputModeRelease = modeRelease;
                     await WriteInlineInputModesAsync(modeEntry).ConfigureAwait(false);
-                    await app.RunAsync(default);
+                    var appRun = app.RunAsync(default);
+                    appStarted.TrySetResult();
+                    await appRun;
                 }
                 finally
                 {
@@ -2000,6 +2006,7 @@ internal sealed class Hex1bFlowRunner
                             try { inputPumpCts.Cancel(); }
                             finally
                             {
+                                appStarted.TrySetCanceled(inputPumpCts.Token);
                                 // The pump retains its graphics lease through
                                 // receipt disposition, including cancellation.
                                 try { await outputPumpTask.ConfigureAwait(false); }
