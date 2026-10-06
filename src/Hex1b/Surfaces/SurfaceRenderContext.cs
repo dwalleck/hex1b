@@ -47,8 +47,8 @@ public class SurfaceRenderContext : Hex1bRenderContext
         => rect.HasValue ? $"{rect.Value.X},{rect.Value.Y} {rect.Value.Width}x{rect.Value.Height}" : "null";
 
     // Maximum dimension for a child surface to prevent overflow in width*height allocation.
-    // Real terminal content rarely exceeds 10000 rows; this prevents int.MaxValue-sized children
-    // (from unconstrained measure passes) from causing OverflowException in Surface allocation.
+    // Larger children render only their visible window instead of allocating their full extent.
+    // Layout remains unbounded so scrolling can reach all content.
     private const int MaxSurfaceDimension = 10_000;
     
     /// <summary>
@@ -130,13 +130,14 @@ public class SurfaceRenderContext : Hex1bRenderContext
     {
         var left = Math.Max(a.X, b.X);
         var top = Math.Max(a.Y, b.Y);
-        var right = Math.Min(a.X + a.Width, b.X + b.Width);
-        var bottom = Math.Min(a.Y + a.Height, b.Y + b.Height);
+        var right = Math.Min((long)a.X + a.Width, (long)b.X + b.Width);
+        var bottom = Math.Min((long)a.Y + a.Height, (long)b.Y + b.Height);
 
         if (right <= left || bottom <= top)
             return null;
 
-        return new Rect(left, top, right - left, bottom - top);
+        // The intersection cannot exceed either input dimension, both of which are ints.
+        return new Rect(left, top, (int)(right - left), (int)(bottom - top));
     }
 
     /// <summary>
@@ -167,18 +168,18 @@ public class SurfaceRenderContext : Hex1bRenderContext
     /// KGP images beneath them.
     /// </summary>
     /// <param name="childSurface">The surface the child rendered into.</param>
-    /// <param name="child">The child node.</param>
+    /// <param name="surfaceBounds">The absolute bounds represented by the child surface.</param>
     /// <param name="visibleBounds">The portion of the child that was actually composited.</param>
     /// <param name="layer">The KGP layer to register the occluder at (pushed before rendering).</param>
-    private void RegisterOccluderFromContent(Surface childSurface, Hex1bNode child, Rect? visibleBounds, int layer)
+    private void RegisterOccluderFromContent(Surface childSurface, Rect surfaceBounds, Rect? visibleBounds, int layer)
     {
         if (_kgpRegistry == null || !childSurface.HasWrittenContent || visibleBounds is null)
             return;
 
         var cb = childSurface.WrittenContentBounds;
         var contentBounds = new Rect(
-            child.Bounds.X + cb.X,
-            child.Bounds.Y + cb.Y,
+            surfaceBounds.X + cb.X,
+            surfaceBounds.Y + cb.Y,
             cb.Width,
             cb.Height);
         var clippedBounds = IntersectRects(contentBounds, visibleBounds.Value);
@@ -977,18 +978,40 @@ public class SurfaceRenderContext : Hex1bRenderContext
         if (RecordsCompositeClips)
             child.DiagCompositeClip = GetEffectiveCurrentClipRect();
         
+        var oversized = child.Bounds.Width > MaxSurfaceDimension || child.Bounds.Height > MaxSurfaceDimension;
+        var renderBounds = child.Bounds;
+        if (oversized)
+        {
+            // A full-child cache cannot represent this extent. Retire it even when the
+            // child is now wholly offscreen, then render only cells this parent can show.
+            var retired = child.CachedSurface ?? child.RenderBuffer;
+            child.CachedSurface = null;
+            child.RenderBuffer = null;
+            if (retired is not null)
+            {
+                if (SurfacePool is { } pool) pool.Return(retired);
+                else retired.ClearAndReleaseTrackedObjects();
+            }
+            if (CachingEnabled) CacheMisses++;
+            var surfaceBounds = new Rect(_offsetX, _offsetY, _surface.Width, _surface.Height);
+            var visible = IntersectRects(child.Bounds, GetEffectiveCurrentClipRect());
+            if (visible is null || IntersectRects(visible.Value, surfaceBounds) is not { } window)
+                return;
+            renderBounds = window;
+        }
+
         // If caching is disabled, render directly into this surface
         // UNLESS there's a layout provider requiring clipping (e.g., ScrollPanel viewport)
-        if (!CachingEnabled)
+        if (!CachingEnabled || oversized)
         {
-            if (CurrentLayoutProvider != null && child.Bounds.Width > 0 && child.Bounds.Height > 0)
+            if ((CurrentLayoutProvider != null || oversized) && child.Bounds.Width > 0 && child.Bounds.Height > 0)
             {
                 // Must use a child surface + composite so the clip rect is respected.
                 // Without this, content inside ScrollPanels bleeds past the viewport.
-                // Clamp dimensions so width*height doesn't overflow int.MaxValue while
-                // preserving the child's full extent (needed for scroll offset rendering).
-                var clampedWidth = Math.Min(child.Bounds.Width, MaxSurfaceDimension);
-                var clampedHeight = Math.Min(child.Bounds.Height, MaxSurfaceDimension);
+                // Oversized children retain their absolute layout while this buffer
+                // represents only the visible window, including deep scroll offsets.
+                var clampedWidth = renderBounds.Width;
+                var clampedHeight = renderBounds.Height;
                 var pool = SurfacePool;
                 var childSurface = pool != null
                     ? pool.Rent(clampedWidth, clampedHeight, CellMetrics)
@@ -1007,8 +1030,8 @@ public class SurfaceRenderContext : Hex1bRenderContext
                     // global layer ordering needed for correct occlusion.
                     var occluderLayer = _kgpRegistry?.CurrentLayer ?? _kgpLayer;
 
-                    var childClip = IntersectKgpClip(_kgpClipRect, child.Bounds);
-                    var childContext = new SurfaceRenderContext(childSurface, child.Bounds.X, child.Bounds.Y, Theme, _trackedObjects)
+                    var childClip = IntersectKgpClip(_kgpClipRect, renderBounds);
+                    var childContext = new SurfaceRenderContext(childSurface, renderBounds.X, renderBounds.Y, Theme, _trackedObjects)
                     {
                         CachingEnabled = false,
                         KgpImageEpoch = KgpImageEpoch,
@@ -1023,7 +1046,7 @@ public class SurfaceRenderContext : Hex1bRenderContext
                         _kgpLayer = _kgpLayer,
                         _kgpClipRect = childClip
                     };
-                    childContext.CurrentLayoutProvider = new RectLayoutProvider(child.Bounds)
+                    childContext.CurrentLayoutProvider = new RectLayoutProvider(renderBounds)
                     {
                         ParentLayoutProvider = CurrentLayoutProvider
                     };
@@ -1043,7 +1066,7 @@ public class SurfaceRenderContext : Hex1bRenderContext
                     // actual content bounds, constrained to what will really be
                     // composited. This prevents clipped-off subcontent from
                     // registering invisible occluders.
-                    RegisterOccluderFromContent(childSurface, child, visibleBounds, occluderLayer);
+                    RegisterOccluderFromContent(childSurface, renderBounds, visibleBounds, occluderLayer);
 
                     var imageCountAfter = _kgpRegistry?.Images.Count ?? 0;
                     if (childSurface.HasKgp || imageCountAfter != imageCountBefore)
@@ -1064,13 +1087,15 @@ public class SurfaceRenderContext : Hex1bRenderContext
                         providerClip.Y - _offsetY,
                         providerClip.Width,
                         providerClip.Height);
-                    _surface.Composite(childSurface, child.Bounds.X - _offsetX, child.Bounds.Y - _offsetY, clipRect);
+                    _surface.Composite(childSurface, renderBounds.X - _offsetX, renderBounds.Y - _offsetY, clipRect);
                     return;
                 }
                 finally
                 {
                     if (pool != null)
                         pool.Return(childSurface);
+                    else
+                        childSurface.ClearAndReleaseTrackedObjects();
                 }
             }
 

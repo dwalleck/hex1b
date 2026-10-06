@@ -235,6 +235,42 @@ public class SurfaceRenderContextTests
         Assert.AreEqual(0, context.TrackedObjectStore.SixelCount);
     }
 
+    [TestMethod]
+    [DataRow(true, true)]
+    [DataRow(true, false)]
+    [DataRow(false, true)]
+    [DataRow(false, false)]
+    public void RenderChild_OversizedVisibleSixel_ReleasesTransientReferences(bool caching, bool pooled)
+    {
+        var surface = new Surface(10, 5);
+        var context = CreateSixelContext(surface, 10, 20, pooled ? new SurfacePool(2, 2) : null);
+        context.CachingEnabled = caching;
+        var node = CreateSixelNode(new Rect(0, 0, 2, 10001));
+        context.RenderChild(node);
+        var tracked = surface[0, 0].Sixel!;
+        Assert.IsNotNull(tracked);
+        Assert.AreEqual(1, tracked.RefCount, "Only the composited parent owns this visible image.");
+        surface.ClearAndReleaseTrackedObjects();
+        Assert.AreEqual(0, tracked.RefCount);
+        Assert.AreEqual(0, context.TrackedObjectStore.SixelCount);
+    }
+
+    [TestMethod]
+    public void RenderChild_OversizedOffscreenChild_ReleasesObsoleteCache()
+    {
+        var surface = new Surface(10, 5);
+        var context = CreateSixelContext(surface);
+        var node = CreateSixelNode(new Rect(0, 0, 2, 1));
+        context.RenderChild(node);
+        var tracked = node.CachedSurface![0, 0].Sixel!;
+        surface.ClearAndReleaseTrackedObjects();
+        Assert.AreEqual(1, tracked.RefCount);
+        node.Arrange(new Rect(0, 10, 2, 10001));
+        context.RenderChild(node);
+        Assert.AreEqual(0, tracked.RefCount);
+        Assert.AreEqual(0, context.TrackedObjectStore.SixelCount);
+    }
+
     private static SixelPixelBuffer CreateSolidPixels(
         int width,
         int height,
@@ -259,7 +295,8 @@ public class SurfaceRenderContextTests
     private static SurfaceRenderContext CreateSixelContext(
         Surface surface,
         double sixelCellWidth,
-        double sixelCellHeight)
+        double sixelCellHeight,
+        SurfacePool? pool = null)
     {
         var capabilities = new TerminalCapabilities
         {
@@ -271,7 +308,7 @@ public class SurfaceRenderContextTests
                 SixelCellMetricsSource.Direct,
                 SixelCellMetricsReliability.Authoritative)
         };
-        var context = new SurfaceRenderContext(surface);
+        var context = new SurfaceRenderContext(surface) { SurfacePool = pool };
         context.SetCapabilities(capabilities);
         return context;
     }
