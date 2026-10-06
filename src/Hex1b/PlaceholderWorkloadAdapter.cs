@@ -218,18 +218,22 @@ internal sealed class PlaceholderWorkloadAdapter : IHex1bTerminalWorkloadAdapter
             // Drain a queued reset sequence first so it lands ahead of the
             // new child's first bytes. Reset is short — single chunk is fine.
             CancellationToken swapToken;
+            CancellationTokenSource readCts;
             IHex1bTerminalWorkloadAdapter active;
             bool emitReset;
             lock (_swapLock)
             {
                 active = _active;
-                // SwapTo can dispose this source after we release the lock.
-                // Capture the token while the source still belongs to this child.
+                // Register before SwapTo can cancel and dispose this source.
+                // Capturing the token alone does not protect a later registration
+                // from racing disposal and missing the cancellation notification.
                 swapToken = _swapCts.Token;
+                readCts = CancellationTokenSource.CreateLinkedTokenSource(ct, swapToken);
                 emitReset = _resetPending;
                 _resetPending = false;
             }
 
+            using var linked = readCts;
             if (emitReset)
             {
                 if (active is IRepaintableWorkloadAdapter repaintable)
@@ -253,7 +257,6 @@ internal sealed class PlaceholderWorkloadAdapter : IHex1bTerminalWorkloadAdapter
                 }
             }
 
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, swapToken);
             try
             {
                 var output = preserveState && active is IHmp1TerminalOutputSource source

@@ -167,12 +167,68 @@ public class PlaceholderWorkloadAdapterTests
                 // The watcher can swap and dispose the old cancellation source
                 // while the reader is capturing its active-child state.
                 primary.SignalConnected();
-                var reset = await adapter.ReadOutputAsync(timeout.Token);
+                var resetRead = adapter.ReadOutputAsync(timeout.Token).AsTask();
+                ReadOnlyMemory<byte> reset;
+                try
+                {
+                    await primary.DisconnectWaitStarted.Task.WaitAsync(timeout.Token);
+                    // The watcher reaches DisconnectedTask only after SwapTo has
+                    // finished cancelling and disposing the previous generation.
+                    if (placeholder.LastReadToken.CanBeCanceled)
+                    {
+                        Assert.IsTrue(placeholder.LastReadToken.IsCancellationRequested,
+                            "The swap completed but the placeholder read missed cancellation.");
+                    }
+                    reset = await resetRead;
+                }
+                finally
+                {
+                    if (!resetRead.IsCompleted)
+                    {
+                        timeout.Cancel();
+                        try { await resetRead; }
+                        catch (OperationCanceledException) { }
+                    }
+                }
                 AssertContainsSequence(reset, "\u001bc"u8);
                 var data = await adapter.ReadOutputAsync(timeout.Token);
                 TestSeq.AreEqual("PRIMARY"u8.ToArray(), data.ToArray());
                 Assert.AreSame(primary, adapter.ActiveChild);
             });
+    }
+
+    [TestMethod]
+    [DataRow(PlaceholderResumePolicy.OneShot, false)]
+    [DataRow(PlaceholderResumePolicy.OneShot, true)]
+    [DataRow(PlaceholderResumePolicy.OnDisconnect, false)]
+    [DataRow(PlaceholderResumePolicy.OnDisconnect, true)]
+    public async Task ReadOutputAsync_CallerCancelsPendingRead_CancelsAndAllowsNextRead(
+        PlaceholderResumePolicy resumePolicy, bool primaryActive)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(10));
+        using var caller = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+        var primary = new FakeConnectableAdapter();
+        var placeholder = new FakeAdapter();
+        await using var adapter = new PlaceholderWorkloadAdapter(primary, placeholder, resumePolicy);
+        if (primaryActive)
+        {
+            primary.SignalConnected();
+            var reset = await adapter.ReadOutputAsync(timeout.Token);
+            TestSeq.AreEqual("\u001bc\u001b[?1049l\u001b[2J\u001b[H"u8.ToArray(), reset.ToArray());
+        }
+
+        // ReadOutputAsync reaches the empty child's channel before returning.
+        var pending = adapter.ReadOutputAsync(caller.Token).AsTask();
+        Assert.IsFalse(pending.IsCompleted);
+        caller.Cancel();
+        await Assert.ThrowsAsync<OperationCanceledException>(() => pending.WaitAsync(timeout.Token));
+
+        var active = primaryActive ? primary : placeholder;
+        active.EnqueueOutput("AFTER-CANCEL"u8.ToArray());
+        var data = await adapter.ReadOutputAsync(timeout.Token);
+        TestSeq.AreEqual("AFTER-CANCEL"u8.ToArray(), data.ToArray());
+        Assert.AreSame(active, adapter.ActiveChild);
     }
 
     [TestMethod]
@@ -342,6 +398,7 @@ public class PlaceholderWorkloadAdapterTests
         public bool HandlesProtocolQueries { get; init; }
         public (int, int)? LastResize;
         private bool _returnedOutput;
+        public CancellationToken LastReadToken { get; private set; }
         public TaskCompletionSource OutputProcessed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public event Action? Disconnected;
@@ -351,6 +408,7 @@ public class PlaceholderWorkloadAdapterTests
 
         public virtual async ValueTask<ReadOnlyMemory<byte>> ReadOutputAsync(CancellationToken ct = default)
         {
+            LastReadToken = ct;
             if (_returnedOutput) OutputProcessed.TrySetResult();
             try
             {
@@ -393,7 +451,15 @@ public class PlaceholderWorkloadAdapterTests
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Task ConnectedTask => _connected.Task;
-        public Task DisconnectedTask => _disconnected.Task;
+        public TaskCompletionSource DisconnectWaitStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task DisconnectedTask
+        {
+            get
+            {
+                DisconnectWaitStarted.TrySetResult();
+                return _disconnected.Task;
+            }
+        }
         public bool IsConnected =>
             _connected.Task.IsCompletedSuccessfully && !_disconnected.Task.IsCompleted;
 
