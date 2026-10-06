@@ -379,7 +379,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
         _invalidateChannel.Writer.TryWrite(true);
     }
 
-    private void RequestSoftWrapRepaint()
+    internal void RequestSoftWrapRepaint()
     {
         Interlocked.Exchange(ref _softWrapRepaintRequested, 1);
         Invalidate();

@@ -1866,7 +1866,7 @@ internal sealed class Hex1bFlowRunner
                                             settleOriginalDims = null;
                                         }
 
-                                        requestFreshFrame = true;
+                                        requestFreshFrame = !settlePreBurstMute;
                                     }
                                 }
                             }
@@ -1878,7 +1878,7 @@ internal sealed class Hex1bFlowRunner
                             // to a freshness-blind queue drain.
                             if (requestFreshFrame)
                             {
-                                appBox.Value?.Invalidate();
+                                appBox.Value?.RequestSoftWrapRepaint();
                             }
                         }
                         catch (OperationCanceledException) when (inputPumpCts.IsCancellationRequested) { }
@@ -3231,6 +3231,11 @@ internal sealed class Hex1bFlowRunner
                 // from here the commit is finished with the live region and the
                 // next frame is laid out for it.
                 System.Threading.Volatile.Write(ref _admission.ResumeGranted, true);
+                // A newer app frame may have rendered after the final live
+                // snapshot while output was still muted. Reconciliation alone
+                // cannot re-emit an unchanged tree: force a current-epoch frame
+                // only after both output gates have been lifted.
+                _app.RequestSoftWrapRepaint();
             }
 
             return previous;
