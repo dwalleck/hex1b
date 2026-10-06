@@ -238,7 +238,9 @@ public class FlowFocusedCursorTests
     }
 
     [TestMethod]
-    public async Task NonFlowApp_FocusedTextBox_KeepsNativeCaretAndDrawsNoCell()
+    [DataRow(false)]
+    [DataRow(true)] // soft-wrap emission outside Flow: nothing parks the cursor, so the native caret stays
+    public async Task NonFlowApp_FocusedTextBox_KeepsNativeCaretAndDrawsNoCell(bool softWrap)
     {
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         using var workload = new Hex1bAppWorkloadAdapter();
@@ -247,7 +249,7 @@ public class FlowFocusedCursorTests
         var state = new TextBoxState("abcdef") { CursorPosition = 3 };
         using var app = new Hex1bApp(ctx => Task.FromResult<Hex1bWidget>(
                 ctx.VStack(v => [v.Text("HEADER-58"), v.TextBox().State(state)])),
-            new Hex1bAppOptions { WorkloadAdapter = workload, Theme = CaretTheme() });
+            new Hex1bAppOptions { WorkloadAdapter = workload, Theme = CaretTheme(), UseSoftWrapEmission = softWrap });
         var running = app.RunAsync(stop.Token);
         try
         {
