@@ -743,7 +743,8 @@ internal sealed class Hex1bFlowRunner
         InlineStepAdapter stepAdapter,
         int rowOrigin,
         int liveHeight,
-        LiveRenderSnapshot liveFrame)
+        LiveRenderSnapshot liveFrame,
+        bool clearAuthoritativeResizeTail = false)
     {
         var liveSurface = liveFrame.Surface;
         var terminalHeight = ReadCurrentGeometry().Height;
@@ -769,7 +770,14 @@ internal sealed class Hex1bFlowRunner
                 // soft-wrap metadata, which EL alone leaves behind. Never send
                 // it at the bottom: that row is reset by the next reservation's
                 // LF, without introducing an extra scroll during repaint.
-                for (var row = 0; row < liveHeight; row++)
+                // Only a resize with a stable host-observed live anchor owns the
+                // obsolete tail below its new image. Host reflow may leave old
+                // live rows there; committed history precedes that anchor.
+                // Other callers retain their existing bounded-region clear.
+                var clearRows = clearAuthoritativeResizeTail
+                    ? terminalHeight - rowOrigin
+                    : liveHeight;
+                for (var row = 0; row < clearRows; row++)
                 {
                     var absolute = rowOrigin + row;
                     if (absolute < 0 || absolute >= terminalHeight) continue;
@@ -1684,7 +1692,8 @@ internal sealed class Hex1bFlowRunner
                                     if (surface is not null)
                                     {
                                         var painted = ReanchorLiveRegion(
-                                            stepAdapter, anchor, liveHeight, surface);
+                                            stepAdapter, anchor, liveHeight, surface,
+                                            clearAuthoritativeResizeTail: observed.HasValue);
                                         stepAdapter.RowOrigin = painted.RowOrigin;
                                         step.StepHeight = painted.LiveHeight;
                                         desiredHeight = painted.LiveHeight;
