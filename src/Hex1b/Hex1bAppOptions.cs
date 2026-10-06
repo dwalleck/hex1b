@@ -9,6 +9,10 @@ namespace Hex1b;
 /// </summary>
 public class Hex1bAppOptions
 {
+    /// <summary>Maximum queued dispatch callbacks, excluding the currently executing callback.
+    /// Must be positive. Default is 256; a full queue refuses admission without dropping existing work.</summary>
+    public int DispatchQueueCapacity { get; set; } = 256;
+
     // === New way (preferred) ===
     
     /// <summary>

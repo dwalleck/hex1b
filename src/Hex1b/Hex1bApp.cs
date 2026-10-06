@@ -39,7 +39,7 @@ namespace Hex1b;
 /// State management is handled via closures - simply capture your state variables
 /// in the widget builder callback.
 /// </remarks>
-public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
+public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
 {
     // Not readonly: a live inline step can replace its root layout without
     // stopping the app (see SwapRootComponent). Read once per frame; the
@@ -276,6 +276,8 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         Hex1bAppOptions? options = null)
     {
         options ??= new Hex1bAppOptions();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(options.DispatchQueueCapacity);
+        _dispatchQueueCapacity = options.DispatchQueueCapacity;
         
         _rootComponent = builder;
         _themeProvider = options.ThemeProvider;
@@ -616,6 +618,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
             if (_disposeRequested) throw new ObjectDisposedException(nameof(Hex1bApp));
             if (_runStopped is not null) throw new InvalidOperationException("The application is already running.");
             _runStopped = stopped = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            _dispatchAccepting = true;
         }
         Exception? failure = null;
         _runExecutionContext.Value = true;
@@ -623,6 +626,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
         catch (Exception error) { failure = error; throw; }
         finally
         {
+            CloseDispatch();
             try
             {
                 bool dispose;
@@ -688,6 +692,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
 
             Task<bool>? inputWaitTask = null;
             Task<bool>? invalidateWaitTask = null;
+            Task<bool>? dispatchWaitTask = null;
 
             // React to input events, invalidation signals, and animation timers
             while (!shutdownTask.IsCompleted && !_stopRequested)
@@ -697,6 +702,7 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
 
                 inputWaitTask ??= _adapter.InputEvents.WaitToReadAsync().AsTask();
                 invalidateWaitTask ??= _invalidateChannel.Reader.WaitToReadAsync().AsTask();
+                dispatchWaitTask ??= _dispatchWakeup.Reader.WaitToReadAsync().AsTask();
 
                 var timeUntilTimer = _animationTimer.GetTimeUntilNextDue();
                 Task completedTask;
@@ -705,11 +711,11 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
                 {
                     // Keep timer waits non-cancelable so steady-state render pacing doesn't throw cancellations.
                     var timerWaitTask = Task.Delay(timeUntilTimer.Value);
-                    completedTask = await Task.WhenAny(inputWaitTask, invalidateWaitTask, timerWaitTask, shutdownTask);
+                    completedTask = await Task.WhenAny(inputWaitTask, invalidateWaitTask, dispatchWaitTask, timerWaitTask, shutdownTask);
                 }
                 else
                 {
-                    completedTask = await Task.WhenAny(inputWaitTask, invalidateWaitTask, shutdownTask);
+                    completedTask = await Task.WhenAny(inputWaitTask, invalidateWaitTask, dispatchWaitTask, shutdownTask);
                 }
 
                 if (completedTask == shutdownTask || cancellationToken.IsCancellationRequested)
@@ -729,6 +735,13 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
                 {
                     _ = await invalidateWaitTask;
                     invalidateWaitTask = null;
+                }
+
+                if (dispatchWaitTask.IsCompleted)
+                {
+                    _ = await dispatchWaitTask;
+                    dispatchWaitTask = null;
+                    _dispatchWakeup.Reader.TryRead(out _);
                 }
 
                 // Process input - the approach depends on whether input was ready
@@ -784,6 +797,8 @@ public class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrameSource
                             break;
                     }
                 }
+
+                DrainDispatch(cancellationToken);
 
                 // Re-render after handling input or invalidation (state may have changed).
                 // Skip the frame-rate pace whenever input was processed - inputs are user-driven

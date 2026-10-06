@@ -138,6 +138,23 @@ public sealed class FlowStep
     /// </summary>
     public void Invalidate() => _app?.Invalidate();
 
+    /// <summary>Queues a short synchronous state transition on this step's application loop.</summary>
+    /// <param name="callback">The synchronous callback; never supply async-void or block on frame-dependent work.</param>
+    /// <param name="completion">For accepted work, its execution outcome; otherwise a completed placeholder.</param>
+    /// <param name="cancellationToken">Cancels work before execution begins.</param>
+    /// <returns>The admission outcome, including NotRunning before the app is attached or after it stops.</returns>
+    /// <remarks>Uses <see cref="Hex1bApp.Dispatch"/>. Await completion outside step input/render handlers.
+    /// Completion acknowledges callback execution, not frame emission or native presentation.</remarks>
+    public Hex1bDispatchAdmission Dispatch(Action callback, out Task completion, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        var app = _app;
+        if (app is not null) return app.Dispatch(callback, out completion, cancellationToken);
+        completion = Task.CompletedTask;
+        return Hex1bDispatchAdmission.NotRunning;
+    }
+
+
     /// <summary>
     /// Completes the step without frozen output. The step region is cleared
     /// and the cursor advances past it.
