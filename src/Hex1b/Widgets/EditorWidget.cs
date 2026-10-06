@@ -241,6 +241,42 @@ public sealed record EditorWidget : Hex1bWidget,
     public EditorWidget WordWrap(bool enabled = true)
         => this with { WordWrapValue = enabled };
 
+    internal bool KeepCursorVisibleValue { get; init; }
+
+    /// <summary>Keeps the primary cursor visible on every layout when enabled.</summary>
+    /// <param name="enabled">True to adjust scroll after layout; false to preserve the default
+    /// behavior of revealing only after cursor movement or an explicit reveal request.</param>
+    /// <returns>An editor configured with the visibility policy.</returns>
+    /// <remarks>
+    /// Defaults to false. This option adjusts vertical and horizontal scroll using the effective
+    /// viewport after scrollbar layout. It does not move the cursor, alter selection, or follow
+    /// document changes automatically. The owner must move the primary cursor to its desired
+    /// position. While enabled, layout can override manual scrolling away from that cursor;
+    /// disable it when user navigation should retain its own viewport. Unlike
+    /// <see cref="EditorNode.RevealCursor"/>, this policy persists across layouts.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// using Hex1b;
+    /// using Hex1b.Documents;
+    /// using Hex1b.Widgets;
+    ///
+    /// var state = new EditorState(new Hex1bDocument("First line\nLast line")) { IsReadOnly = true };
+    /// state.MoveToDocumentEnd();
+    /// var keepVisible = true;
+    /// await using var terminal = Hex1bTerminal.CreateBuilder()
+    ///     .WithHex1bApp(_ =&gt; new VStackWidget([
+    ///         new EditorWidget(state).KeepCursorVisible(keepVisible).FillHeight(),
+    ///         new ButtonWidget("Allow manual scrolling").OnClick(_ =&gt; keepVisible = false),
+    ///         new ButtonWidget("Quit").OnClick(e =&gt; e.Context.RequestStop())
+    ///     ]))
+    ///     .Build();
+    /// await terminal.RunAsync();
+    /// </code>
+    /// </example>
+    public EditorWidget KeepCursorVisible(bool enabled = true)
+        => this with { KeepCursorVisibleValue = enabled };
+
     internal override Task<Hex1bNode> ReconcileAsync(Hex1bNode? existingNode, ReconcileContext context)
     {
         var node = existingNode as EditorNode ?? new EditorNode();
@@ -251,6 +287,7 @@ public sealed record EditorWidget : Hex1bWidget,
         node.ViewRenderer = Renderer ?? TextEditorViewRenderer.Instance;
         node.ShowLineNumbers = ShowLineNumbersValue;
         node.WordWrap = WordWrapValue;
+        node.KeepCursorVisible = KeepCursorVisibleValue;
         node.GutterProviders = GutterProvidersValue != null ? [..GutterProvidersValue] : [];
 
         // Activate/deactivate decoration providers when they change

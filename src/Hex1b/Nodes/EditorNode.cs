@@ -144,6 +144,9 @@ public sealed class EditorNode : Hex1bNode, IEditorSession
     /// <summary>Whether soft line wrapping is enabled.</summary>
     public bool WordWrap { get; set; }
 
+    /// <summary>Whether every layout reveals the primary cursor. Defaults to false.</summary>
+    public bool KeepCursorVisible { get; set; }
+
     /// <summary>
     /// Gutter providers rendered left-to-right in the editor's left margin.
     /// When empty and <see cref="ShowLineNumbers"/> is true, a default
@@ -395,10 +398,10 @@ public sealed class EditorNode : Hex1bNode, IEditorSession
         // Subscribe to document changes if not already
         SubscribeToDocument();
 
-        // Only adjust scroll for cursor visibility when a cursor-changing action
-        // occurred (AfterMove/AfterEdit set _cursorDirty). This prevents scrollbar
-        // interactions from being "flicked back" to the cursor on layout passes.
-        if (_cursorDirty)
+        // Default behavior reveals only after cursor-changing actions, preserving
+        // manual scrolling. Explicit persistent visibility also reveals after layout
+        // changes, using the effective viewport after scrollbar calculation.
+        if (_cursorDirty || KeepCursorVisible)
         {
             EnsureCursorVisible();
             _cursorDirty = false;
