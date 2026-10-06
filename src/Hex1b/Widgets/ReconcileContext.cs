@@ -253,12 +253,14 @@ public sealed class ReconcileContext
         ObserveTransientNode?.Invoke(parent);
         if (widget is null)
         {
+            existingNode?.CancelOrderedPasteForDetach();
             return null;
         }
 
         var childContext = WithParent(parent);
         var isReplacement = existingNode is not null && existingNode.GetType() != widget.GetExpectedNodeType();
         childContext.IsNew = existingNode is null || isReplacement;
+        if (isReplacement) existingNode!.CancelOrderedPasteForDetach();
         
         long reconcileStart = 0;
         var recordReconcileMetric = Metrics?.NodeReconcileDuration != null;

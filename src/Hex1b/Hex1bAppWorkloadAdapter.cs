@@ -42,8 +42,43 @@ public sealed class Hex1bAppWorkloadAdapter :
     Hex1b.Flow.IFlowCurrentGeometrySource,
     IDisposable
 {
+    internal event Action? OrderedGeometryChanged;
+
+    private readonly object _inputConfigurationSync = new();
+    private bool _inputExposed;
+    private int _orderedPasteCapacity;
+    internal OrderedInputState? OrderedInput { get; private set; }
+    private Channel<Hex1bEvent> ExposeInputChannel()
+    {
+        lock (_inputConfigurationSync)
+        {
+            _inputExposed = true;
+            return _inputChannel;
+        }
+    }
+    internal int OrderedPasteCapacity
+    {
+        get => _orderedPasteCapacity;
+        set
+        {
+            lock (_inputConfigurationSync)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                if (_orderedPasteCapacity == value) return;
+                if (_inputExposed)
+                    throw new InvalidOperationException("Configure ordered input before exposing InputEvents or attempting any input admission.");
+                _inputChannel = Channel.CreateBounded<Hex1bEvent>(new BoundedChannelOptions(value)
+                {
+                    SingleReader = true, SingleWriter = false, FullMode = BoundedChannelFullMode.Wait
+                });
+                _orderedPasteCapacity = value;
+                OrderedInput = new OrderedInputState(value);
+            }
+        }
+    }
+
     private readonly Channel<WorkloadOutputItem> _outputChannel;
-    private readonly Channel<Hex1bEvent> _inputChannel;
+    private Channel<Hex1bEvent> _inputChannel;
     private readonly IHex1bTerminalPresentationAdapter? _presentationAdapter;
     private readonly TerminalCapabilities? _staticCapabilities;
     private int _width;
@@ -105,17 +140,35 @@ public sealed class Hex1bAppWorkloadAdapter :
 
     // Every input-channel write goes through here so a tracked session numbers each event in
     // channel order; an untracked session writes exactly as before.
-    private bool TryWriteInput(Hex1bEvent evt) => InputMilestones is { } tracker
-        ? tracker.Accept(evt, _inputChannel.Writer.TryWrite)
-        : _inputChannel.Writer.TryWrite(evt);
-
-    private ValueTask WriteInputTrackedAsync(Hex1bEvent evt, CancellationToken ct)
+    private bool TryWriteInput(Hex1bEvent evt)
     {
-        if (InputMilestones is null)
-            return _inputChannel.Writer.WriteAsync(evt, ct);
-        if (!TryWriteInput(evt))
-            throw new ChannelClosedException();
-        return ValueTask.CompletedTask;
+        var channel = ExposeInputChannel();
+        return InputMilestones is { } tracker
+            ? tracker.Accept(evt, channel.Writer.TryWrite, waitForTurn: OrderedPasteCapacity == 0)
+            : channel.Writer.TryWrite(evt);
+    }
+
+    private async ValueTask WriteInputTrackedAsync(Hex1bEvent evt, CancellationToken ct)
+    {
+        var channel = ExposeInputChannel();
+        if (InputMilestones is not { } tracker)
+        {
+            await channel.Writer.WriteAsync(evt, ct).ConfigureAwait(false);
+            return;
+        }
+        // Await the send turn before channel space, never while holding the tracker's lock.
+        // An outer terminal write may already pin an ended send. Do not replace that
+        // pin or wait for its own gate: only the outer write may release its lifetime.
+        using var pinned = tracker.OwnsPinnedTurn ? null : tracker.PinOwnTurn();
+        var needsTurn = pinned is null && !tracker.OwnsTurn;
+        if (needsTurn) await tracker.WaitForSendTurnAsync(ct).ConfigureAwait(false);
+        using var turn = needsTurn ? tracker.BeginNativeTurn() : null;
+        while (await channel.Writer.WaitToWriteAsync(ct).ConfigureAwait(false))
+        {
+            ct.ThrowIfCancellationRequested();
+            if (TryWriteInput(evt)) return;
+        }
+        throw new ChannelClosedException();
     }
 
     /// <summary>
@@ -710,7 +763,13 @@ public sealed class Hex1bAppWorkloadAdapter :
     /// <summary>
     /// Channel of parsed input events from the terminal.
     /// </summary>
-    public ChannelReader<Hex1bEvent> InputEvents => _inputChannel.Reader;
+    public ChannelReader<Hex1bEvent> InputEvents => ExposeInputChannel().Reader;
+
+    internal void CompleteOrderedInput()
+    {
+        _inputChannel.Writer.TryComplete();
+        OrderedInput?.CompleteInput();
+    }
 
     /// <summary>
     /// Current terminal width.
@@ -901,7 +960,11 @@ public sealed class Hex1bAppWorkloadAdapter :
     /// <inheritdoc />
     public async ValueTask WriteInputAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
     {
-        if (_disposed) return;
+        if (_disposed)
+        {
+            if (OrderedPasteCapacity > 0) throw new ObjectDisposedException(nameof(Hex1bAppWorkloadAdapter));
+            return;
+        }
 
         // Parse raw bytes into events and write to input channel
         // For now, we assume the terminal has already parsed bytes into events
@@ -925,7 +988,11 @@ public sealed class Hex1bAppWorkloadAdapter :
     /// </summary>
     public ValueTask WriteInputEventAsync(Hex1bEvent evt, CancellationToken ct = default)
     {
-        if (_disposed) return ValueTask.CompletedTask;
+        if (_disposed)
+        {
+            if (OrderedPasteCapacity > 0) throw new ObjectDisposedException(nameof(Hex1bAppWorkloadAdapter));
+            return ValueTask.CompletedTask;
+        }
         return WriteInputTrackedAsync(evt, ct);
     }
 
@@ -1007,7 +1074,9 @@ public sealed class Hex1bAppWorkloadAdapter :
         // (skip the initial dimension setup from terminal constructor)
         if (changed && wasInitialized)
         {
-            TryWriteInput(new Hex1bResizeEvent(width, height));
+            if (!TryWriteInput(new Hex1bResizeEvent(width, height)) && OrderedPasteCapacity > 0)
+                RequestFullRepaint();
+            if (OrderedPasteCapacity > 0) OrderedGeometryChanged?.Invoke();
         }
         return ValueTask.CompletedTask;
     }
@@ -1025,7 +1094,8 @@ public sealed class Hex1bAppWorkloadAdapter :
     public void SendKey(ConsoleKey key, char keyChar = '\0', bool shift = false, bool alt = false, bool control = false)
     {
         var evt = KeyMapper.ToHex1bKeyEvent(key, keyChar, shift, alt, control);
-        TryWriteInput(evt);
+        if (!TryWriteInput(evt) && OrderedPasteCapacity > 0)
+            throw new InvalidOperationException("Ordered input is full or closed; use WriteInputEventAsync to await admission.");
     }
 
     /// <summary>
@@ -1034,7 +1104,8 @@ public sealed class Hex1bAppWorkloadAdapter :
     public void SendKey(Hex1bKey key, char keyChar = '\0', Hex1bModifiers modifiers = Hex1bModifiers.None)
     {
         var evt = new Hex1bKeyEvent(key, keyChar, modifiers);
-        TryWriteInput(evt);
+        if (!TryWriteInput(evt) && OrderedPasteCapacity > 0)
+            throw new InvalidOperationException("Ordered input is full or closed; use WriteInputEventAsync to await admission.");
     }
 
     /// <summary>
@@ -1043,7 +1114,8 @@ public sealed class Hex1bAppWorkloadAdapter :
     public void SendMouse(MouseButton button, MouseAction action, int x, int y, Hex1bModifiers modifiers = Hex1bModifiers.None, int clickCount = 1)
     {
         var evt = new Hex1bMouseEvent(button, action, x, y, modifiers, clickCount);
-        TryWriteInput(evt);
+        if (!TryWriteInput(evt) && OrderedPasteCapacity > 0)
+            throw new InvalidOperationException("Ordered input is full or closed; use WriteInputEventAsync to await admission.");
     }
 
     /// <summary>
@@ -1251,8 +1323,12 @@ public sealed class Hex1bAppWorkloadAdapter :
     /// <inheritdoc />
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        lock (_inputConfigurationSync)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _inputChannel.Writer.TryComplete();
+        }
 
         CompleteOutputProcessing();
 

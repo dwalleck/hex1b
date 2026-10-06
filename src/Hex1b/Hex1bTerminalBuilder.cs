@@ -36,6 +36,34 @@ namespace Hex1b;
 /// </remarks>
 public sealed class Hex1bTerminalBuilder
 {
+    /// <summary>Opts into bounded, ordered paste input on the application's input owner.</summary>
+    /// <param name="capacity">Maximum queued input events in each stage; must be positive.</param>
+    /// <returns>This builder.</returns>
+    /// <remarks>
+    /// <para>Legacy streaming paste remains the default. This opt-in supports Hex1b applications
+    /// and Flow on native runtimes; browser input is not supported. Configure a directly supplied
+    /// <see cref="Hex1bAppWorkloadAdapter"/> before exposing its InputEvents reader or admitting input.</para>
+    /// <para>Raw input is queued in blocks of at most 4096 bytes. Parsed paste chunks contain at most
+    /// 4096 UTF-16 code units and do not split a Unicode scalar. Each raw, parent, and inline input
+    /// queue has the configured capacity. An adapter-owned read, ordinary incomplete ANSI sequence,
+    /// and text retained by the application are outside these queue bounds.</para>
+    /// <para>Async producers await capacity. Synchronous TryWrite input reports refusal; synchronous
+    /// SendKey/SendMouse throw when ordered input cannot be admitted. Callbacks run synchronously on
+    /// the application input owner and must not wait for that same owner to process more input.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">Capacity is not positive.</exception>
+    /// <exception cref="PlatformNotSupportedException">Called on a browser runtime.</exception>
+    public Hex1bTerminalBuilder WithOrderedPasteInput(int capacity = 64)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(capacity);
+        if (OperatingSystem.IsBrowser())
+            throw new PlatformNotSupportedException("Ordered paste input requires the streaming UTF-8 decoder, which is unavailable on browser hosts. Use legacy streaming input.");
+        _orderedPasteCapacity = capacity;
+        return this;
+    }
+
+    private int _orderedPasteCapacity;
+    private bool _appWorkloadFactory;
     private IHex1bTerminalWorkloadAdapter? _workloadAdapter;
     private Func<IHex1bTerminalPresentationAdapter?, Hex1bTerminalBuildContext>? _workloadFactory;
     private readonly List<IHex1bTerminalWorkloadFilter> _workloadFilters = [];
@@ -192,6 +220,7 @@ public sealed class Hex1bTerminalBuilder
                 : new Hex1bAppWorkloadAdapter();
             workloadAdapter.DiagnosticTimingEnabled = _diagnosticsEnabled;
             workloadAdapter.HostsApplications = true;
+            if (_orderedPasteCapacity > 0) workloadAdapter.OrderedPasteCapacity = _orderedPasteCapacity;
             var enableMouse = _enableMouse;
 
             var options = new Hex1bAppOptions
@@ -234,6 +263,7 @@ public sealed class Hex1bTerminalBuilder
             return new Hex1bTerminalBuildContext(workloadAdapter, runCallback);
         });
 
+        _appWorkloadFactory = true;
         return this;
     }
 
@@ -248,6 +278,7 @@ public sealed class Hex1bTerminalBuilder
                 : new Hex1bAppWorkloadAdapter();
             workloadAdapter.DiagnosticTimingEnabled = _diagnosticsEnabled;
             workloadAdapter.HostsApplications = true;
+            if (_orderedPasteCapacity > 0) workloadAdapter.OrderedPasteCapacity = _orderedPasteCapacity;
             var enableMouse = _enableMouse;
 
             var options = new Hex1bAppOptions
@@ -287,6 +318,7 @@ public sealed class Hex1bTerminalBuilder
             return new Hex1bTerminalBuildContext(workloadAdapter, runCallback);
         });
 
+        _appWorkloadFactory = true;
         return this;
     }
 
@@ -990,6 +1022,7 @@ public sealed class Hex1bTerminalBuilder
     {
         _workloadAdapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _workloadFactory = null;
+        _appWorkloadFactory = false;
         return this;
     }
 
@@ -1017,6 +1050,9 @@ public sealed class Hex1bTerminalBuilder
 
             workloadAdapter.DiagnosticTimingEnabled = _diagnosticsEnabled;
             workloadAdapter.HostsApplications = true;
+            if (_orderedPasteCapacity > 0) workloadAdapter.OrderedPasteCapacity = _orderedPasteCapacity;
+
+            workloadAdapter.OrderedInput?.EnableFlow();
 
             var options = new Flow.Hex1bFlowOptions();
             configureOptions?.Invoke(options);
@@ -1050,6 +1086,7 @@ public sealed class Hex1bTerminalBuilder
             return new Hex1bTerminalBuildContext(workloadAdapter, runCallback);
         });
 
+        _appWorkloadFactory = true;
         return this;
     }
 
@@ -1493,6 +1530,15 @@ public sealed class Hex1bTerminalBuilder
                 "No workload configured. Call WithWorkload(), WithHex1bApp(), WithShellProcess(), or WithProcess() before Build().");
         }
 
+        // Refuse incompatible/exposed workloads before creating a presentation or process.
+        if (_orderedPasteCapacity > 0)
+        {
+            if (_workloadAdapter is Hex1bAppWorkloadAdapter suppliedApp)
+                suppliedApp.OrderedPasteCapacity = _orderedPasteCapacity;
+            else if (!_appWorkloadFactory)
+                throw new InvalidOperationException("Ordered paste input requires WithHex1bApp, WithHex1bFlow, or an unexposed app workload.");
+        }
+
         // Create presentation adapter via factory
         var presentation = _presentationFactory(this);
 
@@ -1542,6 +1588,13 @@ public sealed class Hex1bTerminalBuilder
         }
 
         // Build terminal using options
+        if (_orderedPasteCapacity > 0)
+        {
+            if (workload is not Hex1bAppWorkloadAdapter appWorkload)
+                throw new InvalidOperationException("Ordered paste input requires an app or Flow workload.");
+            appWorkload.OrderedPasteCapacity = _orderedPasteCapacity;
+        }
+
         var options = new Hex1bTerminalOptions
         {
             PresentationAdapter = presentation,
@@ -1591,6 +1644,7 @@ public sealed class Hex1bTerminalBuilder
     {
         _workloadFactory = factory;
         _workloadAdapter = null;
+        _appWorkloadFactory = false;
     }
 
     // Accessors used by builder extensions that wrap the existing workload
@@ -1611,5 +1665,6 @@ public sealed class Hex1bTerminalBuilder
     {
         _workloadAdapter = null;
         _workloadFactory = null;
+        _appWorkloadFactory = false;
     }
 }

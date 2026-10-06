@@ -102,6 +102,68 @@ public sealed record TextBoxWidget(string? Text = null) : Hex1bWidget,
     /// </summary>
     internal Func<PasteEventArgs, Task>? PasteHandler { get; init; }
 
+    internal Func<OrderedPasteStart, Action<OrderedPasteUpdate>?>? OrderedPasteFactory { get; init; }
+
+    /// <summary>Captures a synchronous receiver once per ordered paste.</summary>
+    /// <param name="begin">Called on the input owner to capture state and return this operation's
+    /// synchronous receiver. Return null to bubble to an ancestor.</param>
+    /// <returns>A widget configured with the factory.</returns>
+    /// <remarks>
+    /// <para>Requires <see cref="Hex1bTerminalBuilder.WithOrderedPasteInput"/>. The receiver owns
+    /// mutation and notifications; the legacy OnPaste handler and automatic OnTextChanged notification
+    /// are not called for its paste chunks. Ordinary typing still uses OnTextChanged. Without an
+    /// explicit factory, ordered mode rejects either legacy handler rather than changing its behavior.</para>
+    /// <para>The factory captures once. Replacing the factory or moving focus does not retarget
+    /// existing chunks. Rebinding the captured TextBoxState or detaching the node reports Cancelled.
+    /// Ending the owning application or Flow step reports Shutdown, or Failed when a failure cause
+    /// is known. Applied text remains; cancellation never rolls back or replays.</para>
+    /// <para>A captured receiver receives literal chunks followed by exactly one terminal phase,
+    /// including an empty paste. Raw control and ANSI-looking payload stays literal. A nested bracketed
+    /// Begin cancels the previous identity and starts another. Completed means the closing delimiter
+    /// and all preceding chunks were consumed; it does not promise a subsequent frame publication.</para>
+    /// <para>Start.Cancel only requests cancellation; terminal notification runs on the owner.
+    /// Receiver exceptions fail the application after terminal notification and mandatory cleanup.
+    /// If both ordinary processing and terminal notification fail, AggregateException preserves both
+    /// causes. A factory that throws before returning has no captured receiver to notify.</para>
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// using Hex1b;
+    /// using Hex1b.Events;
+    /// using Hex1b.Widgets;
+    ///
+    /// var state = new TextBoxState();
+    /// await using var terminal = Hex1bTerminal.CreateBuilder()
+    ///     .WithOrderedPasteInput(64)
+    ///     .WithHex1bApp(ctx =&gt; ctx.VStack(column =&gt;
+    ///     [
+    ///         new TextBoxWidget().State(state).OnOrderedPaste(start =&gt;
+    ///         {
+    ///             var captured = state;
+    ///             return update =&gt;
+    ///             {
+    ///                 if (update.Phase != OrderedPastePhase.Chunk) return;
+    ///                 if (captured.HasSelection)
+    ///                 {
+    ///                     var position = captured.SelectionStart;
+    ///                     captured.Text = captured.Text.Remove(position, captured.SelectionEnd - position);
+    ///                     captured.CursorPosition = position;
+    ///                     captured.ClearSelection();
+    ///                 }
+    ///                 captured.Text = captured.Text.Insert(captured.CursorPosition, update.Text);
+    ///                 captured.CursorPosition += update.Text.Length;
+    ///             };
+    ///         }),
+    ///         column.Button("Quit").OnClick(e =&gt; e.Context.RequestStop())
+    ///     ]))
+    ///     .Build();
+    /// await terminal.RunAsync();
+    /// </code>
+    /// </example>
+    public TextBoxWidget OnOrderedPaste(Func<OrderedPasteStart, Action<OrderedPasteUpdate>?> begin)
+        => this with { OrderedPasteFactory = begin ?? throw new ArgumentNullException(nameof(begin)) };
+
+
     /// <summary>
     /// Sets an asynchronous handler called when paste data is received.
     /// Overrides the default behavior of inserting pasted text at the cursor position.
@@ -357,6 +419,7 @@ public sealed record TextBoxWidget(string? Text = null) : Hex1bWidget,
 
         // Wire paste handler
         node.CustomPasteAction = PasteHandler;
+        node.OrderedPasteFactory = OrderedPasteFactory;
 
         // Sync min/max width to node
         node.MinWidth = MinWidth;

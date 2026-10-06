@@ -200,6 +200,8 @@ public static class InputRouter
         return InputResult.NotHandled;
     }
 
+    internal static IReadOnlyList<Hex1bNode> OrderedPastePath(Hex1bNode root) => BuildPathToFocused(root);
+
     /// <summary>
     /// Routes a paste event through the node tree.
     /// Tries the focused node first, then bubbles up through ancestors.

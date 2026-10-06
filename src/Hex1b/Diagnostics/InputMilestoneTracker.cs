@@ -97,6 +97,10 @@ internal sealed class InputMilestoneTracker
     /// <summary>True when the current async flow already holds this session's send turn.</summary>
     internal bool OwnsTurn => OwnSend() is not null;
 
+    /// <summary>Whether this async flow already holds a live pin, even after its send ends.</summary>
+    internal bool OwnsPinnedTurn => CurrentSend.Value is { } send
+        && ReferenceEquals(send.Tracker, this) && CurrentPin.Value?.ActiveFor(send) == true;
+
     /// <summary>
     /// Pins the turn this async flow holds (its own scope, or one it inherited from the send that
     /// forked it) for a write under the input write lock, so the turn outlives the write even when
@@ -188,21 +192,24 @@ internal sealed class InputMilestoneTracker
     /// reader cannot process it unregistered. Returns the write's result; a rejected event
     /// consumes no id.
     /// </summary>
-    internal bool Accept(Hex1bEvent evt, Func<Hex1bEvent, bool> write)
+    internal bool Accept(Hex1bEvent evt, Func<Hex1bEvent, bool> write, bool waitForTurn = true)
     {
         // The send is held for the whole accept, so it cannot end, and hand the turn to the next send,
         // between this check and the write.
         var send = CurrentSend.Value is { } candidate && ReferenceEquals(candidate.Tracker, this)
             && candidate.TryHold(CurrentPin.Value) ? candidate : null;
         if (send is null)
-            _sendGate.Wait();
+        {
+            if (waitForTurn) _sendGate.Wait();
+            else if (!_sendGate.Wait(0)) return false;
+        }
         try
         {
             lock (_sync)
             {
                 var id = _accepted + 1;
                 var tracked = new Tracked(id, DateTimeOffset.UtcNow, Stopwatch.GetTimestamp(), KindOf(evt),
-                    "native", evt is Hex1bPasteEvent ? null : evt);
+                    "native", evt is Hex1bPasteEvent or Hex1bOrderedPasteEvent ? null : evt);
                 var occurrences = _pending.GetOrCreateValue(evt);
                 occurrences.Enqueue(tracked);
                 bool written;
@@ -263,6 +270,19 @@ internal sealed class InputMilestoneTracker
             }
 
             _streamObserver?.OnInputProcessed(tracked.Id, applicationInstanceId, _processed);
+            WakeUnsafe();
+        }
+    }
+
+    internal void Abandoned(Hex1bEvent evt, string reason)
+    {
+        lock (_sync)
+        {
+            if (_pending.TryGetValue(evt, out var occurrences) && occurrences.TryDequeue(out var tracked))
+            {
+                tracked.AbandonedPasteReason = reason;
+                tracked.Lost = reason;
+            }
             WakeUnsafe();
         }
     }
@@ -478,6 +498,9 @@ internal sealed class InputMilestoneTracker
 
         var record = _recent[inputId % RetainedRecords] is { } retained && retained.Id == inputId ? retained : null;
 
+        if (record is { AbandonedPasteReason: { } reason, ProcessedBy: null })
+            return WaitStatus.Failed("ordered-paste-owner-ended", $"Input {inputId} was cancelled: {reason}.");
+
         // A lost input was never processed, whatever later inputs did to the watermark.
         if (record is { Lost: { } lostBy, ProcessedBy: null })
             return WaitStatus.Failed("application-stopped", $"Input {inputId} was handed to a flow step ({lostBy}) that ended before processing it.");
@@ -555,6 +578,7 @@ internal sealed class InputMilestoneTracker
     {
         Hex1bKeyEvent key => key.Text is { Length: > 0 } && key.Modifiers == Hex1bModifiers.None ? "text" : "key",
         Hex1bPasteEvent => "paste",
+        Hex1bOrderedPasteEvent ordered => "paste-" + (ordered.Update?.Phase.ToString().ToLowerInvariant() ?? "begin"),
         Hex1bMouseEvent => "mouse",
         Hex1bResizeEvent => "resize",
         _ => "other",
@@ -595,6 +619,7 @@ internal sealed class InputMilestoneTracker
         public bool Forwarded { get; set; }
 
         public string? Lost { get; set; }
+        public string? AbandonedPasteReason { get; set; }
     }
 
     /// <summary>An immutable copy of one input's record.</summary>

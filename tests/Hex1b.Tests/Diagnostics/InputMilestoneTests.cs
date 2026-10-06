@@ -990,11 +990,16 @@ public class InputMilestoneTests
     }
 
     [TestMethod]
-    public async Task SendTurn_AWriteForkedInsideASendKeepsTheTurnUntilItFinishes()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task SendTurn_AWriteForkedInsideASendKeepsTheTurnUntilItFinishes(bool ordered)
     {
         var ct = TestContext.Current.CancellationToken;
         var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
-        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 3).Build();
+        var builder = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 3);
+        if (ordered) builder.WithOrderedPasteInput(64);
+        await using var terminal = builder.Build();
+        await using var drain = new SendTurnInputDrain(workload, ordered);
         var tracker = terminal.InputMilestones!;
         // Stands in for the send's own long write: the input write lock is held while the fork waits.
         var writeLock = (SemaphoreSlim)typeof(Hex1bTerminal)
@@ -1024,11 +1029,16 @@ public class InputMilestoneTests
     }
 
     [TestMethod]
-    public async Task SendTurn_ForksOfAnEndedSendCannotHoldItsTurn()
+    [DataRow(false)]
+    [DataRow(true)]
+    public async Task SendTurn_ForksOfAnEndedSendCannotHoldItsTurn(bool ordered)
     {
         var ct = TestContext.Current.CancellationToken;
         var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
-        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 3).Build();
+        var builder = Hex1bTerminal.CreateBuilder().WithWorkload(workload).WithHeadless().WithDimensions(20, 3);
+        if (ordered) builder.WithOrderedPasteInput(64);
+        await using var terminal = builder.Build();
+        await using var drain = new SendTurnInputDrain(workload, ordered);
         var diagnostics = new TerminalDiagnostics(terminal, "chain");
         var tracker = terminal.InputMilestones!;
         var writeLock = (SemaphoreSlim)typeof(Hex1bTerminal)
@@ -1072,6 +1082,38 @@ public class InputMilestoneTests
         Assert.AreSame(native, ended, "forks of an ended send chained their pins and starved a native writer");
         var accepted = await forkSend.WaitAsync(TimeSpan.FromSeconds(10), ct);
         Assert.AreEqual(0, accepted!.LastId - accepted.FirstId, "a fork could not start its own send once its parent had ended");
+    }
+
+    [TestMethod]
+    public async Task SendTurn_OrderedChunksRetainOuterPinAfterFirstInnerAdmission()
+    {
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var ct = stop.Token;
+        var workload = new Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled = true };
+        await using var terminal = Hex1bTerminal.CreateBuilder().WithWorkload(workload)
+            .WithOrderedPasteInput(1).WithHeadless().WithDimensions(20, 3).Build();
+        var tracker = terminal.InputMilestones!;
+        await tracker.WaitForSendTurnAsync(ct);
+        var send = tracker.BeginSend();
+        var write = Task.Run(() => terminal.SendInputAsync("abc"u8.ToArray(), ct));
+        // Capacity one makes the second admission wait after the first inner pin
+        // would have been disposed. End the send before releasing channel space.
+        Assert.IsTrue(await workload.InputEvents.WaitToReadAsync(ct));
+        Assert.AreEqual(1L, tracker.AcceptedInput);
+        send.Dispose();
+        var text = new StringBuilder();
+        for (var i = 0; i < 3; i++)
+        {
+            var input = await workload.InputEvents.ReadAsync(ct);
+            Assert.IsInstanceOfType<Hex1bKeyEvent>(input);
+            text.Append(((Hex1bKeyEvent)input).Text);
+        }
+        await write.WaitAsync(ct);
+        Assert.AreEqual("abc", text.ToString());
+        Assert.AreEqual(3L, tracker.AcceptedInput);
+        Assert.AreEqual(1L, send.LastId);
+        Assert.AreEqual("native", tracker.Record(2)!.Source);
+        Assert.AreEqual("native", tracker.Record(3)!.Source);
     }
 
     [TestMethod]
@@ -1457,4 +1499,30 @@ public class InputMilestoneTests
             _cts.Dispose();
         }
     }
+    private sealed class SendTurnInputDrain : IAsyncDisposable
+    {
+        private readonly CancellationTokenSource _stop = new();
+        private readonly Task _running;
+
+        internal SendTurnInputDrain(Hex1bAppWorkloadAdapter workload, bool enabled)
+        {
+            _running = enabled ? Task.Run(async () =>
+            {
+                try
+                {
+                    await foreach (var input in workload.InputEvents.ReadAllAsync(_stop.Token))
+                        _ = input;
+                }
+                catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
+            }) : Task.CompletedTask;
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await _stop.CancelAsync();
+            await _running;
+            _stop.Dispose();
+        }
+    }
+
 }

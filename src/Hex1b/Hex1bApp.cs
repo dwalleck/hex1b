@@ -48,6 +48,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
     private volatile Func<RootContext, Task<Hex1bWidget>> _rootComponent;
     private readonly Func<Hex1bTheme>? _themeProvider;
     private readonly IHex1bAppTerminalWorkloadAdapter _adapter;
+    private readonly bool _ownsWorkloadAdapter;
     private readonly IHex1bAppTerminalWorkloadAdapter _renderAdapter;
     private readonly SoftWrapFrameAdapter? _softWrapOutput;
     private readonly object _runLifecycleSync = new();
@@ -276,6 +277,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
         Hex1bAppOptions? options = null)
     {
         options ??= new Hex1bAppOptions();
+        _ownsWorkloadAdapter = options.OwnsWorkloadAdapter || options.WorkloadAdapter is null;
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(options.DispatchQueueCapacity);
         _dispatchQueueCapacity = options.DispatchQueueCapacity;
         
@@ -655,6 +657,8 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
         // Register this app as the application-frame source if the adapter supports it
         if (_adapter is Hex1bAppWorkloadAdapter workloadAdapter)
         {
+            if (workloadAdapter.OrderedInput is { IsFlow: true } orderedFlow)
+                _orderedFullScreenEpoch = orderedFlow.BeginFlowOwner();
             _diagnosticTimingEnabled = workloadAdapter.DiagnosticTimingEnabled;
             _inputMilestones = workloadAdapter.InputMilestones;
             _inputMilestones?.ApplicationStarted();
@@ -676,6 +680,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
         }
         
         _context.EnterAlternateScreen();
+        Exception? runFailure = null;
         try
         {
             // Initial render
@@ -730,6 +735,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
                 {
                     inputReady = await inputWaitTask;
                     inputWaitTask = null;
+                    if (!inputReady && InputDrainBudget != int.MaxValue) break;
                 }
                 if (invalidateWaitTask.IsCompleted)
                 {
@@ -768,7 +774,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
                             _inputCoalescingMaxDelayMs);
                         await Task.Delay(coalescingDelayMs, cancellationToken);
 
-                        while (_adapter.InputEvents.TryRead(out var delayedInput))
+                        for (var drained = 0; drained < InputDrainBudget && _adapter.InputEvents.TryRead(out var delayedInput); drained++)
                         {
                             await ProcessInputEventAsync(delayedInput, cancellationToken);
                             if (_stopRequested || cancellationToken.IsCancellationRequested)
@@ -778,7 +784,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
                     else if (_enableInputCoalescing)
                     {
                         // Browser path: drain all already-queued events without delay.
-                        while (_adapter.InputEvents.TryRead(out var delayedInput))
+                        for (var drained = 0; drained < InputDrainBudget && _adapter.InputEvents.TryRead(out var delayedInput); drained++)
                         {
                             await ProcessInputEventAsync(delayedInput, cancellationToken);
                             if (_stopRequested || cancellationToken.IsCancellationRequested)
@@ -790,7 +796,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
                 {
                     // Timer or invalidation woke us - drain ALL pending input first
                     // This ensures resize events are never starved by animation timers
-                    while (_adapter.InputEvents.TryRead(out var pendingInput))
+                    for (var drained = 0; drained < InputDrainBudget && _adapter.InputEvents.TryRead(out var pendingInput); drained++)
                     {
                         await ProcessInputEventAsync(pendingInput, cancellationToken);
                         if (_stopRequested || cancellationToken.IsCancellationRequested)
@@ -835,7 +841,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
                         break;
 
                     // ALWAYS process pending input before each re-render to prevent starvation
-                    while (_adapter.InputEvents.TryRead(out var pendingEvent))
+                    for (var drained = 0; drained < InputDrainBudget && _adapter.InputEvents.TryRead(out var pendingEvent); drained++)
                     {
                         await ProcessInputEventAsync(pendingEvent, cancellationToken);
                         if (_stopRequested || cancellationToken.IsCancellationRequested)
@@ -862,31 +868,46 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
         {
             // Terminal input channel closed, exit gracefully
         }
+        catch (Exception error)
+        {
+            runFailure = error;
+            throw;
+        }
         finally
         {
-            _softWrapOutput?.AbortFrame();
+            if (_adapter is Hex1b.Flow.InlineStepAdapter endingInline) endingInline.EndOrderedInputOwner();
+            if (_adapter is Hex1bAppWorkloadAdapter endingParent)
+                endingParent.OrderedInput?.EndFlowOwner(_orderedFullScreenEpoch);
+            List<Exception>? cleanupFailures = null;
+            void Remember(Exception error) => (cleanupFailures ??= []).Add(error);
+            try { EndOrderedPaste(runFailure is null ? Hex1b.Events.OrderedPastePhase.Shutdown : Hex1b.Events.OrderedPastePhase.Failed, runFailure); }
+            catch (Exception error) { Remember(error); }
+            try { _softWrapOutput?.AbortFrame(); }
+            catch (Exception error) { Remember(error); }
             try
             {
                 if (_softWrapOutput is not null)
                     await _softWrapOutput.ReleaseDirectGraphicsAsync().ConfigureAwait(false);
             }
-            finally
+            catch (Exception error) { Remember(error); }
+            try { _context.ExitAlternateScreen(); }
+            catch (Exception error) { Remember(error); }
+            try
             {
-                // Always exit alternate buffer, even on error
-                _context.ExitAlternateScreen();
-
-                // Drop the repaint handler so we don't keep this app alive via
-                // the workload adapter's delegate slot if RunAsync is restarted
-                // or the host swaps adapters.
                 if (_adapter is Hex1bAppWorkloadAdapter wa)
                 {
                     wa.SetRepaintRequestHandler(null);
-                    // A stopped app publishes no frames; later captures must not see its last one.
-                    if (ReferenceEquals(wa.ApplicationFrameSource, this))
-                        wa.ApplicationFrameSource = null;
+                    if (ReferenceEquals(wa.ApplicationFrameSource, this)) wa.ApplicationFrameSource = null;
                 }
-
                 _inputMilestones?.ApplicationStopped(_applicationInstanceId);
+            }
+            catch (Exception error) { Remember(error); }
+            if (cleanupFailures is not null)
+            {
+                if (runFailure is not null) cleanupFailures.Insert(0, runFailure);
+                if (cleanupFailures.Count == 1)
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(cleanupFailures[0]).Throw();
+                throw new AggregateException(cleanupFailures);
             }
         }
     }
@@ -915,8 +936,12 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
             _ => "other"
         };
         
+        ValidateOrderedPasteTarget();
         switch (inputEvent)
         {
+            case Hex1bOrderedPasteEvent orderedPaste:
+                ProcessOrderedPaste(orderedPaste);
+                break;
             // Terminal capability events are logged but capabilities are now
             // provided via TerminalCapabilities at startup rather than runtime detection
             case Hex1bTerminalEvent:
@@ -934,6 +959,11 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
             
             // Key events are routed to the focused node through the tree
             case Hex1bKeyEvent keyEvent when _rootNode != null:
+                if (keyEvent.Key == Hex1bKey.Escape && _orderedPasteStart is not null)
+                {
+                    EndOrderedPaste(Hex1b.Events.OrderedPastePhase.Cancelled);
+                    break;
+                }
                 // Escape during an active paste cancels the paste
                 if (keyEvent.Key == Hex1bKey.Escape && _activePaste is { IsCompleted: false, IsCancelled: false })
                 {
@@ -1198,6 +1228,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
             long reconcileFrameStart = Stopwatch.GetTimestamp();
             
             _rootNode = await ReconcileAsync(_rootNode, widgetTree, cancellationToken);
+            ValidateOrderedPasteTarget();
             
             // Ensure the drag-drop manager is set on the root ZStack for overlay rendering.
             // It's set after reconciliation here, but since ZStackNode persists across frames,
@@ -2611,6 +2642,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
     {
         if (widget is null)
         {
+            existingNode?.CancelOrderedPasteForDetach();
             return null;
         }
 
@@ -2619,6 +2651,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
             CaptureInput, ReleaseCapture, ScheduleTimer, _windowManagerRegistry, RequestFocus,
             CopyToClipboard);
         context.IsNew = existingNode is null || existingNode.GetType() != widget.GetExpectedNodeType();
+        if (context.IsNew) existingNode?.CancelOrderedPasteForDetach();
         context.DiagnosticTimingEnabled = _diagnosticTimingEnabled;
         context.Metrics = _metrics.NodeReconcileDuration != null ? _metrics : null;
         
@@ -2753,7 +2786,7 @@ public partial class Hex1bApp : IDisposable, IAsyncDisposable, IApplicationFrame
         {
             _softWrapOutput?.Detach();
             if (_ownedTerminal is not null) await _ownedTerminal.DisposeAsync().ConfigureAwait(false);
-            await _adapter.DisposeAsync().ConfigureAwait(false);
+            if (_ownsWorkloadAdapter) await _adapter.DisposeAsync().ConfigureAwait(false);
         }
     }
 }

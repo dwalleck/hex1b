@@ -576,6 +576,22 @@ public abstract class Hex1bNode
         }
     }
 
+    /// <summary>Captures a synchronous ordered-paste receiver, or returns null to bubble.</summary>
+    /// <param name="start">The operation identity and cancellation handle.</param>
+    /// <returns>The receiver captured for this node and operation, or null to continue bubbling.</returns>
+    /// <remarks>The factory and receiver run on the application input owner. A captured receiver
+    /// receives one terminal phase even when later chunks are cancelled. Node replacement cancels
+    /// before replacement reconciliation; children removed directly by a container are detected
+    /// after reconciliation and before further input. This does not own arbitrary extension resources.</remarks>
+    public virtual Action<Hex1b.Events.OrderedPasteUpdate>? BeginOrderedPaste(Hex1b.Events.OrderedPasteStart start) => null;
+
+    internal Action? OrderedPasteDetaching { get; set; }
+    internal void CancelOrderedPasteForDetach()
+    {
+        OrderedPasteDetaching?.Invoke();
+        foreach (var child in GetChildren().ToArray()) child.CancelOrderedPasteForDetach();
+    }
+
     /// <summary>
     /// Gets the direct children of this node for structural tree traversal.
     /// Container nodes should override this to return their children.

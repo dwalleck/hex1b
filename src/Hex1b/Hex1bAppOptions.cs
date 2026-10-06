@@ -13,6 +13,9 @@ public class Hex1bAppOptions
     /// Must be positive. Default is 256; a full queue refuses admission without dropping existing work.</summary>
     public int DispatchQueueCapacity { get; set; } = 256;
 
+    // Flow owns its shared parent and its step adapters beyond each app's lifetime.
+    internal bool OwnsWorkloadAdapter { get; set; } = true;
+
     // === New way (preferred) ===
     
     /// <summary>

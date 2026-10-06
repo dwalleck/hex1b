@@ -37,8 +37,11 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
     [GeneratedRegex(@"\x1b\[2J")]
     private static partial Regex ClearScreenRegex();
 
-    public InlineStepAdapter(int width, int height, int rowOrigin, TerminalCapabilities? capabilities = null)
+    public InlineStepAdapter(int width, int height, int rowOrigin, TerminalCapabilities? capabilities = null, OrderedInputState? orderedInput = null)
     {
+        OrderedInput = orderedInput;
+        OrderedEpoch = orderedInput?.BeginFlowOwner();
+        var orderedPasteCapacity = orderedInput?.Capacity ?? 0;
         _width = width;
         _height = height;
         _rowOrigin = rowOrigin;
@@ -56,12 +59,17 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
             FullMode = BoundedChannelFullMode.DropWrite
         });
 
-        _inputChannel = Channel.CreateUnbounded<Hex1bEvent>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = false
-        });
+        _inputChannel = orderedPasteCapacity > 0
+            ? Channel.CreateBounded<Hex1bEvent>(new BoundedChannelOptions(orderedPasteCapacity)
+                { SingleReader = true, SingleWriter = false, FullMode = BoundedChannelFullMode.Wait })
+            : Channel.CreateUnbounded<Hex1bEvent>(new UnboundedChannelOptions
+                { SingleReader = true, SingleWriter = false });
     }
+    internal OrderedInputState? OrderedInput { get; }
+    internal OrderedInputState.FlowEpoch? OrderedEpoch { get; }
+    internal void EndOrderedInputOwner() => OrderedInput?.EndFlowOwner(OrderedEpoch);
+    internal int OrderedPasteCapacity => OrderedInput?.Capacity ?? 0;
+
     public int RowOrigin
     {
         get => _rowOrigin;
@@ -104,6 +112,8 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
     }
 
     public void Flush() { }
+
+    internal void CompleteOrderedInput() => _inputChannel.Writer.TryComplete();
 
     public ChannelReader<Hex1bEvent> InputEvents => _inputChannel.Reader;
     public int Width => _width;
@@ -320,7 +330,11 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
     {
         lock (_outputGenerationSync)
         {
-            if (_disposed) return ValueTask.CompletedTask;
+            if (_disposed)
+            {
+                if (OrderedPasteCapacity > 0) throw new ObjectDisposedException(nameof(InlineStepAdapter));
+                return ValueTask.CompletedTask;
+            }
 
             // Translate mouse coordinates from absolute terminal space to step-relative space
             if (evt is Hex1bMouseEvent mouse)
@@ -380,6 +394,9 @@ internal sealed partial class InlineStepAdapter : IHex1bAppTerminalWorkloadAdapt
         {
             if (_disposed) return;
             _disposed = true;
+            EndOrderedInputOwner();
+            while (_inputChannel.Reader.TryRead(out var pending))
+                if (pending is Hex1bOrderedPasteEvent paste) paste.Start.Cancel();
             _outputQueue.Clear();
             _pendingRenderFrame = null;
             FrameRejected = null;

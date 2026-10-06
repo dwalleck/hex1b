@@ -1120,7 +1120,9 @@ internal sealed class Hex1bFlowRunner
         // the next one instead of failing when a step stops.
         if (MilestoneTracker is { } milestones)
             milestones.HostsFlow = true;
-        _cancellationToken = ct;
+        var orderedInput = (_parentAdapter as Hex1bAppWorkloadAdapter)?.OrderedInput;
+        using var flowLifetime = orderedInput is null ? null : CancellationTokenSource.CreateLinkedTokenSource(ct);
+        _cancellationToken = flowLifetime?.Token ?? ct;
 
         // Query the current cursor position using the host terminal's
         // synchronous cursor API (when available). Falls back to
@@ -1133,7 +1135,17 @@ internal sealed class Hex1bFlowRunner
         Trace($"RunAsync start: termSize={initialGeometry.Width}x{initialGeometry.Height} cursorRow={_cursorRow} useSoftWrap={_options.UseSoftWrapTombstones}");
 
         var context = new Hex1bFlowContext(this);
-        await _flowCallback(context);
+        var callback = _flowCallback(context);
+        if (orderedInput is not null &&
+            await Task.WhenAny(callback, orderedInput.InputDrained).ConfigureAwait(false) == orderedInput.InputDrained)
+            await flowLifetime!.CancelAsync().ConfigureAwait(false);
+        try { await callback.ConfigureAwait(false); }
+        catch (OperationCanceledException error) when (orderedInput?.InputDrained.IsCompleted == true &&
+            flowLifetime!.IsCancellationRequested && error.CancellationToken == flowLifetime.Token &&
+            !ct.IsCancellationRequested)
+        {
+            // Clean input EOF ended the owned Flow lifetime after admitted input drained.
+        }
 
         Trace($"RunAsync end: cursorRow={_cursorRow}");
 
@@ -1311,7 +1323,7 @@ internal sealed class Hex1bFlowRunner
 
             using var stepAdapter = new InlineStepAdapter(
                 terminalWidth, desiredHeight, startRowOrigin,
-                stepCapabilities);
+                stepCapabilities, (_parentAdapter as Hex1bAppWorkloadAdapter)?.OrderedInput);
 
             if (UseOsc133PromptMarks)
             {
@@ -1323,6 +1335,7 @@ internal sealed class Hex1bFlowRunner
             var appOptions = new Hex1bAppOptions
             {
                 WorkloadAdapter = stepAdapter,
+                OwnsWorkloadAdapter = false,
                 EnableMouse = options?.EnableMouse ?? false,
                 EnableDefaultCtrlCExit = true,
                 // On the soft-wrap path the active step is rendered as
@@ -2051,6 +2064,7 @@ internal sealed class Hex1bFlowRunner
         var appOptions = new Hex1bAppOptions
         {
             WorkloadAdapter = _parentAdapter,
+            OwnsWorkloadAdapter = false,
             EnableMouse = _options.EnableMouse,
         };
 
@@ -2076,7 +2090,7 @@ internal sealed class Hex1bFlowRunner
         app = new Hex1bApp(wrappedBuilder, appOptions);
         await using (app)
         {
-            await app.RunAsync(default);
+            await app.RunAsync(_cancellationToken);
         }
 
         // After returning from full-screen, the terminal restores the normal buffer
@@ -2199,13 +2213,14 @@ internal sealed class Hex1bFlowRunner
             actualBuilder = yieldBuilder;
         }
 
+        // A static output page has no input pump and must never claim a Flow input epoch.
         using var yieldAdapter = new InlineStepAdapter(
-            width, height, _cursorRow,
-            _parentAdapter.Capabilities);
+            width, height, _cursorRow, _parentAdapter.Capabilities);
 
         var yieldOptions = new Hex1bAppOptions
         {
             WorkloadAdapter = yieldAdapter,
+            OwnsWorkloadAdapter = false,
             EnableMouse = false,
             EnableDefaultCtrlCExit = false,
         };
@@ -2831,20 +2846,65 @@ internal sealed class Hex1bFlowRunner
         CancellationToken ct,
         Action<int, int>? onResize = null)
     {
+        var orderedParent = _parentAdapter as Hex1bAppWorkloadAdapter;
+        var ordered = orderedParent?.OrderedPasteCapacity > 0;
+        using var waitLifetime = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var waitToken = waitLifetime.Token;
+        var geometryWake = System.Threading.Channels.Channel.CreateBounded<bool>(
+            new System.Threading.Channels.BoundedChannelOptions(1)
+            { SingleReader = true, SingleWriter = false, FullMode = System.Threading.Channels.BoundedChannelFullMode.DropWrite });
+        void WakeGeometry() => geometryWake.Writer.TryWrite(true);
+        if (ordered)
+        {
+            orderedParent!.OrderedGeometryChanged += WakeGeometry;
+            WakeGeometry();
+        }
+        Task<bool>? inputWait = null;
+        Task<bool>? geometryWait = null;
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                if (await _parentAdapter.InputEvents.WaitToReadAsync(ct))
+                inputWait ??= _parentAdapter.InputEvents.WaitToReadAsync(waitToken).AsTask();
+                if (ordered)
                 {
-                    while (_parentAdapter.InputEvents.TryRead(out var evt))
+                    geometryWait ??= geometryWake.Reader.WaitToReadAsync(waitToken).AsTask();
+                    await Task.WhenAny(inputWait, geometryWait);
+                    if (geometryWait.IsCompleted)
+                    {
+                        var geometryReady = await geometryWait;
+                        geometryWait = null;
+                        if (!geometryReady) break;
+                        geometryWake.Reader.TryRead(out _);
+                        onResize?.Invoke(_parentAdapter.Width, _parentAdapter.Height);
+                    }
+                }
+                if (!ordered || inputWait.IsCompleted)
+                {
+                    var ready = await inputWait;
+                    inputWait = null;
+                    if (!ready)
+                    {
+                        if (ordered) stepAdapter.CompleteOrderedInput();
+                        break;
+                    }
+                    for (var drained = 0; drained < (ordered ? 64 : int.MaxValue) &&
+                        _parentAdapter.InputEvents.TryRead(out var evt); drained++)
                     {
                         if (evt is Hex1bResizeEvent resize && onResize != null)
                         {
-                            // Let the runner handle repositioning before forwarding
-                            onResize(resize.Width, resize.Height);
+                            // Ordered geometry wakes carry current dimensions independently
+                            // of input capacity or the diagnostic send turn.
+                            if (!ordered) onResize(resize.Width, resize.Height);
                             MilestoneTracker?.Processed(evt, "flow-runner", advancesWatermark: false);
-                            continue; // ResizeAsync already called in onResize
+                            continue;
+                        }
+                        if (evt is Hex1bOrderedPasteEvent paste &&
+                            (paste.Start.LostFlowOwner || !ReferenceEquals(paste.Start.FlowEpoch, stepAdapter.OrderedEpoch)))
+                        {
+                            paste.Start.Cancel();
+                            MilestoneTracker?.Abandoned(evt, "ordered paste lost its captured Flow input owner");
+                            continue;
                         }
                         MilestoneTracker?.Forwarded(evt);
                         await stepAdapter.WriteInputEventAsync(evt, ct);
@@ -2852,7 +2912,20 @@ internal sealed class Hex1bFlowRunner
                 }
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        finally
+        {
+            if (ordered) orderedParent!.OrderedGeometryChanged -= WakeGeometry;
+            geometryWake.Writer.TryComplete();
+            await waitLifetime.CancelAsync().ConfigureAwait(false);
+            // Observe both independently so cancellation or closure cannot leave a pending reader.
+            try
+            {
+                await Task.WhenAll((Task?)inputWait ?? Task.CompletedTask, (Task?)geometryWait ?? Task.CompletedTask)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (waitToken.IsCancellationRequested) { }
+        }
     }
 
     /// <summary>

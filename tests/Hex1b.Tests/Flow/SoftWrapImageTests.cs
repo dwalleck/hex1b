@@ -517,8 +517,19 @@ public class SoftWrapImageTests
             app = new Hex1bApp(Image, new Hex1bAppOptions { WorkloadAdapter = parent, UseSoftWrapEmission = true });
             running = app.RunAsync(stop.Token);
         }
-        var failure = await Assert.ThrowsExactlyAsync<IOException>(async () => await running.WaitAsync(TimeSpan.FromSeconds(5)));
-        Assert.AreSame(cleanupFails ? parent.CleanupFailure : parent.UploadFailure, failure);
+        if (!flowMode && cleanupFails)
+        {
+            var failure = await Assert.ThrowsExactlyAsync<AggregateException>(async () => await running.WaitAsync(TimeSpan.FromSeconds(5)));
+            var causes = failure.Flatten().InnerExceptions;
+            Assert.HasCount(2, causes);
+            Assert.AreSame(parent.UploadFailure, causes[0]);
+            Assert.AreSame(parent.CleanupFailure, causes[1]);
+        }
+        else
+        {
+            var failure = await Assert.ThrowsExactlyAsync<IOException>(async () => await running.WaitAsync(TimeSpan.FromSeconds(5)));
+            Assert.AreSame(cleanupFails ? parent.CleanupFailure : parent.UploadFailure, failure);
+        }
         Assert.AreEqual(1, parent.UploadAttempts, "uncertain upload must never replay");
         Assert.AreEqual(1, parent.CleanupAttempts, "unwinding attempts exact owned cleanup once");
         Assert.IsTrue(parent.ImageAppliedBeforeFailure, "the uncertain-write positive control must really apply the image");

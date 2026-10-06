@@ -14,10 +14,22 @@ public sealed class TextBoxNode : Hex1bNode
     /// </summary>
     public TextBoxWidget? SourceWidget { get; set; }
 
+    private TextBoxState _state = new();
+    internal Action? OrderedPasteStateChanging { get; set; }
+
     /// <summary>
     /// The text box state containing text, cursor position, and selection.
     /// </summary>
-    internal TextBoxState State { get; set; } = new();
+    internal TextBoxState State
+    {
+        get => _state;
+        set
+        {
+            if (ReferenceEquals(_state, value)) return;
+            OrderedPasteStateChanging?.Invoke();
+            _state = value;
+        }
+    }
 
     /// <summary>
     /// Tracks the last text value provided by the widget during reconciliation.
@@ -66,6 +78,42 @@ public sealed class TextBoxNode : Hex1bNode
     /// When null, paste is handled by inserting text at cursor position.
     /// </summary>
     internal Func<Events.PasteEventArgs, Task>? CustomPasteAction { get; set; }
+    internal Func<Events.OrderedPasteStart, Action<Events.OrderedPasteUpdate>?>? OrderedPasteFactory { get; set; }
+
+    /// <inheritdoc />
+    public override Action<Events.OrderedPasteUpdate>? BeginOrderedPaste(Events.OrderedPasteStart start)
+    {
+        ClearPrediction();
+        if (OrderedPasteFactory is { } factory) return factory(start);
+        if (CustomPasteAction is not null || TextChangedAction is not null)
+            throw new InvalidOperationException("Ordered paste with OnPaste or OnTextChanged requires an explicit OnOrderedPaste factory, or legacy streaming input.");
+        var state = State;
+        var multiline = IsMultiline;
+        var previousWasCarriageReturn = false;
+        return update =>
+        {
+            if (update.Phase != Events.OrderedPastePhase.Chunk) return;
+            // Normalize CRLF across chunk boundaries without delaying CR before later keys.
+            var text = update.Text;
+            if (previousWasCarriageReturn && text.StartsWith('\n')) text = text[1..];
+            previousWasCarriageReturn = update.Text.EndsWith('\r');
+            text = text.Replace("\r\n", "\n").Replace("\r", "\n");
+            if (!multiline) text = text.Replace('\n', ' ');
+            if (text.Length == 0) return;
+            if (state.HasSelection)
+            {
+                var position = state.SelectionStart;
+                state.Text = state.Text.Remove(position, state.SelectionEnd - position);
+                state.CursorPosition = position;
+                state.ClearSelection();
+            }
+            state.Text = state.Text.Insert(state.CursorPosition, text);
+            state.CursorPosition += text.Length;
+            state.ResetPreferredColumn();
+            MarkDirty();
+        };
+    }
+
 
     /// <summary>
     /// Minimum width of the text box in columns.

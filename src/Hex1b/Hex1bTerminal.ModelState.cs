@@ -552,9 +552,10 @@ public sealed partial class Hex1bTerminal
         Set(MarkAnchors, "_textAnchors", "_historyTextAnchors", "_commandAnchors");
         Set(Anchors, "_customAnchorViews", "_markerDetailsViews");
         Set(Configuration, "_commandMarkHistoryCapacity", "_customMarkerLimit", "_escapeTimeout", "_caseConfiguration");
-        Set(InputPath, "_activePasteContext", "_inBracketedPaste", "_incompleteInputSequenceBuffer", "_inputUtf8Decoder");
+        Set(InputPath, "_activePasteContext", "_inBracketedPaste", "_incompleteInputSequenceBuffer", "_inputUtf8Decoder",
+            "_orderedPaste", "_escapeFlushPending", "_escapeGeneration");
         Set(Infrastructure,
-            "_bufferLock", "_captures", "_captureSequence", "_captureApplicationDepth", "_diagnosticCase", "_disposedCase",
+            "_escapeTimeoutAdmissionSync", "_bufferLock", "_captures", "_captureSequence", "_captureApplicationDepth", "_diagnosticCase", "_disposedCase",
             "_caseIngress", "_caseIngressPending", "_continuationUncommitted", "_disposeCts", "_disposed", "_hmp1OutputStateLock", "_hmp1State",
             "_deferHmp1ReplayCallbacks", "<Hmp1ReplayActivityState>k__BackingField",
             "<Hmp1ReplayCommandMarkState>k__BackingField", "<Hmp1ReplayScrollbackState>k__BackingField",

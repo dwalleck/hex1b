@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Threading.Channels;
 using Hex1b.Automation;
+using Hex1b.Events;
 using Hex1b.Input;
 using Hex1b.Reflow;
 using Hex1b.Sixel;
@@ -166,6 +167,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         Channel.CreateUnbounded<PresentationInputEvent>(
             new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
     private ITimer? _escapeFlushTimer;
+    private long _escapeFlushPending;
+    private readonly object _escapeTimeoutAdmissionSync = new();
+    private long _escapeGeneration;
     
     // Scrollback buffer (opt-in via WithScrollback)
     private readonly ScrollbackBuffer? _scrollbackBuffer;
@@ -177,6 +181,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     // Bracketed paste state
     private bool _inBracketedPaste;
     private PasteContext? _activePasteContext;
+    private Hex1b.Events.OrderedPasteStart? _orderedPaste;
     
     // Scroll region (DECSTBM) - 0-based indices
     private int _scrollTop; // Top margin (0 = first row)
@@ -335,6 +340,10 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         
         _presentation = presentation;
         _workload = workload;
+        if (workload is Hex1bAppWorkloadAdapter { OrderedPasteCapacity: > 0 } orderedWorkload)
+            _presentationInputChannel = Channel.CreateBounded<PresentationInputEvent>(
+                new BoundedChannelOptions(orderedWorkload.OrderedPasteCapacity)
+                { SingleReader = true, SingleWriter = false, FullMode = BoundedChannelFullMode.Wait });
         if (workload is Hex1bAppWorkloadAdapter { DiagnosticTimingEnabled: true } trackedWorkload)
             trackedWorkload.InputMilestones = InputMilestones = new Diagnostics.InputMilestoneTracker();
 
@@ -676,8 +685,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         }
         finally
         {
-            // Stop pumps (via dispose cancellation token)
-            _disposeCts.Cancel();
+            // Stop pumps (via dispose cancellation token).
+            if (UsesOrderedInput) await StopOrderedInputAsync().ConfigureAwait(false);
+            else _disposeCts.Cancel();
 
             // Exit raw mode
             if (_presentation != null)
@@ -802,15 +812,18 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     {
         public readonly ReadOnlyMemory<byte> Data;
         public readonly bool IsTimeout;
+        public readonly long Generation;
 
-        private PresentationInputEvent(ReadOnlyMemory<byte> data, bool isTimeout)
+        private PresentationInputEvent(ReadOnlyMemory<byte> data, bool isTimeout, long generation = 0)
         {
             Data = data;
             IsTimeout = isTimeout;
+            Generation = generation;
         }
 
         public static PresentationInputEvent FromData(ReadOnlyMemory<byte> data) => new(data, false);
         public static readonly PresentationInputEvent TimeoutSentinel = new(default, true);
+        public static PresentationInputEvent TimeoutFor(long generation) => new(default, true, generation);
     }
 
     /// <summary>
@@ -832,7 +845,13 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 {
                     break;
                 }
-                _presentationInputChannel.Writer.TryWrite(PresentationInputEvent.FromData(data));
+                if (_workload is Hex1bAppWorkloadAdapter { OrderedPasteCapacity: > 0 })
+                {
+                    for (var offset = 0; offset < data.Length; offset += 4096)
+                        await _presentationInputChannel.Writer.WriteAsync(
+                            PresentationInputEvent.FromData(data.Slice(offset, Math.Min(4096, data.Length - offset)).ToArray()), ct);
+                }
+                else _presentationInputChannel.Writer.TryWrite(PresentationInputEvent.FromData(data));
             }
         }
         catch (OperationCanceledException)
@@ -841,6 +860,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         }
         catch (Exception ex)
         {
+            (_workload as Hex1bAppWorkloadAdapter)?.OrderedInput?.Fail(ex);
+            Volatile.Read(ref _orderedPaste)?.Fail(ex);
             ReportPumpFault("presentation input reader", ex);
             _presentationInputChannel.Writer.TryComplete(ex);
         }
@@ -856,26 +877,68 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     /// channel so the processing loop can flush the incomplete buffer.
     /// Zero-alloc: only sets a field on the existing channel entry.
     /// </summary>
-    private void OnEscapeFlushTimerFired(object? _)
+    private void OnEscapeFlushTimerFired(object? state)
     {
-        _presentationInputChannel.Writer.TryWrite(PresentationInputEvent.TimeoutSentinel);
+        var generation = state is long value ? value : 0;
+        lock (_escapeTimeoutAdmissionSync)
+        {
+            if (!_presentationInputChannel.Writer.TryWrite(PresentationInputEvent.TimeoutFor(generation)) && generation != 0)
+                RetainLatestEscapeTimeout(generation);
+        }
+    }
+
+    private void RetainLatestEscapeTimeout(long generation)
+    {
+        for (var current = Volatile.Read(ref _escapeFlushPending); current < generation; current = Volatile.Read(ref _escapeFlushPending))
+            if (Interlocked.CompareExchange(ref _escapeFlushPending, generation, current) == current) return;
+    }
+
+    private void RequeuePendingEscapeTimeout()
+    {
+        // The dequeue precedes this gate. A timer either observes the freed slot,
+        // or publishes its pending generation before this consumer checks it.
+        lock (_escapeTimeoutAdmissionSync)
+        {
+            var pending = Interlocked.Exchange(ref _escapeFlushPending, 0);
+            if (pending != 0 && pending == Volatile.Read(ref _escapeGeneration) &&
+                !_presentationInputChannel.Writer.TryWrite(PresentationInputEvent.TimeoutFor(pending)))
+                RetainLatestEscapeTimeout(pending);
+        }
     }
 
     private async Task PumpPresentationInputAsync(CancellationToken ct)
     {
+        using var readerCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task? ownedReader = null;
+        var disconnectSync = new object();
+        var readerClosing = false;
+        void OnPresentationDisconnected()
+        {
+            lock (disconnectSync)
+            {
+                if (!readerClosing) readerCancellation.Cancel();
+            }
+        }
+        var ownedPresentation = UsesOrderedInput ? _presentation : null;
+        if (ownedPresentation is not null) ownedPresentation.Disconnected += OnPresentationDisconnected;
         try
         {
-            // Spin up the background reader that feeds raw data into the channel.
-            _ = Task.Run(() => PumpPresentationReaderAsync(ct), ct);
+            // Ordered input owns its reader through cancellation and final joining.
+            if (UsesOrderedInput)
+                ownedReader = Task.Run(() => PumpPresentationReaderAsync(readerCancellation.Token));
+            else _ = Task.Run(() => PumpPresentationReaderAsync(ct), ct);
 
             await foreach (var item in _presentationInputChannel.Reader.ReadAllAsync(ct))
             {
+                // Every dequeue frees capacity, including a stale timeout with no later data.
+                RequeuePendingEscapeTimeout();
                 if (item.IsTimeout)
                 {
+                    if (item.Generation != 0 && item.Generation != Volatile.Read(ref _escapeGeneration)) continue;
                     // Timer fired — flush the incomplete buffer as a bare Escape key
                     // (or whatever partial sequence was pending).  Guard against a
                     // spurious timeout that arrives after data already cleared the buffer.
-                    if (_incompleteInputSequenceBuffer.Length > 0)
+                    if (_incompleteInputSequenceBuffer.Length > 0 && (!UsesOrderedInput || _orderedPaste is null))
                     {
                         var flushed = _incompleteInputSequenceBuffer;
                         _incompleteInputSequenceBuffer = "";
@@ -887,7 +950,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 var data = item.Data;
                 _metrics.TerminalInputBytes.Record(data.Length);
 
-                // Cancel any pending escape-sequence timeout — real data arrived.
+                // A callback already queued by a disposed timer must not flush a newer prefix.
+                var orderedInput = _workload is Hex1bAppWorkloadAdapter { OrderedPasteCapacity: > 0 };
+                if (orderedInput) Interlocked.Increment(ref _escapeGeneration);
                 _escapeFlushTimer?.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
 
                 // Tokenize input the same way we tokenize output, preserving
@@ -914,6 +979,12 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     decodedText = new string(chars, 0, charsWritten);
                 }
 
+                if (orderedInput)
+                {
+                    await DispatchOrderedRawInputAsync(decodedText, ct);
+                    continue;
+                }
+
                 var text = _incompleteInputSequenceBuffer + decodedText;
                 _incompleteInputSequenceBuffer = "";
 
@@ -930,11 +1001,39 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 // start (or restart) the reusable timer.
                 if (_incompleteInputSequenceBuffer.Length > 0 && _escapeTimeout > TimeSpan.Zero)
                 {
-                    _escapeFlushTimer ??= _timeProvider.CreateTimer(
-                        OnEscapeFlushTimerFired, null,
-                        Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-                    _escapeFlushTimer.Change(_escapeTimeout, Timeout.InfiniteTimeSpan);
+                    if (orderedInput)
+                    {
+                        _escapeFlushTimer?.Dispose();
+                        _escapeFlushTimer = _timeProvider.CreateTimer(
+                            OnEscapeFlushTimerFired, Volatile.Read(ref _escapeGeneration),
+                            _escapeTimeout, Timeout.InfiniteTimeSpan);
+                    }
+                    else
+                    {
+                        _escapeFlushTimer ??= _timeProvider.CreateTimer(
+                            OnEscapeFlushTimerFired, null,
+                            Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+                        _escapeFlushTimer.Change(_escapeTimeout, Timeout.InfiniteTimeSpan);
+                    }
                 }
+            }
+            if (UsesOrderedInput && !ct.IsCancellationRequested)
+            {
+                var workload = (Hex1bAppWorkloadAdapter)_workload;
+                if (_orderedPaste is { } incomplete)
+                {
+                    if (_incompleteInputSequenceBuffer.Length > 0)
+                    {
+                        await DispatchOrderedLiteralAsync(_incompleteInputSequenceBuffer, workload, ct);
+                        _incompleteInputSequenceBuffer = "";
+                    }
+                    // EOF follows all admitted raw data; deliver its prefix before its terminal outcome.
+                    var error = new EndOfStreamException("Bracketed paste ended without a closing delimiter.");
+                    await workload.WriteInputEventAsync(new Hex1bOrderedPasteEvent(incomplete,
+                        new OrderedPasteUpdate(OrderedPastePhase.Failed, error: error)), ct);
+                    _orderedPaste = null;
+                }
+                workload.CompleteOrderedInput();
             }
         }
         catch (OperationCanceledException)
@@ -943,8 +1042,111 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         }
         catch (Exception ex)
         {
+            (_workload as Hex1bAppWorkloadAdapter)?.OrderedInput?.Fail(ex);
+            Volatile.Read(ref _orderedPaste)?.Fail(ex);
             ReportPumpFault("presentation input pump", ex);
         }
+        finally
+        {
+            // Set closure under the callback gate before disposing its cancellation source.
+            // A previously captured event delegate can then safely run after unsubscription.
+            lock (disconnectSync)
+            {
+                readerClosing = true;
+                if (ownedPresentation is not null) ownedPresentation.Disconnected -= OnPresentationDisconnected;
+            }
+            if (ownedReader is not null)
+            {
+                await readerCancellation.CancelAsync().ConfigureAwait(false);
+                await ownedReader.ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task DispatchOrderedRawInputAsync(string decodedText, CancellationToken ct)
+    {
+        const string begin = "\x1b[200~";
+        const string end = "\x1b[201~";
+        var workload = (Hex1bAppWorkloadAdapter)_workload;
+        var remaining = _incompleteInputSequenceBuffer + decodedText;
+        _incompleteInputSequenceBuffer = "";
+        while (remaining.Length > 0)
+        {
+            if (_orderedPaste is not null)
+            {
+                var beginAt = remaining.IndexOf(begin, StringComparison.Ordinal);
+                var endAt = remaining.IndexOf(end, StringComparison.Ordinal);
+                var delimiterAt = beginAt < 0 ? endAt : endAt < 0 ? beginAt : Math.Min(beginAt, endAt);
+                if (delimiterAt < 0)
+                {
+                    var held = 0;
+                    for (var length = 1; length < begin.Length && length <= remaining.Length; length++)
+                        if (begin.AsSpan().StartsWith(remaining.AsSpan(remaining.Length - length), StringComparison.Ordinal) ||
+                            end.AsSpan().StartsWith(remaining.AsSpan(remaining.Length - length), StringComparison.Ordinal)) held = length;
+                    await DispatchOrderedLiteralAsync(remaining[..(remaining.Length - held)], workload, ct);
+                    _incompleteInputSequenceBuffer = held == 0 ? "" : remaining[^held..];
+                    return;
+                }
+                await DispatchOrderedLiteralAsync(remaining[..delimiterAt], workload, ct);
+                await DispatchOrderedPasteTokenAsync(new SpecialKeyToken(delimiterAt == beginAt ? 200 : 201), workload, ct);
+                remaining = remaining[(delimiterAt + begin.Length)..];
+                continue;
+            }
+            var startAt = FindTopLevelOrderedPasteBegin(remaining);
+            var outside = startAt < 0 ? remaining : remaining[..startAt];
+            var extracted = ExtractIncompleteEscapeSequence(outside);
+            if (extracted.completeText.Length > 0)
+                await DispatchCompleteInputTextAsync(extracted.completeText, ReadOnlyMemory<byte>.Empty, ct);
+            if (startAt >= 0)
+            {
+                // A bracketed begin terminates any preceding ambiguous ordinary prefix.
+                if (extracted.incompleteSequence.Length > 0)
+                    await DispatchCompleteInputTextAsync(extracted.incompleteSequence, ReadOnlyMemory<byte>.Empty, ct);
+                await DispatchOrderedPasteTokenAsync(new SpecialKeyToken(200), workload, ct);
+                remaining = remaining[(startAt + begin.Length)..];
+                continue;
+            }
+            _incompleteInputSequenceBuffer = extracted.incompleteSequence;
+            if (_incompleteInputSequenceBuffer.Length > 0 && _escapeTimeout > TimeSpan.Zero)
+            {
+                _escapeFlushTimer?.Dispose();
+                _escapeFlushTimer = _timeProvider.CreateTimer(OnEscapeFlushTimerFired,
+                    Volatile.Read(ref _escapeGeneration), _escapeTimeout, Timeout.InfiniteTimeSpan);
+            }
+            return;
+        }
+    }
+
+    private static int FindTopLevelOrderedPasteBegin(string text)
+    {
+        const string begin = "\x1b[200~";
+        for (var index = 0; index < text.Length; index++)
+        {
+            if (!IsEscapeSequenceIntroducer(text[index], recognizeC1Dcs: true)) continue;
+            if (text.AsSpan(index).StartsWith(begin, StringComparison.Ordinal)) return index;
+            // Control strings own their embedded escapes; an incomplete ordinary
+            // sequence stays buffered by the existing ANSI input parser.
+            if (!TryFindEscapeSequenceEnd(text, index, out var end)) return -1;
+            index = end - 1;
+        }
+        return -1;
+    }
+
+    private async Task DispatchOrderedLiteralAsync(string text, Hex1bAppWorkloadAdapter workload, CancellationToken ct)
+    {
+        if (text.Length == 0) return;
+        IReadOnlyList<AnsiToken> literal = [new TextToken(text)];
+        await NotifyPresentationFiltersInputAsync(literal);
+        await NotifyWorkloadFiltersInputAsync(literal);
+        await DispatchOrderedPasteTokenAsync(literal[0], workload, ct);
+    }
+
+    private bool UsesOrderedInput => _workload is Hex1bAppWorkloadAdapter { OrderedPasteCapacity: > 0 };
+
+    private async Task StopOrderedInputAsync()
+    {
+        await _disposeCts.CancelAsync().ConfigureAwait(false);
+        if (_inputProcessingTask is { } input) await input.ConfigureAwait(false);
     }
     
     /// <summary>
@@ -994,6 +1196,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         {
             ct.ThrowIfCancellationRequested();
             
+            if (workload.OrderedPasteCapacity > 0 && await DispatchOrderedPasteTokenAsync(token, workload, ct))
+                continue;
+
             // Check for bracketed paste start/end markers
             if (token is SpecialKeyToken { KeyCode: 200 })
             {
@@ -1050,6 +1255,44 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         }
     }
     
+    private async Task<bool> DispatchOrderedPasteTokenAsync(AnsiToken token, Hex1bAppWorkloadAdapter workload, CancellationToken ct)
+    {
+        if (token is SpecialKeyToken { KeyCode: 200 })
+        {
+            if (_orderedPaste is { } previous)
+            {
+                previous.Cancel();
+                await workload.WriteInputEventAsync(new Hex1bOrderedPasteEvent(previous,
+                    new Hex1b.Events.OrderedPasteUpdate(Hex1b.Events.OrderedPastePhase.Cancelled)), ct);
+            }
+            _orderedPaste = new Hex1b.Events.OrderedPasteStart(workload.OrderedInput);
+            await workload.WriteInputEventAsync(new Hex1bOrderedPasteEvent(_orderedPaste), ct);
+            return true;
+        }
+        if (token is SpecialKeyToken { KeyCode: 201 })
+        {
+            if (_orderedPaste is { } completed)
+            {
+                _orderedPaste = null;
+                await workload.WriteInputEventAsync(new Hex1bOrderedPasteEvent(completed,
+                    new Hex1b.Events.OrderedPasteUpdate(completed.IsCancellationRequested
+                        ? Hex1b.Events.OrderedPastePhase.Cancelled : Hex1b.Events.OrderedPastePhase.Completed)), ct);
+            }
+            return true;
+        }
+        if (_orderedPaste is not { } active || ExtractPasteText(token) is not { } text)
+            return false;
+        for (var offset = 0; offset < text.Length && !active.IsCancellationRequested;)
+        {
+            var length = Math.Min(4096, text.Length - offset);
+            if (offset + length < text.Length && char.IsHighSurrogate(text[offset + length - 1])) length--;
+            await workload.WriteInputEventAsync(new Hex1bOrderedPasteEvent(active,
+                new Hex1b.Events.OrderedPasteUpdate(Hex1b.Events.OrderedPastePhase.Chunk, text.Substring(offset, length))), ct);
+            offset += length;
+        }
+        return true;
+    }
+
     private static IEnumerable<Hex1bEvent> TokenToInputEvents(AnsiToken token)
     {
         // Output tokenization can batch C0 controls with printable text. Input
@@ -8198,6 +8441,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         if (!TryBeginDisposalAndResetScreenOwnedState())
             return;
 
+        if (UsesOrderedInput) StopOrderedInputAsync().GetAwaiter().GetResult();
+
         // Complete any active paste context
         if (_activePasteContext != null)
         {
@@ -8243,6 +8488,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     {
         if (!TryBeginDisposalAndResetScreenOwnedState())
             return;
+
+        if (UsesOrderedInput) await StopOrderedInputAsync().ConfigureAwait(false);
 
         // Complete any active paste context
         if (_activePasteContext != null)
