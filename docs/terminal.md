@@ -483,6 +483,14 @@ is not a runtime history anchor: ConPTY's cursor can diverge from the presenting
 terminal's cursor during resize. Non-reply input is preserved while the reader
 collects the response.
 
+A terminal queues its reply behind input it already holds, such as a large paste,
+and the application consumes delivered input at its own pace. While it waits for
+the reply, the reader therefore keeps reading past that input, up to 1 MiB, and
+delivers it in order once the reply is found or the reply window ends. Below
+1 MiB, a later observation is serviced before that input is delivered, since its
+reply can only follow it. Beyond 1 MiB the input is delivered first, and a yielded
+observation resumes inside its unchanged reply window.
+
 Windows input waits are directly cancellable, so an observation request does not
 wait for a polling interval to wake the reader. A request at the head of the FIFO
 gate has a 250 ms caller watchdog covering its posting, reader claim and wake-up

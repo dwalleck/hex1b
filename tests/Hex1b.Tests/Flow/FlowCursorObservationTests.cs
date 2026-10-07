@@ -964,6 +964,12 @@ internal sealed class ScriptedConsoleDriver : IConsoleDriver
     public TaskCompletionSource SecondCursorReplyReadEntered { get; } =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    /// <summary>
+    /// Replies the terminal sends when a cursor query is flushed, one per query. Each is
+    /// queued behind whatever input is already waiting, as a real terminal's reply is.
+    /// </summary>
+    public Queue<string> RepliesOnCursorQueryFlush { get; } = new();
+
 
     public string WrittenText
     {
@@ -1109,6 +1115,11 @@ internal sealed class ScriptedConsoleDriver : IConsoleDriver
             {
                 _cursorQueryFlushed = true;
                 queryFlushNumber = ++_cursorQueryFlushCount;
+                if (RepliesOnCursorQueryFlush.TryDequeue(out var reply))
+                {
+                    _chunks.Enqueue(Encoding.UTF8.GetBytes(reply));
+                    _available.Release();
+                }
             }
         }
 

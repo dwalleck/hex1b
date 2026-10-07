@@ -71,9 +71,22 @@ public sealed class ConsolePresentationAdapter :
     private static readonly TimeSpan CursorObservationTimeout = TimeSpan.FromMilliseconds(250);
 
     // Bound the observation's scan window, not the amount of ordinary input that
-    // can precede a report. Safe prefixes return through the existing stdin reader
-    // while the same request retains its query/deadline and serialization gate.
+    // can precede a report. A full window yields its safe prefix to the read-ahead
+    // input; the same request keeps its query/deadline and serialization gate.
     private const int MaxCursorObservationBufferedBytes = 4096;
+
+    // How much ordinary input may wait undelivered while an observation looks for its
+    // reply (issue 61). A terminal queues its reply behind input it already holds, such
+    // as a 100 KiB paste, and the application consumes delivered input at its own pace
+    // (ordered paste input makes this reader wait for it). Delivering that input before
+    // the reply is found would spend the reply window on the application's work, so the
+    // reader resumes a yielded request at once while the read-ahead is under this bound,
+    // and delivers the input first only beyond it, inside the unchanged reply window.
+    private const int MaxCursorObservationReadAheadBytes = 1024 * 1024;
+
+    // One driver read, and the most read-ahead input one ReadInputAsync call returns,
+    // so a waiting observation is admitted between deliveries, as between reads.
+    private const int InputReadSize = 256;
 
     // A cell dimension above this is treated as implausible/overflow garbage
     // rather than a real (if unusual) HiDPI or legacy display value. Real
@@ -89,7 +102,13 @@ public sealed class ConsolePresentationAdapter :
     private readonly CancellationTokenSource _disposeCts = new();
     private ITerminalReflowProvider _reflowStrategy;
     private TerminalCapabilities _capabilities;
-    private byte[] _prefetchedInput = [];
+    // Input read ahead of its delivery, in arrival order: bytes an observation read
+    // past while scanning for its reply, a retired observation's retained scan bytes,
+    // and capability-probe input. It is delivered before any newer driver input.
+    // Guarded by _cursorObservationSync.
+    private readonly Queue<byte[]> _prefetchedInput = new();
+    private int _prefetchedHeadOffset;
+    private int _prefetchedLength;
 
     // Serializes driver writes. The rendering path (WriteOutputAsync) and a cursor
     // query both write to the same fd; UnixConsoleDriver.Write is a multi-write() loop,
@@ -456,7 +475,7 @@ public sealed class ConsolePresentationAdapter :
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _disposeCts.Token);
 
-        var buffer = new byte[256];
+        var buffer = new byte[InputReadSize];
 
         try
         {
@@ -471,12 +490,17 @@ public sealed class ConsolePresentationAdapter :
                 CursorObservationRequest? observation;
                 lock (_cursorObservationSync)
                 {
-                    prefetched = _prefetchedInput;
-                    _prefetchedInput = [];
-                    // Idle expiry may flush a retained suffix. Drain input or
-                    // claim its request atomically, so newer driver bytes cannot
+                    // A waiting observation goes first, even with read-ahead input
+                    // undelivered: its reply can only be in bytes the driver has not
+                    // returned yet, and the service queues those behind the read-ahead
+                    // input. Otherwise deliver read-ahead input before reading the
+                    // driver. Idle expiry may flush a retained suffix, so claim the
+                    // request or take input atomically: newer driver bytes never
                     // overtake a suffix flushed between these two decisions.
-                    observation = prefetched.Length == 0 ? TakePendingCursorObservation() : null;
+                    observation = _prefetchedLength < MaxCursorObservationReadAheadBytes
+                        ? TakePendingCursorObservation()
+                        : null;
+                    prefetched = observation is null ? TakePrefetchedInput() : [];
                 }
                 if (prefetched.Length > 0)
                 {
@@ -704,7 +728,7 @@ public sealed class ConsolePresentationAdapter :
         CancellationToken ct)
     {
         var buffered = request.BufferedInput;
-        var readBuffer = new byte[256];
+        var readBuffer = new byte[InputReadSize];
         try
         {
             if ((request.IsCompleted && request.ReplyDeadline is null) || _disposed)
@@ -1815,17 +1839,60 @@ public sealed class ConsolePresentationAdapter :
 
         lock (_cursorObservationSync)
         {
-            if (_prefetchedInput.Length == 0)
-            {
-                _prefetchedInput = data.ToArray();
-                return;
-            }
-
-            var combined = new byte[_prefetchedInput.Length + data.Length];
-            _prefetchedInput.CopyTo(combined, 0);
-            data.CopyTo(combined.AsSpan(_prefetchedInput.Length));
-            _prefetchedInput = combined;
+            _prefetchedInput.Enqueue(data.ToArray());
+            _prefetchedLength += data.Length;
         }
+    }
+
+    // Called under _cursorObservationSync. Returns the oldest read-ahead input, at
+    // most one read's worth, or an empty array when none is waiting. While more input
+    // follows, the slice ends before its last ESC (unless the ESC starts it), as a
+    // yielded scan prefix does: a query admitted between two slices must not hold the
+    // rest of an escape sequence past the terminal's escape timeout.
+    private byte[] TakePrefetchedInput()
+    {
+        var length = Math.Min(InputReadSize, _prefetchedLength);
+        if (length == 0)
+            return [];
+
+        var taken = new byte[length];
+        var filled = 0;
+        var offset = _prefetchedHeadOffset;
+        foreach (var segment in _prefetchedInput)
+        {
+            var count = Math.Min(length - filled, segment.Length - offset);
+            segment.AsSpan(offset, count).CopyTo(taken.AsSpan(filled));
+            filled += count;
+            offset = 0;
+            if (filled == length)
+                break;
+        }
+
+        if (length < _prefetchedLength)
+        {
+            var lastEscape = Array.LastIndexOf(taken, (byte)0x1b);
+            if (lastEscape > 0)
+            {
+                length = lastEscape;
+                taken = taken[..length];
+            }
+        }
+
+        for (var remaining = length; remaining > 0;)
+        {
+            var head = _prefetchedInput.Peek();
+            var count = Math.Min(remaining, head.Length - _prefetchedHeadOffset);
+            _prefetchedHeadOffset += count;
+            remaining -= count;
+            if (_prefetchedHeadOffset == head.Length)
+            {
+                _prefetchedInput.Dequeue();
+                _prefetchedHeadOffset = 0;
+            }
+        }
+
+        _prefetchedLength -= length;
+        return taken;
     }
 
     private static bool TryConsumeKgpProbeResponse(List<byte> buffer, uint probeImageId, out bool supportsKgp)
