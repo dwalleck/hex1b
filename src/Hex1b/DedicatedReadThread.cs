@@ -10,8 +10,10 @@ namespace Hex1b;
 /// <remarks>
 /// Reads keep the outcomes <c>Task.Run(read, ct)</c> gave: a token canceled before the read starts
 /// cancels it, a read that throws <see cref="OperationCanceledException"/> for its token is canceled, and
-/// any other exception faults it. Continuations run asynchronously, as they did. The thread starts with
-/// the first read and ends after <see cref="Dispose"/> once the read in progress returns.
+/// any other exception faults it. The awaiting code resumes on the thread pool (one dispatch per read, as
+/// before, when the read itself needed one to start); what changes is that a blocked read no longer holds
+/// a pool thread. The thread starts with the first read and ends after <see cref="Dispose"/> once the read
+/// in progress returns.
 /// </remarks>
 internal sealed class DedicatedReadThread : IDisposable
 {
@@ -56,7 +58,7 @@ internal sealed class DedicatedReadThread : IDisposable
             if (_thread is not null)
                 return;
             var thread = new Thread(Run) { IsBackground = true, Name = _name };
-            thread.Start();
+            thread.UnsafeStart();
             Volatile.Write(ref _thread, thread);
         }
     }

@@ -1818,12 +1818,15 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Starts the output pump on its own thread, so a starved thread pool cannot delay it past a Flow
-    /// cursor barrier's bound (issue 61). Hosts without threads keep the thread-pool pump.
+    /// cursor barrier's bound (issue 61). Hosts without threads, and workloads other than
+    /// <see cref="Hex1bAppWorkloadAdapter"/>, keep the thread-pool pump.
     /// </summary>
     private Task StartOutputPump()
     {
         var ct = _disposeCts.Token;
-        if (OperatingSystem.IsBrowser() || OperatingSystem.IsWasi())
+        // Scoped to the app workload, whose read only awaits its own channel (so it resumes on the pump's
+        // thread and runs no foreign code there); other workloads keep the thread-pool pump.
+        if (OperatingSystem.IsBrowser() || OperatingSystem.IsWasi() || _workload is not Hex1bAppWorkloadAdapter)
             return Task.Run(() => PumpWorkloadOutputAsync(ct));
         return DedicatedThreadSynchronizationContext.Start("Hex1b output pump", pump =>
         {
@@ -1864,6 +1867,8 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 Action<List<AnsiToken>>? pooledItemTokensReturn = null;
                 WorkloadOutputItem readItem = default;
 
+                try
+                {
                 if (_workload is IHmp1TerminalOutputSource remoteWorkload)
                 {
                     var item = await remoteWorkload.ReadTerminalOutputAsync(ct);
@@ -1890,11 +1895,15 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 {
                     data = await _workload.ReadOutputAsync(ct);
                 }
-
-                // Process the item with the scheduling it always had: its awaits resume on the pool,
-                // never queued behind this thread (a synchronous wait here cannot deadlock on it).
-                if (pumpContext is not null)
-                    SynchronizationContext.SetSynchronizationContext(null);
+                }
+                finally
+                {
+                    // Process the item (or a failed read) with the scheduling it always had: its awaits
+                    // resume on the pool, never queued behind this thread (a synchronous wait here cannot
+                    // deadlock on it).
+                    if (pumpContext is not null)
+                        SynchronizationContext.SetSynchronizationContext(null);
+                }
 
                 if (readItem.Resize is { } resize)
                 {
@@ -1965,8 +1974,18 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     
                     CompleteMilestoneItem(readItem);
 
-                    // Small delay to prevent busy-waiting in headless mode
-                    await Task.Delay(10, ct);
+                    // Small delay to prevent busy-waiting in headless mode. On the pump's own thread it is
+                    // taken there: a timer would resume on the pool and hold the next barrier behind it.
+                    if (pumpContext is { } idlePump)
+                    {
+                        await idlePump.SwitchTo();
+                        if (ct.WaitHandle.WaitOne(10))
+                            ct.ThrowIfCancellationRequested();
+                    }
+                    else
+                    {
+                        await Task.Delay(10, ct);
+                    }
                     continue;
                 }
 

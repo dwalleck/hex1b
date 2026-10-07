@@ -39,7 +39,7 @@ internal sealed class DedicatedThreadSynchronizationContext : SynchronizationCon
     public static Task Start(string name, Func<DedicatedThreadSynchronizationContext, Task> loop)
     {
         var context = new DedicatedThreadSynchronizationContext(name, loop);
-        context._thread.Start();
+        context._thread.UnsafeStart();
         return context._completion.Task;
     }
 
@@ -84,18 +84,40 @@ internal sealed class DedicatedThreadSynchronizationContext : SynchronizationCon
         loop.ContinueWith(static (_, work) => ((BlockingCollection<(SendOrPostCallback, object?)>)work!).CompleteAdding(),
             _work, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
 
-        foreach (var (callback, state) in _work.GetConsumingEnumerable())
+        try
         {
-            SetSynchronizationContext(this);
-            callback(state);
+            foreach (var (callback, state) in _work.GetConsumingEnumerable())
+            {
+                SetSynchronizationContext(this);
+                callback(state);
+            }
         }
+        finally
+        {
+            // A callback that throws ends the thread (and, unhandled, the process, as on the pool); the
+            // loop's completion is still published.
+            if (!loop.IsCompleted)
+                _completion.TrySetException(new InvalidOperationException("The dedicated loop thread ended before its loop."));
+            else if (loop.IsFaulted)
+                _completion.TrySetException(loop.Exception!.InnerExceptions);
+            else if (loop.IsCanceled)
+                _completion.TrySetCanceled(CanceledToken(loop));
+            else
+                _completion.TrySetResult();
+        }
+    }
 
-        if (loop.IsFaulted)
-            _completion.TrySetException(loop.Exception!.InnerExceptions);
-        else if (loop.IsCanceled)
-            _completion.TrySetCanceled();
-        else
-            _completion.TrySetResult();
+    private static CancellationToken CanceledToken(Task canceled)
+    {
+        try
+        {
+            canceled.GetAwaiter().GetResult();
+        }
+        catch (OperationCanceledException error)
+        {
+            return error.CancellationToken;
+        }
+        return default;
     }
 
     /// <summary>Resumes the awaiting method on the context's thread.</summary>

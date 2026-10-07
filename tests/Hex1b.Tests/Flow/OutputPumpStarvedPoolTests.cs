@@ -52,19 +52,65 @@ public class OutputPumpStarvedPoolTests
         SettlePump();
 
         Task<(int Column, int Row)?> observation;
-        TaskCompletionSource<bool> barrier;
         using (PoolStarvation.Begin())
         {
-            // The observation enqueues its barrier synchronously on this thread, then waits.
-            observation = ((ICursorPositionSource)workload).ObserveCursorPositionAsync(CancellationToken.None);
-            barrier = PendingBarrier(workload);
-            // Task.Wait completes from the barrier's completion itself, not from a pool continuation.
-            Assert.IsTrue(barrier.Task.Wait(BarrierBound),
-                "The output pump must consume a cursor barrier within its 250 ms bound while the pool is starved.");
+            observation = ObserveAndAssertBarrierConsumedWithinBound(workload, []);
         }
 
         Assert.IsTrue(observation.Wait(TimeSpan.FromSeconds(10)), "The observation completes once the pool recovers.");
         Assert.AreEqual((3, 2), observation.Result);
+    }
+
+    [TestMethod]
+    public void CursorBarriers_BackToBack_AreEachConsumedWithinTheBoundWhileThePoolIsStarved()
+    {
+        var presentation = new RecordingPresentation();
+        using var workload = new Hex1bAppWorkloadAdapter(presentation);
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithPresentation(presentation)
+            .WithDimensions(20, 6)
+            .Build();
+        workload.Write("warm");
+        Assert.IsTrue(presentation.WaitForOutput("warm", TimeSpan.FromSeconds(10)));
+        SettlePump();
+
+        using (PoolStarvation.Begin())
+        {
+            // A barrier is an empty item: after it the pump idles briefly before its next read. Flow posts
+            // its next observation right away (the next unit, or a retry after a resize).
+            for (var i = 0; i < 2; i++)
+            {
+                // The first observation's waiter cannot run (starved), so its barrier stays listed.
+                ObserveAndAssertBarrierConsumedWithinBound(workload, PendingBarriers(workload));
+            }
+        }
+    }
+
+    [TestMethod]
+    public void Observation_ConsumedBarrierStillReportsAfterStarvationOutlastsTheBound()
+    {
+        var presentation = new RecordingPresentation();
+        using var workload = new Hex1bAppWorkloadAdapter(presentation);
+        using var terminal = Hex1bTerminal.CreateBuilder()
+            .WithWorkload(workload)
+            .WithPresentation(presentation)
+            .WithDimensions(20, 6)
+            .Build();
+        workload.Write("warm");
+        Assert.IsTrue(presentation.WaitForOutput("warm", TimeSpan.FromSeconds(10)));
+        SettlePump();
+
+        Task<(int Column, int Row)?> observation;
+        using (PoolStarvation.Begin())
+        {
+            observation = ObserveAndAssertBarrierConsumedWithinBound(workload, []);
+            // The pool stays starved past the barrier's 250 ms bound after the pump consumed it in time.
+            Thread.Sleep(400);
+        }
+
+        Assert.IsTrue(observation.Wait(TimeSpan.FromSeconds(10)));
+        Assert.AreEqual((3, 2), observation.Result, "A barrier consumed within its bound must not be reported as a timeout.");
     }
 
     [TestMethod]
@@ -93,16 +139,33 @@ public class OutputPumpStarvedPoolTests
 
     // The workload adapter keeps each barrier waiting for the pump in a private list; this reads the one
     // the observation just enqueued. It is the measurement point, not part of the verdict's logic.
-    private static TaskCompletionSource<bool> PendingBarrier(Hex1bAppWorkloadAdapter workload)
+    // Starts an observation on this thread (it enqueues its barrier synchronously) and asserts that the pump
+    // consumed the barrier within the 250 ms bound. A pump fast enough to consume it before the observation
+    // even started waiting leaves no barrier listed; then the observation has already completed.
+    private static Task<(int Column, int Row)?> ObserveAndAssertBarrierConsumedWithinBound(
+        Hex1bAppWorkloadAdapter workload, List<TaskCompletionSource<bool>> before)
+    {
+        var observation = ((ICursorPositionSource)workload).ObserveCursorPositionAsync(CancellationToken.None);
+        var added = PendingBarriers(workload).Except(before).ToList();
+        if (added.Count == 0)
+        {
+            Assert.IsTrue(observation.IsCompleted, "With no barrier listed, the pump consumed it before the wait began.");
+            return observation;
+        }
+
+        // Task.Wait completes from the barrier's completion itself, not from a pool continuation.
+        Assert.IsTrue(added.Single().Task.Wait(BarrierBound),
+            "The output pump must consume a cursor barrier within its 250 ms bound while the pool is starved.");
+        return observation;
+    }
+
+    private static List<TaskCompletionSource<bool>> PendingBarriers(Hex1bAppWorkloadAdapter workload)
     {
         var flags = BindingFlags.Instance | BindingFlags.NonPublic;
         var sync = typeof(Hex1bAppWorkloadAdapter).GetField("_barrierSync", flags)!.GetValue(workload)!;
         var pending = (HashSet<TaskCompletionSource<bool>>)typeof(Hex1bAppWorkloadAdapter).GetField("_pendingBarriers", flags)!.GetValue(workload)!;
         lock (sync)
-        {
-            Assert.HasCount(1, pending, "Exactly one cursor barrier is pending.");
-            return pending.Single();
-        }
+            return [.. pending];
     }
 
     /// <summary>Blocks every thread-pool worker (and the ones the pool injects) until disposed.</summary>
@@ -149,9 +212,12 @@ public class OutputPumpStarvedPoolTests
         public void Dispose()
         {
             _release.Set();
-            _finished.Wait(TimeSpan.FromSeconds(30));
-            _release.Dispose();
-            _finished.Dispose();
+            // Blocked items still use these until they finish; never dispose them under a running item.
+            if (_finished.Wait(TimeSpan.FromSeconds(30)))
+            {
+                _release.Dispose();
+                _finished.Dispose();
+            }
         }
     }
 
