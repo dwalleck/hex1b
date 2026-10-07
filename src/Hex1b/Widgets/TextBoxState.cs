@@ -86,7 +86,17 @@ public class TextBoxState
     /// Must be called after any horizontal cursor movement or text edit
     /// so that the next Up/Down arrow uses the actual cursor column.
     /// </summary>
-    internal void ResetPreferredColumn() => _preferredColumn = null;
+    internal void ResetPreferredColumn()
+    {
+        _preferredColumn = null;
+        PreferredDisplayColumn = null;
+    }
+
+    /// <summary>
+    /// The vertical-navigation column of a TextBox with a display map, in display cells from the line start
+    /// (issue 62). Reset together with the character column.
+    /// </summary>
+    internal int? PreferredDisplayColumn { get; set; }
 
     public string Text
     {
@@ -180,7 +190,7 @@ public class TextBoxState
         _text = _text[..start] + _text[end..];
         _cursorPosition = start;
         ClearSelection();
-        _preferredColumn = null;
+        ResetPreferredColumn();
     }
 
     /// <summary>
@@ -336,7 +346,7 @@ public class TextBoxState
         _text = _text.Insert(_cursorPosition, "\n");
         _cursorPosition++;
         BumpVersion();
-        _preferredColumn = null;
+        ResetPreferredColumn();
     }
 
     /// <summary>
@@ -371,7 +381,7 @@ public class TextBoxState
                     _cursorPosition--;
                     BumpVersion();
                 }
-                _preferredColumn = null;
+                ResetPreferredColumn();
                 return true;
 
             case Hex1bKey.Delete:
@@ -384,7 +394,7 @@ public class TextBoxState
                     _text = _text.Remove(_cursorPosition, 1);
                     BumpVersion();
                 }
-                _preferredColumn = null;
+                ResetPreferredColumn();
                 return true;
 
             case Hex1bKey.LeftArrow:
@@ -411,7 +421,7 @@ public class TextBoxState
                         CursorPosition--;
                     }
                 }
-                _preferredColumn = null;
+                ResetPreferredColumn();
                 return true;
 
             case Hex1bKey.RightArrow:
@@ -438,7 +448,7 @@ public class TextBoxState
                         CursorPosition++;
                     }
                 }
-                _preferredColumn = null;
+                ResetPreferredColumn();
                 return true;
 
             case Hex1bKey.UpArrow:
@@ -479,7 +489,7 @@ public class TextBoxState
                 {
                     CursorPosition = 0;
                 }
-                _preferredColumn = null;
+                ResetPreferredColumn();
                 return true;
 
             case Hex1bKey.End:
@@ -504,7 +514,7 @@ public class TextBoxState
                 {
                     CursorPosition = Text.Length;
                 }
-                _preferredColumn = null;
+                ResetPreferredColumn();
                 return true;
 
             case Hex1bKey.Enter:
@@ -526,7 +536,7 @@ public class TextBoxState
                     _text = _text.Insert(_cursorPosition, evt.Character.ToString());
                     _cursorPosition++;
                     BumpVersion();
-                    _preferredColumn = null;
+                    ResetPreferredColumn();
                     return true;
                 }
                 // Non-printable, non-handled key
