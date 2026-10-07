@@ -20,6 +20,7 @@ namespace Hex1b;
 /// </remarks>
 internal sealed class WindowsConsoleDriver : IConsoleDriver
 {
+    private readonly DedicatedReadThread _inputReader = new("Hex1b console input");
     // Standard handles
     private const int STD_INPUT_HANDLE = -10;
     private const int STD_OUTPUT_HANDLE = -11;
@@ -314,7 +315,9 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
             throw new InvalidOperationException("Must enter raw mode before reading");
         }
 
-        return new ValueTask<int>(Task.Run(() => ReadCore(buffer, ct), ct));
+        // A dedicated thread, not Task.Run: a blocked console read must not hold one of the thread pool's
+        // threads (issue 61: a 2-CPU host has few, and a large paste starved the rest).
+        return _inputReader.ReadAsync(token => ReadCore(buffer, token), ct);
     }
 
     private unsafe int ReadCore(Memory<byte> buffer, CancellationToken ct)
@@ -1031,6 +1034,7 @@ internal sealed class WindowsConsoleDriver : IConsoleDriver
         _disposed = true;
         
         ExitRawMode();
+        _inputReader.Dispose();
     }
     
     // P/Invoke declarations

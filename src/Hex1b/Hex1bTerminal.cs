@@ -111,6 +111,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     private int _alternateScreenSavedCursorY; // Saved cursor Y for alternate screen (mode 1049)
     private Task? _inputProcessingTask;
     private Task? _outputProcessingTask;
+    // The output pump's own thread (issue 61); null where threads are unavailable (browser, WASI).
+    private DedicatedThreadSynchronizationContext? _outputPump;
+    internal Thread? OutputPumpThreadForTesting => _outputPump?.Thread;
     private readonly TaskCompletionSource<(string PumpName, Exception Error)> _pumpFaultTcs =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _writeSequence; // Monotonically increasing write order counter
@@ -649,7 +652,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         // Start pumping workload output → presentation
         if (_outputProcessingTask == null)
         {
-            _outputProcessingTask = Task.Run(() => PumpWorkloadOutputAsync(_disposeCts.Token));
+            _outputProcessingTask = StartOutputPump();
         }
     }
 
@@ -1813,6 +1816,22 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
             "transform output.");
     }
 
+    /// <summary>
+    /// Starts the output pump on its own thread, so a starved thread pool cannot delay it past a Flow
+    /// cursor barrier's bound (issue 61). Hosts without threads keep the thread-pool pump.
+    /// </summary>
+    private Task StartOutputPump()
+    {
+        var ct = _disposeCts.Token;
+        if (OperatingSystem.IsBrowser() || OperatingSystem.IsWasi())
+            return Task.Run(() => PumpWorkloadOutputAsync(ct));
+        return DedicatedThreadSynchronizationContext.Start("Hex1b output pump", pump =>
+        {
+            _outputPump = pump;
+            return PumpWorkloadOutputAsync(ct);
+        });
+    }
+
     private async Task PumpWorkloadOutputAsync(CancellationToken ct)
     {
         EnterCaseIngressPump();
@@ -1820,6 +1839,14 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
         {
             while (!ct.IsCancellationRequested)
             {
+                if (_outputPump is { } pump)
+                {
+                    // Wait for the next item on the pump's own thread: the read resumes there, not on
+                    // the pool. An item's processing may have resumed elsewhere; come back first.
+                    await pump.SwitchTo();
+                    SynchronizationContext.SetSynchronizationContext(pump);
+                }
+
                 ReadOnlyMemory<byte> data;
                 IReadOnlyList<AnsiToken>? preTokenizedTokens = null;
                 Hmp1TerminalState? remoteState = null;
@@ -1860,6 +1887,11 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 {
                     data = await _workload.ReadOutputAsync(ct);
                 }
+
+                // Process the item with the scheduling it always had: its awaits resume on the pool,
+                // never queued behind this thread (a synchronous wait here cannot deadlock on it).
+                if (_outputPump is not null)
+                    SynchronizationContext.SetSynchronizationContext(null);
 
                 if (readItem.Resize is { } resize)
                 {
