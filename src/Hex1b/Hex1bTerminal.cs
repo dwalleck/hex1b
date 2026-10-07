@@ -1835,11 +1835,14 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     private async Task PumpWorkloadOutputAsync(CancellationToken ct)
     {
         EnterCaseIngressPump();
+        // Only the run started on the pump's own thread uses it; a direct call (a test fixture) keeps the
+        // caller's scheduling.
+        var pumpContext = _outputPump is { IsCurrentThread: true } dedicated ? dedicated : null;
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                if (_outputPump is { } pump)
+                if (pumpContext is { } pump)
                 {
                     // Wait for the next item on the pump's own thread: the read resumes there, not on
                     // the pool. An item's processing may have resumed elsewhere; come back first.
@@ -1890,7 +1893,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
 
                 // Process the item with the scheduling it always had: its awaits resume on the pool,
                 // never queued behind this thread (a synchronous wait here cannot deadlock on it).
-                if (_outputPump is not null)
+                if (pumpContext is not null)
                     SynchronizationContext.SetSynchronizationContext(null);
 
                 if (readItem.Resize is { } resize)

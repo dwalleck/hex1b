@@ -621,7 +621,7 @@ public sealed partial class Hex1bTerminal
             "_caseIngress", "_caseIngressPending", "_continuationUncommitted", "_disposeCts", "_disposed", "_hmp1OutputStateLock", "_hmp1State",
             "_deferHmp1ReplayCallbacks", "<Hmp1ReplayActivityState>k__BackingField",
             "<Hmp1ReplayCommandMarkState>k__BackingField", "<Hmp1ReplayScrollbackState>k__BackingField",
-            "_inputProcessingTask", "_outputProcessingTask", "_metrics", "_nativeDelivery", "<InputMilestones>k__BackingField",
+            "_inputProcessingTask", "_outputProcessingTask", "_outputPump", "_metrics", "_nativeDelivery", "<InputMilestones>k__BackingField",
             "_presentation", "_presentationFilters", "_presentationInputChannel", "_presentationOwnsResize", "_pumpFaultTcs",
             "_runCallback", "_scrollbackCallback", "_timeProvider", "_workload", "_workloadFilters",
             "_workloadInputWriteLock", "_outputBytesRead", "_trackedObjects", "_currentGraphicsImpacts",
