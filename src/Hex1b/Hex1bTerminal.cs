@@ -1979,8 +1979,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                     if (pumpContext is { } idlePump)
                     {
                         await idlePump.SwitchTo();
-                        if (ct.WaitHandle.WaitOne(10))
-                            ct.ThrowIfCancellationRequested();
+                        // Not ct.WaitHandle: disposal disposes the token's source, and reading it then throws.
+                        Thread.Sleep(10);
+                        ct.ThrowIfCancellationRequested();
                     }
                     else
                     {

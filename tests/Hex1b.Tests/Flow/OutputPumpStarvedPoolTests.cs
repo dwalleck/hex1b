@@ -75,6 +75,7 @@ public class OutputPumpStarvedPoolTests
         Assert.IsTrue(presentation.WaitForOutput("warm", TimeSpan.FromSeconds(10)));
         SettlePump();
 
+        var observations = new List<Task<(int Column, int Row)?>>();
         using (PoolStarvation.Begin())
         {
             // A barrier is an empty item: after it the pump idles briefly before its next read. Flow posts
@@ -82,8 +83,14 @@ public class OutputPumpStarvedPoolTests
             for (var i = 0; i < 2; i++)
             {
                 // The first observation's waiter cannot run (starved), so its barrier stays listed.
-                ObserveAndAssertBarrierConsumedWithinBound(workload, PendingBarriers(workload));
+                observations.Add(ObserveAndAssertBarrierConsumedWithinBound(workload, PendingBarriers(workload)));
             }
+        }
+
+        foreach (var observation in observations)
+        {
+            Assert.IsTrue(observation.Wait(TimeSpan.FromSeconds(10)));
+            Assert.AreEqual((3, 2), observation.Result, "Each observation reports the position once the pool recovers.");
         }
     }
 

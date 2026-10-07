@@ -39,7 +39,7 @@ internal sealed class DedicatedThreadSynchronizationContext : SynchronizationCon
     public static Task Start(string name, Func<DedicatedThreadSynchronizationContext, Task> loop)
     {
         var context = new DedicatedThreadSynchronizationContext(name, loop);
-        context._thread.UnsafeStart();
+        context._thread.Start(); // flows the creator's ExecutionContext, as Task.Run did
         return context._completion.Task;
     }
 
