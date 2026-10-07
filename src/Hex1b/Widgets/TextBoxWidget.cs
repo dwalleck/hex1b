@@ -283,6 +283,42 @@ public sealed record TextBoxWidget(string? Text = null) : Hex1bWidget,
         => this with { PredictHandler = predictor, PredictionDebounceValue = debounce };
 
     /// <summary>
+    /// Internal display map (issue 62). When set, each grapheme of the buffer is shown as the map's stand-in.
+    /// </summary>
+    internal Func<string, string?>? DisplayMapValue { get; init; }
+
+    /// <summary>
+    /// Shows each grapheme of the buffer as <paramref name="map"/>'s stand-in while the buffer keeps its exact
+    /// characters: <see cref="TextBoxState.Text"/>, <see cref="TextBoxState.SelectedText"/>, offsets and the text
+    /// passed to change, submit and paste handlers are unchanged. Use it to make control, bidi-format and other
+    /// invisible characters visible while the user edits.
+    /// </summary>
+    /// <param name="map">Receives one grapheme cluster (<see cref="System.Globalization.StringInfo"/> text elements:
+    /// extend characters such as ZWJ or combining marks arrive attached to their base, and in multiline mode
+    /// <c>\n</c> never arrives) and returns the text to show instead, or <c>null</c> to show the grapheme itself. The
+    /// result may be wider or narrower than the original, or empty. Any C0 control, DEL or C1 control left in the shown
+    /// text is drawn as U+FFFD, and the inline prediction goes through the same map, so a mapped text box never writes
+    /// a raw control character to the terminal. Each grapheme's shown text must start a new grapheme on screen: where a
+    /// stand-in would fuse with a neighbour (for example an empty stand-in between two regional indicators, or a
+    /// stand-in followed by a lone ZWJ or spacing mark), one of the two is drawn as U+FFFD.</param>
+    /// <returns>A widget configured with the map.</returns>
+    /// <remarks>
+    /// <para>Measurement, scrolling, word wrap, the caret, selection cells, mouse hit-testing and Up/Down movement all
+    /// use the shown widths, one grapheme at a time: a stand-in is never split across rows, and a click or vertical
+    /// move lands on a grapheme boundary.</para>
+    /// <para>Keyboard movement and deletion step by <see cref="GraphemeHelper"/> clusters, which scan at most 64 UTF-16
+    /// chars; a longer cluster (for example a base followed by many tag characters) takes more than one step, and the
+    /// caret is drawn at the cluster's start until it leaves it.</para>
+    /// <para>The map runs during layout on the input thread and must be pure. Layout is cached per buffer string and
+    /// map delegate (compared with <see cref="Delegate.Equals(object)"/>), so pass a stable delegate; a delegate over a
+    /// new closure each build re-lays out the buffer and redraws the text box. The map's result must depend only on
+    /// the grapheme: an equal delegate whose target's state changed is not re-run.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="map"/> is null.</exception>
+    public TextBoxWidget DisplayMap(Func<string, string?> map)
+        => this with { DisplayMapValue = map ?? throw new ArgumentNullException(nameof(map)) };
+
+    /// <summary>
     /// Externally-supplied state instance. When set, the textbox becomes a
     /// pure view of <see cref="InjectedState"/> — the framework routes this
     /// exact instance into the underlying node on every reconcile, so the
@@ -420,6 +456,8 @@ public sealed record TextBoxWidget(string? Text = null) : Hex1bWidget,
         // Wire paste handler
         node.CustomPasteAction = PasteHandler;
         node.OrderedPasteFactory = OrderedPasteFactory;
+
+        node.DisplayMap = DisplayMapValue;
 
         // Sync min/max width to node
         node.MinWidth = MinWidth;

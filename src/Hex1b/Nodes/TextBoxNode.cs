@@ -6,7 +6,7 @@ using Hex1b.Widgets;
 
 namespace Hex1b;
 
-public sealed class TextBoxNode : Hex1bNode
+public sealed partial class TextBoxNode : Hex1bNode
 {
     /// <summary>
     /// The source widget that was reconciled into this node.
@@ -761,7 +761,7 @@ public sealed class TextBoxNode : Hex1bNode
     private void MoveUp()
     {
         ClearPrediction();
-        State.MoveUp();
+        MoveVertical(-1, extend: false);
         MarkDirty();
     }
 
@@ -787,7 +787,7 @@ public sealed class TextBoxNode : Hex1bNode
         }
         else
         {
-            State.MoveDown();
+            MoveVertical(1, extend: false);
             MarkDirty();
         }
     }
@@ -795,14 +795,14 @@ public sealed class TextBoxNode : Hex1bNode
     private void SelectUp()
     {
         ClearPrediction();
-        State.MoveUp(extend: true);
+        MoveVertical(-1, extend: true);
         MarkDirty();
     }
 
     private void SelectDown()
     {
         ClearPrediction();
-        State.MoveDown(extend: true);
+        MoveVertical(1, extend: true);
         MarkDirty();
     }
 
@@ -963,6 +963,11 @@ public sealed class TextBoxNode : Hex1bNode
         // Any click cancels an active prediction.
         ClearPrediction();
 
+        if (DisplayMap is { } map)
+        {
+            return HandleMouseClickMapped(map, localX, localY);
+        }
+
         if (IsMultiline)
         {
             return HandleMouseClickMultiline(localX, localY);
@@ -1085,7 +1090,9 @@ public sealed class TextBoxNode : Hex1bNode
             return MeasureMultiline(constraints);
         }
 
-        var textDisplayWidth = Math.Max(DisplayWidth.GetStringWidth(State.Text), 1);
+        var textDisplayWidth = Math.Max(DisplayMap is { } map
+            ? GetDisplayLayout(map).Lines[0].Width
+            : DisplayWidth.GetStringWidth(State.Text), 1);
 
         int width;
         if (MinWidth.HasValue || MaxWidth.HasValue)
@@ -1208,6 +1215,7 @@ public sealed class TextBoxNode : Hex1bNode
     /// </summary>
     private int ComputeWrappedLineCount(int viewportWidth)
     {
+        if (DisplayMap is { } map) return Math.Max(1, GetDisplayLayout(map).GetRows(viewportWidth, wrap: true).Length);
         if (viewportWidth <= 0) return State.GetLineCount();
         var count = 0;
         var lineCount = State.GetLineCount();
@@ -1500,6 +1508,12 @@ public sealed class TextBoxNode : Hex1bNode
 
         var globalColors = theme.GetGlobalColorCodes();
         var resetToGlobal = theme.GetResetToGlobalCodes();
+
+        if (DisplayMap is { } map)
+        {
+            RenderMapped(context, map, globalColors, resetToGlobal, fillBg, selFg, selBg, predictionFg, predictionBg);
+            return;
+        }
 
         // Multiline text boxes use their own render path. Predictions are
         // single-line only by design.
