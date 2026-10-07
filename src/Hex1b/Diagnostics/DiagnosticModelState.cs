@@ -117,7 +117,7 @@ public sealed record DiagnosticModelState
 
     /// <summary>
     /// State surfaces the profile cannot represent that hold state (<c>graphics</c>, <c>sixel-continuation</c>,
-    /// <c>dcs-retention-limit</c>), in name order. A projection naming any is not comparable.
+    /// <c>dcs-retention-limit</c>, <c>line-renditions</c>), in name order. A projection naming any is not comparable.
     /// </summary>
     [JsonPropertyName("unsupported")]
     public IReadOnlyList<string> Unsupported { get; init; } = [];

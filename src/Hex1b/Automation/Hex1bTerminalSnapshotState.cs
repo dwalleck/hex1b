@@ -43,4 +43,7 @@ internal sealed record Hex1bTerminalSnapshotState(
     bool ReflowEnabled,
     bool SynchronizedUpdatePending,
     long SynchronizedUpdateStartedSequence,
-    bool Disposed);
+    bool Disposed)
+{
+    internal LineRendition[] LineRenditions { get; init; } = [];
+}

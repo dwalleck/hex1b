@@ -95,6 +95,9 @@ public partial class DiagnosticModelRestoreTests
             for (var column = 0; column < buffer.GetLength(1); column++)
                 if (buffer[row, column].Sequence != 0)
                     buffer[row, column] = buffer[row, column] with { Sequence = 9_000_000_000_000L - buffer[row, column].Sequence };
+        // The last-printed copy's write is relabeled with the buffers (issue 60, D1): only its equality is projected.
+        var printed = (TerminalCell)PrivateField(model, "_lastPrintedCell");
+        SetPrivateField(model, "_lastPrintedCell", printed with { Sequence = 9_000_000_000_000L - printed.Sequence });
         Assert.IsEmpty(JsonDifferences(json, Json(model.CaptureModelState())), "absolute sequences leaked into the projection");
     }
 
@@ -222,7 +225,7 @@ public partial class DiagnosticModelRestoreTests
         row with { Cells = row.Cells.Select((cell, index) => index == column ? change(cell) : cell).ToArray() };
 
     private static TerminalCell[,] WriteClassBuffer(Hex1bTerminal terminal, string name) =>
-        (TerminalCell[,])PrivateField(terminal, name);
+        ((TerminalScreenBuffer)PrivateField(terminal, name)).Cells;
 
     private static IEnumerable<long> WriteClassSequences(Hex1bTerminal terminal)
     {
@@ -231,7 +234,7 @@ public partial class DiagnosticModelRestoreTests
                 yield return cell.Sequence;
         foreach (var cell in WriteClassBuffer(terminal, "_screenBuffer"))
             yield return cell.Sequence;
-        if (PrivateField(terminal, "_savedMainScreenBuffer") is TerminalCell[,] main)
+        if (PrivateField(terminal, "_savedMainScreenBuffer") is TerminalScreenBuffer { Cells: var main })
             foreach (var cell in main)
                 yield return cell.Sequence;
     }

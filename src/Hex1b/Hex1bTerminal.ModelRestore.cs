@@ -155,8 +155,17 @@ public sealed partial class Hex1bTerminal
                     _lastPrintedCellX = last.X;
                     _lastPrintedCellY = last.Y;
                     _lastPrintedCellWidth = last.Width;
-                    // The original holds the cell as a copy, not a counted reference: the restored one does too.
-                    var cell = RestoreCell(last.Cell, state.Styles, cells, built);
+                    // The original holds the cell as a copy, not a counted reference: the restored one does too. Its write
+                    // identity is its same-write buffer cell's restored one (shared with that cell's whole class), otherwise
+                    // its own fresh one, never zero (which never-written and erased cells hold): later modifiers attach to
+                    // it exactly when they attached in the original (issue 60, decision D1).
+                    var cell = RestoreCell(last.Cell, state.Styles, cells, built, last.SameWrite switch
+                    {
+                        { Buffer: "history" } at => _scrollbackBuffer!.GetEntryAt(at.Row).Row.Cells[at.Column].Sequence,
+                        { Buffer: "savedMainScreen" } at => _savedMainScreenBuffer![at.Row, at.Column].Sequence,
+                        { } at => _screenBuffer[at.Row, at.Column].Sequence,
+                        null => ++_writeSequence,
+                    });
                     cell.TrackedHyperlink?.Release();
                     _lastPrintedCell = cell;
                 }
@@ -251,6 +260,22 @@ public sealed partial class Hex1bTerminal
             return $"unsupported surfaces ({string.Join(", ", state.Unsupported)})";
         if (state.Screen.Count != state.Height || state.Screen.Any(row => row.Cells.Count != state.Width))
             return "a screen whose rows do not match its geometry";
+        // A copy that is the same write as a buffer cell needs that cell to exist and to be written.
+        if (state.LastPrinted?.SameWrite is { } same)
+        {
+            var rows = same.Buffer switch
+            {
+                "history" => state.History?.Rows,
+                "savedMainScreen" => state.SavedMainScreen,
+                "screen" => state.Screen,
+                _ => null,
+            };
+            // This runs before the rows themselves are validated: a missing row or cell list refuses here, never throws.
+            var lastRun = 0;
+            if (rows is null || same.Row < 0 || same.Row >= rows.Count || rows[same.Row]?.Cells is not { } cells
+                || same.Column < 0 || same.Column >= cells.Count || UnwrittenAt(rows[same.Row].Unwritten, same.Column, ref lastRun))
+                return "a last-printed same-write cell that is not a written buffer cell";
+        }
         return null;
     }
 

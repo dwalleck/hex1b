@@ -74,6 +74,7 @@ export class WebTerminal implements WebTerminalHandle {
   #connected = false;
   #closed = false;
   #readOnly: boolean;
+  #preserveOnDisconnect: boolean;
   #disposed = false;
   #hasGeometry = false;
   #resizeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -114,6 +115,7 @@ export class WebTerminal implements WebTerminalHandle {
   #selectionUIError = "";
   #canvasSize = { width: 0, height: 0 };
   #hyperlinks = new Hyperlinks();
+  #lineRenditions: readonly number[] = [];
   #links: false | TerminalLinkOptions;
   #linkDetector: LinkDetection;
   #linkGeneration = 1;
@@ -155,6 +157,9 @@ export class WebTerminal implements WebTerminalHandle {
     if (options.readOnly !== undefined && typeof options.readOnly !== "boolean")
       throw new TypeError("readOnly must be a boolean");
     this.#readOnly = options.readOnly ?? false;
+    if (options.preserveOnDisconnect !== undefined && typeof options.preserveOnDisconnect !== "boolean")
+      throw new TypeError("preserveOnDisconnect must be a boolean");
+    this.#preserveOnDisconnect = options.preserveOnDisconnect ?? false;
     this.#renderer = normalizeRenderer(options.renderer);
     this.#colorMode = normalizeColorMode(options.colorMode);
     this.#palettes = {
@@ -344,6 +349,7 @@ export class WebTerminal implements WebTerminalHandle {
       catch (error) { this.#inspectionError = errorMessage(error); this.#inspectionChanged(); }
     };
     this.#mouse = captureMouse(this.#canvas, command => this.#inputCommand(command), () => this.focus(), {
+      lineRenditions: () => this.#lineRenditions,
       state: () => ({ historical: !this.viewport.following || this.viewport.pending, readOnly: this.#readOnly,
         selection: this.selection }),
       begin: (point, selection) => inspect(() => this.#history.begin(point, selection)),
@@ -402,7 +408,8 @@ export class WebTerminal implements WebTerminalHandle {
     this.#colorScheme = window.matchMedia?.("(prefers-color-scheme: dark)");
     this.#colorScheme?.addEventListener("change", this.#systemColorChanged);
     this.#post({ type: "init", canvas, transport: url === undefined ? { type: "custom" } : { type: "websocket", url }, scale, font,
-      renderer: this.#renderer, palette: this.#palettes[this.resolvedColorMode] }, [canvas]);
+      renderer: this.#renderer, palette: this.#palettes[this.resolvedColorMode],
+      preserveOnDisconnect: this.#preserveOnDisconnect }, [canvas]);
     this.#applyPalette();
     this.#postLinkConfiguration();
   }
@@ -429,7 +436,8 @@ export class WebTerminal implements WebTerminalHandle {
         .then(() => this.#transportSession?.send(message.control))
         .then(() => this.#post({ type: "transportSent" }))
         .catch(error => {
-          if (!this.#disposed) this.#post({ type: "transportError", message: errorMessage(error) });
+          if (!this.#disposed && !this.#transportSession?.closing)
+            this.#post({ type: "transportError", message: errorMessage(error) });
         });
     } else if (message.type === "transportReceived") {
       this.#transportFrame?.resolve();
@@ -461,6 +469,7 @@ export class WebTerminal implements WebTerminalHandle {
       }
       this.#options.onStatus?.(message.message, message.level);
     } else if (message.type === "geometry") {
+      this.#lineRenditions = message.lineRenditions ?? [];
       this.#linkRevision = message.revision;
       this.#osc8Rows.clear();
       for (const range of message.hyperlinks) {
@@ -637,7 +646,8 @@ export class WebTerminal implements WebTerminalHandle {
         const element = document.createElement("span");
         element.className = "highlight";
         element.setAttribute("part", "selection-highlight");
-        element.style.cssText = `left:${range.startColumn / this.#geometry.columns * 100}%;top:${range.row / this.#geometry.rows * 100}%;width:${(range.endColumn - range.startColumn) / this.#geometry.columns * 100}%;height:${100 / this.#geometry.rows}%`;
+        const scaleX = this.#lineRenditions[range.row] ? 2 : 1;
+        element.style.cssText = `left:${range.startColumn * scaleX / this.#geometry.columns * 100}%;top:${range.row / this.#geometry.rows * 100}%;width:${(range.endColumn - range.startColumn) * scaleX / this.#geometry.columns * 100}%;height:${100 / this.#geometry.rows}%`;
         return element;
       }));
       const live = requiredElement(this.#inspection, ".return-live", HTMLButtonElement);

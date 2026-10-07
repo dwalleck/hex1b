@@ -131,6 +131,8 @@ public partial class DiagnosticModelRestoreTests
         var pendingStarts = 0;
         var saves = 0;
         var restores = 0;
+        var currentModifiers = 0;
+        var otherWriteModifiers = 0;
         for (var seed = first; seed < first + trials; seed++)
         {
             var random = new Random(seed);
@@ -170,6 +172,13 @@ public partial class DiagnosticModelRestoreTests
             var p = state.PendingInput;
             if (p.EscapePrefix.Length > 0 || p.Utf8.Length > 0 || p.GroundEscape || p.FramerUtf8Remaining != 0)
                 pendingStarts++;
+            if (state.LastPrinted is { } printed && after.Take(1).Any(step => step is "\u0301" or "\u200D"))
+            {
+                if (printed.SameWrite is { Buffer: "screen" } same && same.Row == printed.Y && same.Column == printed.X)
+                    currentModifiers++;
+                else
+                    otherWriteModifiers++;
+            }
             var replica = FuzzModel(width, height, scrollback, strategy, modern);
             try
             {
@@ -206,6 +215,8 @@ public partial class DiagnosticModelRestoreTests
             Assert.IsGreaterThan(0, pendingStarts, "the run never started between the halves of a split chunk, so it did not exercise pending input");
             Assert.IsGreaterThan(0, saves, "the run never applied DECSC");
             Assert.IsGreaterThan(0, restores, "the run never applied DECRC");
+            Assert.IsGreaterThan(0, currentModifiers, "no start was followed by a zero-width modifier on a current last-printed glyph");
+            Assert.IsGreaterThan(0, otherWriteModifiers, "no start was followed by a zero-width modifier while the last-printed glyph was not in place (scrolled, erased, moved or replaced)");
         }
     }
 
@@ -257,9 +268,9 @@ public partial class DiagnosticModelRestoreTests
     private static string FuzzStep(Random random, int width, int height)
     {
         string[] clusters = ["กำ", "각", "\u001b[?2027hकि", "漢", "❤️", "❤\u001b[m️"];
-        var kind = random.Next(36);
-        if (kind >= 28)
-            kind = kind < 32 ? 0 : 3;
+        var kind = random.Next(38);
+        if (kind >= 30)
+            kind = kind < 34 ? 0 : 3;
         return kind switch
         {
             0 or 1 or 2 => new string('a', random.Next(0, width)) + clusters[random.Next(clusters.Length)] + "xyz",
@@ -286,6 +297,10 @@ public partial class DiagnosticModelRestoreTests
             24 => $"\u001b[{random.Next(1, 3)}@",
             25 => $"\u001b[{random.Next(1, 3)}P",
             26 => "\u001b7",
+            // Issue 60 (D1): a lone combining mark or ZWJ attaches to the last printed glyph only while it is the same
+            // write as the cell at its position, so these exercise the restored last-printed identity both ways.
+            28 => "\u0301",
+            29 => "\u200D",
             _ => "\u001b8",
         };
     }

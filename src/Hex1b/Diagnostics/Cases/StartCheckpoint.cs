@@ -62,7 +62,7 @@ internal static class StartCheckpoint
     /// </summary>
     internal static IReadOnlyList<string> Unsupported(DiagnosticModelState state)
     {
-        // The projection names the remaining refused surfaces: identified Sixel, lost DCS content and graphics.
+        // The projection names the remaining refused surfaces: identified Sixel, lost DCS content, graphics and DEC line renditions.
         return state.Unsupported;
     }
 }

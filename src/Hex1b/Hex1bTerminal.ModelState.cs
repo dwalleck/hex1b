@@ -73,7 +73,7 @@ public sealed partial class Hex1bTerminal
     private long EstimateModelStateCellsUnsafe()
     {
         // The saved main screen keeps the size it had when the alternate screen was entered.
-        var cells = (long)_width * _height + (_savedMainScreenBuffer?.Length ?? 0);
+        var cells = (long)_width * _height + (_savedMainScreenBuffer is { } saved ? (long)saved.Width * saved.Height : 0);
         if (_scrollbackBuffer is { Count: > 0 } history)
         {
             for (var row = 0; row < history.Count; row++)
@@ -129,8 +129,8 @@ public sealed partial class Hex1bTerminal
                 history = new DiagnosticModelHistory { Capacity = scrollback.Capacity, NextRowId = scrollback.NextRowId, Rows = rows };
             }
             // Assign class labels at their first occurrence in history, main/saved main, then alternate.
-            var savedMain = _savedMainScreenBuffer is { } main ? ProjectScreen(main, styles, writeClasses, historyLast) : null;
-            var screen = ProjectScreen(_screenBuffer, styles, writeClasses, _inAlternateScreen ? null : historyLast);
+            var savedMain = _savedMainScreenBuffer is { } main ? ProjectScreen(main.Cells, styles, writeClasses, historyLast) : null;
+            var screen = ProjectScreen(_screenBuffer.Cells, styles, writeClasses, _inAlternateScreen ? null : historyLast);
 
             var tabColumns = new List<int>();
             for (var column = 0; column < _tabStops.Length; column++)
@@ -154,6 +154,7 @@ public sealed partial class Hex1bTerminal
                     Y = _lastPrintedCellY,
                     Width = _lastPrintedCellWidth,
                     Cell = ProjectCell(_lastPrintedCell, styles),
+                    SameWrite = LastPrintedSameWriteUnsafe(),
                 }
                 : null;
 
@@ -161,6 +162,8 @@ public sealed partial class Hex1bTerminal
             AddPendingInputUnsupportedUnsafe(unsupported);
             if (HoldsGraphicsState())
                 unsupported.Add("graphics");
+            if (HoldsLineRenditionsUnsafe())
+                unsupported.Add("line-renditions");
             unsupported.Sort(StringComparer.Ordinal);
 
             var activity = _activityState;
@@ -241,6 +244,64 @@ public sealed partial class Hex1bTerminal
                 Styles = styles.Styles,
                 Unsupported = unsupported,
             };
+        }
+    }
+
+    // The first buffer cell in reading order that is the same write as the last printed copy, or null. A later combining
+    // mark, ZWJ continuation or variation selector attaches only while the active cell at the copy's position is that
+    // write (UpdateLastGrapheme), and rows can move it away and back, so the identity is recorded as a member of the
+    // copy's write class rather than as a fact about one position (issue 60, decision D1). O(cells).
+    private DiagnosticModelCellLocation? LastPrintedSameWriteUnsafe()
+    {
+        var sequence = _lastPrintedCell.Sequence;
+        if (sequence == 0)
+            return null;
+        if (_scrollbackBuffer is { } history)
+        {
+            for (var row = 0; row < history.Count; row++)
+            {
+                var cells = history.GetEntryAt(row).Row.Cells;
+                for (var column = 0; column < cells.Length; column++)
+                    if (cells[column].Sequence == sequence)
+                        return new DiagnosticModelCellLocation { Buffer = "history", Row = row, Column = column };
+            }
+        }
+        if (_inAlternateScreen && _savedMainScreenBuffer is { } main && Find(main) is var (savedRow, savedColumn))
+            return new DiagnosticModelCellLocation { Buffer = "savedMainScreen", Row = savedRow, Column = savedColumn };
+        if (Find(_screenBuffer) is var (screenRow, screenColumn))
+            return new DiagnosticModelCellLocation { Buffer = "screen", Row = screenRow, Column = screenColumn };
+        return null;
+
+        (int Row, int Column)? Find(TerminalScreenBuffer buffer)
+        {
+            for (var row = 0; row < buffer.Height; row++)
+                for (var column = 0; column < buffer.Width; column++)
+                    if (buffer[row, column].Sequence == sequence)
+                        return (row, column);
+            return null;
+        }
+    }
+
+    // DEC line renditions (DECDWL/DECDHL) have no text-state field: any non-single-width row on a screen or in retained
+    // history makes the state unsupported rather than restored as single width (issue 60, decision D2).
+    private bool HoldsLineRenditionsUnsafe()
+    {
+        if (HasLineRendition(_screenBuffer) || (_savedMainScreenBuffer is { } main && HasLineRendition(main)))
+            return true;
+        if (_scrollbackBuffer is { } history)
+        {
+            for (var row = 0; row < history.Count; row++)
+                if (history.GetEntryAt(row).Row.Rendition != LineRendition.SingleWidth)
+                    return true;
+        }
+        return false;
+
+        static bool HasLineRendition(TerminalScreenBuffer buffer)
+        {
+            foreach (var rendition in buffer.Renditions)
+                if (rendition != LineRendition.SingleWidth)
+                    return true;
+            return false;
         }
     }
 
@@ -414,9 +475,9 @@ public sealed partial class Hex1bTerminal
                 foreach (var cell in history.GetEntryAt(row).Row.Cells)
                     classes.Observe(cell.Sequence);
         }
-        ObserveScreen(_screenBuffer);
+        ObserveScreen(_screenBuffer.Cells);
         if (_savedMainScreenBuffer is { } main)
-            ObserveScreen(main);
+            ObserveScreen(main.Cells);
         return classes;
 
         void ObserveScreen(TerminalCell[,] buffer)
@@ -511,6 +572,7 @@ public sealed partial class Hex1bTerminal
         const string MarkAnchors = "projected: command marks' anchors, as their positions (buffer, row, column); "
             + "browser custom markers' anchors in the same sets are view state, not projected";
         const string Graphics = "unsupported:graphics";
+        const string LineRenditions = "unsupported:line-renditions";
 
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
         void Set(string value, params string[] names)
@@ -574,12 +636,14 @@ public sealed partial class Hex1bTerminal
             "TerminalCell.<UnderlineColor>k__BackingField", "TerminalCell.<UnderlineStyle>k__BackingField",
             "TerminalCell.<IsWideWrapPadding>k__BackingField",
             "ScrollbackRow.<Cells>k__BackingField", "ScrollbackRow.<OriginalWidth>k__BackingField",
+            "TerminalScreenBuffer._cells", "TerminalScreenBuffer.<Width>k__BackingField", "TerminalScreenBuffer.<Height>k__BackingField",
             "ScrollbackBuffer._rows", "ScrollbackBuffer._rowIds", "ScrollbackBuffer._head", "ScrollbackBuffer._count",
             "ScrollbackBuffer._nextRowId", "ScrollbackBuffer.<Capacity>k__BackingField",
             "TerminalCommandMark.<Phase>k__BackingField", "TerminalCommandMark.<ExitCode>k__BackingField",
             "TerminalCommandMark.<RawParameters>k__BackingField",
             "TerminalActivityState.<Progress>k__BackingField", "TerminalActivityState.<ShellIntegration>k__BackingField",
             "TerminalActivityState.<WorkingDirectory>k__BackingField");
+        Set(LineRenditions, "TerminalScreenBuffer._renditions", "ScrollbackRow.<Rendition>k__BackingField");
         Set(Clock, "TerminalCell.<WrittenAt>k__BackingField", "ScrollbackRow.<Timestamp>k__BackingField");
         Set(Identity, "TerminalCommandMark.<TextGeneration>k__BackingField", "TerminalCommandMark.<TextRowId>k__BackingField");
         Set(Infrastructure, "ScrollbackBuffer._rowPruned", "TerminalCommandMark._parameters");

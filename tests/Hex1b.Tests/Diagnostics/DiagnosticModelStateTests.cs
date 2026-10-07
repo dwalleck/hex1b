@@ -43,6 +43,8 @@ public class DiagnosticModelStateTests
         var fields = FieldNames(typeof(Hex1bTerminal), qualified: false)
             .Concat(FieldNames(typeof(TerminalCell), qualified: true))
             .Concat(FieldNames(typeof(ScrollbackRow), qualified: true))
+            // Issue 60 (D2): the screen buffers' own fields, so a model field inside them cannot be dropped silently.
+            .Concat(FieldNames(typeof(TerminalScreenBuffer), qualified: true))
             .Concat(FieldNames(typeof(ScrollbackBuffer), qualified: true))
             .Concat(FieldNames(typeof(TerminalCommandMark), qualified: true))
             .Concat(FieldNames(typeof(TerminalActivityState), qualified: true))

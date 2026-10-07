@@ -148,16 +148,26 @@ dotnet run --project apphost.cs
 
 - [.NET SDK 10.0.401](https://dotnet.microsoft.com/download), pinned by `global.json` for the repository's Roslyn 5.9 analyzers
 - A terminal emulator with good ANSI support
-- On Linux: GCC and Make for the native interop library
+- For source builds on Unix: `build-essential` on Ubuntu/Debian, or Xcode Command
+  Line Tools on macOS (`xcode-select --install`).
 
 ### Building
 
 ```bash
-dotnet build
+dotnet build src/Hex1b/Hex1b.csproj
 ```
 
-On Linux, rebuild the native library from the same source revision before running
-PTY or native interop tests; the managed build does not compile the C source:
+Samples build their native interop dependency automatically. For example:
+
+```bash
+dotnet run --project samples/KgpCloudDemo
+```
+
+See [Contributing](CONTRIBUTING.md#running-samples) for native build prerequisites
+and cross-publishing.
+
+The managed build compiles the native library when its source changes. To rebuild it
+explicitly and check its exported symbols on Linux:
 
 ```bash
 make -C src/Hex1b/native all check-exports
@@ -166,7 +176,7 @@ make -C src/Hex1b/native all check-exports
 ### Running Tests
 
 ```bash
-dotnet test
+dotnet test tests/Hex1b.Tests/Hex1b.Tests.csproj
 ```
 
 ### Project Structure

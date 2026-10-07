@@ -20,10 +20,13 @@ switch (benchmarkType)
     case "diagnostics":
         BenchmarkSwitcher.FromTypes([typeof(DiagnosticCaseBenchmarks)]).Run(bdnArgs);
         break;
+    case "text":
+        BenchmarkSwitcher.FromTypes([typeof(TerminalTextBenchmarks)]).Run(bdnArgs);
+        break;
     case "all":
     default:
         BenchmarkSwitcher.FromTypes(
-            [typeof(SurfaceBenchmarks), typeof(RenderingModeBenchmarks), typeof(SixelHardeningBenchmarks), typeof(DiagnosticCaseBenchmarks)])
+            [typeof(SurfaceBenchmarks), typeof(RenderingModeBenchmarks), typeof(SixelHardeningBenchmarks), typeof(DiagnosticCaseBenchmarks), typeof(TerminalTextBenchmarks)])
             .Run(bdnArgs);
         break;
 }

@@ -28,6 +28,7 @@ internal static class ModelStateComparer
         "text identities: row ids and the text generation, assigned when text is read (a command mark's position is compared as its buffer, row and column)",
         "caller-created text anchors and their views (browser custom markers)",
         "graphics: images, placements and Sixel registers are named unsupported, never compared",
+        "line renditions: DEC double-width and double-height rows are named unsupported (line-renditions), never compared",
     ];
     internal const int MaxMaxDifferences = 100_000;
 
@@ -357,6 +358,12 @@ internal static class ModelStateComparer
             Number("lastPrinted", "lastPrinted.y", recorded.Y, reapplied.Y);
             Number("lastPrinted", "lastPrinted.width", recorded.Width, reapplied.Width);
             Cell("lastPrinted", "lastPrinted.cell", -1, -1, recorded.Cell, reapplied.Cell, bufferCell: false);
+            if (Presence("lastPrinted", "lastPrinted.sameWrite", recorded.SameWrite, reapplied.SameWrite))
+            {
+                String("lastPrinted", "lastPrinted.sameWrite.buffer", recorded.SameWrite!.Buffer, reapplied.SameWrite!.Buffer);
+                Number("lastPrinted", "lastPrinted.sameWrite.row", recorded.SameWrite.Row, reapplied.SameWrite.Row);
+                Number("lastPrinted", "lastPrinted.sameWrite.column", recorded.SameWrite.Column, reapplied.SameWrite.Column);
+            }
         }
 
         public void PendingInput(DiagnosticModelPendingInput recorded, DiagnosticModelPendingInput reapplied)

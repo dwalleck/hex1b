@@ -331,7 +331,9 @@ Start a case in one of two ways:
   by the start and restored before the first recorded chunk, so a split scalar, sequence or
   DCS continues as in the original. Otherwise it is `unsupported`, and `unsupportedSurfaces`
   names each surface found: `sixel-continuation` (an identified unfinished Sixel),
-  `dcs-retention-limit` (required DCS content the parser has discarded), and `graphics`.
+  `dcs-retention-limit` (required DCS content the parser has discarded), `graphics`, and
+  `line-renditions` (a DEC double-width or double-height row, DECDWL/DECDHL, on either screen or in
+  retained history; the profile has no field for it).
   A start too large for the case's `maxBytes` (`size-limit`; retained continuation and its
   serialized metadata count toward it), one larger than the 256 MiB pending-state budget,
   one taken inside an application, or one on a terminal whose configuration a re-application
@@ -469,8 +471,8 @@ taken in one hold of the model lock, between two model events, at the model sequ
   margins, tab stops, character sets, rendition, titles and the title stack, activity, command
   marks with the positions of their text (`buffer`, `row` over retained history then the screen,
   and `column`), grapheme continuation, and output held between chunks, including supported DCS.
-  `state.unsupported` names `sixel-continuation`, `dcs-retention-limit` or `graphics` when present;
-  such a checkpoint is never compared.
+  `state.unsupported` names `sixel-continuation`, `dcs-retention-limit`, `graphics` or
+  `line-renditions` when present; such a checkpoint is never compared.
 - Without it, the checkpoint records the boundary only (`status: unavailable`,
   `reason: requires reapplication-data`).
 - A state too large for the case's size bound is written without it (`status: missing`,
@@ -572,7 +574,7 @@ start is, in one hold of the model lock at an event boundary, and holds the mode
 state at that model sequence (`checkpoint` line, trigger `recovery`, status `recorded`, with its
 `state`). It needs `reapplication-data`, and is classified as a start is: `complete`, or
 `unsupported` with the reason (`unsupported-surfaces` naming `sixel-continuation`,
-`dcs-retention-limit` or `graphics`;
+`dcs-retention-limit`, `graphics` or `line-renditions`;
 `size-limit`, a state that would not fit what the case's events tier leaves after the queued events
 and the checkpoint states already awaiting the writer; `pending-state budget`, counted with those
 states; `mid-application`; `unapplied-output`; `configuration: …`; `capture-failed`), in which case
@@ -672,7 +674,7 @@ the target, field by field:
 |--------------|---------|
 | `matched` | every field equal |
 | `different` | typed `differences`: paths such as `screen[3][5].text`, `history.rows[12][0].style.foreground` or `modes.wraparound`, in the projection's order, counted per surface (`bySurface`), listed up to `maxDifferences` (default 1,000) |
-| `unavailable` | no checkpoint at the target, one without state, or one naming `graphics`, `sixel-continuation` or `dcs-retention-limit` (`comparisonReason` says which) |
+| `unavailable` | no checkpoint at the target, one without state, or one naming `graphics`, `sixel-continuation`, `dcs-retention-limit` or `line-renditions` (`comparisonReason` says which); a target is unavailable when either the recorded or the reapplied state names one |
 
 The target is a model sequence (`12`; `0` is the fresh model), a case sequence (`case:34`, of a
 checkpoint or a model event), or a checkpoint label (`label:name`, or the bare name; a label that is
@@ -794,6 +796,18 @@ ownership and command-mark positions. `lastPrinted.cell` is outside the buffer-c
 Comparison checks the global equality relation: consistent label renumbering matches, while
 splitting or merging classes differs at the affected cells' `writeClass` paths.
 
+The last printed glyph is a copy, but a later combining mark, ZWJ continuation or variation
+selector attaches to it only while the active screen's cell at its position is the same write.
+Rows can move that cell away and bring it back, so the state records the write, not the position:
+`lastPrinted.sameWrite` is the `{buffer, row, column}` (`buffer` is `history`, `savedMainScreen` or
+`screen`; rows as in the buffer) of the first buffer cell, in that reading order, that is the same
+write as the copy. It is absent when no buffer cell is. Restoration gives the copy that cell's
+restored write identity, shared with its class, and otherwise a fresh one of its own, never the
+identity of never-written or erased cells. A location outside its buffer, on an unwritten cell or in an
+unknown buffer is refused. Comparison checks `lastPrinted.sameWrite.buffer`, `.row` and `.column`. The field is
+additive within `text-state/3`: a state recorded before it existed has no `sameWrite`, so its restored
+copy takes a fresh identity, and comparing it with a newer build's state reports `lastPrinted.sameWrite`.
+
 This is a clean cumulative profile cutover: the current consumer refuses `text-state/1` and
 `text-state/2` starts, targets and recovery origins as `incompatible`, and older consumers
 decline `text-state/3`. Artifact format `2` and diagnostics socket contract `1` are unchanged;
@@ -867,6 +881,6 @@ its limitations): see [Diagnostic cases](#diagnostic-cases).
 - A case started on a running target re-applies from its cumulative `text-state/3` start
   checkpoint, not from the first byte: only a case started at construction holds the output before
   it. Intact bounded non-Sixel DCS continuation is supported; refused surfaces are named
-  `sixel-continuation`, `dcs-retention-limit` and `graphics`. Output held between chunks is restored;
+  `sixel-continuation`, `dcs-retention-limit`, `graphics` and `line-renditions`. Output held between chunks is restored;
   the bytes of an unfinished escape sequence read before the start are owned as the model's
   decoded text, not as input. Budget refusal never supplies a truncated complete checkpoint.

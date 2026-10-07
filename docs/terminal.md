@@ -417,12 +417,15 @@ Located in `src/Hex1b/Reflow/`:
 | `ITerm2ReflowStrategy` | `ITerm2ReflowStrategy.cs` | No reflow (iTerm2 doesn't fully reflow) |
 | `NoReflowStrategy` | `NoReflowStrategy.cs` | No reflow (crop fallback, default) |
 
-DECRC (`ESC 8`) clamps the restored cursor to the current screen dimensions. A
-narrower or shorter screen cannot turn a saved position into an out-of-bounds
-active cursor. Strategies that reflow the DECSC save still supply its mapped
-position; other strategies retain the saved coordinates so a later widening can
-restore the original position. Restoring does not overwrite that save or discard
-its pending-wrap and character-protection state.
+DECRC (`ESC 8`) clamps the restored row to the current screen height and the
+restored column to that row's logical width (half the screen width on a DEC
+double-width or double-height line). A narrower or shorter screen cannot turn a
+saved position into an out-of-bounds active cursor. The saved pending wrap is
+restored only when the cursor lands on the line's last column. Strategies that
+reflow the DECSC save still supply its mapped position; other strategies retain
+the saved coordinates so a later widening can restore the original position.
+Restoring does not overwrite that save or discard its pending-wrap and
+character-protection state.
 
 ### Adapter Wiring
 

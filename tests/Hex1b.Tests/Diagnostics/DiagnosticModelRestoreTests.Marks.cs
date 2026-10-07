@@ -334,7 +334,9 @@ public partial class DiagnosticModelRestoreTests
     // a restored row reads as the original's for marks placed later, whatever made the glyph wide or left the cell
     // behind (review round 2: RR#1, RR#2).
     [TestMethod]
-    [DataRow("vs16 applied later", 20, 4, true, "ab\u2764\u001b[m\uFE0F", false)]
+    // Upstream 3dc2d9b6 (issue 60): a later VS16 widens the glyph through UpdateLastGrapheme, which gives the new
+    // continuation the glyph's own write, as an inline VS16 does.
+    [DataRow("vs16 applied later", 20, 4, true, "ab\u2764\u001b[m\uFE0F", true)]
     [DataRow("2027 conjunct", 20, 4, false, "ab\u0915\u094D\u0937", false)]
     [DataRow("2027 spacing mark", 20, 4, false, "ab\u0915\u093F", true)]
     [DataRow("2027 zwj text", 20, 4, false, "ab\u261D\u200D\u261D", true)]
@@ -548,7 +550,7 @@ public partial class DiagnosticModelRestoreTests
 
     private static void AssertUnflaggedGlyphIdentity(Hex1bTerminal original, DiagnosticModelState state, string cluster, string shape)
     {
-        var raw = (TerminalCell[,])PrivateField(original, "_screenBuffer");
+        var raw = ((TerminalScreenBuffer)PrivateField(original, "_screenBuffer")).Cells;
         var owners = (from row in Enumerable.Range(0, state.Screen.Count)
                       from column in Enumerable.Range(0, state.Screen[row].Cells.Count)
                       where state.Screen[row].Cells[column].Text == cluster
@@ -589,7 +591,7 @@ public partial class DiagnosticModelRestoreTests
         var original = MarkModel(MarkScenarios["screen and history"], "none");
         original.ApplyRecordedOutput(Encoding.UTF8.GetBytes("abcdefghij\u001b[3G\u001b[2X\u001b[7G\u001b[1X\r\n" + MarkLines(10) + "0123456789\u001b[2G\u001b[3X"));
         var state = original.CaptureModelState();
-        var screen = (TerminalCell[,])PrivateField(original, "_screenBuffer");
+        var screen = ((TerminalScreenBuffer)PrivateField(original, "_screenBuffer")).Cells;
         for (var row = 0; row < state.Screen.Count; row++)
             CollectionAssert.AreEqual(Zeros(Enumerable.Range(0, screen.GetLength(1)).Select(c => screen[row, c].Sequence)), Mask(state.Screen[row]), $"screen row {row}");
         var history = original.GetScrollbackRows(original.ScrollbackCount).ToList();
