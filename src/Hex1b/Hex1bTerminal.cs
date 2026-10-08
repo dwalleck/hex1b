@@ -1945,7 +1945,11 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 // been read, every item enqueued before it has already been fully applied.
                 // Complete it before any processing decision — including the empty-item
                 // frame-boundary path below, which is exactly where barriers land.
-                readItem.ProcessingBarrier?.TrySetResult(true);
+                // A cursor barrier is stamped with its consumption time (issue 61).
+                if (readItem.ProcessingBarrier is OutputProcessingBarrier cursorBarrier)
+                    cursorBarrier.Consume();
+                else
+                    readItem.ProcessingBarrier?.TrySetResult(true);
                 
                 if (data.IsEmpty && remoteState is null && animationState is null)
                 {

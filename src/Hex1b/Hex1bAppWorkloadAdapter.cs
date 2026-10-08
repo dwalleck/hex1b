@@ -1229,7 +1229,7 @@ public sealed class Hex1bAppWorkloadAdapter :
     /// </returns>
     private async Task<bool> TryAwaitOutputBarrierAsync(CancellationToken cancellationToken)
     {
-        var barrier = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var barrier = new OutputProcessingBarrier();
         var item = new WorkloadOutputItem(ReadOnlyMemory<byte>.Empty, Tokens: null)
         {
             ProcessingBarrier = barrier
@@ -1241,6 +1241,8 @@ public sealed class Hex1bAppWorkloadAdapter :
         }
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var deadline = System.Diagnostics.Stopwatch.GetTimestamp()
+            + (long)(CursorObservationBarrierTimeout.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
         timeoutCts.CancelAfter(CursorObservationBarrierTimeout);
 
         try
@@ -1258,7 +1260,10 @@ public sealed class Hex1bAppWorkloadAdapter :
         }
         catch (OperationCanceledException)
         {
-            return false;
+            // The timeout ran. The pump stamps the barrier when it consumes it: a barrier consumed within
+            // the bound still counts, even if the thread pool ran this timeout before the barrier's
+            // completion (issue 61). The 250 ms bound itself is unchanged.
+            return barrier.ConsumedBy(deadline);
         }
         finally
         {
