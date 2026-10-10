@@ -12,6 +12,10 @@ public static class AnsiTokenizer
     {
         RecognizeDcs = false,
     };
+    private static readonly TokenizerOptions s_keyInputOptions = new()
+    {
+        KeyInput = true,
+    };
 
     /// <summary>
     /// Tokenizes the given text into a list of ANSI tokens.
@@ -23,6 +27,14 @@ public static class AnsiTokenizer
 
     internal static IReadOnlyList<AnsiToken> TokenizeWithoutDcs(string text) =>
         Tokenize(text, s_withoutDcsOptions);
+
+    /// <summary>
+    /// Tokenizes text a terminal sent as input. Key encodings that output tokens cannot carry (CSI u and xterm
+    /// modifyOtherKeys <c>CSI 27;mod;code ~</c>) stay whole as <see cref="UnrecognizedSequenceToken"/>s for the input
+    /// decoder; on input, <c>CSI u</c> is never restore-cursor.
+    /// </summary>
+    internal static IReadOnlyList<AnsiToken> TokenizeInput(string text) =>
+        Tokenize(text, s_keyInputOptions);
 
     private static IReadOnlyList<AnsiToken> Tokenize(string text, TokenizerOptions options)
     {
@@ -82,7 +94,7 @@ public static class AnsiTokenizer
             else if (text[i] == '\x1b' && i + 1 < text.Length && text[i + 1] == '[')
             {
                 FlushTextToken(text, ref textStart, i, tokens);
-                i = ParseCsiSequence(text, i, tokens);
+                i = ParseCsiSequence(text, i, tokens, options.KeyInput);
             }
             // Check for SS3 sequence (ESC O) - function keys F1-F4 and arrow keys in application mode
             else if (text[i] == '\x1b' && i + 1 < text.Length && text[i + 1] == 'O' && i + 2 < text.Length)
@@ -284,7 +296,7 @@ public static class AnsiTokenizer
         }
     }
 
-    private static int ParseCsiSequence(string text, int start, List<AnsiToken> tokens)
+    private static int ParseCsiSequence(string text, int start, List<AnsiToken> tokens, bool keyInput)
     {
         // Find the command character (first letter or ~ after ESC [)
         int end = start + 2;
@@ -317,6 +329,16 @@ public static class AnsiTokenizer
         var command = text[end];
         var paramStart = start + 2 + (isPrivateMode ? 1 : 0);
         var parameters = text[paramStart..end];
+
+        // Input only (issue 63): CSI u (fixterm/CSI-u keys) is a key, not restore-cursor, and xterm modifyOtherKeys
+        // (CSI 27;mod;code ~) is a key, not a special key with a dropped third parameter. Their bytes stay whole
+        // for the input decoder.
+        if (keyInput && (command == 'u' || !isPrivateMode && command == '~' &&
+            parameters.StartsWith("27;", StringComparison.Ordinal) && parameters.Count(c => c == ';') == 2))
+        {
+            tokens.Add(new UnrecognizedSequenceToken(text[start..(end + 1)]));
+            return end + 1;
+        }
 
         switch (command)
         {
@@ -1197,5 +1219,6 @@ public static class AnsiTokenizer
     private sealed class TokenizerOptions
     {
         public bool RecognizeDcs { get; init; } = true;
+        public bool KeyInput { get; init; }
     }
 }

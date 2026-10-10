@@ -1163,7 +1163,7 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     /// </summary>
     private async Task DispatchCompleteInputTextAsync(string completeText, ReadOnlyMemory<byte> rawData, CancellationToken ct)
     {
-        var tokens = AnsiTokenizer.Tokenize(completeText);
+        var tokens = AnsiTokenizer.TokenizeInput(completeText);
 
         _metrics.TerminalInputTokens.Record(tokens.Count);
 
@@ -1539,6 +1539,9 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
     private static Hex1bKeyEvent? UnrecognizedToKeyEvent(UnrecognizedSequenceToken token)
     {
         var seq = token.Sequence;
+
+        if (TryParseKeyCodeSequence(seq, out var codepoint, out var modifierCode))
+            return KeyCodeToKeyEvent(codepoint, modifierCode);
         
         // Bare Escape
         if (seq == "\x1b")
@@ -1571,11 +1574,101 @@ public sealed partial class Hex1bTerminal : IDisposable, IAsyncDisposable
                 return new Hex1bKeyEvent(
                     KeyMapper.ToHex1bKey((ConsoleKey)((int)ConsoleKey.D0 + (c - '0'))), c, Hex1bModifiers.Alt);
             }
+
+            // Alt+control key (issue 63): ESC before a control byte is Alt on the key that byte decodes to alone
+            // (ESC CR = Alt+Enter, ESC DEL = Alt+Backspace). ESC ESC stays undecoded.
+            if (char.IsControl(c) && c != '\x1b' && ParseKeyInput(c) is { } control)
+            {
+                return control with { Modifiers = control.Modifiers | Hex1bModifiers.Alt };
+            }
         }
         
         return null;
     }
     
+    /// <summary>
+    /// Reads a key-code encoding (issue 63): xterm modifyOtherKeys <c>CSI 27 ; mod ; code ~</c> or fixterm/CSI u
+    /// <c>CSI code [; mod] u</c>.
+    /// </summary>
+    private static bool TryParseKeyCodeSequence(string seq, out int codepoint, out int modifierCode)
+    {
+        codepoint = 0;
+        modifierCode = 1;
+        if (seq.Length < 4 || seq[0] != '\x1b' || seq[1] != '[')
+            return false;
+        var parts = seq[2..^1].Split(';');
+        return seq[^1] switch
+        {
+            '~' when parts is ["27", var mod, var code] => TryParseKeyNumber(code, out codepoint) && TryParseKeyNumber(mod, out modifierCode),
+            'u' when parts is [var code] => TryParseKeyNumber(code, out codepoint),
+            'u' when parts is [var code, var mod] => TryParseKeyNumber(code, out codepoint) && TryParseKeyNumber(mod, out modifierCode),
+            _ => false
+        };
+    }
+
+    private static bool TryParseKeyNumber(string text, out int value)
+        => int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out value);
+
+    /// <summary>
+    /// The key event for a key-code encoding: the code is a Unicode codepoint (the fixterm/CSI u table names the key;
+    /// other punctuation takes the key a bare byte of it decodes to, then <see cref="PunctuationKey"/>) and the
+    /// modifier parameter is xterm's (1 + Shift/Alt/Ctrl bits). The event carries the text the same key's legacy
+    /// encoding carries, so character bindings and <see cref="TerminalInputEncoder"/> see one shape per key: a control
+    /// key (Tab, Enter, Escape, Backspace) its control byte; under Ctrl the C0 control of the key, if it has one;
+    /// otherwise the typed character (Shift on a lowercase letter types the uppercase one; Alt adds only the ESC
+    /// prefix). A code with neither a key name nor printable text is no event.
+    /// </summary>
+    private static Hex1bKeyEvent? KeyCodeToKeyEvent(int codepoint, int modifierCode)
+    {
+        if (!Rune.IsValid(codepoint))
+            return null;
+        var rune = new Rune(codepoint);
+        var modifiers = DecodeXtermModifiers(modifierCode);
+        var key = ParseFixtermKeycode(codepoint);
+        if (key == Hex1bKey.None && rune.IsBmp && !Rune.IsControl(rune))
+        {
+            key = ParseKeyInput((char)codepoint) is { Key: not Hex1bKey.None } legacy
+                ? legacy.Key
+                : PunctuationKey((char)codepoint);
+        }
+        string text;
+        if (Rune.IsControl(rune))
+        {
+            text = key == Hex1bKey.None ? "" : rune.ToString();
+        }
+        else if ((modifiers & Hex1bModifiers.Control) != 0)
+        {
+            var upper = rune.IsBmp ? char.ToUpperInvariant((char)codepoint) : '\0';
+            text = upper is > '@' and <= '_' ? ((char)(upper & 31)).ToString() : "";
+        }
+        else
+        {
+            if ((modifiers & Hex1bModifiers.Shift) != 0 && Rune.IsLower(rune))
+                rune = Rune.ToUpperInvariant(rune);
+            text = rune.ToString();
+        }
+        var printable = text.Length > 0 && !Rune.IsControl(Rune.GetRuneAt(text, 0));
+        return key == Hex1bKey.None && !printable ? null : new Hex1bKeyEvent(key, text, modifiers);
+    }
+
+    /// <summary>
+    /// US-layout punctuation keys by either glyph (the layout <see cref="TerminalInputEncoder"/> assumes), for key-code
+    /// events only: a bare byte keeps <see cref="ParseKeyInput"/>'s decoding. modifyOtherKeys reports the shifted glyph.
+    /// </summary>
+    private static Hex1bKey PunctuationKey(char c) => c switch
+    {
+        ';' or ':' => Hex1bKey.Oem1,
+        '[' or '{' => Hex1bKey.Oem4,
+        '\\' or '|' => Hex1bKey.Oem5,
+        ']' or '}' => Hex1bKey.Oem6,
+        '\'' or '"' => Hex1bKey.Oem7,
+        '`' or '~' => Hex1bKey.OemTilde,
+        '<' => Hex1bKey.OemComma,
+        '>' => Hex1bKey.OemPeriod,
+        '_' => Hex1bKey.OemMinus,
+        _ => Hex1bKey.None
+    };
+
     private byte[] EncodeInputEvent(Hex1bEvent evt, out IReadOnlyList<AnsiToken> tokens)
     {
         var modes = InputModes;
