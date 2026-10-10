@@ -127,6 +127,7 @@ public sealed class WindowPanelNode : Hex1bNode, IWindowHost, ILayoutProvider
     /// </summary>
     internal async Task ReconcileWindowsAsync(ReconcileContext context)
     {
+        RememberFocusedContent();
         var entries = Windows.All;
         var activeWindow = Windows.ActiveWindow;
         var newWindowNodes = new List<WindowNode>();
@@ -187,10 +188,14 @@ public sealed class WindowPanelNode : Hex1bNode, IWindowHost, ILayoutProvider
                 // FocusWhere properly clears old focus and calls SyncAncestorFocusState.
                 // Target the first content focusable (skip WindowNode itself and title bar).
                 var contentNode = targetNode.Content;
+                // Issue 64: a window that had a content control focused gets that control back instead.
+                var restore = _lastFocusedContent.GetValueOrDefault(targetNode);
                 if (contentNode != null)
                 {
                     context.RequestFocusCallback(n =>
                     {
+                        // Checked here, after layout: a control that layout removed falls back to the first one.
+                        if (restore != null && contentNode.GetFocusableNodes().Any(f => ReferenceEquals(f, restore))) return ReferenceEquals(n, restore);
                         var contentFocusables = contentNode.GetFocusableNodes();
                         return contentFocusables.Any(f => ReferenceEquals(f, n));
                     });
@@ -206,6 +211,46 @@ public sealed class WindowPanelNode : Hex1bNode, IWindowHost, ILayoutProvider
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// The content control each open window last had focused (issue 64), so a window that becomes active again when
+    /// the window over it closes gets that control back rather than its first content focusable.
+    /// </summary>
+    private Dictionary<WindowNode, Hex1bNode> _lastFocusedContent = [];
+
+    /// <summary>
+    /// Updates <see cref="_lastFocusedContent"/> from the windows as the previous frame left them. It runs first in the
+    /// reconcile, so focus flags are the focus ring's, not flags that reconcile sets on new nodes (a new list marks
+    /// itself focused), and a window being covered in this frame still reports the control it had. Only windows whose
+    /// controls were in the focus ring are read: under a modal, the topmost modal; a covered window keeps its memory,
+    /// since the ring never clears flags outside it. A read window with no focused content control keeps its remembered
+    /// one while that control is still in its content. Closed windows drop out on the next reconcile.
+    /// </summary>
+    private void RememberFocusedContent()
+    {
+        var modal = WindowNodes.LastOrDefault(w => w.IsModal);
+        var remembered = new Dictionary<WindowNode, Hex1bNode>();
+        foreach (var windowNode in WindowNodes)
+        {
+            var previous = _lastFocusedContent.GetValueOrDefault(windowNode);
+            var kept = previous;
+            if (windowNode.Content != null && (modal == null || ReferenceEquals(windowNode, modal)))
+            {
+                kept = null;
+                foreach (var focusable in windowNode.Content.GetFocusableNodes())
+                {
+                    if (focusable.IsFocused)
+                    {
+                        kept = focusable;
+                        break;
+                    }
+                    if (ReferenceEquals(focusable, previous)) kept = focusable;
+                }
+            }
+            if (kept != null) remembered[windowNode] = kept;
+        }
+        _lastFocusedContent = remembered;
     }
 
     public override IEnumerable<Hex1bNode> GetFocusableNodes()
